@@ -63,14 +63,17 @@ size_t engine_process_block(engine_channel_t *eng,
 
     /* FIR rate conversion */
     uint32_t fs_out = cfg->fs_out ? cfg->fs_out : cfg->fs_in;
-    size_t ratio = fs_out / cfg->fs_in;
-    size_t out_count = count * ratio;
+    size_t fir_out_count;
+    if (fs_out >= cfg->fs_in)
+        fir_out_count = count * (fs_out / cfg->fs_in);
+    else
+        fir_out_count = count / (cfg->fs_in / fs_out);
 
     /* Ensure intermediate buffer */
-    if (eng->fir_buf_sz < out_count * sizeof(float)) {
+    if (eng->fir_buf_sz < fir_out_count * sizeof(float)) {
         free(eng->fir_buf);
-        eng->fir_buf = (float *)malloc(out_count * sizeof(float));
-        eng->fir_buf_sz = out_count * sizeof(float);
+        eng->fir_buf = (float *)malloc(fir_out_count * sizeof(float));
+        eng->fir_buf_sz = fir_out_count * sizeof(float);
     }
 
     size_t fir_out = fir_chain_process(&eng->fir, in, eng->fir_buf, count);
