@@ -2,9 +2,9 @@
  * foo_dsd_trellis — foobar2000 DSP v2 C++ wrapper
  *
  * Thin C++ layer implementing the fb2k service interface.
- * Delegates all processing to the C engine (dsp_plugin.c).
- *
- * Phase 0: Scaffold — passthrough only.
+ * Each DSP instance owns a plugin_state_t for independent processing.
+ * Detects DoP in incoming chunks, processes through the DSD engine,
+ * and returns DoP-encoded output.
  */
 
 #include "stdafx.h"
@@ -12,11 +12,22 @@
 extern "C" {
 #include "../include/dsd_types.h"
 
-/* C-side plugin management from dsp_plugin.c */
-int              plugin_init(int num_channels, const dsd_config_t *cfg);
-void             plugin_shutdown(void);
-int              plugin_reconfigure(const dsd_config_t *cfg);
-const dsd_config_t *plugin_get_config(void);
+/* Per-instance plugin state (opaque, defined in dsp_plugin.c) */
+typedef struct plugin_state plugin_state_t;
+
+plugin_state_t *plugin_create(void);
+void            plugin_destroy(plugin_state_t *s);
+void            plugin_set_config(plugin_state_t *s, const dsd_config_t *cfg);
+const dsd_config_t *plugin_get_config(const plugin_state_t *s);
+size_t          plugin_process(plugin_state_t *s,
+                               const float *in_pcm, float *out_pcm,
+                               size_t pcm_frames, int num_channels,
+                               uint32_t pcm_rate);
+size_t          plugin_drain(plugin_state_t *s, float *out_pcm,
+                             int num_channels);
+double          plugin_get_latency(const plugin_state_t *s);
+void            plugin_flush(plugin_state_t *s);
+int             plugin_reconfigure(plugin_state_t *s, const dsd_config_t *cfg);
 }
 
 /* {7A3F2D1E-B4C5-4E6F-8A9B-0C1D2E3F4A5B} */
@@ -43,7 +54,16 @@ class dsp_dsd_trellis : public dsp_impl_base {
 public:
     dsp_dsd_trellis(dsp_preset const &preset)
         : m_config(parse_preset(preset))
+        , m_state(plugin_create())
+        , m_channels(0)
+        , m_pcm_rate(0)
     {
+        if (m_state)
+            plugin_set_config(m_state, &m_config);
+    }
+
+    ~dsp_dsd_trellis() {
+        plugin_destroy(m_state);
     }
 
     static GUID g_get_guid() { return g_dsp_guid; }
@@ -60,38 +80,126 @@ public:
     }
 
     static bool g_have_config_popup() {
-        /* TODO (Phase 6): Return true when config dialog is implemented */
-        return false;
+        return true;
     }
 
 #ifdef _WIN32
-    static void g_show_config_popup(const dsp_preset & /*p_data*/,
-                                    HWND /*p_parent*/,
+    static void g_show_config_popup(const dsp_preset &p_data,
+                                    HWND p_parent,
                                     dsp_preset_edit_callback & /*p_callback*/) {
-        /* TODO (Phase 6): Property page dialog */
+        dsd_config_t cfg = parse_preset(p_data);
+
+        /* Simple message box showing current settings.
+         * Full property page dialog deferred to Phase 7. */
+        pfc::string8 msg;
+        msg << "DSD Trellis SDM Settings\n\n"
+            << "Trellis Depth: " << cfg.trellis_depth << "\n"
+            << "Candidates: " << cfg.trellis_cands << "\n"
+            << "Latency: " << cfg.trellis_lat << "\n"
+            << "Gain: " << pfc::format_float(cfg.gain, 0, 2) << "\n"
+            << "NTF Filter: " << cfg.ntf_filter << " (Auto=-1)\n"
+            << "\nEdit settings via the preset system.";
+
+        MessageBoxA(p_parent, msg.c_str(), "DSD Trellis SDM", MB_OK);
     }
 #endif
 
     bool on_chunk(audio_chunk *chunk, abort_callback & /*abort*/) override {
-        /* Phase 0: passthrough — return chunk unmodified */
-        (void)chunk;
+        if (!m_state)
+            return true;  /* Pass through on allocation failure */
+
+        const unsigned channels = chunk->get_channel_count();
+        const unsigned pcm_rate = chunk->get_sample_rate();
+        const t_size pcm_frames = chunk->get_sample_count();
+
+        if (channels == 0 || pcm_frames == 0)
+            return true;
+
+        /* Track channel/rate changes for latency reporting */
+        m_channels = (int)channels;
+        m_pcm_rate = pcm_rate;
+
+        /* Convert audio_sample (double on x64) to float for C engine */
+        const audio_sample *src = chunk->get_data();
+        size_t total_in = pcm_frames * channels;
+        pfc::array_staticsize_t<float> in_f32;
+        in_f32.set_size_discard(total_in);
+        for (size_t i = 0; i < total_in; i++)
+            in_f32[i] = (float)src[i];
+
+        /* Allocate output buffer: worst case is 8x rate conversion.
+         * Output is interleaved: out_frames * channels. */
+        size_t max_out_frames = pcm_frames * 8;
+        pfc::array_staticsize_t<float> out_buf;
+        out_buf.set_size_discard(max_out_frames * channels);
+
+        size_t out_frames = plugin_process(
+            m_state, in_f32.get_ptr(), out_buf.get_ptr(),
+            pcm_frames, (int)channels, pcm_rate);
+
+        if (out_frames == 0) {
+            /* Not DoP or processing failed — pass through unmodified */
+            return true;
+        }
+
+        /* Determine output PCM sample rate */
+        uint32_t dsd_rate_in = pcm_rate * 16;
+        uint32_t dsd_rate_out = m_config.fs_out ? m_config.fs_out : dsd_rate_in;
+        uint32_t out_pcm_rate = dsd_rate_out / 16;
+
+        /* Convert float output back to audio_sample and update chunk */
+        size_t total_out = out_frames * channels;
+        pfc::array_staticsize_t<audio_sample> out_as;
+        out_as.set_size_discard(total_out);
+        for (size_t i = 0; i < total_out; i++)
+            out_as[i] = (audio_sample)out_buf[i];
+        chunk->set_data(out_as.get_ptr(), out_frames, channels, out_pcm_rate);
+
         return true;
     }
 
     void on_endofplayback(abort_callback & /*abort*/) override {
-        /* TODO (Phase 6): Flush SDM latency buffer */
+        if (!m_state || m_channels == 0)
+            return;
+
+        /* Drain remaining SDM latency and output as a final chunk */
+        size_t max_drain_frames = 2048 / 16;  /* max latency / bits per frame */
+        pfc::array_staticsize_t<float> drain_buf;
+        drain_buf.set_size_discard(max_drain_frames * (unsigned)m_channels);
+
+        size_t drain_frames = plugin_drain(m_state, drain_buf.get_ptr(),
+                                           m_channels);
+
+        if (drain_frames > 0 && m_pcm_rate > 0) {
+            uint32_t dsd_rate_in = m_pcm_rate * 16;
+            uint32_t dsd_rate_out = m_config.fs_out ? m_config.fs_out
+                                                     : dsd_rate_in;
+            uint32_t out_pcm_rate = dsd_rate_out / 16;
+
+            /* Convert float to audio_sample */
+            size_t total = drain_frames * (unsigned)m_channels;
+            pfc::array_staticsize_t<audio_sample> drain_as;
+            drain_as.set_size_discard(total);
+            for (size_t i = 0; i < total; i++)
+                drain_as[i] = (audio_sample)drain_buf[i];
+
+            audio_chunk_impl chunk_out;
+            chunk_out.set_data(drain_as.get_ptr(), drain_frames,
+                               (unsigned)m_channels, out_pcm_rate);
+            insert_chunk(chunk_out);
+        }
     }
 
     void on_endoftrack(abort_callback & /*abort*/) override {
-        /* No action needed unless need_track_change_mark() returns true */
+        /* No action needed */
     }
 
     void flush() override {
-        /* Reset SDM state on seek */
+        plugin_flush(m_state);
     }
 
     double get_latency() override {
-        return 0.0;
+        return plugin_get_latency(m_state);
     }
 
     bool need_track_change_mark() override {
@@ -99,7 +207,10 @@ public:
     }
 
 private:
-    dsd_config_t m_config;
+    dsd_config_t     m_config;
+    plugin_state_t  *m_state;
+    int              m_channels;
+    unsigned         m_pcm_rate;
 };
 
 static dsp_factory_t<dsp_dsd_trellis> g_dsp_factory;

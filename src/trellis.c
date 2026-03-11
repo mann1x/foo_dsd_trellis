@@ -144,7 +144,7 @@ static sdm_state_t *sdm_check_path(sdm_context_t *p, sdm_state_t *s)
 
 static unsigned sdm_sort_cands(sdm_context_t *p, sdm_trellis_t *st)
 {
-    sdm_state_t *r, *s, *t;
+    sdm_state_t *r = NULL, *s, *t;
     sdm_state_t *min = NULL;
     unsigned i, j, n;
 
@@ -250,7 +250,7 @@ static double sdm_sample_trellis(sdm_context_t *p, double x)
         if (s->parent->hist_used) {
             unsigned h = sdm_histbuf_get(p);
             sdm_hist_copy(p, h, s->hist);
-            s->hist = h;
+            s->hist = (uint8_t)h;
         } else {
             s->parent->hist_used = 1;
         }
