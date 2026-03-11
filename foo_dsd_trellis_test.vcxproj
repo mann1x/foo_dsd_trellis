@@ -123,6 +123,7 @@
     <ClCompile Include="test\test_fir.c" />
     <ClCompile Include="test\test_trellis.c" />
     <ClCompile Include="test\test_threadpool.c" />
+    <ClCompile Include="test\test_hardening.c" />
     <!-- Library sources (linked directly, no DLL dependency) -->
     <ClCompile Include="src\config.c" />
     <ClCompile Include="src\dop.c" />

@@ -17,6 +17,7 @@ int main(void) {
     test_fir_suite();
     test_trellis_suite();
     test_threadpool_suite();
+    test_hardening_suite();
 
     TEST_SUMMARY();
 }

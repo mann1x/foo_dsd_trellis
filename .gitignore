@@ -30,6 +30,9 @@ ipch/
 # foobar2000 SDK (vendored, download separately)
 foobar2000-sdk/
 
+# foobar2000 test component
+foobar2000-test/
+
 # Reference files (not distributed)
 reference/
 

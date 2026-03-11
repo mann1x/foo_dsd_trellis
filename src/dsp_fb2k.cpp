@@ -90,7 +90,7 @@ public:
         dsd_config_t cfg = parse_preset(p_data);
 
         /* Simple message box showing current settings.
-         * Full property page dialog deferred to Phase 7. */
+         * TODO: Full property page dialog. */
         pfc::string8 msg;
         msg << "DSD Trellis SDM Settings\n\n"
             << "Trellis Depth: " << cfg.trellis_depth << "\n"
