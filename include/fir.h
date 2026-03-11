@@ -50,4 +50,8 @@ void fir_chain_reset(fir_chain_t *chain);
 /* Free scratch buffer and reset. */
 void fir_chain_free(fir_chain_t *chain);
 
+/* SIMD-dispatched FIR convolution (fir_simd.c) */
+void fir_simd_init(void);
+const char *fir_simd_name(void);
+
 #endif /* FIR_H */

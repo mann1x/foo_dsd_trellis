@@ -18,6 +18,8 @@ int main(void) {
     test_trellis_suite();
     test_threadpool_suite();
     test_hardening_suite();
+    test_config_suite();
+    test_simd_suite();
 
     TEST_SUMMARY();
 }

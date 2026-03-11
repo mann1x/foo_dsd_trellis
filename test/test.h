@@ -58,5 +58,7 @@ void test_fir_suite(void);
 void test_trellis_suite(void);
 void test_threadpool_suite(void);
 void test_hardening_suite(void);
+void test_config_suite(void);
+void test_simd_suite(void);
 
 #endif /* TEST_H */

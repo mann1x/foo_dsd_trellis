@@ -11,7 +11,13 @@ A native foobar2000 DSP plugin that processes DSD (Direct Stream Digital) audio 
 | Passthrough | Repack only -- bypass FIR and SDM when input/output rate and gain are identical |
 | Mute | Silence pattern substitution (0x69/0x96) |
 | DoP Detection | Auto-detect DoP markers (0x05/0xFA) in 24-bit PCM frames; falls back to native ASIO |
+| Native DSD | Raw DSD bitstream support (FORMAT_NATIVE) for ASIO and native input components |
 | Trellis Depth | Configurable look-ahead N (4, 8, 16, 32) and candidates M (4-32) |
+| SIMD Acceleration | Runtime CPU dispatch: AVX2+FMA (Intel/Zen 3+), AVX128+FMA (Zen 1/2), SSE2 fallback |
+| Property Page | Full configuration dialog with dark mode support |
+| Output Modes | DoP (native DSD output) or PCM (for VU meter / non-DSD DACs) |
+| Config Versioning | Forward-compatible binary preset serialization with legacy fallback |
+| foo_input_udsd | Compatible with foo_input_udsd / foo_input_sacd DSD input components |
 
 ## Architecture
 
@@ -25,8 +31,9 @@ Four-layer design with clean separation of concerns:
 |-------|---------|-------|
 | fb2k Interface | foobar2000 DSP v2 glue, config dialog | `dsp_fb2k.cpp`, `dsp_plugin.c`, `config.c` |
 | Format Bridge | DoP/native detection, 1-bit <-> float32 | `dop.c`, `bitpack.c` |
-| Processing Engine | FIR rate conversion + gain | `engine.c`, `fir.c` |
+| Processing Engine | FIR rate conversion + gain + SIMD | `engine.c`, `fir.c`, `fir_simd.c` |
 | Trellis SDM | Viterbi look-ahead requantiser | `trellis.c`, `ntf.c` |
+| CPU Detection | Runtime SSE2/AVX2/FMA dispatch, AMD vs Intel tuning | `simd_detect.c` |
 
 Thread pool (`threadpool.c`) provides per-channel parallelism.
 

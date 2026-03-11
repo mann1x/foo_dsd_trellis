@@ -15,6 +15,10 @@
 #include <string.h>
 #include <math.h>
 
+/* SIMD-dispatched FIR convolution (defined in fir_simd.c) */
+extern double fir_convolve_dispatch(const double *coeffs, const float *delay,
+                                    int pos, int ntaps);
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -97,11 +101,8 @@ static size_t upsample2(fir_stage_t *stage,
         ph->delay[ph->delay_pos] = in[i];
 
         /* Phase 0 output: FIR with even-indexed coefficients, scaled ×2 */
-        double sum = 0.0;
-        for (int j = 0; j < ntaps; j++) {
-            int idx = (ph->delay_pos - j) & (FIR_MAX_PHASE_TAPS - 1);
-            sum += ph->coeffs[j] * (double)ph->delay[idx];
-        }
+        double sum = fir_convolve_dispatch(ph->coeffs, ph->delay,
+                                           ph->delay_pos, ntaps);
         out[2 * i] = (float)(2.0 * sum);
 
         /* Phase 1 output: 1.0 × delayed input (0.5 center tap × 2 gain) */
@@ -130,11 +131,8 @@ static size_t downsample2(fir_stage_t *stage,
         odd->delay[odd->delay_pos] = in[2 * i + 1];
 
         /* Phase 0: FIR convolution on even samples */
-        double sum = 0.0;
-        for (int j = 0; j < ntaps; j++) {
-            int idx = (even->delay_pos - j) & (FIR_MAX_PHASE_TAPS - 1);
-            sum += even->coeffs[j] * (double)even->delay[idx];
-        }
+        double sum = fir_convolve_dispatch(even->coeffs, even->delay,
+                                           even->delay_pos, ntaps);
 
         /* Phase 1: 0.5 × delayed odd sample */
         int d = (odd->delay_pos - HB_PHASE1_DELAY_DN) & (FIR_MAX_PHASE_TAPS - 1);

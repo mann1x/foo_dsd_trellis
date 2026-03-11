@@ -178,6 +178,15 @@
     <ClCompile Include="src\threadpool.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\simd_detect.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\fir_simd.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\foo_dsd_trellis.rc" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\stdafx.h" />
@@ -188,6 +197,8 @@
     <ClInclude Include="include\dop.h" />
     <ClInclude Include="include\engine.h" />
     <ClInclude Include="include\threadpool.h" />
+    <ClInclude Include="include\simd_detect.h" />
+    <ClInclude Include="src\resource.h" />
   </ItemGroup>
   <!-- SDK project references -->
   <ItemGroup>

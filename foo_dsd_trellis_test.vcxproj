@@ -124,6 +124,8 @@
     <ClCompile Include="test\test_trellis.c" />
     <ClCompile Include="test\test_threadpool.c" />
     <ClCompile Include="test\test_hardening.c" />
+    <ClCompile Include="test\test_config.c" />
+    <ClCompile Include="test\test_simd.c" />
     <!-- Library sources (linked directly, no DLL dependency) -->
     <ClCompile Include="src\config.c" />
     <ClCompile Include="src\dop.c" />
@@ -133,6 +135,8 @@
     <ClCompile Include="src\trellis.c" />
     <ClCompile Include="src\ntf.c" />
     <ClCompile Include="src\threadpool.c" />
+    <ClCompile Include="src\simd_detect.c" />
+    <ClCompile Include="src\fir_simd.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\dsd_types.h" />

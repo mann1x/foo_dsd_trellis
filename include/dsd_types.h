@@ -26,12 +26,18 @@ typedef unsigned long DWORD;
 #define DSD_SILENCE_A 0x69u
 #define DSD_SILENCE_B 0x96u
 
-/* Stream format */
+/* Stream format (input detection) */
 typedef enum {
     FORMAT_AUTO   = 0,
     FORMAT_DOP    = 1,
     FORMAT_NATIVE = 2,
 } dsd_format_t;
+
+/* Output format */
+typedef enum {
+    OUTPUT_DOP    = 0,    /* Re-encode to DoP (default) */
+    OUTPUT_PCM    = 1,    /* Decimate to PCM (for visualization / non-DSD DACs) */
+} dsd_output_format_t;
 
 /* NTF filter selection */
 typedef enum {
@@ -62,7 +68,11 @@ typedef struct {
     int       thread_count;   /* Worker threads: 1 - logical_cpu_count */
     DWORD     affinity_mask;  /* SetThreadAffinityMask value, 0 = OS default */
     int       format;         /* dsd_format_t (auto-detected or forced) */
+    int       output_format;  /* dsd_output_format_t: DoP or PCM output */
 } dsd_config_t;
+
+/* Config serialization version */
+#define DSD_CONFIG_VERSION 1
 
 /* Default configuration values */
 #define DSD_DEFAULT_GAIN         1.0f
@@ -83,6 +93,7 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     cfg->thread_count   = DSD_DEFAULT_THREADS;
     cfg->affinity_mask  = 0;
     cfg->format         = FORMAT_AUTO;
+    cfg->output_format  = OUTPUT_DOP;
 }
 
 #endif /* DSD_TYPES_H */
