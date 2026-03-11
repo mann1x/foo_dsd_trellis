@@ -1,0 +1,46 @@
+# Build output
+bin/
+obj/
+x64/
+Debug/
+Release/
+
+# Executables
+*.exe
+*.dll
+*.lib
+*.pdb
+*.exp
+*.ilk
+*.obj
+*.o
+
+# Visual Studio
+*.user
+*.suo
+*.ncb
+*.sdf
+*.opensdf
+*.vc.db
+*.vc.db-shm
+*.vc.db-wal
+.vs/
+ipch/
+
+# foobar2000 SDK (vendored, download separately)
+foobar2000-sdk/
+
+# Reference files (not distributed)
+reference/
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# NuGet
+packages/
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
