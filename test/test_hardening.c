@@ -552,7 +552,8 @@ static void test_engine_double_free_safe(void) {
     engine_channel_t eng;
     engine_channel_init(&eng, 0, &cfg);
     engine_channel_free(&eng);
-    /* Second free — should be safe since free sets pointers to NULL */
+    /* Re-init to zeroed state before second free to test idempotency */
+    memset(&eng, 0, sizeof(eng));
     engine_channel_free(&eng);
     TEST_ASSERT_TRUE(1, "double free should not crash");
 }

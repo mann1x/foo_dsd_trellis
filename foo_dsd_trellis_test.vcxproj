@@ -126,6 +126,7 @@
     <ClCompile Include="test\test_hardening.c" />
     <ClCompile Include="test\test_config.c" />
     <ClCompile Include="test\test_simd.c" />
+    <ClCompile Include="test\test_rate_sinad.c" />
     <!-- Library sources (linked directly, no DLL dependency) -->
     <ClCompile Include="src\config.c" />
     <ClCompile Include="src\dop.c" />

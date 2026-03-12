@@ -16,10 +16,11 @@ int main(void) {
     test_ntf_suite();
     test_fir_suite();
     test_trellis_suite();
-    test_threadpool_suite();
-    test_hardening_suite();
     test_config_suite();
     test_simd_suite();
+    test_rate_sinad_suite();
+    test_hardening_suite();
+    test_threadpool_suite();
 
     TEST_SUMMARY();
 }
