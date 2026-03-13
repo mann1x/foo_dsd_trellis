@@ -68,12 +68,17 @@ static size_t read_u8(const uint8_t *buf, size_t pos, uint8_t *val) {
  * 4  affinity_mask
  * 4  format
  * 4  output_format
- * Total: 45 bytes */
+ * Total: 45 bytes
+ *
+ * Version 2 adds:
+ * 1  debug_log (bool)
+ * Total: 46 bytes */
 #define CONFIG_V1_SIZE 45
+#define CONFIG_V2_SIZE 46
 
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
-    if (buf_size < CONFIG_V1_SIZE)
+    if (buf_size < CONFIG_V2_SIZE)
         return 0;
 
     size_t pos = 0;
@@ -90,6 +95,7 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     pos = write_u32(buf, pos, (uint32_t)cfg->affinity_mask);
     pos = write_i32(buf, pos, (int32_t)cfg->format);
     pos = write_i32(buf, pos, (int32_t)cfg->output_format);
+    pos = write_u8(buf, pos, cfg->debug_log ? 1 : 0);
 
     return pos;
 }
@@ -105,8 +111,8 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
     uint32_t version;
     read_u32(buf, 0, &version);
 
-    if (version == DSD_CONFIG_VERSION && buf_size >= CONFIG_V1_SIZE) {
-        /* Version 1: field-by-field */
+    if ((version == 1 || version == 2) && buf_size >= CONFIG_V1_SIZE) {
+        /* Version 1/2: field-by-field */
         size_t pos = 4;
         pos = read_u32(buf, pos, &cfg->fs_in);
         pos = read_u32(buf, pos, &cfg->fs_out);
@@ -124,6 +130,12 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
         pos = read_u32(buf, pos, &u32); cfg->affinity_mask = (DWORD)u32;
         pos = read_i32(buf, pos, &i32); cfg->format = (int)i32;
         pos = read_i32(buf, pos, &i32); cfg->output_format = (int)i32;
+        /* Version 2 adds debug_log */
+        if (version >= 2 && buf_size >= CONFIG_V2_SIZE) {
+            uint8_t log_byte;
+            pos = read_u8(buf, pos, &log_byte);
+            cfg->debug_log = log_byte != 0;
+        }
         (void)pos;
         config_validate(cfg);
         return 0;

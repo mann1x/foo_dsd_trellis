@@ -11,6 +11,8 @@
 #include "resource.h"
 #include <helpers/DarkMode.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdarg.h>
 
 extern "C" {
 #include "../include/dsd_types.h"
@@ -50,6 +52,96 @@ static inline float gain_to_db(float linear) {
 static inline float db_to_gain(float db) {
     if (db <= -120.0f) return 0.0f;
     return powf(10.0f, db / 20.0f);
+}
+
+/* ─── File logger ─── */
+
+static CRITICAL_SECTION g_log_cs;
+static bool g_log_cs_init = false;
+static FILE *g_log_file = NULL;
+static bool g_log_enabled = false;
+
+static void log_init_cs() {
+    if (!g_log_cs_init) {
+        InitializeCriticalSection(&g_log_cs);
+        g_log_cs_init = true;
+    }
+}
+
+/* Build log path next to the DLL */
+static pfc::string8 get_log_path() {
+    pfc::string8 path;
+    path = core_api::get_my_full_path();
+    /* Strip filename, keep directory */
+    t_size slash = path.find_last('/');
+    t_size bslash = path.find_last('\\');
+    t_size sep = 0;
+    if (slash != pfc::infinite_size && slash > sep) sep = slash;
+    if (bslash != pfc::infinite_size && bslash > sep) sep = bslash;
+    if (sep > 0)
+        path.truncate(sep + 1);
+    path += "foo_dsd_trellis.log";
+    return path;
+}
+
+static void log_open() {
+    if (g_log_file) return;
+    pfc::string8 path = get_log_path();
+    g_log_file = fopen(path.c_str(), "a");
+    if (g_log_file) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        fprintf(g_log_file, "\n--- DSD Trellis log opened %04d-%02d-%02d %02d:%02d:%02d ---\n",
+                st.wYear, st.wMonth, st.wDay,
+                st.wHour, st.wMinute, st.wSecond);
+        fflush(g_log_file);
+    }
+}
+
+static void log_close() {
+    if (g_log_file) {
+        fprintf(g_log_file, "--- log closed ---\n");
+        fclose(g_log_file);
+        g_log_file = NULL;
+    }
+}
+
+static void trellis_log(const char *fmt, ...) {
+    log_init_cs();
+    EnterCriticalSection(&g_log_cs);
+
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    /* Always write to fb2k console */
+    pfc::string_formatter msg;
+    msg << "DSD Trellis: " << buf;
+    console::print(msg);
+
+    /* Write to file if enabled */
+    if (g_log_enabled && g_log_file) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        fprintf(g_log_file, "[%02d:%02d:%02d.%03d] %s\n",
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
+        fflush(g_log_file);
+    }
+
+    LeaveCriticalSection(&g_log_cs);
+}
+
+static void log_set_enabled(bool enabled) {
+    log_init_cs();
+    EnterCriticalSection(&g_log_cs);
+    g_log_enabled = enabled;
+    if (enabled)
+        log_open();
+    else
+        log_close();
+    LeaveCriticalSection(&g_log_cs);
 }
 
 /* {7A3F2D1E-B4C5-4E6F-8A9B-0C1D2E3F4A5B} */
@@ -101,6 +193,7 @@ public:
         COMMAND_HANDLER_EX(IDC_COMBO_FORMAT, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_COMBO_OUTPUT_FORMAT, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_CHECK_MUTE, BN_CLICKED, OnChange)
+        COMMAND_HANDLER_EX(IDC_CHECK_DEBUG_LOG, BN_CLICKED, OnChange)
         COMMAND_HANDLER_EX(IDC_EDIT_GAIN, EN_CHANGE, OnEditChange)
         COMMAND_HANDLER_EX(IDC_EDIT_TRELLIS_CANDS, EN_CHANGE, OnEditChange)
         COMMAND_HANDLER_EX(IDC_EDIT_TRELLIS_LAT, EN_CHANGE, OnEditChange)
@@ -192,6 +285,9 @@ private:
         /* Mute checkbox */
         CheckDlgButton(IDC_CHECK_MUTE, cfg.mute ? BST_CHECKED : BST_UNCHECKED);
 
+        /* Debug log checkbox */
+        CheckDlgButton(IDC_CHECK_DEBUG_LOG, cfg.debug_log ? BST_CHECKED : BST_UNCHECKED);
+
         /* Show SIMD engine info */
         const cpu_features_t *cpu = cpu_detect();
         const char *simd = fir_simd_name();
@@ -261,6 +357,9 @@ private:
         /* Mute */
         cfg.mute = IsDlgButtonChecked(IDC_CHECK_MUTE) == BST_CHECKED;
 
+        /* Debug log */
+        cfg.debug_log = IsDlgButtonChecked(IDC_CHECK_DEBUG_LOG) == BST_CHECKED;
+
         config_validate(&cfg);
 
         dsp_preset_impl preset;
@@ -302,9 +401,24 @@ public:
     {
         if (m_state)
             plugin_set_config(m_state, &m_config);
+
+        log_set_enabled(m_config.debug_log);
+
+        const char *simd = fir_simd_name();
+        uint32_t fs = m_config.fs_out;
+        trellis_log("initialized (engine=%s, output=%s, depth=%d, cands=%d)",
+                    simd,
+                    fs == 0 ? "as-input" :
+                    fs == DSD_RATE_64  ? "DSD64" :
+                    fs == DSD_RATE_128 ? "DSD128" :
+                    fs == DSD_RATE_256 ? "DSD256" :
+                    fs == DSD_RATE_512 ? "DSD512" : "?",
+                    m_config.trellis_depth, m_config.trellis_cands);
     }
 
     ~dsp_dsd_trellis() {
+        trellis_log("shutting down");
+        log_set_enabled(false);
         plugin_destroy(m_state);
     }
 
@@ -344,6 +458,14 @@ public:
         if (channels == 0 || pcm_frames == 0)
             return true;
 
+        /* Log first chunk detection */
+        if (m_pcm_rate != pcm_rate || m_channels != (int)channels) {
+            uint32_t dsd_rate = pcm_rate * 16;
+            unsigned dsd_mult = dsd_rate / 44100;
+            trellis_log("detected DSD%u (%u Hz) via DoP @ %u Hz, %uch",
+                        dsd_mult, dsd_rate, pcm_rate, channels);
+        }
+
         m_channels = (int)channels;
         m_pcm_rate = pcm_rate;
 
@@ -364,8 +486,14 @@ public:
             m_state, in_f32.get_ptr(), out_buf.get_ptr(),
             pcm_frames, (int)channels, pcm_rate);
 
-        if (out_frames == 0)
+        if (out_frames == 0) {
+            if (!m_logged_passthrough) {
+                trellis_log("no DoP detected, passing through");
+                m_logged_passthrough = true;
+            }
             return true;  /* Not DoP or processing failed — pass through */
+        }
+        m_logged_passthrough = false;
 
         /* Determine output PCM sample rate */
         uint32_t dsd_rate_in = pcm_rate * 16;
@@ -378,6 +506,18 @@ public:
         out_as.set_size_discard(total_out);
         for (size_t i = 0; i < total_out; i++)
             out_as[i] = (audio_sample)out_buf[i];
+
+        if (!m_logged_processing) {
+            unsigned out_mult = dsd_rate_out / 44100;
+            unsigned in_mult  = dsd_rate_in  / 44100;
+            if (dsd_rate_in != dsd_rate_out)
+                trellis_log("processing DSD%u -> DSD%u (%zu -> %zu frames)",
+                            in_mult, out_mult, pcm_frames, out_frames);
+            else
+                trellis_log("processing DSD%u (%zu -> %zu frames)",
+                            in_mult, pcm_frames, out_frames);
+            m_logged_processing = true;
+        }
 
         if (m_config.output_format == OUTPUT_PCM) {
             /* PCM output mode: decimate DoP to PCM for visualization.
@@ -426,6 +566,8 @@ public:
 
     void flush() override {
         plugin_flush(m_state);
+        m_logged_passthrough = false;
+        m_logged_processing = false;
     }
 
     double get_latency() override {
@@ -441,6 +583,8 @@ private:
     plugin_state_t  *m_state;
     int              m_channels;
     unsigned         m_pcm_rate;
+    bool             m_logged_passthrough = false;
+    bool             m_logged_processing = false;
 };
 
 static dsp_factory_t<dsp_dsd_trellis> g_dsp_factory;

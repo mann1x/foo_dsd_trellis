@@ -215,8 +215,8 @@ size_t plugin_process(plugin_state_t *s,
     if (dsd_rate == 0)
         return 0;  /* Not DoP, pass through */
 
-    /* Detect DoP markers in first channel */
-    if (pcm_frames >= 8 && !dop_detect(in_pcm, pcm_frames))
+    /* Detect DoP markers in channel 0 of interleaved data */
+    if (pcm_frames >= 8 && !dop_detect_interleaved(in_pcm, pcm_frames, num_channels))
         return 0;  /* No DoP markers, pass through */
 
     /* Initialize engine on first use or channel count change */

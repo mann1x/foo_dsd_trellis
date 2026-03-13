@@ -69,10 +69,11 @@ typedef struct {
     DWORD     affinity_mask;  /* SetThreadAffinityMask value, 0 = OS default */
     int       format;         /* dsd_format_t (auto-detected or forced) */
     int       output_format;  /* dsd_output_format_t: DoP or PCM output */
+    bool      debug_log;      /* Write diagnostic log to file */
 } dsd_config_t;
 
 /* Config serialization version */
-#define DSD_CONFIG_VERSION 1
+#define DSD_CONFIG_VERSION 2
 
 /* Default configuration values */
 #define DSD_DEFAULT_GAIN         1.0f
@@ -94,6 +95,7 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     cfg->affinity_mask  = 0;
     cfg->format         = FORMAT_AUTO;
     cfg->output_format  = OUTPUT_DOP;
+    cfg->debug_log      = false;
 }
 
 #endif /* DSD_TYPES_H */

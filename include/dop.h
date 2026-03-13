@@ -11,10 +11,14 @@
 #define DOP_MARKER_A 0x05u
 #define DOP_MARKER_B 0xFAu
 
-/* Detect DoP markers in a PCM24 stream.
+/* Detect DoP markers in a PCM24 stream (single channel, contiguous).
  * Scans first 8 frames for alternating 0x05/0xFA in MSB of 24-bit words.
  * Returns true if DoP is detected. */
 bool dop_detect(const float *pcm24, size_t frames);
+
+/* Detect DoP markers in interleaved multi-channel PCM24.
+ * Checks channel 0 at the given stride (= num_channels). */
+bool dop_detect_interleaved(const float *pcm24, size_t frames, int channels);
 
 /* Unpack DoP PCM24 frames to float32 ±1.0 DSD bits.
  * Extracts 16 DSD bits per PCM frame.

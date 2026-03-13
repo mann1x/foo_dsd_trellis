@@ -51,6 +51,26 @@ bool dop_detect(const float *pcm24, size_t frames) {
     return true;
 }
 
+bool dop_detect_interleaved(const float *pcm24, size_t frames, int channels) {
+    if (!pcm24 || frames < 2 || channels < 1)
+        return false;
+
+    /* Scan up to 8 frames of channel 0 (stride = channels) */
+    size_t check = frames < 8 ? frames : 8;
+
+    for (size_t i = 0; i < check; i++) {
+        int32_t val = float_to_int24(pcm24[i * (size_t)channels]);
+        uint32_t uval = (uint32_t)val & 0x00FFFFFFu;
+        uint8_t marker = (uint8_t)(uval >> 16);
+
+        uint8_t expected = (i & 1) ? DOP_MARKER_B : DOP_MARKER_A;
+        if (marker != expected)
+            return false;
+    }
+
+    return true;
+}
+
 void dop_unpack(const float *pcm24, float *bits, size_t frames) {
     if (!pcm24 || !bits || frames == 0)
         return;
