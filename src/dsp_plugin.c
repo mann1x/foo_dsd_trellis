@@ -75,7 +75,8 @@ static uint32_t dsd_to_dop_pcm_rate(uint32_t dsd_rate) {
 
 /* Ensure per-channel buffers are large enough */
 static int ensure_ch_bufs(plugin_state_t *s, int num_ch, size_t dsd_samples) {
-    if (s->ch_in && s->num_channels >= num_ch && s->ch_buf_size >= dsd_samples)
+    size_t needed = dsd_samples * 8;  /* worst case: 8x rate conversion */
+    if (s->ch_in && s->num_channels >= num_ch && s->ch_buf_size >= needed)
         return 0;
 
     /* Free old */
