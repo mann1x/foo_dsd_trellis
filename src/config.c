@@ -72,13 +72,20 @@ static size_t read_u8(const uint8_t *buf, size_t pos, uint8_t *val) {
  *
  * Version 2 adds:
  * 1  debug_log (bool)
- * Total: 46 bytes */
+ * Total: 46 bytes
+ *
+ * Version 3 adds:
+ * 1  smt_mode
+ * 1  ccd_mode
+ * 1  ecore_mode
+ * Total: 49 bytes */
 #define CONFIG_V1_SIZE 45
 #define CONFIG_V2_SIZE 46
+#define CONFIG_V3_SIZE 49
 
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
-    if (buf_size < CONFIG_V2_SIZE)
+    if (buf_size < CONFIG_V3_SIZE)
         return 0;
 
     size_t pos = 0;
@@ -96,6 +103,9 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     pos = write_i32(buf, pos, (int32_t)cfg->format);
     pos = write_i32(buf, pos, (int32_t)cfg->output_format);
     pos = write_u8(buf, pos, cfg->debug_log ? 1 : 0);
+    pos = write_u8(buf, pos, (uint8_t)cfg->smt_mode);
+    pos = write_u8(buf, pos, (uint8_t)cfg->ccd_mode);
+    pos = write_u8(buf, pos, (uint8_t)cfg->ecore_mode);
 
     return pos;
 }
@@ -111,7 +121,7 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
     uint32_t version;
     read_u32(buf, 0, &version);
 
-    if ((version == 1 || version == 2) && buf_size >= CONFIG_V1_SIZE) {
+    if ((version >= 1 && version <= 3) && buf_size >= CONFIG_V1_SIZE) {
         /* Version 1/2: field-by-field */
         size_t pos = 4;
         pos = read_u32(buf, pos, &cfg->fs_in);
@@ -135,6 +145,13 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
             uint8_t log_byte;
             pos = read_u8(buf, pos, &log_byte);
             cfg->debug_log = log_byte != 0;
+        }
+        /* Version 3 adds smt_mode, ccd_mode, ecore_mode */
+        if (version >= 3 && buf_size >= CONFIG_V3_SIZE) {
+            uint8_t u8;
+            pos = read_u8(buf, pos, &u8); cfg->smt_mode = (int)u8;
+            pos = read_u8(buf, pos, &u8); cfg->ccd_mode = (int)u8;
+            pos = read_u8(buf, pos, &u8); cfg->ecore_mode = (int)u8;
         }
         (void)pos;
         config_validate(cfg);

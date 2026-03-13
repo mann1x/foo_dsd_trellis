@@ -18,6 +18,8 @@ extern "C" {
 #include "../include/dsd_types.h"
 #include "../include/simd_detect.h"
 #include "../include/fir.h"
+#include "../include/cpuset.h"
+#include "build_version.h"
 
 /* Per-instance plugin state (opaque, defined in dsp_plugin.c) */
 typedef struct plugin_state plugin_state_t;
@@ -35,6 +37,14 @@ size_t          plugin_drain(plugin_state_t *s, float *out_pcm,
 double          plugin_get_latency(const plugin_state_t *s);
 void            plugin_flush(plugin_state_t *s);
 int             plugin_reconfigure(plugin_state_t *s, const dsd_config_t *cfg);
+const cpu_topology_t *plugin_get_topology(const plugin_state_t *s);
+void            plugin_get_workload(const plugin_state_t *s,
+                                     int *num_threads, int *segments_per_ch,
+                                     bool *changed);
+void            plugin_get_phase_timing(const plugin_state_t *s,
+                                         double *unpack_ms, double *fir_ms,
+                                         double *sdm_ms, double *pack_ms);
+bool            plugin_get_cpuset_change(const plugin_state_t *s, uint64_t *mask);
 
 /* Config serialization (config.c) */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size);
@@ -404,6 +414,10 @@ public:
 
         log_set_enabled(m_config.debug_log);
 
+        /* Log version, build hash, and build time */
+        trellis_log("DSD Trellis v%s (build %s, %s %s)",
+                    BUILD_VERSION, BUILD_GIT_HASH, BUILD_DATE, BUILD_TIME);
+
         const char *simd = fir_simd_name();
         uint32_t fs = m_config.fs_out;
         trellis_log("initialized (engine=%s, output=%s, depth=%d, cands=%d)",
@@ -482,14 +496,28 @@ public:
         pfc::array_staticsize_t<float> out_buf;
         out_buf.set_size_discard(max_out_frames * channels);
 
+        LARGE_INTEGER t0, t1, freq;
+        QueryPerformanceCounter(&t0);
+
         size_t out_frames = plugin_process(
             m_state, in_f32.get_ptr(), out_buf.get_ptr(),
             pcm_frames, (int)channels, pcm_rate);
 
+        QueryPerformanceCounter(&t1);
+        QueryPerformanceFrequency(&freq);
+        double process_ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+
         if (out_frames == 0) {
+            m_chunk_count++;
             if (!m_logged_passthrough) {
-                trellis_log("no DoP detected, passing through");
+                trellis_log("no DoP detected, passing through (chunk #%u, %.1fms)",
+                            m_chunk_count, process_ms);
                 m_logged_passthrough = true;
+            }
+            /* Log first 5 passthrough chunks for diagnostics */
+            if (m_chunk_count <= 5) {
+                trellis_log("chunk #%u: out_frames=0, process_ms=%.1f, pcm_frames=%zu",
+                            m_chunk_count, process_ms, pcm_frames);
             }
             return true;  /* Not DoP or processing failed — pass through */
         }
@@ -507,16 +535,84 @@ public:
         for (size_t i = 0; i < total_out; i++)
             out_as[i] = (audio_sample)out_buf[i];
 
-        if (!m_logged_processing) {
+        {
             unsigned out_mult = dsd_rate_out / 44100;
             unsigned in_mult  = dsd_rate_in  / 44100;
-            if (dsd_rate_in != dsd_rate_out)
-                trellis_log("processing DSD%u -> DSD%u (%zu -> %zu frames)",
-                            in_mult, out_mult, pcm_frames, out_frames);
-            else
-                trellis_log("processing DSD%u (%zu -> %zu frames)",
-                            in_mult, pcm_frames, out_frames);
-            m_logged_processing = true;
+            double chunk_ms = (double)pcm_frames / (double)pcm_rate * 1000.0;
+            double ratio = chunk_ms > 0 ? process_ms / chunk_ms : 0;
+
+            if (!m_logged_processing) {
+                if (dsd_rate_in != dsd_rate_out)
+                    trellis_log("processing DSD%u -> DSD%u (%zu -> %zu frames, %.1fms/%.1fms = %.1fx RT)",
+                                in_mult, out_mult, pcm_frames, out_frames,
+                                process_ms, chunk_ms, ratio);
+                else
+                    trellis_log("processing DSD%u (%zu -> %zu frames, %.1fms/%.1fms = %.1fx RT)",
+                                in_mult, pcm_frames, out_frames,
+                                process_ms, chunk_ms, ratio);
+                m_logged_processing = true;
+
+                /* Log topology after first successful processing */
+                const cpu_topology_t *topo = plugin_get_topology(m_state);
+                if (topo) {
+                    char topo_buf[512];
+                    cpuset_summary(topo, topo_buf, sizeof(topo_buf));
+                    trellis_log("CPU: %s", topo_buf);
+
+                    /* Detailed per-core info when debug log is enabled */
+                    if (g_log_enabled) {
+                        cpuset_log_detail(topo, [](const char *line, void *) {
+                            trellis_log("  topo: %s", line);
+                        }, nullptr);
+                    }
+                }
+
+                /* Log initial workload and phase timing */
+                int wl_threads = 0, wl_segments = 0;
+                bool wl_changed = false;
+                plugin_get_workload(m_state, &wl_threads, &wl_segments, &wl_changed);
+                trellis_log("workload: %d threads, %d segments/ch",
+                            wl_threads, wl_segments);
+
+                double t_unpack, t_fir, t_sdm, t_pack;
+                plugin_get_phase_timing(m_state, &t_unpack, &t_fir, &t_sdm, &t_pack);
+                trellis_log("phase timing: unpack=%.1fms fir=%.1fms sdm=%.1fms pack=%.1fms",
+                            t_unpack, t_fir, t_sdm, t_pack);
+            }
+
+            /* Log CPUSET changes (CPUDoc dynamic core management) */
+            {
+                uint64_t cpuset_mask = 0;
+                if (plugin_get_cpuset_change(m_state, &cpuset_mask)) {
+                    int enabled = 0;
+                    for (int b = 0; b < 64; b++)
+                        if (cpuset_mask & ((uint64_t)1 << b)) enabled++;
+                    trellis_log("cpuset changed: 0x%016llX (%d cores enabled)",
+                                (unsigned long long)cpuset_mask, enabled);
+                }
+            }
+
+            /* Log workload changes (thread count / segment count) */
+            {
+                int wl_threads = 0, wl_segments = 0;
+                bool wl_changed = false;
+                plugin_get_workload(m_state, &wl_threads, &wl_segments, &wl_changed);
+                if (wl_changed && m_logged_processing) {
+                    trellis_log("workload changed: %d threads, %d segments/ch",
+                                wl_threads, wl_segments);
+                }
+            }
+
+            /* Log periodic timing every 100 chunks when debug log is enabled */
+            m_chunk_count++;
+            if (g_log_enabled && (m_chunk_count <= 5 || (m_chunk_count % 100) == 0)) {
+                double t_unpack, t_fir, t_sdm, t_pack;
+                plugin_get_phase_timing(m_state, &t_unpack, &t_fir, &t_sdm, &t_pack);
+                trellis_log("chunk #%u: %.1fms total (unpack=%.1f fir=%.1f sdm=%.1f pack=%.1f) / %.1fms audio = %.2fx RT",
+                            m_chunk_count, process_ms,
+                            t_unpack, t_fir, t_sdm, t_pack,
+                            chunk_ms, ratio);
+            }
         }
 
         if (m_config.output_format == OUTPUT_PCM) {
@@ -585,13 +681,14 @@ private:
     unsigned         m_pcm_rate;
     bool             m_logged_passthrough = false;
     bool             m_logged_processing = false;
+    unsigned         m_chunk_count = 0;
 };
 
 static dsp_factory_t<dsp_dsd_trellis> g_dsp_factory;
 
 DECLARE_COMPONENT_VERSION(
     "DSD Trellis SDM",
-    "0.2.0",
+    BUILD_VERSION,
     "DSD Trellis (Viterbi) Sigma-Delta Modulator\n"
     "Rate conversion, volume control, and noise shaping for DSD streams.\n"
     "Supports DoP and native DSD input from foo_input_sacd / foo_input_udsd.\n\n"

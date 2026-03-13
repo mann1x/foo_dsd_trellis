@@ -184,6 +184,9 @@
     <ClCompile Include="src\fir_simd.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\cpuset.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\foo_dsd_trellis.rc" />
@@ -199,6 +202,7 @@
     <ClInclude Include="include\threadpool.h" />
     <ClInclude Include="include\simd_detect.h" />
     <ClInclude Include="src\resource.h" />
+    <ClInclude Include="src\build_version.h" />
   </ItemGroup>
   <!-- SDK project references -->
   <ItemGroup>
@@ -218,6 +222,11 @@
       <Project>{7729EB82-4069-4414-964B-AD399091A03F}</Project>
     </ProjectReference>
   </ItemGroup>
+  <!-- Pre-build: generate git hash define -->
+  <Target Name="GenerateGitHash" BeforeTargets="ClCompile">
+    <Exec Command="for /f &quot;tokens=*&quot; %%i in ('git rev-parse --short HEAD 2^>nul') do @echo #define BUILD_GIT_HASH &quot;%%i&quot; &gt; &quot;$(ProjectDir)src\build_version_gen.h&quot;" IgnoreExitCode="true" />
+    <Exec Command="if exist &quot;$(ProjectDir)src\build_version_gen.h&quot; (copy /y &quot;$(ProjectDir)src\build_version_gen.h&quot; &quot;$(ProjectDir)src\build_version_hash.h&quot; &gt;nul) else (echo #define BUILD_GIT_HASH &quot;unknown&quot; &gt; &quot;$(ProjectDir)src\build_version_hash.h&quot;)" IgnoreExitCode="true" />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>

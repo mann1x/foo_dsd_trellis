@@ -138,6 +138,7 @@
     <ClCompile Include="src\threadpool.c" />
     <ClCompile Include="src\simd_detect.c" />
     <ClCompile Include="src\fir_simd.c" />
+    <ClCompile Include="src\cpuset.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\dsd_types.h" />

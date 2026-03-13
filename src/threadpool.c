@@ -7,6 +7,7 @@
  *   - Semaphore to wake workers
  *   - Atomic completion counter + event for batch synchronization
  *   - Optional CPU affinity via SetThreadAffinityMask
+ *   - MMCSS "Pro Audio" scheduling for real-time priority
  */
 
 #include "../include/threadpool.h"
@@ -14,6 +15,53 @@
 #include <string.h>
 
 #define MAX_QUEUE_SIZE 256
+
+/* ─── MMCSS (Multimedia Class Scheduler Service) ─── */
+
+typedef HANDLE (WINAPI *PFN_AvSetMmThreadCharacteristicsW)(
+    LPCWSTR TaskName, LPDWORD TaskIndex);
+typedef BOOL (WINAPI *PFN_AvRevertMmThreadCharacteristics)(HANDLE AvrtHandle);
+typedef BOOL (WINAPI *PFN_AvSetMmThreadPriority)(
+    HANDLE AvrtHandle, int Priority);
+
+/* AVRT_PRIORITY_HIGH = 2 (from avrt.h) */
+#define MMCSS_PRIORITY_HIGH 2
+
+static HMODULE              g_avrt_dll = NULL;
+static PFN_AvSetMmThreadCharacteristicsW g_pfn_set_mmthread = NULL;
+static PFN_AvRevertMmThreadCharacteristics g_pfn_revert_mmthread = NULL;
+static PFN_AvSetMmThreadPriority g_pfn_set_mm_priority = NULL;
+
+static void mmcss_init(void) {
+    if (g_avrt_dll)
+        return;
+    g_avrt_dll = LoadLibraryW(L"avrt.dll");
+    if (!g_avrt_dll)
+        return;
+    g_pfn_set_mmthread = (PFN_AvSetMmThreadCharacteristicsW)
+        GetProcAddress(g_avrt_dll, "AvSetMmThreadCharacteristicsW");
+    g_pfn_revert_mmthread = (PFN_AvRevertMmThreadCharacteristics)
+        GetProcAddress(g_avrt_dll, "AvRevertMmThreadCharacteristics");
+    g_pfn_set_mm_priority = (PFN_AvSetMmThreadPriority)
+        GetProcAddress(g_avrt_dll, "AvSetMmThreadPriority");
+}
+
+/* Register calling thread with MMCSS "Pro Audio" task.
+ * Returns MMCSS handle (or NULL if unavailable). */
+static HANDLE mmcss_register(void) {
+    if (!g_pfn_set_mmthread)
+        return NULL;
+    DWORD task_index = 0;
+    HANDLE h = g_pfn_set_mmthread(L"Pro Audio", &task_index);
+    if (h && g_pfn_set_mm_priority)
+        g_pfn_set_mm_priority(h, MMCSS_PRIORITY_HIGH);
+    return h;
+}
+
+static void mmcss_unregister(HANDLE h) {
+    if (h && g_pfn_revert_mmthread)
+        g_pfn_revert_mmthread(h);
+}
 
 struct threadpool {
     int          thread_count;
@@ -41,6 +89,9 @@ struct threadpool {
 static DWORD WINAPI worker_func(LPVOID param) {
     threadpool_t *pool = (threadpool_t *)param;
 
+    /* Register with MMCSS for real-time audio scheduling */
+    HANDLE mmcss_handle = mmcss_register();
+
     for (;;) {
         /* Wait for work or shutdown */
         WaitForSingleObject(pool->work_sem, INFINITE);
@@ -62,22 +113,35 @@ static DWORD WINAPI worker_func(LPVOID param) {
         if (!block)
             continue;
 
-        /* Process the block */
-        block->out_count = engine_process_block(block->eng, block->in,
-                                                 block->out, block->count,
-                                                 block->cfg);
+        /* Process the block based on mode */
+        if (block->mode == BLOCK_MODE_SDM) {
+            block->out_count = sdm_segment_process(block->sdm_ctx,
+                                                     block->in, block->out,
+                                                     block->count, block->discard);
+        } else if (block->mode == BLOCK_MODE_FIR) {
+            block->out_count = engine_process_fir_gain(block->eng,
+                                                        block->in, block->count,
+                                                        block->cfg, &block->fir_out);
+        } else {
+            block->out_count = engine_process_block(block->eng, block->in,
+                                                     block->out, block->count,
+                                                     block->cfg);
+        }
 
         /* Decrement pending counter; if zero, signal done */
         if (InterlockedDecrement(&pool->pending) == 0)
             SetEvent(pool->done_event);
     }
 
+    mmcss_unregister(mmcss_handle);
     return 0;
 }
 
 /* ─── Public API ─── */
 
 threadpool_t *threadpool_create(int thread_count, DWORD affinity_mask) {
+    mmcss_init();
+
     threadpool_t *pool = (threadpool_t *)calloc(1, sizeof(threadpool_t));
     if (!pool)
         return NULL;
@@ -85,8 +149,8 @@ threadpool_t *threadpool_create(int thread_count, DWORD affinity_mask) {
     if (thread_count <= 0) {
         SYSTEM_INFO si;
         GetSystemInfo(&si);
-        thread_count = (int)si.dwNumberOfProcessors / 2;
-        if (thread_count < 1) thread_count = 1;
+        thread_count = (int)si.dwNumberOfProcessors;
+        if (thread_count < 2) thread_count = 2;
     }
 
     pool->thread_count = thread_count;
@@ -211,4 +275,80 @@ void threadpool_destroy(threadpool_t *pool) {
 
 int threadpool_get_thread_count(threadpool_t *pool) {
     return pool ? pool->thread_count : 0;
+}
+
+/* ─── CPUSET-aware thread pool creation ─── */
+
+typedef BOOL (WINAPI *PFN_SetThreadSelectedCpuSets2)(
+    HANDLE Thread, const ULONG *CpuSetIds, ULONG CpuSetIdCount);
+
+threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids, int cpuset_count) {
+    if (!cpuset_ids || cpuset_count < 1)
+        return NULL;
+
+    mmcss_init();
+
+    threadpool_t *pool = (threadpool_t *)calloc(1, sizeof(threadpool_t));
+    if (!pool)
+        return NULL;
+
+    pool->thread_count = cpuset_count;
+    pool->affinity_mask = 0;
+
+    InitializeCriticalSection(&pool->queue_cs);
+
+    pool->work_sem = CreateSemaphoreW(NULL, 0, MAX_QUEUE_SIZE, NULL);
+    if (!pool->work_sem) {
+        DeleteCriticalSection(&pool->queue_cs);
+        free(pool);
+        return NULL;
+    }
+
+    pool->done_event = CreateEventW(NULL, TRUE, TRUE, NULL);
+    if (!pool->done_event) {
+        CloseHandle(pool->work_sem);
+        DeleteCriticalSection(&pool->queue_cs);
+        free(pool);
+        return NULL;
+    }
+
+    pool->threads = (HANDLE *)calloc((size_t)cpuset_count, sizeof(HANDLE));
+    if (!pool->threads) {
+        CloseHandle(pool->done_event);
+        CloseHandle(pool->work_sem);
+        DeleteCriticalSection(&pool->queue_cs);
+        free(pool);
+        return NULL;
+    }
+
+    /* Load SetThreadSelectedCpuSets dynamically */
+    PFN_SetThreadSelectedCpuSets2 pfn_set_cpusets =
+        (PFN_SetThreadSelectedCpuSets2)GetProcAddress(
+            GetModuleHandleW(L"kernel32.dll"), "SetThreadSelectedCpuSets");
+
+    for (int i = 0; i < cpuset_count; i++) {
+        pool->threads[i] = CreateThread(NULL, 0, worker_func, pool, 0, NULL);
+        if (!pool->threads[i]) {
+            InterlockedExchange(&pool->shutdown, 1);
+            ReleaseSemaphore(pool->work_sem, i, NULL);
+            for (int j = 0; j < i; j++) {
+                WaitForSingleObject(pool->threads[j], INFINITE);
+                CloseHandle(pool->threads[j]);
+            }
+            free(pool->threads);
+            CloseHandle(pool->done_event);
+            CloseHandle(pool->work_sem);
+            DeleteCriticalSection(&pool->queue_cs);
+            free(pool);
+            return NULL;
+        }
+
+        /* Pin worker to its designated CPU set */
+        if (pfn_set_cpusets) {
+            ULONG id = cpuset_ids[i];
+            pfn_set_cpusets(pool->threads[i], &id, 1);
+        }
+    }
+
+    return pool;
 }

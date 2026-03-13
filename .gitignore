@@ -43,6 +43,10 @@ CLAUDE.md
 # NuGet
 packages/
 
+# Auto-generated build version
+src/build_version_hash.h
+src/build_version_gen.h
+
 # OS junk
 Thumbs.db
 desktop.ini

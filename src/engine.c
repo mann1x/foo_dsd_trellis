@@ -107,3 +107,70 @@ int engine_channel_reconfigure(engine_channel_t *eng,
     engine_channel_free(eng);
     return engine_channel_init(eng, eng->channel, cfg);
 }
+
+size_t engine_process_fir_gain(engine_channel_t *eng,
+                                const float *in, size_t count,
+                                const dsd_config_t *cfg,
+                                float **fir_out_ptr) {
+    uint32_t fs_out = cfg->fs_out ? cfg->fs_out : cfg->fs_in;
+    size_t fir_out_count;
+    if (fs_out >= cfg->fs_in)
+        fir_out_count = count * (fs_out / cfg->fs_in);
+    else
+        fir_out_count = count / (cfg->fs_in / fs_out);
+
+    if (eng->fir_buf_sz < fir_out_count * sizeof(float)) {
+        free(eng->fir_buf);
+        eng->fir_buf = (float *)malloc(fir_out_count * sizeof(float));
+        eng->fir_buf_sz = fir_out_count * sizeof(float);
+    }
+
+    size_t fir_count = fir_chain_process(&eng->fir, in, eng->fir_buf, count);
+
+    if (cfg->gain != 1.0f) {
+        for (size_t i = 0; i < fir_count; i++)
+            eng->fir_buf[i] *= cfg->gain;
+    }
+
+    *fir_out_ptr = eng->fir_buf;
+    return fir_count;
+}
+
+/* Thread-local scratch buffer for SDM warmup discard.
+ * Avoids malloc/free per segment call on the hot path. */
+static __declspec(thread) float *tls_trash_buf = NULL;
+static __declspec(thread) size_t tls_trash_sz = 0;
+
+static float *get_trash_buf(size_t need) {
+    if (tls_trash_sz < need) {
+        free(tls_trash_buf);
+        tls_trash_buf = (float *)malloc(need * sizeof(float));
+        tls_trash_sz = tls_trash_buf ? need : 0;
+    }
+    return tls_trash_buf;
+}
+
+size_t sdm_segment_process(sdm_context_t *sdm,
+                            const float *in, float *out,
+                            size_t count, size_t discard) {
+    if (discard == 0)
+        return sdm_process_block(sdm, in, out, count);
+
+    /* Warmup phase: feed trellis_lat + discard input samples.
+     * First trellis_lat fill the latency buffer (no output).
+     * Next 'discard' samples produce output we throw away. */
+    size_t warmup_in = (size_t)sdm->trellis_lat + discard;
+    if (warmup_in > count) {
+        float *trash = get_trash_buf(count);
+        if (!trash) return 0;
+        sdm_process_block(sdm, in, trash, count);
+        return 0;
+    }
+
+    float *trash = get_trash_buf(discard);
+    if (!trash) return 0;
+    sdm_process_block(sdm, in, trash, warmup_in);
+
+    /* Process remaining input directly into output */
+    return sdm_process_block(sdm, in + warmup_in, out, count - warmup_in);
+}

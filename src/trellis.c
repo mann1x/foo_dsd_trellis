@@ -10,15 +10,23 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef _MSC_VER
+#include <immintrin.h>
+#endif
+
 #define PATH_HASH_MASK (PATH_HASH_SIZE - 1)
 
 #define sqr(x) ((x) * (x))
 
-/* ─── NTF state advance ─── */
+/* ─── NTF state advance (hot path — force-inlined) ─── */
 
-static double sdm_filter_calc(const double *s, double *d,
-                               const ntf_filter_t *f,
-                               double x, double y)
+/*
+ * Generic filter calc for arbitrary order.
+ * Used as fallback when order doesn't match specialized versions.
+ */
+static __forceinline double sdm_filter_calc_generic(const double *s, double *d,
+                                                      const ntf_filter_t *f,
+                                                      double x, double y)
 {
     const double *a = f->a;
     const double *g = f->g;
@@ -39,17 +47,115 @@ static double sdm_filter_calc(const double *s, double *d,
     return v;
 }
 
-static void sdm_filter_calc2(sdm_state_t *src, sdm_state_t *dst,
-                              const ntf_filter_t *f, double x)
+/* Fully unrolled order-4 filter calc */
+static __forceinline double sdm_filter_calc_o4(const double *s, double *d,
+                                                 const double *a, const double *g,
+                                                 double x, double y)
+{
+    d[0] = s[0] - g[0] * s[1] + x - y;
+    d[1] = s[1] + s[0] - g[1] * s[2];
+    d[2] = s[2] + s[1] - g[2] * s[3];
+    d[3] = s[3] + s[2];
+    return x + a[0] * d[0] + a[1] * d[1] + a[2] * d[2] + a[3] * d[3];
+}
+
+/* Fully unrolled order-5 filter calc */
+static __forceinline double sdm_filter_calc_o5(const double *s, double *d,
+                                                 const double *a, const double *g,
+                                                 double x, double y)
+{
+    d[0] = s[0] - g[0] * s[1] + x - y;
+    d[1] = s[1] + s[0] - g[1] * s[2];
+    d[2] = s[2] + s[1] - g[2] * s[3];
+    d[3] = s[3] + s[2] - g[3] * s[4];
+    d[4] = s[4] + s[3];
+    return x + a[0] * d[0] + a[1] * d[1] + a[2] * d[2] + a[3] * d[3] + a[4] * d[4];
+}
+
+/* Fully unrolled order-6 filter calc */
+static __forceinline double sdm_filter_calc_o6(const double *s, double *d,
+                                                 const double *a, const double *g,
+                                                 double x, double y)
+{
+    d[0] = s[0] - g[0] * s[1] + x - y;
+    d[1] = s[1] + s[0] - g[1] * s[2];
+    d[2] = s[2] + s[1] - g[2] * s[3];
+    d[3] = s[3] + s[2] - g[3] * s[4];
+    d[4] = s[4] + s[3] - g[4] * s[5];
+    d[5] = s[5] + s[4];
+    return x + a[0] * d[0] + a[1] * d[1] + a[2] * d[2]
+             + a[3] * d[3] + a[4] * d[4] + a[5] * d[5];
+}
+
+/* Fully unrolled order-7 filter calc */
+static __forceinline double sdm_filter_calc_o7(const double *s, double *d,
+                                                 const double *a, const double *g,
+                                                 double x, double y)
+{
+    d[0] = s[0] - g[0] * s[1] + x - y;
+    d[1] = s[1] + s[0] - g[1] * s[2];
+    d[2] = s[2] + s[1] - g[2] * s[3];
+    d[3] = s[3] + s[2] - g[3] * s[4];
+    d[4] = s[4] + s[3] - g[4] * s[5];
+    d[5] = s[5] + s[4] - g[5] * s[6];
+    d[6] = s[6] + s[5];
+    return x + a[0] * d[0] + a[1] * d[1] + a[2] * d[2]
+             + a[3] * d[3] + a[4] * d[4] + a[5] * d[5] + a[6] * d[6];
+}
+
+/* Fully unrolled order-8 filter calc */
+static __forceinline double sdm_filter_calc_o8(const double *s, double *d,
+                                                 const double *a, const double *g,
+                                                 double x, double y)
+{
+    d[0] = s[0] - g[0] * s[1] + x - y;
+    d[1] = s[1] + s[0] - g[1] * s[2];
+    d[2] = s[2] + s[1] - g[2] * s[3];
+    d[3] = s[3] + s[2] - g[3] * s[4];
+    d[4] = s[4] + s[3] - g[4] * s[5];
+    d[5] = s[5] + s[4] - g[5] * s[6];
+    d[6] = s[6] + s[5] - g[6] * s[7];
+    d[7] = s[7] + s[6];
+    return x + a[0] * d[0] + a[1] * d[1] + a[2] * d[2] + a[3] * d[3]
+             + a[4] * d[4] + a[5] * d[5] + a[6] * d[6] + a[7] * d[7];
+}
+
+/* Dispatch to order-specialized filter calc */
+static __forceinline double sdm_filter_calc(const double *s, double *d,
+                                              const ntf_filter_t *f,
+                                              double x, double y)
+{
+    switch (f->order) {
+    case 4: return sdm_filter_calc_o4(s, d, f->a, f->g, x, y);
+    case 5: return sdm_filter_calc_o5(s, d, f->a, f->g, x, y);
+    case 6: return sdm_filter_calc_o6(s, d, f->a, f->g, x, y);
+    case 7: return sdm_filter_calc_o7(s, d, f->a, f->g, x, y);
+    case 8: return sdm_filter_calc_o8(s, d, f->a, f->g, x, y);
+    default: return sdm_filter_calc_generic(s, d, f, x, y);
+    }
+}
+
+static __forceinline void sdm_filter_calc2(sdm_state_t *src, sdm_state_t *dst,
+                                             const ntf_filter_t *f, double x)
 {
     const double *a = f->a;
     double v;
-    int i;
 
     v = sdm_filter_calc(src->state, dst[0].state, f, x, 0.0);
 
-    for (i = 0; i < f->order; i++)
+    /* Copy state vector: dst[1] = dst[0] using AVX2 where possible */
+#if defined(_MSC_VER) && defined(__AVX2__)
+    {
+        /* Copy first 4 doubles (32 bytes) with AVX2, rest scalar */
+        __m256d st4 = _mm256_loadu_pd(dst[0].state);
+        _mm256_storeu_pd(dst[1].state, st4);
+        for (int i = 4; i < f->order; i++)
+            dst[1].state[i] = dst[0].state[i];
+    }
+#else
+    for (int i = 0; i < f->order; i++)
         dst[1].state[i] = dst[0].state[i];
+#endif
 
     dst[0].state[0] += 1.0;
     dst[1].state[0] -= 1.0;
@@ -110,12 +216,12 @@ static inline int64_t dbl2int64(double a)
     return v.i;
 }
 
-static inline int sdm_cmplt(const sdm_state_t *a, const sdm_state_t *b)
+static __forceinline int sdm_cmplt(const sdm_state_t *a, const sdm_state_t *b)
 {
     return dbl2int64(a->cost) < dbl2int64(b->cost);
 }
 
-static inline int sdm_cmple(const sdm_state_t *a, const sdm_state_t *b)
+static __forceinline int sdm_cmple(const sdm_state_t *a, const sdm_state_t *b)
 {
     return dbl2int64(a->cost) <= dbl2int64(b->cost);
 }
@@ -204,8 +310,8 @@ static unsigned sdm_sort_cands(sdm_context_t *p, sdm_trellis_t *st)
 
 /* ─── Per-candidate step ─── */
 
-static inline void sdm_step(sdm_context_t *p, sdm_state_t *cur,
-                             sdm_state_t *next, double x)
+static __forceinline void sdm_step(sdm_context_t *p, sdm_state_t *cur,
+                                    sdm_state_t *next, double x)
 {
     sdm_filter_calc2(cur, next, p->filter, x);
 

@@ -70,17 +70,20 @@ typedef struct {
     int       format;         /* dsd_format_t (auto-detected or forced) */
     int       output_format;  /* dsd_output_format_t: DoP or PCM output */
     bool      debug_log;      /* Write diagnostic log to file */
+    int       smt_mode;       /* 0=Auto (prefer T0), 1=T0 only */
+    int       ccd_mode;       /* 0=Auto (prefer first CCD), 1=All CCDs */
+    int       ecore_mode;     /* 0=Auto, 1=Exclude E-cores, 2=E-cores only */
 } dsd_config_t;
 
 /* Config serialization version */
-#define DSD_CONFIG_VERSION 2
+#define DSD_CONFIG_VERSION 3
 
 /* Default configuration values */
 #define DSD_DEFAULT_GAIN         1.0f
 #define DSD_DEFAULT_TRELLIS_N    8
-#define DSD_DEFAULT_TRELLIS_M    16
+#define DSD_DEFAULT_TRELLIS_M    8
 #define DSD_DEFAULT_TRELLIS_LAT  64
-#define DSD_DEFAULT_THREADS      0   /* 0 = auto (logical cores / 2) */
+#define DSD_DEFAULT_THREADS      0   /* 0 = auto (all logical cores) */
 
 static inline void dsd_config_defaults(dsd_config_t *cfg) {
     cfg->fs_in          = 0;  /* determined at runtime */
@@ -96,6 +99,9 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     cfg->format         = FORMAT_AUTO;
     cfg->output_format  = OUTPUT_DOP;
     cfg->debug_log      = false;
+    cfg->smt_mode       = 0;  /* SMT_AUTO */
+    cfg->ccd_mode       = 0;  /* CCD_AUTO */
+    cfg->ecore_mode     = 0;  /* ECORE_AUTO */
 }
 
 #endif /* DSD_TYPES_H */
