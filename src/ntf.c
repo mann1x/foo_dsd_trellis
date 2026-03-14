@@ -791,16 +791,37 @@ const ntf_filter_t *ntf_get_filter(ntf_filter_id_t id, unsigned dsd_rate) {
  *   DSD512 → CLANS-8 @ 256×44100 (highest available freq group)
  */
 const ntf_filter_t *ntf_auto_select(unsigned dsd_rate) {
+    /* DSD64/DSD128: keep conservative NTF orders — higher orders cause the
+     * trellis to struggle at low DSD rates (insufficient noise shaping bandwidth).
+     * DSD256/DSD512: +1 order gives large SINAD improvement. */
     ntf_filter_id_t id;
 
     if (dsd_rate >= DSD_RATE_512)
         id = NTF_CLANS_8;
     else if (dsd_rate >= DSD_RATE_256)
-        id = NTF_CLANS_7;
+        id = NTF_CLANS_8;
     else if (dsd_rate >= DSD_RATE_128)
         id = NTF_CLANS_6;
     else
         id = NTF_CLANS_5;
+
+    return ntf_get_filter(id, dsd_rate);
+}
+
+const ntf_filter_t *ntf_auto_select_precorr(unsigned dsd_rate) {
+    /* PreCorr's greedy quantizer benefits from +1 NTF order vs Trellis.
+     * DSD64→clans-6, DSD128→clans-7, DSD256→clans-8, DSD512→clans-7.
+     * DSD512 clans-8 is unstable for PreCorr's greedy quantizer. */
+    ntf_filter_id_t id;
+
+    if (dsd_rate >= DSD_RATE_512)
+        id = NTF_CLANS_7;
+    else if (dsd_rate >= DSD_RATE_256)
+        id = NTF_CLANS_8;
+    else if (dsd_rate >= DSD_RATE_128)
+        id = NTF_CLANS_7;
+    else
+        id = NTF_CLANS_6;
 
     return ntf_get_filter(id, dsd_rate);
 }

@@ -436,7 +436,8 @@ size_t plugin_process(plugin_state_t *s,
     int segments_per_ch = 1;
     size_t overlap = 0;
 
-    if (need_rate_conv && num_threads > num_channels) {
+    if (need_rate_conv && num_threads > num_channels &&
+        s->config.sdm_mode == SDM_MODE_TRELLIS) {
         uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
         size_t fir_out_est = dsd_in_count;
         if (fs_out > s->config.fs_in)
@@ -684,6 +685,10 @@ size_t plugin_drain(plugin_state_t *s, float *out_pcm, int num_channels) {
     if (!s || !s->initialized || !s->channels)
         return 0;
 
+    /* PreCorr has no latency — nothing to drain */
+    if (s->config.sdm_mode == SDM_MODE_PRECORR)
+        return 0;
+
     /* Drain each channel's SDM */
     size_t max_drain = (size_t)s->config.trellis_lat;
     float *drain_buf = (float *)malloc(max_drain * sizeof(float));
@@ -722,6 +727,10 @@ size_t plugin_drain(plugin_state_t *s, float *out_pcm, int num_channels) {
 /* Get processing latency in seconds */
 double plugin_get_latency(const plugin_state_t *s) {
     if (!s || !s->initialized || s->detected_dsd_rate == 0)
+        return 0.0;
+
+    /* PreCorr has no latency */
+    if (s->config.sdm_mode == SDM_MODE_PRECORR)
         return 0.0;
 
     uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;

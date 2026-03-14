@@ -7,16 +7,19 @@
 
 #include "dsd_types.h"
 #include "trellis.h"
+#include "precorr.h"
 #include "fir.h"
 
 /* Per-channel processing state */
 typedef struct {
-    sdm_context_t  sdm;        /* Trellis SDM context */
-    fir_chain_t    fir;        /* FIR rate conversion chain */
-    float         *fir_buf;    /* Post-FIR intermediate buffer */
-    size_t         fir_buf_sz; /* Allocated size of fir_buf */
-    int            channel;    /* Channel index (0=L, 1=R, ...) */
-    bool           passthrough;/* true if no processing needed */
+    sdm_context_t    sdm;        /* Trellis SDM context */
+    precorr_context_t precorr;   /* PreCorr SDM context */
+    fir_chain_t      fir;        /* FIR rate conversion chain */
+    float           *fir_buf;    /* Post-FIR intermediate buffer */
+    size_t           fir_buf_sz; /* Allocated size of fir_buf */
+    int              channel;    /* Channel index (0=L, 1=R, ...) */
+    int              sdm_mode;   /* Cached sdm_mode_t for dispatch */
+    bool             passthrough;/* true if no processing needed */
 } engine_channel_t;
 
 /* Block processing mode */

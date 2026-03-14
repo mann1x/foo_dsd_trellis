@@ -25,6 +25,10 @@ const ntf_filter_t *ntf_get_filter(ntf_filter_id_t id, unsigned dsd_rate);
 /* Auto-select best filter for a given DSD rate (CLANS-N, order matched to rate). */
 const ntf_filter_t *ntf_auto_select(unsigned dsd_rate);
 
+/* Auto-select best filter for PreCorr SDM at a given DSD rate.
+ * PreCorr's greedy quantizer benefits from +1 NTF order vs Trellis. */
+const ntf_filter_t *ntf_auto_select_precorr(unsigned dsd_rate);
+
 /* Get filter count */
 int ntf_get_filter_count(void);
 

@@ -1,6 +1,16 @@
 /*
- * foo_dsd_trellis — Minimal test framework
+ * foo_dsd_trellis — Minimal test framework with suite filtering
  * No external dependencies — just assert macros and a test runner.
+ *
+ * Usage:
+ *   test.exe                 — run "quick" suites only (default)
+ *   test.exe --all           — run all suites including extended
+ *   test.exe --suite trellis — run only suites matching "trellis"
+ *   test.exe --suite diag    — run only suites matching "diag"
+ *   test.exe --exclude diag  — run all except suites matching "diag"
+ *   test.exe --list          — list available suites and exit
+ *
+ * Multiple --suite/--exclude flags can be combined.
  */
 
 #ifndef TEST_H
@@ -15,6 +25,9 @@
 extern int g_tests_run;
 extern int g_tests_passed;
 extern int g_tests_failed;
+
+/* Suite filter state (defined in test_main.c) */
+extern int test_should_run_suite(const char *suite_tag);
 
 #define TEST_ASSERT(cond, msg) do {                                    \
     g_tests_run++;                                                     \
@@ -61,5 +74,7 @@ void test_hardening_suite(void);
 void test_config_suite(void);
 void test_simd_suite(void);
 void test_rate_sinad_suite(void);
+void test_precorr_suite(void);
+void test_sinad_diag_suite(void);
 
 #endif /* TEST_H */

@@ -39,6 +39,12 @@ typedef enum {
     OUTPUT_PCM    = 1,    /* Decimate to PCM (for visualization / non-DSD DACs) */
 } dsd_output_format_t;
 
+/* SDM mode selection */
+typedef enum {
+    SDM_MODE_PRECORR = 0,   /* Greedy + prediction correction (default, low CPU) */
+    SDM_MODE_TRELLIS = 1,   /* Viterbi trellis search (high quality, high CPU) */
+} sdm_mode_t;
+
 /* NTF filter selection */
 typedef enum {
     NTF_AUTO    = -1,
@@ -73,16 +79,21 @@ typedef struct {
     int       smt_mode;       /* 0=Auto (prefer T0), 1=T0 only */
     int       ccd_mode;       /* 0=Auto (prefer first CCD), 1=All CCDs */
     int       ecore_mode;     /* 0=Auto, 1=Exclude E-cores, 2=E-cores only */
+    uint16_t  api_port;       /* REST API port (0=disabled, default 8881) */
+    int       sdm_mode;      /* sdm_mode_t: PreCorr or Trellis */
 } dsd_config_t;
 
 /* Config serialization version */
-#define DSD_CONFIG_VERSION 3
+#define DSD_CONFIG_VERSION 5
+
+/* Default REST API port */
+#define DSD_DEFAULT_API_PORT 8881
 
 /* Default configuration values */
 #define DSD_DEFAULT_GAIN         1.0f
 #define DSD_DEFAULT_TRELLIS_N    8
-#define DSD_DEFAULT_TRELLIS_M    8
-#define DSD_DEFAULT_TRELLIS_LAT  64
+#define DSD_DEFAULT_TRELLIS_M    4
+#define DSD_DEFAULT_TRELLIS_LAT  128
 #define DSD_DEFAULT_THREADS      0   /* 0 = auto (all logical cores) */
 
 static inline void dsd_config_defaults(dsd_config_t *cfg) {
@@ -102,6 +113,8 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     cfg->smt_mode       = 0;  /* SMT_AUTO */
     cfg->ccd_mode       = 0;  /* CCD_AUTO */
     cfg->ecore_mode     = 0;  /* ECORE_AUTO */
+    cfg->api_port       = DSD_DEFAULT_API_PORT;
+    cfg->sdm_mode       = SDM_MODE_PRECORR;
 }
 
 #endif /* DSD_TYPES_H */

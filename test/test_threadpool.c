@@ -229,6 +229,7 @@ static void test_threadpool_sdm_concurrent(void) {
     cfg.trellis_depth = 8;
     cfg.trellis_cands = 8;
     cfg.trellis_lat = 64;
+    cfg.sdm_mode = SDM_MODE_TRELLIS;
 
     engine_channel_t eng_l, eng_r;
     int ret_l = engine_channel_init(&eng_l, 0, &cfg);

@@ -41,6 +41,45 @@ static void test_config_roundtrip(void) {
     TEST_ASSERT_TRUE(cfg2.mute, "mute roundtrip");
     TEST_ASSERT_EQ(cfg2.format, FORMAT_DOP, "format roundtrip");
     TEST_ASSERT_EQ(cfg2.output_format, OUTPUT_PCM, "output_format roundtrip");
+    TEST_ASSERT_EQ(cfg2.sdm_mode, SDM_MODE_PRECORR, "sdm_mode roundtrip (default)");
+}
+
+static void test_config_sdm_mode_roundtrip(void) {
+    dsd_config_t cfg;
+    dsd_config_defaults(&cfg);
+    cfg.sdm_mode = SDM_MODE_TRELLIS;
+
+    uint8_t buf[128];
+    size_t len = config_serialize(&cfg, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(len > 0, "serialize should write bytes");
+
+    dsd_config_t cfg2;
+    int ret = config_deserialize(&cfg2, buf, len);
+    TEST_ASSERT_EQ(ret, 0, "deserialize should succeed");
+    TEST_ASSERT_EQ(cfg2.sdm_mode, SDM_MODE_TRELLIS, "sdm_mode=TRELLIS roundtrip");
+}
+
+static void test_config_v4_compat(void) {
+    /* Simulate a v4 config (no sdm_mode field) */
+    dsd_config_t cfg;
+    dsd_config_defaults(&cfg);
+    cfg.sdm_mode = SDM_MODE_PRECORR;
+
+    uint8_t buf[128];
+    size_t len = config_serialize(&cfg, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(len > 0, "serialize should work");
+
+    /* Patch to look like v4: set version=4, truncate to 51 bytes */
+    uint32_t v4 = 4;
+    memcpy(buf, &v4, 4);
+    size_t v4_len = 51;
+
+    dsd_config_t cfg2;
+    int ret = config_deserialize(&cfg2, buf, v4_len);
+    TEST_ASSERT_EQ(ret, 0, "v4 deserialize should succeed");
+    /* Pre-v5 should default to Trellis (preserve existing behavior) */
+    TEST_ASSERT_EQ(cfg2.sdm_mode, SDM_MODE_TRELLIS,
+                   "v4 config should default to Trellis mode");
 }
 
 static void test_config_defaults_roundtrip(void) {
@@ -59,13 +98,13 @@ static void test_config_defaults_roundtrip(void) {
     TEST_ASSERT_EQ(cfg2.trellis_lat, DSD_DEFAULT_TRELLIS_LAT, "default lat");
     TEST_ASSERT_FALSE(cfg2.mute, "default mute");
     TEST_ASSERT_EQ(cfg2.output_format, OUTPUT_DOP, "default output format");
+    TEST_ASSERT_EQ(cfg2.sdm_mode, SDM_MODE_PRECORR, "default sdm_mode");
 }
 
 static void test_config_corrupt_falls_back(void) {
     uint8_t junk[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
     dsd_config_t cfg;
     config_deserialize(&cfg, junk, sizeof(junk));
-    /* Should fall back to defaults */
     TEST_ASSERT_FLOAT_EQ(cfg.gain, DSD_DEFAULT_GAIN, 0.001f,
                          "corrupt data should give default gain");
 }
@@ -95,6 +134,11 @@ static void test_config_validate_clamp(void) {
     TEST_ASSERT_EQ(cfg.trellis_cands, 32, "cands clamped to 32");
     TEST_ASSERT_EQ(cfg.trellis_lat, 2048, "lat clamped to 2048");
     TEST_ASSERT_EQ(cfg.output_format, OUTPUT_DOP, "invalid output_format clamped");
+
+    /* Invalid sdm_mode should clamp to PreCorr */
+    cfg.sdm_mode = 99;
+    config_validate(&cfg);
+    TEST_ASSERT_EQ(cfg.sdm_mode, SDM_MODE_PRECORR, "invalid sdm_mode clamped");
 }
 
 static void test_config_buffer_too_small(void) {
@@ -113,4 +157,6 @@ void test_config_suite(void) {
     TEST_RUN(test_config_empty_buffer);
     TEST_RUN(test_config_validate_clamp);
     TEST_RUN(test_config_buffer_too_small);
+    TEST_RUN(test_config_sdm_mode_roundtrip);
+    TEST_RUN(test_config_v4_compat);
 }

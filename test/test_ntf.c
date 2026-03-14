@@ -175,8 +175,8 @@ static void test_ntf_auto_select_dsd128(void) {
 static void test_ntf_auto_select_dsd256(void) {
     const ntf_filter_t *f = ntf_auto_select(DSD_RATE_256);
     TEST_ASSERT_NOT_NULL(f, "auto DSD256");
-    TEST_ASSERT_EQ(strcmp(f->name, "clans-7"), 0, "DSD256 → clans-7");
-    TEST_ASSERT_EQ(f->order, 7, "order 7");
+    TEST_ASSERT_EQ(strcmp(f->name, "clans-8"), 0, "DSD256 → clans-8");
+    TEST_ASSERT_EQ(f->order, 8, "order 8");
 }
 
 static void test_ntf_auto_select_dsd512(void) {

@@ -366,6 +366,7 @@ static void test_single_sample_sdm(void) {
     cfg.fs_out = DSD_RATE_64;
     cfg.gain = 0.5f;
     cfg.trellis_lat = 64;
+    cfg.sdm_mode = SDM_MODE_TRELLIS;
 
     engine_channel_t eng;
     engine_channel_init(&eng, 0, &cfg);
@@ -438,6 +439,7 @@ static void test_continuous_blocks_no_gap(void) {
     cfg.fs_out = DSD_RATE_64;
     cfg.gain = 0.5f;
     cfg.trellis_lat = 64;
+    cfg.sdm_mode = SDM_MODE_TRELLIS;
 
     engine_channel_t eng;
     engine_channel_init(&eng, 0, &cfg);

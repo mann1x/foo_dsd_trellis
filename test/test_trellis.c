@@ -266,28 +266,28 @@ static double measure_sinad_1khz(unsigned dsd_rate_mult, int trellis_depth,
 }
 
 static void test_sdm_sinad_dsd64(void) {
-    /* SoX clans-5 -t8 -n16 with lat=512 should give high SINAD.
+    /* Use default latency (64) matching runtime config.
      * Goertzel-based measurement directly on DSD avoids decimation
      * artifacts. Expect >80 dB for a well-functioning trellis. */
-    double sinad = measure_sinad_1khz(64, 8, 16, 512);
+    double sinad = measure_sinad_1khz(64, 8, 16, DSD_DEFAULT_TRELLIS_LAT);
     TEST_ASSERT_TRUE(sinad > 60.0,
                      "DSD64 trellis SINAD should exceed 60 dB for 1kHz sine");
 }
 
 static void test_sdm_sinad_dsd128(void) {
-    double sinad = measure_sinad_1khz(128, 8, 16, 512);
+    double sinad = measure_sinad_1khz(128, 8, 16, DSD_DEFAULT_TRELLIS_LAT);
     TEST_ASSERT_TRUE(sinad > 60.0,
                      "DSD128 trellis SINAD should exceed 60 dB for 1kHz sine");
 }
 
 static void test_sdm_sinad_dsd256(void) {
-    double sinad = measure_sinad_1khz(256, 8, 16, 512);
+    double sinad = measure_sinad_1khz(256, 8, 16, DSD_DEFAULT_TRELLIS_LAT);
     TEST_ASSERT_TRUE(sinad > 60.0,
                      "DSD256 trellis SINAD should exceed 60 dB for 1kHz sine");
 }
 
 static void test_sdm_sinad_dsd512(void) {
-    double sinad = measure_sinad_1khz(512, 8, 16, 512);
+    double sinad = measure_sinad_1khz(512, 8, 16, DSD_DEFAULT_TRELLIS_LAT);
     TEST_ASSERT_TRUE(sinad > 60.0,
                      "DSD512 trellis SINAD should exceed 60 dB for 1kHz sine");
 }

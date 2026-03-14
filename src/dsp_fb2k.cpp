@@ -19,6 +19,7 @@ extern "C" {
 #include "../include/simd_detect.h"
 #include "../include/fir.h"
 #include "../include/cpuset.h"
+#include "../include/httpapi.h"
 #include "build_version.h"
 
 /* Per-instance plugin state (opaque, defined in dsp_plugin.c) */
@@ -197,6 +198,7 @@ public:
         MSG_WM_INITDIALOG(OnInitDialog)
         COMMAND_HANDLER_EX(IDOK, BN_CLICKED, OnButton)
         COMMAND_HANDLER_EX(IDCANCEL, BN_CLICKED, OnButton)
+        COMMAND_HANDLER_EX(IDC_COMBO_SDM_MODE, CBN_SELCHANGE, OnSdmModeChange)
         COMMAND_HANDLER_EX(IDC_COMBO_OUTPUT_RATE, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_COMBO_TRELLIS_DEPTH, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_COMBO_NTF, CBN_SELCHANGE, OnChange)
@@ -215,6 +217,12 @@ private:
         m_dark.AddDialogWithControls(m_hWnd);
 
         dsd_config_t cfg = parse_preset(m_initData);
+
+        /* SDM Mode combo */
+        CComboBox sdm(GetDlgItem(IDC_COMBO_SDM_MODE));
+        sdm.AddString(L"PreCorr (low CPU)");
+        sdm.AddString(L"Trellis (high quality)");
+        sdm.SetCurSel(cfg.sdm_mode);
 
         /* Output Rate combo */
         CComboBox rate(GetDlgItem(IDC_COMBO_OUTPUT_RATE));
@@ -298,14 +306,16 @@ private:
         /* Debug log checkbox */
         CheckDlgButton(IDC_CHECK_DEBUG_LOG, cfg.debug_log ? BST_CHECKED : BST_UNCHECKED);
 
-        /* Show SIMD engine info */
+        /* Show engine info */
         const cpu_features_t *cpu = cpu_detect();
-        const char *simd = fir_simd_name();
         pfc::string_formatter info;
-        info << "Engine: " << simd
+        info << "FIR: " << fir_ipp_kernel_name()
              << " | CPU: " << (cpu->vendor == CPU_VENDOR_INTEL ? "Intel" :
                                cpu->vendor == CPU_VENDOR_AMD   ? "AMD" : "Unknown");
         ::uSetDlgItemText(*this, IDC_STATIC_VU_L, info);
+
+        /* Enable/disable trellis controls based on SDM mode */
+        EnableTrellisControls(cfg.sdm_mode == SDM_MODE_TRELLIS);
 
         return TRUE;
     }
@@ -322,11 +332,29 @@ private:
         if (!m_updating) UpdatePreset();
     }
 
+    void OnSdmModeChange(UINT, int, CWindow) {
+        int mode = CComboBox(GetDlgItem(IDC_COMBO_SDM_MODE)).GetCurSel();
+        EnableTrellisControls(mode == SDM_MODE_TRELLIS);
+        if (!m_updating) UpdatePreset();
+    }
+
+    void EnableTrellisControls(bool enable) {
+        BOOL en = enable ? TRUE : FALSE;
+        ::EnableWindow(GetDlgItem(IDC_COMBO_TRELLIS_DEPTH), en);
+        ::EnableWindow(GetDlgItem(IDC_EDIT_TRELLIS_CANDS), en);
+        ::EnableWindow(GetDlgItem(IDC_SPIN_TRELLIS_CANDS), en);
+        ::EnableWindow(GetDlgItem(IDC_EDIT_TRELLIS_LAT), en);
+        ::EnableWindow(GetDlgItem(IDC_SPIN_TRELLIS_LAT), en);
+    }
+
     void UpdatePreset() {
         m_updating = true;
 
         dsd_config_t cfg;
         dsd_config_defaults(&cfg);
+
+        /* Read SDM mode */
+        cfg.sdm_mode = CComboBox(GetDlgItem(IDC_COMBO_SDM_MODE)).GetCurSel();
 
         /* Read output rate */
         int rate_idx = CComboBox(GetDlgItem(IDC_COMBO_OUTPUT_RATE)).GetCurSel();
@@ -408,6 +436,7 @@ public:
         , m_state(plugin_create())
         , m_channels(0)
         , m_pcm_rate(0)
+        , m_httpapi(nullptr)
     {
         if (m_state)
             plugin_set_config(m_state, &m_config);
@@ -418,20 +447,31 @@ public:
         trellis_log("DSD Trellis v%s (build %s, %s %s)",
                     BUILD_VERSION, BUILD_GIT_HASH, BUILD_DATE, BUILD_TIME);
 
-        const char *simd = fir_simd_name();
         uint32_t fs = m_config.fs_out;
-        trellis_log("initialized (engine=%s, output=%s, depth=%d, cands=%d)",
-                    simd,
+        const char *sdm_mode_str = m_config.sdm_mode == SDM_MODE_TRELLIS
+                                   ? "Trellis" : "PreCorr";
+        trellis_log("initialized (sdm=%s, fir=%s, output=%s, depth=%d, cands=%d)",
+                    sdm_mode_str, fir_ipp_kernel_name(),
                     fs == 0 ? "as-input" :
                     fs == DSD_RATE_64  ? "DSD64" :
                     fs == DSD_RATE_128 ? "DSD128" :
                     fs == DSD_RATE_256 ? "DSD256" :
                     fs == DSD_RATE_512 ? "DSD512" : "?",
                     m_config.trellis_depth, m_config.trellis_cands);
+
+        /* Start REST API server */
+        if (m_config.api_port > 0) {
+            m_httpapi = httpapi_create(m_config.api_port, &m_config);
+            if (m_httpapi)
+                trellis_log("REST API listening on 127.0.0.1:%u", (unsigned)m_config.api_port);
+            else
+                trellis_log("REST API failed to start on port %u", (unsigned)m_config.api_port);
+        }
     }
 
     ~dsp_dsd_trellis() {
         trellis_log("shutting down");
+        httpapi_destroy(m_httpapi);
         log_set_enabled(false);
         plugin_destroy(m_state);
     }
@@ -464,6 +504,24 @@ public:
     bool on_chunk(audio_chunk *chunk, abort_callback & /*abort*/) override {
         if (!m_state)
             return true;
+
+        /* Check for pending config from REST API */
+        {
+            dsd_config_t pending;
+            if (httpapi_get_pending_config(m_httpapi, &pending)) {
+                /* Preserve runtime-detected fs_in — it's not user-settable */
+                const dsd_config_t *current = plugin_get_config(m_state);
+                if (current)
+                    pending.fs_in = current->fs_in;
+                m_config = pending;
+                plugin_set_config(m_state, &m_config);
+                plugin_reconfigure(m_state, &m_config);
+                httpapi_update_config(m_httpapi, &m_config);
+                log_set_enabled(m_config.debug_log);
+                trellis_log("config updated via REST API (cands=%d, depth=%d, gain=%.3f)",
+                            m_config.trellis_cands, m_config.trellis_depth, (double)m_config.gain);
+            }
+        }
 
         const unsigned channels = chunk->get_channel_count();
         const unsigned pcm_rate = chunk->get_sample_rate();
@@ -613,6 +671,37 @@ public:
                             t_unpack, t_fir, t_sdm, t_pack,
                             chunk_ms, ratio);
             }
+
+            /* Push status to REST API */
+            if (m_httpapi) {
+                httpapi_status_t st;
+                memset(&st, 0, sizeof(st));
+                st.playing = true;
+                st.dsd_rate_in = dsd_rate_in;
+                st.dsd_rate_out = dsd_rate_out;
+                st.channels = (int)channels;
+                int wl_t = 0, wl_s = 0;
+                bool wl_c = false;
+                plugin_get_workload(m_state, &wl_t, &wl_s, &wl_c);
+                st.threads = wl_t;
+                st.segments_per_ch = wl_s;
+                uint64_t cm = 0;
+                plugin_get_cpuset_change(m_state, &cm);
+                st.cpuset_mask = cm;
+                for (int b = 0; b < 64; b++)
+                    if (cm & ((uint64_t)1 << b)) st.cpuset_enabled++;
+                st.chunk_count = m_chunk_count;
+                st.last_chunk_ms = process_ms;
+                st.last_audio_ms = chunk_ms;
+                st.rt_ratio = ratio;
+                double tu, tf, ts, tp;
+                plugin_get_phase_timing(m_state, &tu, &tf, &ts, &tp);
+                st.unpack_ms = tu;
+                st.fir_ms = tf;
+                st.sdm_ms = ts;
+                st.pack_ms = tp;
+                httpapi_update_status(m_httpapi, &st);
+            }
         }
 
         if (m_config.output_format == OUTPUT_PCM) {
@@ -677,6 +766,7 @@ public:
 private:
     dsd_config_t     m_config;
     plugin_state_t  *m_state;
+    httpapi_t       *m_httpapi;
     int              m_channels;
     unsigned         m_pcm_rate;
     bool             m_logged_passthrough = false;

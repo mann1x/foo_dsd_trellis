@@ -72,7 +72,7 @@
   <!-- Shared compile settings -->
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)packages\intelipp.devel.win-x64.2022.3.0.387\build\native\include\ipp;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <ConformanceMode>true</ConformanceMode>
       <WarningLevel>Level4</WarningLevel>
@@ -110,6 +110,16 @@
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
     </ClCompile>
   </ItemDefinitionGroup>
+  <!-- x64: Intel IPP static link -->
+  <ItemDefinitionGroup Condition="'$(Platform)'=='x64'">
+    <ClCompile>
+      <PreprocessorDefinitions>USE_IPP;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(ProjectDir)packages\intelipp.static.win-x64.2022.3.1.8\build\native\win-x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>ippsmt.lib;ippvmmt.lib;ippcoremt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Platform)'=='Win32'">
     <Link>
       <TargetMachine>MachineX86</TargetMachine>
@@ -127,6 +137,8 @@
     <ClCompile Include="test\test_config.c" />
     <ClCompile Include="test\test_simd.c" />
     <ClCompile Include="test\test_rate_sinad.c" />
+    <ClCompile Include="test\test_precorr.c" />
+    <ClCompile Include="test\test_sinad_diag.c" />
     <!-- Library sources (linked directly, no DLL dependency) -->
     <ClCompile Include="src\config.c" />
     <ClCompile Include="src\dop.c" />
@@ -137,11 +149,13 @@
     <ClCompile Include="src\ntf.c" />
     <ClCompile Include="src\threadpool.c" />
     <ClCompile Include="src\simd_detect.c" />
-    <ClCompile Include="src\fir_simd.c" />
     <ClCompile Include="src\cpuset.c" />
+    <ClCompile Include="src\precorr.c" />
+    <ClCompile Include="src\wav_io.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\dsd_types.h" />
+    <ClInclude Include="include\wav_io.h" />
     <ClInclude Include="include\ntf.h" />
     <ClInclude Include="include\trellis.h" />
     <ClInclude Include="include\fir.h" />

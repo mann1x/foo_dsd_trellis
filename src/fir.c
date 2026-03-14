@@ -1,42 +1,29 @@
 /*
- * foo_dsd_trellis — Polyphase FIR half-band filter for DSD rate conversion
+ * foo_dsd_trellis — FIR half-band filter for DSD rate conversion
  *
- * Half-band filter design: Kaiser-windowed sinc, computed at init time.
- * Polyphase decomposition for efficient 2x up/down-sampling:
- *   Phase 0 (non-zero taps): FIR convolution
- *   Phase 1 (only center tap = 0.5): trivial delayed copy
- *
- * For DSD rates, the transition band is extremely wide (~0.47 Fs),
- * so a short 23-tap filter provides >90 dB stopband attenuation.
+ * Uses Intel IPP ippsFIRSR_32f with a 63-tap Kaiser half-band filter.
+ * Multi-stage 2x up/down-sampling:
+ *   Upsample:   zero-stuff → FIR → scale by 2
+ *   Downsample: FIR → decimate (keep every other sample)
  */
 
 #include "../include/fir.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-
-/* SIMD-dispatched FIR convolution (defined in fir_simd.c) */
-extern double fir_convolve_dispatch(const double *coeffs, const float *delay,
-                                    int pos, int ntaps);
+#include <ipps.h>
+#include <ippcore.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ─── Half-band filter parameters ─── */
+#define IPP_HB_KAISER_BETA 12.0   /* ~120 dB stopband */
 
-#define HB_NTAPS         23     /* 4*5 + 3: valid half-band length */
-#define HB_CENTER        11     /* (HB_NTAPS - 1) / 2 */
-#define HB_PHASE0_TAPS   12     /* h[0], h[2], ..., h[22] */
-#define HB_PHASE1_DELAY_UP   5  /* Phase 1 center at index 5 for upsample */
-#define HB_PHASE1_DELAY_DN   6  /* Phase 1 delay for downsample */
-#define HB_KAISER_BETA   9.0    /* ~90 dB sidelobe suppression */
-
-/* Phase 0 coefficients (even-indexed taps of the half-band filter) */
-static double hb_phase0[HB_PHASE0_TAPS];
-static int hb_initialized = 0;
-
-/* ─── Bessel I0 (modified, order 0) via series expansion ─── */
+/* ═══════════════════════════════════════════════════════════════════════
+ * Half-band filter design
+ * ═══════════════════════════════════════════════════════════════════════ */
 
 static double bessel_I0(double x) {
     double sum = 1.0;
@@ -52,102 +39,159 @@ static double bessel_I0(double x) {
     return sum;
 }
 
-/* ─── Compute half-band filter coefficients ─── */
-
-static void init_halfband(void) {
-    if (hb_initialized)
-        return;
-
-    double h[HB_NTAPS];
-    double I0b = bessel_I0(HB_KAISER_BETA);
+static void design_halfband_kaiser(double *h, int ntaps, double beta) {
+    int center = (ntaps - 1) / 2;
+    double I0b = bessel_I0(beta);
     double sum = 0.0;
 
-    for (int n = 0; n < HB_NTAPS; n++) {
-        /* Windowed sinc: sinc((n - center) / 2) * kaiser(n) */
-        double x = (double)(n - HB_CENTER) / 2.0;
+    for (int n = 0; n < ntaps; n++) {
+        double x = (double)(n - center) / 2.0;
         double sinc_val = (fabs(x) < 1e-15) ? 1.0 : sin(M_PI * x) / (M_PI * x);
 
-        double t = (double)(n - HB_CENTER) / HB_CENTER;
+        double t = (double)(n - center) / center;
         double arg = 1.0 - t * t;
-        double w = bessel_I0(HB_KAISER_BETA * sqrt(arg > 0.0 ? arg : 0.0)) / I0b;
+        double w = bessel_I0(beta * sqrt(arg > 0.0 ? arg : 0.0)) / I0b;
 
         h[n] = sinc_val * w;
         sum += h[n];
     }
 
-    /* Normalize for unity DC gain */
-    for (int n = 0; n < HB_NTAPS; n++)
+    for (int n = 0; n < ntaps; n++)
         h[n] /= sum;
-
-    /* Extract phase 0 coefficients (even indices) */
-    for (int j = 0; j < HB_PHASE0_TAPS; j++)
-        hb_phase0[j] = h[2 * j];
-
-    /* Verify half-band property: h[center] should be ~0.5 */
-    /* h[11] / sum ≈ 0.5 — the center tap is in phase 1 */
-
-    hb_initialized = 1;
 }
 
-/* ─── Polyphase 2x upsample ─── */
+/* ═══════════════════════════════════════════════════════════════════════
+ * IPP FIRSR per-stage init/free
+ * ═══════════════════════════════════════════════════════════════════════ */
 
-static size_t upsample2(fir_stage_t *stage,
-                         const float *in, float *out, size_t count) {
-    fir_phase_t *ph = &stage->phase[0];
-    int ntaps = ph->num_taps;
+static int ipp_firsr_stage_init(fir_chain_t *chain, int stage_idx) {
+    double hd[IPP_HB_NTAPS];
+    design_halfband_kaiser(hd, IPP_HB_NTAPS, IPP_HB_KAISER_BETA);
 
-    for (size_t i = 0; i < count; i++) {
-        /* Push new input sample */
-        ph->delay[ph->delay_pos] = in[i];
+    Ipp32f taps[IPP_HB_NTAPS];
+    for (int i = 0; i < IPP_HB_NTAPS; i++)
+        taps[i] = (Ipp32f)hd[i];
 
-        /* Phase 0 output: FIR with even-indexed coefficients, scaled ×2 */
-        double sum = fir_convolve_dispatch(ph->coeffs, ph->delay,
-                                           ph->delay_pos, ntaps);
-        out[2 * i] = (float)(2.0 * sum);
+    int specSize = 0, bufSize = 0;
+    IppStatus st = ippsFIRSRGetSize(IPP_HB_NTAPS, ipp32f, &specSize, &bufSize);
+    if (st != ippStsNoErr)
+        return -1;
 
-        /* Phase 1 output: 1.0 × delayed input (0.5 center tap × 2 gain) */
-        int d = (ph->delay_pos - HB_PHASE1_DELAY_UP) & (FIR_MAX_PHASE_TAPS - 1);
-        out[2 * i + 1] = ph->delay[d];
+    IppsFIRSpec_32f *spec = (IppsFIRSpec_32f *)ippsMalloc_8u(specSize);
+    if (!spec)
+        return -1;
 
-        ph->delay_pos = (ph->delay_pos + 1) & (FIR_MAX_PHASE_TAPS - 1);
+    st = ippsFIRSRInit_32f(taps, IPP_HB_NTAPS, ippAlgDirect, spec);
+    if (st != ippStsNoErr) {
+        ippsFree(spec);
+        return -1;
     }
 
-    return count * 2;
+    Ipp8u *buf = ippsMalloc_8u(bufSize);
+    if (!buf) {
+        ippsFree(spec);
+        return -1;
+    }
+
+    int dlyLen = IPP_HB_NTAPS - 1;
+    Ipp32f *dly = ippsMalloc_32f(dlyLen);
+    if (!dly) {
+        ippsFree(buf);
+        ippsFree(spec);
+        return -1;
+    }
+    ippsZero_32f(dly, dlyLen);
+
+    chain->ipp_spec[stage_idx] = spec;
+    chain->ipp_buf[stage_idx] = buf;
+    chain->ipp_dly[stage_idx] = dly;
+    chain->ipp_taps_len = IPP_HB_NTAPS;
+
+    return 0;
 }
 
-/* ─── Polyphase 2x downsample ─── */
-
-static size_t downsample2(fir_stage_t *stage,
-                           const float *in, float *out, size_t in_count) {
-    fir_phase_t *even = &stage->phase[0];  /* Even-indexed input samples */
-    fir_phase_t *odd  = &stage->phase[1];  /* Odd-indexed input samples */
-    int ntaps = even->num_taps;
-    size_t out_count = in_count / 2;
-
-    for (size_t i = 0; i < out_count; i++) {
-        /* Push even sample x[2i] */
-        even->delay[even->delay_pos] = in[2 * i];
-        /* Push odd sample x[2i+1] */
-        odd->delay[odd->delay_pos] = in[2 * i + 1];
-
-        /* Phase 0: FIR convolution on even samples */
-        double sum = fir_convolve_dispatch(even->coeffs, even->delay,
-                                           even->delay_pos, ntaps);
-
-        /* Phase 1: 0.5 × delayed odd sample */
-        int d = (odd->delay_pos - HB_PHASE1_DELAY_DN) & (FIR_MAX_PHASE_TAPS - 1);
-        sum += 0.5 * (double)odd->delay[d];
-
-        out[i] = (float)sum;
-
-        even->delay_pos = (even->delay_pos + 1) & (FIR_MAX_PHASE_TAPS - 1);
-        odd->delay_pos = (odd->delay_pos + 1) & (FIR_MAX_PHASE_TAPS - 1);
+static void ipp_firsr_stage_free(fir_chain_t *chain, int stage_idx) {
+    if (chain->ipp_spec[stage_idx]) {
+        ippsFree(chain->ipp_spec[stage_idx]);
+        chain->ipp_spec[stage_idx] = NULL;
     }
+    if (chain->ipp_buf[stage_idx]) {
+        ippsFree(chain->ipp_buf[stage_idx]);
+        chain->ipp_buf[stage_idx] = NULL;
+    }
+    if (chain->ipp_dly[stage_idx]) {
+        ippsFree(chain->ipp_dly[stage_idx]);
+        chain->ipp_dly[stage_idx] = NULL;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Zero-stuff temp buffer
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static int ipp_ensure_zerostuff(fir_chain_t *chain, size_t need) {
+    if (chain->ipp_zerostuff_sz >= need)
+        return 0;
+    if (chain->ipp_zerostuff)
+        ippsFree(chain->ipp_zerostuff);
+    chain->ipp_zerostuff = ippsMalloc_32f((int)need);
+    chain->ipp_zerostuff_sz = chain->ipp_zerostuff ? need : 0;
+    return chain->ipp_zerostuff ? 0 : -1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Upsample / Downsample 2x via IPP FIRSR
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static size_t ipp_upsample2(fir_chain_t *chain, int stage_idx,
+                             const float *in, float *out, size_t count) {
+    size_t out_count = count * 2;
+
+    if (ipp_ensure_zerostuff(chain, out_count) != 0)
+        return 0;
+
+    /* Zero-stuff: in[i] → tmp[2i], 0 → tmp[2i+1] */
+    ippsZero_32f(chain->ipp_zerostuff, (int)out_count);
+    for (size_t i = 0; i < count; i++)
+        chain->ipp_zerostuff[2 * i] = in[i];
+
+    IppsFIRSpec_32f *spec = (IppsFIRSpec_32f *)chain->ipp_spec[stage_idx];
+    Ipp32f *dly = chain->ipp_dly[stage_idx];
+    Ipp8u *buf = (Ipp8u *)chain->ipp_buf[stage_idx];
+
+    ippsFIRSR_32f(chain->ipp_zerostuff, out, (int)out_count,
+                  spec, dly, dly, buf);
+
+    /* Scale by 2 to compensate for zero insertion */
+    ippsMulC_32f_I(2.0f, out, (int)out_count);
 
     return out_count;
 }
 
-/* ─── Scratch buffer management ─── */
+static size_t ipp_downsample2(fir_chain_t *chain, int stage_idx,
+                               const float *in, float *out, size_t in_count) {
+    size_t out_count = in_count / 2;
+
+    if (ipp_ensure_zerostuff(chain, in_count) != 0)
+        return 0;
+
+    IppsFIRSpec_32f *spec = (IppsFIRSpec_32f *)chain->ipp_spec[stage_idx];
+    Ipp32f *dly = chain->ipp_dly[stage_idx];
+    Ipp8u *buf = (Ipp8u *)chain->ipp_buf[stage_idx];
+
+    ippsFIRSR_32f(in, chain->ipp_zerostuff, (int)in_count,
+                  spec, dly, dly, buf);
+
+    /* Decimate: keep every other sample */
+    for (size_t i = 0; i < out_count; i++)
+        out[i] = chain->ipp_zerostuff[2 * i];
+
+    return out_count;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Scratch buffer management
+ * ═══════════════════════════════════════════════════════════════════════ */
 
 static int ensure_scratch(fir_chain_t *chain, size_t need) {
     if (chain->scratch_size >= need)
@@ -160,12 +204,12 @@ static int ensure_scratch(fir_chain_t *chain, size_t need) {
     return 0;
 }
 
-/* ─── Public API ─── */
+/* ═══════════════════════════════════════════════════════════════════════
+ * Public API
+ * ═══════════════════════════════════════════════════════════════════════ */
 
 int fir_chain_init(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out) {
     memset(chain, 0, sizeof(*chain));
-
-    init_halfband();
 
     if (fs_in == fs_out) {
         chain->num_stages = 0;
@@ -174,14 +218,13 @@ int fir_chain_init(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out) {
 
     /* Determine number of ×2 or ÷2 stages needed */
     uint32_t ratio;
-    bool upsample;
 
     if (fs_out > fs_in) {
         ratio = fs_out / fs_in;
-        upsample = true;
+        chain->upsample = true;
     } else {
         ratio = fs_in / fs_out;
-        upsample = false;
+        chain->upsample = false;
     }
 
     /* Must be power of 2 */
@@ -200,21 +243,13 @@ int fir_chain_init(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out) {
 
     chain->num_stages = stages;
 
+    /* Init per-stage IPP FIRSR specs */
     for (int i = 0; i < stages; i++) {
-        fir_stage_t *st = &chain->stages[i];
-        st->upsample = upsample;
-
-        /* Load phase 0 coefficients into both phases */
-        memcpy(st->phase[0].coeffs, hb_phase0, HB_PHASE0_TAPS * sizeof(double));
-        st->phase[0].num_taps = HB_PHASE0_TAPS;
-        st->phase[0].delay_pos = 0;
-        memset(st->phase[0].delay, 0, sizeof(st->phase[0].delay));
-
-        /* Phase 1 used only for downsampling (odd delay line) */
-        memcpy(st->phase[1].coeffs, hb_phase0, HB_PHASE0_TAPS * sizeof(double));
-        st->phase[1].num_taps = HB_PHASE0_TAPS;
-        st->phase[1].delay_pos = 0;
-        memset(st->phase[1].delay, 0, sizeof(st->phase[1].delay));
+        if (ipp_firsr_stage_init(chain, i) != 0) {
+            for (int j = 0; j < i; j++)
+                ipp_firsr_stage_free(chain, j);
+            return -1;
+        }
     }
 
     return 0;
@@ -224,49 +259,40 @@ size_t fir_chain_process(fir_chain_t *chain,
                          const float *in, float *out,
                          size_t in_count) {
     if (chain->num_stages == 0) {
-        /* Passthrough */
         memcpy(out, in, in_count * sizeof(float));
         return in_count;
     }
 
+    /* Single stage: direct in → out */
     if (chain->num_stages == 1) {
-        /* Single stage: process directly into output */
-        if (chain->stages[0].upsample)
-            return upsample2(&chain->stages[0], in, out, in_count);
+        if (chain->upsample)
+            return ipp_upsample2(chain, 0, in, out, in_count);
         else
-            return downsample2(&chain->stages[0], in, out, in_count);
+            return ipp_downsample2(chain, 0, in, out, in_count);
     }
 
-    /* Multi-stage: use ping-pong between scratch and out buffers.
-     * For upsampling: N → 2N → 4N → 8N (out is largest, always fits).
-     * For downsampling: N → N/2 → N/4 → N/8.
-     * Scratch sized for the largest intermediate result. */
+    /* Multi-stage: ping-pong between scratch and out */
     size_t max_intermediate;
-    if (chain->stages[0].upsample) {
+    if (chain->upsample)
         max_intermediate = in_count << (chain->num_stages - 1);
-    } else {
+    else
         max_intermediate = in_count / 2;
-    }
 
     if (ensure_scratch(chain, max_intermediate) != 0)
         return 0;
 
-    /* Ping-pong: stages alternate between scratch and out.
-     * Last stage always writes to out. Work backwards to assign:
-     *   2 stages: in → scratch → out
-     *   3 stages: in → out → scratch → out */
     float *bufs[2] = { out, chain->scratch };
     const float *src = in;
     size_t count = in_count;
 
     for (int i = 0; i < chain->num_stages; i++) {
         int remaining = chain->num_stages - 1 - i;
-        float *dst = bufs[remaining & 1]; /* last stage → bufs[0] = out */
+        float *dst = bufs[remaining & 1];
 
-        if (chain->stages[i].upsample)
-            count = upsample2(&chain->stages[i], src, dst, count);
+        if (chain->upsample)
+            count = ipp_upsample2(chain, i, src, dst, count);
         else
-            count = downsample2(&chain->stages[i], src, dst, count);
+            count = ipp_downsample2(chain, i, src, dst, count);
 
         src = dst;
     }
@@ -275,19 +301,41 @@ size_t fir_chain_process(fir_chain_t *chain,
 }
 
 void fir_chain_reset(fir_chain_t *chain) {
+    int dlyLen = chain->ipp_taps_len - 1;
     for (int i = 0; i < chain->num_stages; i++) {
-        memset(chain->stages[i].phase[0].delay, 0,
-               sizeof(chain->stages[i].phase[0].delay));
-        memset(chain->stages[i].phase[1].delay, 0,
-               sizeof(chain->stages[i].phase[1].delay));
-        chain->stages[i].phase[0].delay_pos = 0;
-        chain->stages[i].phase[1].delay_pos = 0;
+        if (chain->ipp_dly[i])
+            ippsZero_32f(chain->ipp_dly[i], dlyLen);
     }
 }
 
 void fir_chain_free(fir_chain_t *chain) {
+    for (int i = 0; i < FIR_MAX_STAGES; i++)
+        ipp_firsr_stage_free(chain, i);
+
+    if (chain->ipp_zerostuff) {
+        ippsFree(chain->ipp_zerostuff);
+        chain->ipp_zerostuff = NULL;
+        chain->ipp_zerostuff_sz = 0;
+    }
+
     free(chain->scratch);
     chain->scratch = NULL;
     chain->scratch_size = 0;
     chain->num_stages = 0;
+}
+
+const char *fir_ipp_version(void) {
+    static char ver[128] = {0};
+    if (ver[0] == 0) {
+        const IppLibraryVersion *v = ippGetLibVersion();
+        if (v)
+            snprintf(ver, sizeof(ver), "%s %s", v->Name, v->Version);
+        else
+            snprintf(ver, sizeof(ver), "IPP (unknown version)");
+    }
+    return ver;
+}
+
+const char *fir_ipp_kernel_name(void) {
+    return "IPP FIRSR (63-tap Kaiser)";
 }

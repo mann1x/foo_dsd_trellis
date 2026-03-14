@@ -164,6 +164,201 @@ static __forceinline void sdm_filter_calc2(sdm_state_t *src, sdm_state_t *dst,
     dst[1].cost = src->cost + sqr(v - a[0]);
 }
 
+/* ─── Batched 4-candidate AVX2 filter calc ─── */
+
+#if defined(_MSC_VER) && defined(__AVX2__)
+
+/*
+ * Transpose 4 __m256d row vectors into 4 column vectors.
+ * Input:  a = {a0,a1,a2,a3}, b = {b0,b1,b2,b3}, c, d
+ * Output: r0 = {a0,b0,c0,d0}, r1 = {a1,b1,c1,d1}, r2, r3
+ */
+static __forceinline void transpose_4x4_pd(
+    __m256d a, __m256d b, __m256d c, __m256d d,
+    __m256d *r0, __m256d *r1, __m256d *r2, __m256d *r3)
+{
+    __m256d t0 = _mm256_unpacklo_pd(a, b);
+    __m256d t1 = _mm256_unpackhi_pd(a, b);
+    __m256d t2 = _mm256_unpacklo_pd(c, d);
+    __m256d t3 = _mm256_unpackhi_pd(c, d);
+    *r0 = _mm256_permute2f128_pd(t0, t2, 0x20);
+    *r1 = _mm256_permute2f128_pd(t1, t3, 0x20);
+    *r2 = _mm256_permute2f128_pd(t0, t2, 0x31);
+    *r3 = _mm256_permute2f128_pd(t1, t3, 0x31);
+}
+
+/*
+ * Process 4 candidates simultaneously through sdm_step for order 8.
+ * Computes filter_calc2 + path/hist assignments for all 4 in parallel.
+ */
+static __forceinline void sdm_step_4x_o8(
+    sdm_context_t *p,
+    sdm_state_t *src0, sdm_state_t *src1,
+    sdm_state_t *src2, sdm_state_t *src3,
+    sdm_state_t *dst0, sdm_state_t *dst1,
+    sdm_state_t *dst2, sdm_state_t *dst3,
+    double x)
+{
+    const ntf_filter_t *f = p->filter;
+    const double *a = f->a;
+    const double *g = f->g;
+
+    /* ── Gather: transpose 4 AoS state vectors → 8 SoA __m256d ── */
+    __m256d s0, s1, s2, s3, s4, s5, s6, s7;
+    {
+        /* Load state[0..3] from each candidate, then transpose */
+        __m256d r0 = _mm256_loadu_pd(src0->state);
+        __m256d r1 = _mm256_loadu_pd(src1->state);
+        __m256d r2 = _mm256_loadu_pd(src2->state);
+        __m256d r3 = _mm256_loadu_pd(src3->state);
+        transpose_4x4_pd(r0, r1, r2, r3, &s0, &s1, &s2, &s3);
+
+        /* Load state[4..7] from each candidate, then transpose */
+        r0 = _mm256_loadu_pd(src0->state + 4);
+        r1 = _mm256_loadu_pd(src1->state + 4);
+        r2 = _mm256_loadu_pd(src2->state + 4);
+        r3 = _mm256_loadu_pd(src3->state + 4);
+        transpose_4x4_pd(r0, r1, r2, r3, &s4, &s5, &s6, &s7);
+    }
+
+    /* ── Compute: order-8 filter calc for all 4 candidates ── */
+    __m256d x4 = _mm256_set1_pd(x);
+    __m256d d0, d1, d2, d3, d4, d5, d6, d7;
+
+    /* d[0] = s[0] - g[0]*s[1] + x  (y=0) */
+    d0 = _mm256_add_pd(s0, x4);
+    d0 = _mm256_fnmadd_pd(_mm256_set1_pd(g[0]), s1, d0);
+
+    /* d[1] = s[1] + s[0] - g[1]*s[2] */
+    d1 = _mm256_add_pd(s1, s0);
+    d1 = _mm256_fnmadd_pd(_mm256_set1_pd(g[1]), s2, d1);
+
+    /* d[2] = s[2] + s[1] - g[2]*s[3] */
+    d2 = _mm256_add_pd(s2, s1);
+    d2 = _mm256_fnmadd_pd(_mm256_set1_pd(g[2]), s3, d2);
+
+    /* d[3] = s[3] + s[2] - g[3]*s[4] */
+    d3 = _mm256_add_pd(s3, s2);
+    d3 = _mm256_fnmadd_pd(_mm256_set1_pd(g[3]), s4, d3);
+
+    /* d[4] = s[4] + s[3] - g[4]*s[5] */
+    d4 = _mm256_add_pd(s4, s3);
+    d4 = _mm256_fnmadd_pd(_mm256_set1_pd(g[4]), s5, d4);
+
+    /* d[5] = s[5] + s[4] - g[5]*s[6] */
+    d5 = _mm256_add_pd(s5, s4);
+    d5 = _mm256_fnmadd_pd(_mm256_set1_pd(g[5]), s6, d5);
+
+    /* d[6] = s[6] + s[5] - g[6]*s[7] */
+    d6 = _mm256_add_pd(s6, s5);
+    d6 = _mm256_fnmadd_pd(_mm256_set1_pd(g[6]), s7, d6);
+
+    /* d[7] = s[7] + s[6] */
+    d7 = _mm256_add_pd(s7, s6);
+
+    /* v = x + a[0]*d[0] + a[1]*d[1] + ... + a[7]*d[7] */
+    __m256d v4 = _mm256_fmadd_pd(_mm256_set1_pd(a[0]), d0, x4);
+    v4 = _mm256_fmadd_pd(_mm256_set1_pd(a[1]), d1, v4);
+    v4 = _mm256_fmadd_pd(_mm256_set1_pd(a[2]), d2, v4);
+    v4 = _mm256_fmadd_pd(_mm256_set1_pd(a[3]), d3, v4);
+    v4 = _mm256_fmadd_pd(_mm256_set1_pd(a[4]), d4, v4);
+    v4 = _mm256_fmadd_pd(_mm256_set1_pd(a[5]), d5, v4);
+    v4 = _mm256_fmadd_pd(_mm256_set1_pd(a[6]), d6, v4);
+    v4 = _mm256_fmadd_pd(_mm256_set1_pd(a[7]), d7, v4);
+
+    /* ── Scatter: transpose 8 SoA __m256d → 4 AoS state vectors ── */
+    __m256d out0_lo, out0_hi, out1_lo, out1_hi, out2_lo, out2_hi, out3_lo, out3_hi;
+    transpose_4x4_pd(d0, d1, d2, d3, &out0_lo, &out1_lo, &out2_lo, &out3_lo);
+    transpose_4x4_pd(d4, d5, d6, d7, &out0_hi, &out1_hi, &out2_hi, &out3_hi);
+
+    /* Store to dst[0].state and copy to dst[1].state for each candidate */
+
+    /* Candidate 0 */
+    _mm256_storeu_pd(dst0[0].state, out0_lo);
+    _mm256_storeu_pd(dst0[0].state + 4, out0_hi);
+    _mm256_storeu_pd(dst0[1].state, out0_lo);
+    _mm256_storeu_pd(dst0[1].state + 4, out0_hi);
+    dst0[0].state[0] += 1.0;
+    dst0[1].state[0] -= 1.0;
+
+    /* Candidate 1 */
+    _mm256_storeu_pd(dst1[0].state, out1_lo);
+    _mm256_storeu_pd(dst1[0].state + 4, out1_hi);
+    _mm256_storeu_pd(dst1[1].state, out1_lo);
+    _mm256_storeu_pd(dst1[1].state + 4, out1_hi);
+    dst1[0].state[0] += 1.0;
+    dst1[1].state[0] -= 1.0;
+
+    /* Candidate 2 */
+    _mm256_storeu_pd(dst2[0].state, out2_lo);
+    _mm256_storeu_pd(dst2[0].state + 4, out2_hi);
+    _mm256_storeu_pd(dst2[1].state, out2_lo);
+    _mm256_storeu_pd(dst2[1].state + 4, out2_hi);
+    dst2[0].state[0] += 1.0;
+    dst2[1].state[0] -= 1.0;
+
+    /* Candidate 3 */
+    _mm256_storeu_pd(dst3[0].state, out3_lo);
+    _mm256_storeu_pd(dst3[0].state + 4, out3_hi);
+    _mm256_storeu_pd(dst3[1].state, out3_lo);
+    _mm256_storeu_pd(dst3[1].state + 4, out3_hi);
+    dst3[0].state[0] += 1.0;
+    dst3[1].state[0] -= 1.0;
+
+    /* ── Costs: extract v values and compute per-candidate ── */
+    {
+        __m256d a0_4 = _mm256_set1_pd(a[0]);
+        __m256d vpa = _mm256_add_pd(v4, a0_4);  /* v + a[0] for all 4 */
+        __m256d vma = _mm256_sub_pd(v4, a0_4);  /* v - a[0] for all 4 */
+        __m256d cost_p = _mm256_mul_pd(vpa, vpa); /* sqr(v + a[0]) */
+        __m256d cost_m = _mm256_mul_pd(vma, vma); /* sqr(v - a[0]) */
+
+        /* Load source costs and add */
+        __m256d src_costs = _mm256_set_pd(
+            src3->cost, src2->cost, src1->cost, src0->cost);
+        cost_p = _mm256_add_pd(src_costs, cost_p);
+        cost_m = _mm256_add_pd(src_costs, cost_m);
+
+        /* Extract and store costs */
+        double cp[4], cm[4];
+        _mm256_storeu_pd(cp, cost_p);
+        _mm256_storeu_pd(cm, cost_m);
+        dst0[0].cost = cp[0]; dst0[1].cost = cm[0];
+        dst1[0].cost = cp[1]; dst1[1].cost = cm[1];
+        dst2[0].cost = cp[2]; dst2[1].cost = cm[2];
+        dst3[0].cost = cp[3]; dst3[1].cost = cm[3];
+    }
+
+    /* ── Path, hist, parent assignments ── */
+    uint32_t mask = (uint32_t)p->trellis_mask;
+
+    dst0[0].path = (src0->path << 1 | 0u) & mask;
+    dst0[1].path = (src0->path << 1 | 1u) & mask;
+    dst0[0].hist = dst0[1].hist = src0->hist;
+    dst0[0].next = dst0[1].next = src0->next;
+    dst0[0].parent = dst0[1].parent = src0;
+
+    dst1[0].path = (src1->path << 1 | 0u) & mask;
+    dst1[1].path = (src1->path << 1 | 1u) & mask;
+    dst1[0].hist = dst1[1].hist = src1->hist;
+    dst1[0].next = dst1[1].next = src1->next;
+    dst1[0].parent = dst1[1].parent = src1;
+
+    dst2[0].path = (src2->path << 1 | 0u) & mask;
+    dst2[1].path = (src2->path << 1 | 1u) & mask;
+    dst2[0].hist = dst2[1].hist = src2->hist;
+    dst2[0].next = dst2[1].next = src2->next;
+    dst2[0].parent = dst2[1].parent = src2;
+
+    dst3[0].path = (src3->path << 1 | 0u) & mask;
+    dst3[1].path = (src3->path << 1 | 1u) & mask;
+    dst3[0].hist = dst3[1].hist = src3->hist;
+    dst3[0].next = dst3[1].next = src3->next;
+    dst3[0].parent = dst3[1].parent = src3;
+}
+
+#endif /* _MSC_VER && __AVX2__ */
+
 /* ─── History buffer management ─── */
 
 static inline unsigned sdm_histbuf_get(sdm_context_t *p)
@@ -339,6 +534,35 @@ static double sdm_sample_trellis(sdm_context_t *p, double x)
     if (next_pos == p->trellis_lat)
         next_pos = 0;
 
+#if defined(_MSC_VER) && defined(__AVX2__)
+    /* Batched 4-candidate AVX2 path for order 8 */
+    if (p->filter->order == 8) {
+        for (i = 0; i + 3 < p->num_cands; i += 4) {
+            sdm_step_4x_o8(p,
+                st_cur->act[i], st_cur->act[i+1],
+                st_cur->act[i+2], st_cur->act[i+3],
+                &st_next->sdm[2*i], &st_next->sdm[2*(i+1)],
+                &st_next->sdm[2*(i+2)], &st_next->sdm[2*(i+3)],
+                x);
+            st_cur->act[i]->next   = (uint8_t)sdm_hist_get(p, st_cur->act[i]->hist, next_pos);
+            st_cur->act[i]->hist_used = 0;
+            st_cur->act[i+1]->next = (uint8_t)sdm_hist_get(p, st_cur->act[i+1]->hist, next_pos);
+            st_cur->act[i+1]->hist_used = 0;
+            st_cur->act[i+2]->next = (uint8_t)sdm_hist_get(p, st_cur->act[i+2]->hist, next_pos);
+            st_cur->act[i+2]->hist_used = 0;
+            st_cur->act[i+3]->next = (uint8_t)sdm_hist_get(p, st_cur->act[i+3]->hist, next_pos);
+            st_cur->act[i+3]->hist_used = 0;
+        }
+        /* Handle remaining candidates (0-3) */
+        for (; i < p->num_cands; i++) {
+            sdm_state_t *cur  = st_cur->act[i];
+            sdm_state_t *next = &st_next->sdm[2 * i];
+            sdm_step(p, cur, next, x);
+            cur->next = (uint8_t)sdm_hist_get(p, cur->hist, next_pos);
+            cur->hist_used = 0;
+        }
+    } else
+#endif
     for (i = 0; i < p->num_cands; i++) {
         sdm_state_t *cur  = st_cur->act[i];
         sdm_state_t *next = &st_next->sdm[2 * i];

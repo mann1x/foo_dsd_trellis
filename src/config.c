@@ -49,9 +49,19 @@ static size_t read_f32(const uint8_t *buf, size_t pos, float *val) {
     return pos + 4;
 }
 
+static size_t write_u16(uint8_t *buf, size_t pos, uint16_t val) {
+    memcpy(buf + pos, &val, 2);
+    return pos + 2;
+}
+
 static size_t read_u8(const uint8_t *buf, size_t pos, uint8_t *val) {
     *val = buf[pos];
     return pos + 1;
+}
+
+static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
+    memcpy(val, buf + pos, 2);
+    return pos + 2;
 }
 
 /* ─── Version 1 field layout ─── */
@@ -78,14 +88,28 @@ static size_t read_u8(const uint8_t *buf, size_t pos, uint8_t *val) {
  * 1  smt_mode
  * 1  ccd_mode
  * 1  ecore_mode
- * Total: 49 bytes */
+ * Total: 49 bytes
+ *
+ * Version 4 adds:
+ * 2  api_port (uint16_t)
+ * Total: 51 bytes
+ *
+ * Version 5 adds:
+ * 1  sdm_mode
+ * Total: 52 bytes
+ *
+ * Version 6 added fir_mode (1 byte, now removed — read and discard)
+ * Total: 53 bytes */
 #define CONFIG_V1_SIZE 45
 #define CONFIG_V2_SIZE 46
 #define CONFIG_V3_SIZE 49
+#define CONFIG_V4_SIZE 51
+#define CONFIG_V5_SIZE 52
+#define CONFIG_V6_SIZE 53
 
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
-    if (buf_size < CONFIG_V3_SIZE)
+    if (buf_size < CONFIG_V5_SIZE)
         return 0;
 
     size_t pos = 0;
@@ -106,6 +130,8 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     pos = write_u8(buf, pos, (uint8_t)cfg->smt_mode);
     pos = write_u8(buf, pos, (uint8_t)cfg->ccd_mode);
     pos = write_u8(buf, pos, (uint8_t)cfg->ecore_mode);
+    pos = write_u16(buf, pos, cfg->api_port);
+    pos = write_u8(buf, pos, (uint8_t)cfg->sdm_mode);
 
     return pos;
 }
@@ -121,7 +147,7 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
     uint32_t version;
     read_u32(buf, 0, &version);
 
-    if ((version >= 1 && version <= 3) && buf_size >= CONFIG_V1_SIZE) {
+    if ((version >= 1 && version <= DSD_CONFIG_VERSION) && buf_size >= CONFIG_V1_SIZE) {
         /* Version 1/2: field-by-field */
         size_t pos = 4;
         pos = read_u32(buf, pos, &cfg->fs_in);
@@ -152,6 +178,23 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
             pos = read_u8(buf, pos, &u8); cfg->smt_mode = (int)u8;
             pos = read_u8(buf, pos, &u8); cfg->ccd_mode = (int)u8;
             pos = read_u8(buf, pos, &u8); cfg->ecore_mode = (int)u8;
+        }
+        /* Version 4 adds api_port */
+        if (version >= 4 && buf_size >= CONFIG_V4_SIZE) {
+            pos = read_u16(buf, pos, &cfg->api_port);
+        }
+        /* Version 5 adds sdm_mode */
+        if (version >= 5 && buf_size >= CONFIG_V5_SIZE) {
+            uint8_t u8;
+            pos = read_u8(buf, pos, &u8); cfg->sdm_mode = (int)u8;
+        } else {
+            /* Pre-v5 configs default to Trellis to preserve existing behavior */
+            cfg->sdm_mode = SDM_MODE_TRELLIS;
+        }
+        /* Version 6 had fir_mode (removed — read and discard for compat) */
+        if (version >= 6 && buf_size >= CONFIG_V6_SIZE) {
+            uint8_t u8;
+            pos = read_u8(buf, pos, &u8); /* discard fir_mode */
         }
         (void)pos;
         config_validate(cfg);
@@ -212,4 +255,8 @@ void config_validate(dsd_config_t *cfg) {
     /* Validate output format */
     if (cfg->output_format != OUTPUT_DOP && cfg->output_format != OUTPUT_PCM)
         cfg->output_format = OUTPUT_DOP;
+
+    /* Validate SDM mode */
+    if (cfg->sdm_mode != SDM_MODE_PRECORR && cfg->sdm_mode != SDM_MODE_TRELLIS)
+        cfg->sdm_mode = SDM_MODE_PRECORR;
 }

@@ -1,5 +1,8 @@
 /*
- * foo_dsd_trellis — Polyphase FIR half-band filter for DSD rate conversion
+ * foo_dsd_trellis — FIR half-band filter for DSD rate conversion
+ *
+ * Uses Intel IPP ippsFIRSR_32f with a 63-tap Kaiser half-band filter.
+ * Multi-stage 2x up/down-sampling via zero-stuffing + FIR + scaling.
  */
 
 #ifndef FIR_H
@@ -7,31 +10,25 @@
 
 #include "dsd_types.h"
 
-/* Maximum FIR filter length (taps per polyphase phase) */
-#define FIR_MAX_PHASE_TAPS 64
+/* Rate conversion chain (up to 9 stages for PCM 44.1k → DSD512) */
+#define FIR_MAX_STAGES 9
 
-/* FIR filter state (per-channel, per-stage) */
-typedef struct {
-    double   coeffs[FIR_MAX_PHASE_TAPS];   /* Polyphase phase coefficients */
-    float    delay[FIR_MAX_PHASE_TAPS];    /* Circular delay buffer */
-    int      num_taps;                      /* Active taps in this phase */
-    int      delay_pos;                     /* Current position in delay buffer */
-} fir_phase_t;
-
-/* Single rate conversion stage (×2 or ÷2) */
-typedef struct {
-    fir_phase_t phase[2];      /* Two polyphase phases for half-band */
-    bool        upsample;      /* true = ×2 interpolation, false = ÷2 decimation */
-} fir_stage_t;
-
-/* Rate conversion chain (up to 3 stages for DSD64↔DSD512) */
-#define FIR_MAX_STAGES 3
+/* IPP FIRSR half-band filter length */
+#define IPP_HB_NTAPS 63
 
 typedef struct {
-    fir_stage_t stages[FIR_MAX_STAGES];
     int         num_stages;     /* 0 = passthrough */
     float      *scratch;        /* Intermediate buffer between stages */
     size_t      scratch_size;
+    bool        upsample;       /* Direction for all stages */
+
+    /* IPP FIRSR state (per stage) */
+    void       *ipp_spec[FIR_MAX_STAGES];   /* IppsFIRSpec_32f* */
+    void       *ipp_buf[FIR_MAX_STAGES];    /* Ipp8u* work buffer */
+    float      *ipp_dly[FIR_MAX_STAGES];    /* Delay lines (tapsLen-1 floats) */
+    float      *ipp_zerostuff;              /* Temp buffer for zero-stuffing */
+    size_t      ipp_zerostuff_sz;
+    int         ipp_taps_len;               /* Actual filter length */
 } fir_chain_t;
 
 /* Initialise rate conversion chain for given input/output rates.
@@ -50,8 +47,8 @@ void fir_chain_reset(fir_chain_t *chain);
 /* Free scratch buffer and reset. */
 void fir_chain_free(fir_chain_t *chain);
 
-/* SIMD-dispatched FIR convolution (fir_simd.c) */
-void fir_simd_init(void);
-const char *fir_simd_name(void);
+/* IPP info */
+const char *fir_ipp_version(void);
+const char *fir_ipp_kernel_name(void);
 
 #endif /* FIR_H */

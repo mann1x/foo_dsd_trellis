@@ -80,7 +80,7 @@
   <!-- Shared compile settings -->
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)foobar2000-sdk;$(ProjectDir)foobar2000-sdk\foobar2000;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)packages\intelipp.devel.win-x64.2022.3.0.387\build\native\include\ipp;$(ProjectDir)foobar2000-sdk;$(ProjectDir)foobar2000-sdk\foobar2000;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <ConformanceMode>true</ConformanceMode>
@@ -128,6 +128,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
+      <AdditionalOptions>/PDBPAGESIZE:8192 %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <!-- x64 Release: enable AVX2 -->
@@ -135,6 +136,16 @@
     <ClCompile>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
     </ClCompile>
+  </ItemDefinitionGroup>
+  <!-- x64: Intel IPP static link -->
+  <ItemDefinitionGroup Condition="'$(Platform)'=='x64'">
+    <ClCompile>
+      <PreprocessorDefinitions>USE_IPP;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(ProjectDir)packages\intelipp.static.win-x64.2022.3.1.8\build\native\win-x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>ippsmt.lib;ippvmmt.lib;ippcoremt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
   </ItemDefinitionGroup>
   <!-- Win32-specific: target machine -->
   <ItemDefinitionGroup Condition="'$(Platform)'=='Win32'">
@@ -181,10 +192,16 @@
     <ClCompile Include="src\simd_detect.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="src\fir_simd.c">
+    <ClCompile Include="src\cpuset.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="src\cpuset.c">
+    <ClCompile Include="src\httpapi.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\wav_io.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\precorr.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
   </ItemGroup>
@@ -203,6 +220,10 @@
     <ClInclude Include="include\simd_detect.h" />
     <ClInclude Include="src\resource.h" />
     <ClInclude Include="src\build_version.h" />
+    <ClInclude Include="include\httpapi.h" />
+    <ClInclude Include="include\wav_io.h" />
+    <ClInclude Include="include\cpuset.h" />
+    <ClInclude Include="include\precorr.h" />
   </ItemGroup>
   <!-- SDK project references -->
   <ItemGroup>

@@ -1,22 +1,24 @@
 # foo_dsd_trellis
 
-A native foobar2000 DSP plugin that processes DSD (Direct Stream Digital) audio using a Trellis (Viterbi look-ahead) Sigma-Delta Modulator. All processing stays in the 1-bit DSD domain -- no decimation to audio-rate PCM ever occurs.
+A native foobar2000 DSP plugin that converts PCM and DSD audio to DSD using sigma-delta modulation. Supports two SDM modes: **Trellis** (Viterbi look-ahead, highest quality) and **PreCorr** (greedy + prediction correction, near-zero CPU). FIR rate conversion uses Intel IPP with automatic SSE2/AVX2/AVX-512 dispatch.
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| Rate Conversion | DSD64 / DSD128 / DSD256 / DSD512 (power-of-2 ratios via polyphase half-band FIR) |
+| SDM Modes | PreCorr (default, ~0.01x RT) and Trellis (high quality, configurable depth/candidates) |
+| Rate Conversion | DSD64 / DSD128 / DSD256 / DSD512 via Intel IPP FIRSR (63-tap Kaiser half-band) |
+| PCM to DSD | Float32 PCM input upsampled via FIR then quantised to 1-bit DSD |
 | Volume Control | Linear gain multiply before SDM requantiser |
 | Passthrough | Repack only -- bypass FIR and SDM when input/output rate and gain are identical |
 | Mute | Silence pattern substitution (0x69/0x96) |
 | DoP Detection | Auto-detect DoP markers (0x05/0xFA) in 24-bit PCM frames; falls back to native ASIO |
 | Native DSD | Raw DSD bitstream support (FORMAT_NATIVE) for ASIO and native input components |
-| Trellis Depth | Configurable look-ahead N (4, 8, 16, 32) and candidates M (4-32) |
-| SIMD Acceleration | Runtime CPU dispatch: AVX2+FMA (Intel/Zen 3+), AVX128+FMA (Zen 1/2), SSE2 fallback |
-| Property Page | Full configuration dialog with dark mode support |
 | Output Modes | DoP (native DSD output) or PCM (for VU meter / non-DSD DACs) |
+| Intel IPP | Statically linked, automatic CPU dispatch (SSE2 -> AVX2 -> AVX-512) |
+| Property Page | Full configuration dialog with dark mode support |
 | Config Versioning | Forward-compatible binary preset serialization with legacy fallback |
+| REST API | HTTP control/monitoring API with render and SINAD measurement endpoints |
 | foo_input_udsd | Compatible with foo_input_udsd / foo_input_sacd DSD input components |
 
 ## Architecture
@@ -24,18 +26,18 @@ A native foobar2000 DSP plugin that processes DSD (Direct Stream Digital) audio 
 Four-layer design with clean separation of concerns:
 
 ```
-1-bit in -> unpack -> float32 @ Fs_in -> [polyphase FIR] -> x gain -> Trellis SDM -> 1-bit out @ Fs_out
+1-bit in -> unpack -> float32 @ Fs_in -> [IPP FIRSR] -> x gain -> SDM (Trellis|PreCorr) -> 1-bit out @ Fs_out
 ```
 
 | Layer | Purpose | Files |
 |-------|---------|-------|
 | fb2k Interface | foobar2000 DSP v2 glue, config dialog | `dsp_fb2k.cpp`, `dsp_plugin.c`, `config.c` |
 | Format Bridge | DoP/native detection, 1-bit <-> float32 | `dop.c`, `bitpack.c` |
-| Processing Engine | FIR rate conversion + gain + SIMD | `engine.c`, `fir.c`, `fir_simd.c` |
-| Trellis SDM | Viterbi look-ahead requantiser | `trellis.c`, `ntf.c` |
-| CPU Detection | Runtime SSE2/AVX2/FMA dispatch, AMD vs Intel tuning | `simd_detect.c` |
+| Processing Engine | IPP FIR rate conversion + gain | `engine.c`, `fir.c` |
+| SDM | Trellis (Viterbi) or PreCorr (greedy + prediction) | `trellis.c`, `precorr.c`, `ntf.c` |
+| Infrastructure | Thread pool, CPU detection, REST API | `threadpool.c`, `simd_detect.c`, `cpuset.c`, `httpapi.c` |
 
-Thread pool (`threadpool.c`) provides per-channel parallelism.
+Thread pool (`threadpool.c`) provides per-channel parallelism with MMCSS "Pro Audio" scheduling.
 
 ## DSD Rates
 
@@ -45,6 +47,58 @@ Thread pool (`threadpool.c`) provides per-channel parallelism.
 | DSD128 | 5,644,800 Hz | 128 x 44.1 kHz |
 | DSD256 | 11,289,600 Hz | 256 x 44.1 kHz |
 | DSD512 | 22,579,200 Hz | 512 x 44.1 kHz |
+
+## SINAD Measurements
+
+All measurements use bin-aligned 1 kHz sine at amplitude 0.5, measured via Goertzel algorithm on the DSD output stream (0-22.05 kHz noise floor). Auto-selected NTF filters per rate.
+
+### Trellis SDM (depth=8, candidates=8, latency=512)
+
+Viterbi look-ahead search. Highest quality, higher CPU.
+
+| Rate | NTF Filter | SINAD (dB) |
+|------|------------|------------|
+| DSD64 | CLANS-5 (order 5) | 86.9 |
+| DSD128 | CLANS-6 (order 6) | 112.2 |
+| DSD256 | CLANS-7 (order 7) | 136.7 |
+| DSD512 | CLANS-8 (order 8) | 139.8 |
+
+### PreCorr SDM (greedy + prediction correction)
+
+Greedy quantiser with trained prediction table. Near-zero CPU (~0.01x realtime).
+
+| Rate | NTF Filter | SINAD (dB) |
+|------|------------|------------|
+| DSD64 | CLANS-6 (order 6) | 117.2 |
+| DSD128 | CLANS-7 (order 7) | 115.3 |
+| DSD256 | CLANS-8 (order 8) | 125.6 |
+| DSD512 | CLANS-7 (order 7) | 137.5 |
+
+### DSD Rate Conversion (IPP FIRSR, 63-tap Kaiser half-band)
+
+End-to-end SINAD through FIR + Trellis SDM pipeline. Measures combined degradation from rate conversion and requantisation.
+
+**Upsample:**
+
+| Conversion | SINAD (dB) |
+|------------|------------|
+| DSD64 -> DSD128 | 51.2 |
+| DSD64 -> DSD256 | 90.2 |
+| DSD64 -> DSD512 | 57.3 |
+| DSD128 -> DSD256 | 107.5 |
+| DSD128 -> DSD512 | 63.2 |
+| DSD256 -> DSD512 | 106.1 |
+
+**Downsample:**
+
+| Conversion | SINAD (dB) |
+|------------|------------|
+| DSD128 -> DSD64 | 75.4 |
+| DSD256 -> DSD64 | 79.4 |
+| DSD512 -> DSD64 | 91.2 |
+| DSD256 -> DSD128 | 106.9 |
+| DSD512 -> DSD128 | 118.3 |
+| DSD512 -> DSD256 | 103.0 |
 
 ## Module Details
 
@@ -90,53 +144,41 @@ Viterbi look-ahead sigma-delta modulator, ported from mansr/sox sdm.c (LGPL v2.1
 4. Deduplicate paths via hash table, sort by cost, keep M best survivors
 5. Output the traceback bit from the lowest-cost candidate's history buffer
 
-**Key functions:**
-- `sdm_filter_calc` -- CRFB state vector advance: `d[i] = s[i] + s[i-1] - g[i]*s[i+1]`
-- `sdm_filter_calc2` -- Branch computation for y=+1 and y=-1 simultaneously
-- `sdm_sort_cands` -- Insertion sort with path deduplication via PATH_HASH_SIZE=128 hash table
-- `sdm_sample_trellis` -- Main per-sample algorithm with double-buffered trellis generations
-
-**Structures:**
-- `sdm_state_t` -- Per-candidate: NTF state vector, cost, path bits, history buffer index
-- `sdm_trellis_t` -- Double-buffered generation: 2*MAX_NUM candidates, MAX_NUM active pointers
-- `sdm_context_t` -- Per-channel: two trellis generations, path hash, history buffers, config
-
-**Cost comparison** uses an IEEE 754 trick: cast double to int64 for integer comparison, avoiding floating-point comparison overhead while preserving ordering for non-negative values.
-
-**Input scaling**: float +/-1.0 scaled by 0.5 before SDM (matching SoX convention). Output: +/-1.0 float.
-
 **Latency**: configurable via `trellis_lat` (16-2048 DSD samples). First `trellis_lat` input samples fill the latency buffer with no output; `sdm_drain` flushes remaining samples at end of stream.
+
+### PreCorr SDM (`precorr.c`)
+
+Greedy sigma-delta modulator with prediction correction table:
+
+1. Greedy quantise: `y = (v >= 0) ? +1 : -1`
+2. Apply learned correction from `pred_table[history][phase]`
+3. Re-quantise corrected output
+4. Update 8-bit output history register
+
+**Table training**: At init, runs 65536 pseudo-random noise samples through a greedy SDM, accumulating mean corrections per (8-bit history, phase) pair.
+
+**Zero latency**: Output count equals input count from first sample. No drain needed.
 
 ### FIR Rate Conversion (`fir.c`)
 
-Polyphase half-band FIR for power-of-2 DSD rate conversion:
+Intel IPP FIRSR-based half-band FIR for power-of-2 DSD rate conversion:
 
 **Filter design:**
-- 23-tap Kaiser-windowed sinc (beta=9.0, ~90 dB sidelobe suppression)
+- 63-tap Kaiser-windowed sinc (beta=12.0, ~120 dB stopband)
 - Coefficients computed at init time via Bessel I0 series expansion (25 terms)
-- Half-band property: every other tap is zero, center tap = 0.5
 
-**Polyphase decomposition** (2x upsample):
-- Phase 0 (even outputs): 12-tap FIR convolution with non-zero coefficients, gain x2
-- Phase 1 (odd outputs): trivial delayed copy (0.5 x input, scaled by 2 = passthrough)
+**Upsample 2x:** zero-stuff -> `ippsFIRSR_32f` -> scale by 2
 
-**Polyphase decomposition** (2x downsample):
-- Separate even/odd delay lines
-- Phase 0: FIR on even-indexed inputs
-- Phase 1: 0.5 x delayed odd-indexed input
+**Downsample 2x:** `ippsFIRSR_32f` -> decimate (keep every other sample)
 
-**Multi-stage chaining:** up to 3 stages (8x ratio) with ping-pong scratch buffers. Output buffer doubles as intermediate storage.
-
-**Measured performance:**
-- Passband: flat to +/-0.000 dB from 1 kHz to 20 kHz
-- Stopband: -105 dB image attenuation
-- Round-trip (up then down): 0.000 dB at 1 kHz
+**Multi-stage chaining:** up to 3 stages (8x ratio) with ping-pong scratch buffers.
 
 ### Processing Engine (`engine.c`)
 
 Per-channel orchestrator:
 - Configures FIR chain based on input/output rate ratio
 - Applies gain multiply after FIR, before SDM
+- Dispatches to Trellis or PreCorr based on `sdm_mode` config
 - Detects passthrough (same rate, unity gain) to bypass FIR+SDM entirely
 - Handles mute (silence pattern substitution)
 
@@ -146,25 +188,16 @@ Runtime parameters serialized to foobar2000 config store:
 
 | Parameter | Type | Range | Default |
 |-----------|------|-------|---------|
+| SDM mode | enum | PreCorr / Trellis | PreCorr |
 | Output DSD rate | enum | As input / DSD64-512 | As input |
 | Volume | float | 0.0 - 1.0 | 1.0 |
 | Mute | bool | on/off | off |
 | NTF filter | enum | Auto / CLANS-4..8 / SDM-4..8 | Auto |
 | Trellis depth (N) | int | 4, 8, 16, 32 | 8 |
-| Trellis candidates (M) | int | 4 - 32 | 16 |
+| Trellis candidates (M) | int | 4 - 32 | 8 |
 | Trellis latency | int | 16 - 2048 | 64 |
+| Output format | enum | DoP / PCM | DoP |
 | Thread count | int | 0 (auto) - cores | 0 |
-
-## SINAD Measurements
-
-Measured via Goertzel algorithm directly on DSD output stream (bin-aligned 1 kHz sine, amplitude 0.5, trellis depth=8, candidates=16, latency=512):
-
-| Rate | NTF Filter | SINAD (dB) | Convergence Failures |
-|------|------------|------------|----------------------|
-| DSD64 | CLANS-5 | 85.3 | 0 |
-| DSD128 | CLANS-6 | 117.4 | 0 |
-| DSD256 | CLANS-7 | 115.8 | 0 |
-| DSD512 | CLANS-8 | 121.0 | 0 |
 
 ## Building
 
@@ -173,6 +206,7 @@ Measured via Goertzel algorithm directly on DSD output stream (bin-aligned 1 kHz
 - Visual Studio 2022 with MSVC v142 toolset
 - Windows 10 SDK
 - foobar2000 SDK (place in `foobar2000-sdk/`)
+- Intel IPP (NuGet packages: `intelipp.devel.win-x64`, `intelipp.static.win-x64`)
 
 ### Build with MSBuild
 
@@ -181,21 +215,9 @@ Measured via Goertzel algorithm directly on DSD output stream (bin-aligned 1 kHz
     foo_dsd_trellis.sln /p:Configuration=Release /p:Platform=x64
 ```
 
-### Build tests with GCC (MSYS2)
-
-```bash
-gcc -std=c17 -Wall -Wextra -O2 -Iinclude -o test_runner.exe \
-    test/test_main.c test/test_dop.c test/test_ntf.c test/test_fir.c \
-    test/test_trellis.c test/test_threadpool.c \
-    src/config.c src/dop.c src/bitpack.c src/engine.c src/fir.c \
-    src/trellis.c src/ntf.c src/threadpool.c -lm
-```
-
 ### Run tests
 
 ```bash
-./test_runner.exe
-# or
 bin\Release\x64\foo_dsd_trellis_test.exe
 ```
 
@@ -210,60 +232,68 @@ foo_dsd_trellis/
 |   |-- dop.c                 DoP detection, pack/unpack
 |   |-- bitpack.c             Native ASIO bitstream pack/unpack
 |   |-- engine.c              Per-channel processing orchestrator
-|   |-- fir.c                 Polyphase half-band FIR (rate conversion)
+|   |-- fir.c                 IPP FIRSR half-band FIR (rate conversion)
 |   |-- trellis.c             Viterbi look-ahead trellis SDM
+|   |-- precorr.c             Greedy + prediction correction SDM
 |   |-- ntf.c                 NTF coefficient tables (40 filters)
-|   +-- threadpool.c          Worker thread pool
+|   |-- threadpool.c          Worker thread pool (MMCSS)
+|   |-- simd_detect.c         CPU feature detection
+|   |-- cpuset.c              CPU topology and dynamic CPUSET
+|   |-- httpapi.c             REST API server
+|   +-- wav_io.c              WAV file read/write
 |-- include/
 |   |-- dsd_types.h           Core types, constants, enums
 |   |-- engine.h              Engine API
-|   |-- trellis.h             SDM API and structures
+|   |-- trellis.h             Trellis SDM API
+|   |-- precorr.h             PreCorr SDM API
 |   |-- ntf.h                 NTF filter API
 |   |-- fir.h                 FIR chain API
 |   |-- dop.h                 DoP API
-|   +-- threadpool.h          Thread pool API
+|   |-- threadpool.h          Thread pool API
+|   |-- simd_detect.h         CPU detection API
+|   |-- cpuset.h              CPU topology API
+|   |-- httpapi.h             REST API
+|   +-- wav_io.h              WAV I/O API
 |-- test/
 |   |-- test.h                Minimal test framework (no dependencies)
-|   |-- test_main.c           Test runner
-|   |-- test_dop.c            DoP tests (24 functions)
-|   |-- test_ntf.c            NTF tests (18 functions)
-|   |-- test_fir.c            FIR tests (18 functions)
-|   |-- test_trellis.c        Trellis SDM tests (13 functions, SINAD measurement)
-|   +-- test_threadpool.c     Thread pool tests (3 functions)
+|   |-- test_main.c           Test runner with suite selection
+|   |-- test_dop.c            DoP tests
+|   |-- test_ntf.c            NTF tests
+|   |-- test_fir.c            FIR tests
+|   |-- test_trellis.c        Trellis SDM tests (SINAD measurement)
+|   |-- test_precorr.c        PreCorr SDM tests (SINAD measurement)
+|   |-- test_rate_sinad.c     Rate conversion SINAD tests
+|   |-- test_config.c         Config serialization tests
+|   |-- test_simd.c           CPU detection and IPP tests
+|   |-- test_hardening.c      Edge cases and robustness
+|   |-- test_threadpool.c     Thread pool tests
+|   +-- test_sinad_diag.c     Extended SINAD diagnostics
 |-- tools/
 |   |-- gen_ntf_512.py        DSD512 NTF coefficient generator
 |   +-- sinad_check.c         Standalone SINAD verification tool
 |-- reference/
 |   +-- sdm.c                 Source reference from mansr/sox (LGPL v2.1+)
 |-- foobar2000-sdk/            Vendored fb2k SDK
-|-- PLAN.md                    Full implementation plan and architecture
 +-- foo_dsd_trellis.sln        Visual Studio solution (7 projects)
 ```
 
-## Implementation Status
-
-| Phase | Description | Status |
-|-------|-------------|--------|
-| 0 | Scaffold, MSVC project, plugin loads | Complete |
-| 1 | Format bridge (DoP pack/unpack) | Complete |
-| 2 | NTF coefficient tables (40 filters, 4 DSD rates) | Complete |
-| 3 | Trellis SDM (full Viterbi algorithm) | Complete |
-| 4 | FIR rate conversion (polyphase half-band) | Complete |
-| 5 | Thread pool (lock-free MPMC queue) | Stub |
-| 6 | fb2k integration (full DSP chain) | Stub |
-| 7 | Hardening (edge cases, mid-stream config) | Pending |
-
 ## Test Results
 
-472 assertions across 5 test suites, all passing:
+635 tests across 11 suites, all passing:
 
-| Suite | Tests | Assertions | Coverage |
-|-------|-------|------------|----------|
-| DoP | 24 | 134 | Detection, pack/unpack, round-trip, edge cases |
-| NTF | 18 | ~80 | All 40 filters, coefficient verification, auto-select |
-| FIR | 18 | ~30 | Passband/stopband response, round-trip, chain tests |
-| Trellis | 13 | ~20 | Init, reset, latency, drain, SINAD (4 DSD rates), DC stability |
-| Thread Pool | 3 | ~6 | Create/destroy, auto core count |
+| Suite | Tag | Tests | Coverage |
+|-------|-----|-------|----------|
+| DoP | `dop` | 24 | Detection, pack/unpack, round-trip, edge cases |
+| NTF | `ntf` | 18 | All 40 filters, coefficient verification, auto-select |
+| FIR | `fir` | 17 | Passband/stopband, round-trip, chain tests |
+| Trellis SDM | `trellis` | 13 | Init, reset, latency, drain, SINAD (4 rates), DC stability |
+| PreCorr SDM | `precorr` | 8 | Init, binary output, no latency, SINAD (4 rates) |
+| Rate Conversion | `rate` | 12 | SINAD for all upsample/downsample pairs |
+| Config | `config` | 8 | Serialization, versioning, validation |
+| CPU & IPP | `simd` | 5 | CPU detection, IPP kernel, FIR correctness |
+| Hardening | `hardening` | 22 | Edge cases, robustness |
+| Thread Pool | `threadpool` | 3 | Concurrent SDM processing |
+| SINAD Diagnostics | `diag` | 7 | NTF sweeps, warmup analysis (extended) |
 
 ## References
 

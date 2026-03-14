@@ -19,6 +19,8 @@ int engine_channel_init(engine_channel_t *eng, int channel,
                        (cfg->gain == 1.0f) &&
                        (!cfg->mute);
 
+    eng->sdm_mode = cfg->sdm_mode;
+
     if (!eng->passthrough && !cfg->mute) {
         /* Init FIR chain */
         if (fir_chain_init(&eng->fir, cfg->fs_in, fs_out) != 0)
@@ -26,19 +28,28 @@ int engine_channel_init(engine_channel_t *eng, int channel,
 
         /* Init SDM */
         const ntf_filter_t *filter = NULL;
-        if (cfg->ntf_filter == NTF_AUTO)
-            filter = ntf_auto_select(fs_out);
-        else
+        if (cfg->ntf_filter == NTF_AUTO) {
+            if (cfg->sdm_mode == SDM_MODE_PRECORR)
+                filter = ntf_auto_select_precorr(fs_out);
+            else
+                filter = ntf_auto_select(fs_out);
+        } else {
             filter = ntf_get_filter((ntf_filter_id_t)cfg->ntf_filter, fs_out);
+        }
 
         if (!filter)
             return -1;
 
-        if (sdm_context_init(&eng->sdm, filter,
-                             cfg->trellis_depth,
-                             cfg->trellis_cands,
-                             cfg->trellis_lat) != 0)
-            return -1;
+        if (cfg->sdm_mode == SDM_MODE_PRECORR) {
+            if (precorr_context_init(&eng->precorr, filter) != 0)
+                return -1;
+        } else {
+            if (sdm_context_init(&eng->sdm, filter,
+                                 cfg->trellis_depth,
+                                 cfg->trellis_cands,
+                                 cfg->trellis_lat) != 0)
+                return -1;
+        }
     }
 
     return 0;
@@ -84,19 +95,29 @@ size_t engine_process_block(engine_channel_t *eng,
             eng->fir_buf[i] *= cfg->gain;
     }
 
-    /* Trellis SDM */
-    size_t sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, fir_out);
+    /* SDM (PreCorr or Trellis) */
+    size_t sdm_out;
+    if (eng->sdm_mode == SDM_MODE_PRECORR)
+        sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, fir_out);
+    else
+        sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, fir_out);
     return sdm_out;
 }
 
 void engine_channel_reset(engine_channel_t *eng) {
     fir_chain_reset(&eng->fir);
-    sdm_context_reset(&eng->sdm);
+    if (eng->sdm_mode == SDM_MODE_PRECORR)
+        precorr_context_reset(&eng->precorr);
+    else
+        sdm_context_reset(&eng->sdm);
 }
 
 void engine_channel_free(engine_channel_t *eng) {
     fir_chain_free(&eng->fir);
-    sdm_context_free(&eng->sdm);
+    if (eng->sdm_mode == SDM_MODE_PRECORR)
+        precorr_context_free(&eng->precorr);
+    else
+        sdm_context_free(&eng->sdm);
     free(eng->fir_buf);
     eng->fir_buf = NULL;
     eng->fir_buf_sz = 0;

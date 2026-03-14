@@ -1,21 +1,22 @@
 /*
  * foo_dsd_trellis — SIMD-optimized FIR convolution kernels
  *
- * Provides SSE2 and AVX2+FMA variants of the FIR inner loop.
- * Runtime dispatch via function pointers set at init time.
+ * When USE_IPP is defined, delegates to Intel IPP for auto-dispatched
+ * SIMD (SSE2→AVX2→AVX-512). Otherwise falls back to hand-rolled kernels.
  *
  * The FIR inner loop computes:
  *   sum = sum(coeffs[j] * delay[(pos-j) & mask], j=0..ntaps-1)
  * where coeffs are double, delay are float, ntaps=12.
- *
- * AMD Zen 1/2 (Family 17h): 256-bit AVX is cracked into 2×128-bit uops,
- * so we use 128-bit SSE2/AVX paths. Zen 3+ has native 256-bit.
- * Intel: always use 256-bit AVX2 when available.
  */
 
 #include "../include/simd_detect.h"
 #include "../include/fir.h"
 #include <string.h>
+
+#ifdef USE_IPP
+#include <ipps.h>
+#include <ippcore.h>
+#endif
 
 #ifdef _MSC_VER
 #include <immintrin.h>
@@ -154,6 +155,26 @@ double fir_convolve_avx128(const double *coeffs, const float *delay,
 }
 #endif
 
+/* ─── Intel IPP kernel (auto-dispatched SIMD) ─── */
+
+#ifdef USE_IPP
+static int g_ipp_initialized = 0;
+
+double fir_convolve_ipp(const double *coeffs, const float *delay,
+                        int pos, int ntaps) {
+    float linear[FIR_MAX_PHASE_TAPS];
+    linearize_delay(delay, pos, ntaps, linear);
+
+    /* Convert float delay to double for IPP dot product */
+    Ipp64f delay_d[FIR_MAX_PHASE_TAPS];
+    ippsConvert_32f64f(linear, delay_d, ntaps);
+
+    Ipp64f result = 0.0;
+    ippsDotProd_64f(coeffs, delay_d, ntaps, &result);
+    return result;
+}
+#endif
+
 /* ─── Function pointer dispatch ─── */
 
 typedef double (*fir_convolve_fn)(const double *, const float *, int, int);
@@ -161,6 +182,13 @@ typedef double (*fir_convolve_fn)(const double *, const float *, int, int);
 static fir_convolve_fn g_convolve_fn = NULL;
 
 void fir_simd_init(void) {
+#ifdef USE_IPP
+    if (!g_ipp_initialized) {
+        ippInit();
+        g_ipp_initialized = 1;
+    }
+    g_convolve_fn = fir_convolve_ipp;
+#else
     const cpu_features_t *cpu = cpu_detect();
 
     if (cpu->avx2 && cpu->fma3) {
@@ -176,6 +204,7 @@ void fir_simd_init(void) {
     } else {
         g_convolve_fn = fir_convolve_scalar;
     }
+#endif
 }
 
 double fir_convolve_dispatch(const double *coeffs, const float *delay,
@@ -189,8 +218,23 @@ const char *fir_simd_name(void) {
     if (!g_convolve_fn)
         fir_simd_init();
 
+#ifdef USE_IPP
+    return "IPP (auto-dispatch)";
+#else
     if (g_convolve_fn == fir_convolve_avx2)    return "AVX2+FMA";
     if (g_convolve_fn == fir_convolve_avx128)  return "AVX128+FMA (Zen)";
     if (g_convolve_fn == fir_convolve_sse2)    return "SSE2";
     return "Scalar";
+#endif
 }
+
+#ifdef USE_IPP
+const char *fir_ipp_version(void) {
+    if (!g_ipp_initialized) {
+        ippInit();
+        g_ipp_initialized = 1;
+    }
+    const IppLibraryVersion *ver = ippsGetLibVersion();
+    return ver ? ver->Version : "unknown";
+}
+#endif

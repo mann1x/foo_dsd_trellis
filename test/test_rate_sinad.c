@@ -59,11 +59,6 @@ static double measure_sinad(const float *x, size_t n, double freq_hz,
 
 /* ─── Generate DSD-encoded sine at a given DSD rate ─── */
 
-/*
- * Pre-compute a bin-aligned frequency near target_hz for Goertzel on
- * `n_produced` samples at `sample_rate`.  The frequency must land on an
- * exact DFT bin of the MEASURED signal to avoid spectral leakage.
- */
 static double bin_align_freq(double target_hz, double sample_rate,
                               size_t n_produced) {
     double bw = sample_rate / (double)n_produced;
@@ -106,14 +101,11 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     else if (mult_in <= 256) n_in = 1048576;
     else                     n_in = 2097152;
 
-    /* For multi-stage FIR, the output buffer is used for intermediate
-     * results (ping-pong).  For downsampling, the first stage writes
-     * n_in/2 samples into 'out'.  Size for the worst case. */
     size_t max_out;
     if (fs_out >= fs_in)
         max_out = n_in * (fs_out / fs_in) + 4096;
     else
-        max_out = n_in / 2 + 4096;  /* first downsample stage output */
+        max_out = n_in / 2 + 4096;
 
     float *dsd_in  = (float *)malloc(n_in * sizeof(float));
     float *fir_buf = (float *)malloc(max_out * sizeof(float));
@@ -123,7 +115,6 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
         return -999.0;
     }
 
-    /* Estimate output count to bin-align frequency to the MEASURED signal */
     size_t est_in_produced = n_in - SINAD_TRELLIS_LAT;
     size_t est_fir_out;
     if (fs_out >= fs_in)
@@ -178,10 +169,8 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     unsigned rate_in_mult  = fs_in  / 44100;
     unsigned rate_out_mult = fs_out / 44100;
     const char *dir = (fs_out > fs_in) ? "UP" : "DN";
-
-    printf("    [SINAD] DSD%u->DSD%u (%s): %zu->%zu samples, SINAD=%.1f dB\n",
-           rate_in_mult, rate_out_mult, dir,
-           dsd_in_count, out_count, sinad_db);
+    printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB\n",
+           rate_in_mult, rate_out_mult, dir, sinad_db);
 
     free(dsd_in);
     free(fir_buf);
