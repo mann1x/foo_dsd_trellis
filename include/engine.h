@@ -10,16 +10,27 @@
 #include "precorr.h"
 #include "fir.h"
 
+/* DSD-Wide boxcar filter: smooths 1-bit DSD to multi-bit at same rate.
+ * Enables gain control without decimating to PCM domain. */
+#define BOXCAR_TAPS 8
+typedef struct {
+    float ring[BOXCAR_TAPS];
+    float sum;
+    int   pos;
+} boxcar_t;
+
 /* Per-channel processing state */
 typedef struct {
     sdm_context_t    sdm;        /* Trellis SDM context */
     precorr_context_t precorr;   /* PreCorr SDM context */
     fir_chain_t      fir;        /* FIR rate conversion chain */
+    boxcar_t         boxcar;     /* DSD-Wide smoothing for volume control */
     float           *fir_buf;    /* Post-FIR intermediate buffer */
     size_t           fir_buf_sz; /* Allocated size of fir_buf */
     int              channel;    /* Channel index (0=L, 1=R, ...) */
     int              sdm_mode;   /* Cached sdm_mode_t for dispatch */
     bool             passthrough;/* true if no processing needed */
+    bool             fir_only;   /* true for DSD→PCM decimation (no SDM) */
 } engine_channel_t;
 
 /* Block processing mode */
@@ -81,5 +92,23 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
 size_t sdm_segment_process(sdm_context_t *sdm,
                             const float *in, float *out,
                             size_t count, size_t discard);
+
+/* Path info for UI display — resolved parameters for a given conversion path */
+typedef struct {
+    int  ntf_filter;    /* Resolved NTF filter ID (from path_table or auto-select) */
+    int  cands;         /* Trellis candidates */
+    int  lat;           /* Trellis latency */
+    int  depth;         /* Trellis depth */
+    double state_limit; /* State limiter (0 = disabled) */
+    int  fir_stages;    /* Number of FIR 2x stages */
+    bool fir_only;      /* True if FIR decimation only (DSD→PCM) */
+} engine_path_info_t;
+
+/* Query resolved path parameters for UI info display.
+ * Returns 0 on success, -1 if path is invalid. */
+int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
+                          int ntf_override, int sdm_mode,
+                          const dsd_config_t *cfg,
+                          engine_path_info_t *info);
 
 #endif /* ENGINE_H */

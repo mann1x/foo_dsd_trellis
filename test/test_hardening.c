@@ -100,7 +100,7 @@ static void test_passthrough_preserves_sign(void) {
     engine_channel_t eng;
     TEST_ASSERT_EQ(engine_channel_init(&eng, 0, &cfg), 0,
                    "passthrough init");
-    TEST_ASSERT_TRUE(eng.passthrough, "should be passthrough mode");
+    /* passthrough is now dynamic (checked at process time, not init) */
 
     float in[128], out[128];
     for (int i = 0; i < 128; i++)
@@ -201,7 +201,7 @@ static void test_reconfigure_mute_to_passthrough(void) {
     cfg.gain = 1.0f;
     int ret = engine_channel_reconfigure(&eng, &cfg);
     TEST_ASSERT_EQ(ret, 0, "reconfigure should succeed");
-    TEST_ASSERT_TRUE(eng.passthrough, "should now be passthrough");
+    /* passthrough is now dynamic — verified by output matching */
 
     /* Process passthrough block */
     for (int i = 0; i < 64; i++) in[i] = (i & 1) ? 1.0f : -1.0f;
@@ -220,13 +220,12 @@ static void test_reconfigure_passthrough_to_sdm(void) {
 
     engine_channel_t eng;
     engine_channel_init(&eng, 0, &cfg);
-    TEST_ASSERT_TRUE(eng.passthrough, "initial passthrough");
+    /* passthrough is now dynamic — verify via output behavior */
 
     /* Reconfigure to SDM path (gain < 1.0) */
     cfg.gain = 0.5f;
     int ret = engine_channel_reconfigure(&eng, &cfg);
     TEST_ASSERT_EQ(ret, 0, "reconfigure to SDM should succeed");
-    TEST_ASSERT_FALSE(eng.passthrough, "should not be passthrough after reconfig");
 
     /* Process through SDM */
     float in[256], out[256];

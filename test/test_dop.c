@@ -10,6 +10,9 @@
 /* Helper: build a float that encodes a 24-bit integer via the DoP convention */
 static float make_dop_sample(uint8_t marker, uint16_t dsd_bits) {
     int32_t val = ((int32_t)marker << 16) | (int32_t)dsd_bits;
+    /* Sign-extend 24-bit to 32-bit (marker 0xFA has bit 23 set) */
+    if (val & 0x800000)
+        val |= (int32_t)0xFF000000;
     return (float)((double)val / (double)SCALE_23);
 }
 

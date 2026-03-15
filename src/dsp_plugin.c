@@ -46,6 +46,9 @@ typedef struct plugin_state {
     threadpool_t      *pool;
     bool               initialized;
     uint32_t           detected_dsd_rate;
+    uint32_t           active_fs_out;     /* Output rate engine was initialized with */
+    float              active_gain;       /* Gain engine was initialized with */
+    bool               active_mute;       /* Mute state engine was initialized with */
 
     /* Per-channel buffers for unpack/repack */
     float            **ch_in;        /* [ch][dsd_samples] unpacked DSD input */
@@ -106,6 +109,57 @@ static uint32_t dop_pcm_to_dsd_rate(uint32_t pcm_rate) {
 /* Convert DSD rate to DoP PCM sample rate */
 static uint32_t dsd_to_dop_pcm_rate(uint32_t dsd_rate) {
     return dsd_rate / DOP_BITS_PER_FRAME;
+}
+
+/* Determine target DSD rate for PCM→DSD conversion.
+ * Returns 0 if the PCM rate is not supported or the ratio is not a power of 2. */
+static uint32_t pcm_to_target_dsd_rate(uint32_t pcm_rate, uint32_t cfg_fs_out) {
+    /* If user configured a specific output rate, check compatibility */
+    if (cfg_fs_out != 0) {
+        if (cfg_fs_out <= pcm_rate)
+            return 0;  /* DSD rate must be higher than PCM rate */
+        uint32_t ratio = cfg_fs_out / pcm_rate;
+        if (cfg_fs_out != ratio * pcm_rate)
+            return 0;  /* Not evenly divisible */
+        /* Check power of 2 */
+        if (ratio == 0 || (ratio & (ratio - 1)) != 0)
+            return 0;
+        return cfg_fs_out;
+    }
+
+    /* Auto-select: DSD64 base rate for the PCM rate's family */
+    /* 44100 family: 44100, 88200, 176400, 352800 → DSD base = 2822400 */
+    /* 48000 family: 48000, 96000, 192000, 384000 → DSD base = 3072000 */
+    uint32_t dsd_base;
+    if (pcm_rate % 44100 == 0)
+        dsd_base = DSD_RATE_64;    /* 2822400 = 64 * 44100 */
+    else if (pcm_rate % 48000 == 0)
+        dsd_base = 64 * 48000;     /* 3072000 = 64 * 48000 */
+    else
+        return 0;  /* Unsupported PCM rate family */
+
+    /* dsd_base must be > pcm_rate and ratio must be power of 2 */
+    if (dsd_base <= pcm_rate) {
+        /* PCM rate is already at or above DSD64 equivalent — use DSD128 etc. */
+        /* Find smallest DSD rate > pcm_rate with power-of-2 ratio */
+        uint32_t base_unit = (pcm_rate % 44100 == 0) ? 44100 : 48000;
+        uint32_t mult = 64;  /* Start at DSD64 */
+        while (mult <= 512) {
+            uint32_t dsd_rate = mult * base_unit;
+            if (dsd_rate > pcm_rate) {
+                uint32_t ratio = dsd_rate / pcm_rate;
+                if (dsd_rate == ratio * pcm_rate && (ratio & (ratio - 1)) == 0)
+                    return dsd_rate;
+            }
+            mult *= 2;
+        }
+        return 0;
+    }
+
+    uint32_t ratio = dsd_base / pcm_rate;
+    if (dsd_base != ratio * pcm_rate || (ratio & (ratio - 1)) != 0)
+        return 0;
+    return dsd_base;
 }
 
 /* Ensure per-channel buffers are large enough */
@@ -197,6 +251,9 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     s->config.fs_in = dsd_rate;
     s->num_channels = num_channels;
     s->detected_dsd_rate = dsd_rate;
+    s->active_fs_out = s->config.fs_out;
+    s->active_gain = s->config.gain;
+    s->active_mute = s->config.mute;
 
     s->channels = (engine_channel_t *)calloc(
         (size_t)num_channels, sizeof(engine_channel_t));
@@ -327,9 +384,13 @@ size_t plugin_process(plugin_state_t *s,
     if (pcm_frames >= 8 && !dop_detect_interleaved(in_pcm, pcm_frames, num_channels))
         return 0;  /* No DoP markers, pass through */
 
-    /* Initialize engine on first use or channel count change */
+    /* Always keep fs_in in sync (plugin_set_config may have overwritten it) */
+    s->config.fs_in = dsd_rate;
+
+    /* Initialize engine on first use, channel/rate change, or output rate change */
     if (!s->initialized || s->num_channels != num_channels ||
-        s->detected_dsd_rate != dsd_rate) {
+        s->detected_dsd_rate != dsd_rate ||
+        s->active_fs_out != s->config.fs_out) {
         /* Tear down old state */
         if (s->initialized) {
             if (s->pool) {
@@ -344,7 +405,6 @@ size_t plugin_process(plugin_state_t *s,
             }
             s->initialized = false;
         }
-        s->config.fs_in = dsd_rate;
         if (plugin_init_engine(s, num_channels, dsd_rate) != 0)
             return 0;
     }
@@ -643,14 +703,28 @@ size_t plugin_process(plugin_state_t *s,
     if (dsd_out_count == 0)
         return 0;
 
+    LARGE_INTEGER t_pack_start, t_pack_end;
+    QueryPerformanceCounter(&t_pack_start);
+
+    /* Check if FIR-only mode (DSD→PCM decimation) */
+    bool fir_only = (s->channels && s->channels[0].fir_only);
+
+    if (fir_only) {
+        /* DSD→PCM: output is already multi-bit PCM, just interleave */
+        for (int ch = 0; ch < num_channels; ch++) {
+            for (size_t f = 0; f < dsd_out_count; f++)
+                out_pcm[f * (size_t)num_channels + (size_t)ch] = s->ch_out[ch][f];
+        }
+        QueryPerformanceCounter(&t_pack_end);
+        s->time_pack_ms = perf_ms(t_pack_start, t_pack_end);
+        return dsd_out_count;
+    }
+
     /* Repack DSD floats to DoP PCM, then interleave into output.
      * Output PCM frames = dsd_out_count / 16 */
     size_t out_pcm_frames = dsd_out_count / DOP_BITS_PER_FRAME;
     if (out_pcm_frames == 0)
         return 0;
-
-    LARGE_INTEGER t_pack_start, t_pack_end;
-    QueryPerformanceCounter(&t_pack_start);
 
     /* Reuse cached pcm_temp, ensure it's large enough for output */
     if (s->cached_pcm_temp_sz < out_pcm_frames) {
@@ -667,6 +741,130 @@ size_t plugin_process(plugin_state_t *s,
         dop_pack(s->ch_out[ch], pcm_temp, dsd_out_count);
 
         /* Interleave into output */
+        for (size_t f = 0; f < out_pcm_frames; f++)
+            out_pcm[f * (size_t)num_channels + (size_t)ch] = pcm_temp[f];
+    }
+
+    QueryPerformanceCounter(&t_pack_end);
+    s->time_pack_ms = perf_ms(t_pack_start, t_pack_end);
+
+    return out_pcm_frames;
+}
+
+/*
+ * Process an interleaved PCM chunk and convert to DoP DSD output.
+ *
+ * in_pcm:      interleaved float32 PCM, num_channels * pcm_frames
+ * out_pcm:     output buffer (caller-allocated, large enough for DSD output)
+ * pcm_frames:  number of PCM frames (per channel) in input
+ * num_channels: channel count
+ * pcm_rate:    PCM sample rate (44100, 48000, 88200, 96000, etc.)
+ *
+ * Returns: number of output PCM frames per channel (DoP), or 0 on error.
+ */
+size_t plugin_process_pcm(plugin_state_t *s,
+                           const float *in_pcm, float *out_pcm,
+                           size_t pcm_frames, int num_channels,
+                           uint32_t pcm_rate) {
+    if (!s)
+        return 0;
+
+    /* Determine target DSD rate */
+    uint32_t dsd_rate = pcm_to_target_dsd_rate(pcm_rate, s->config.fs_out);
+    if (dsd_rate == 0)
+        return 0;  /* Unsupported rate combination */
+
+    /* Always keep fs_in/fs_out in sync (plugin_set_config may have overwritten them) */
+    s->config.fs_in = pcm_rate;
+    s->config.fs_out = dsd_rate;
+
+    /* Initialize engine on first use or parameter change */
+    if (!s->initialized || s->num_channels != num_channels ||
+        s->detected_dsd_rate != dsd_rate ||
+        s->active_fs_out != s->config.fs_out) {
+        /* Tear down old state */
+        if (s->initialized) {
+            if (s->pool) {
+                threadpool_destroy(s->pool);
+                s->pool = NULL;
+            }
+            if (s->channels) {
+                for (int i = 0; i < s->num_channels; i++)
+                    engine_channel_free(&s->channels[i]);
+                free(s->channels);
+                s->channels = NULL;
+            }
+            s->initialized = false;
+        }
+        if (plugin_init_engine(s, num_channels, dsd_rate) != 0)
+            return 0;
+    }
+
+    /* FIR upsample ratio */
+    uint32_t ratio = dsd_rate / pcm_rate;
+    size_t dsd_out_count = pcm_frames * ratio;
+
+    /* Ensure per-channel buffers */
+    if (ensure_ch_bufs(s, num_channels, dsd_out_count) != 0)
+        return 0;
+
+    LARGE_INTEGER t_start, t_end;
+    QueryPerformanceCounter(&t_start);
+
+    /* De-interleave PCM input to per-channel arrays */
+    for (int ch = 0; ch < num_channels; ch++) {
+        for (size_t f = 0; f < pcm_frames; f++)
+            s->ch_in[ch][f] = in_pcm[f * (size_t)num_channels + (size_t)ch];
+    }
+
+    QueryPerformanceCounter(&t_end);
+    s->time_unpack_ms = perf_ms(t_start, t_end);
+
+    /* Process each channel: FIR upsample + gain + SDM */
+    channel_block_t *blocks = (channel_block_t *)calloc(
+        (size_t)num_channels, sizeof(channel_block_t));
+    if (!blocks)
+        return 0;
+
+    for (int ch = 0; ch < num_channels; ch++) {
+        blocks[ch].in       = s->ch_in[ch];
+        blocks[ch].out      = s->ch_out[ch];
+        blocks[ch].count    = pcm_frames;
+        blocks[ch].out_count = 0;
+        blocks[ch].channel  = ch;
+        blocks[ch].eng      = &s->channels[ch];
+        blocks[ch].cfg      = &s->config;
+        blocks[ch].mode     = BLOCK_MODE_FULL;
+        threadpool_submit(s->pool, &blocks[ch]);
+    }
+    threadpool_wait(s->pool);
+
+    size_t sdm_out_count = blocks[0].out_count;
+    free(blocks);
+
+    if (sdm_out_count == 0)
+        return 0;
+
+    /* Pack DSD floats to DoP PCM, then interleave into output */
+    size_t out_pcm_frames = sdm_out_count / DOP_BITS_PER_FRAME;
+    if (out_pcm_frames == 0)
+        return 0;
+
+    LARGE_INTEGER t_pack_start, t_pack_end;
+    QueryPerformanceCounter(&t_pack_start);
+
+    /* Ensure cached pcm_temp buffer is large enough */
+    if (s->cached_pcm_temp_sz < out_pcm_frames) {
+        free(s->cached_pcm_temp);
+        s->cached_pcm_temp = (float *)malloc(out_pcm_frames * sizeof(float));
+        s->cached_pcm_temp_sz = s->cached_pcm_temp ? out_pcm_frames : 0;
+    }
+    float *pcm_temp = s->cached_pcm_temp;
+    if (!pcm_temp)
+        return 0;
+
+    for (int ch = 0; ch < num_channels; ch++) {
+        dop_pack(s->ch_out[ch], pcm_temp, sdm_out_count);
         for (size_t f = 0; f < out_pcm_frames; f++)
             out_pcm[f * (size_t)num_channels + (size_t)ch] = pcm_temp[f];
     }

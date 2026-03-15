@@ -13,6 +13,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <commctrl.h>
 
 extern "C" {
 #include "../include/dsd_types.h"
@@ -20,6 +21,8 @@ extern "C" {
 #include "../include/fir.h"
 #include "../include/cpuset.h"
 #include "../include/httpapi.h"
+#include "../include/dop.h"
+#include "../include/engine.h"
 #include "build_version.h"
 
 /* Per-instance plugin state (opaque, defined in dsp_plugin.c) */
@@ -33,6 +36,10 @@ size_t          plugin_process(plugin_state_t *s,
                                const float *in_pcm, float *out_pcm,
                                size_t pcm_frames, int num_channels,
                                uint32_t pcm_rate);
+size_t          plugin_process_pcm(plugin_state_t *s,
+                                    const float *in_pcm, float *out_pcm,
+                                    size_t pcm_frames, int num_channels,
+                                    uint32_t pcm_rate);
 size_t          plugin_drain(plugin_state_t *s, float *out_pcm,
                              int num_channels);
 double          plugin_get_latency(const plugin_state_t *s);
@@ -53,6 +60,25 @@ int    config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size
 void   config_validate(dsd_config_t *cfg);
 }
 
+/* ─── Rate map display helpers ─── */
+
+static const wchar_t *g_rate_names[RATE_MAP_COUNT] = {
+    L"44100", L"48000", L"88200", L"96000",
+    L"176400", L"192000", L"352800", L"384000",
+    L"DSD64", L"DSD128", L"DSD256", L"DSD512"
+};
+
+static const wchar_t *g_output_names[RATE_OUT_COUNT] = {
+    L"-", L"DSD64", L"DSD128", L"DSD256", L"DSD512",
+    L"PCM 44.1k", L"PCM 88.2k", L"PCM 176.4k", L"PCM 352.8k"
+};
+
+static const wchar_t *g_ntf_names[] = {
+    L"Auto", L"CLANS-4", L"SDM-4", L"CLANS-5", L"SDM-5",
+    L"CLANS-6", L"SDM-6", L"CLANS-7", L"SDM-7", L"CLANS-8", L"SDM-8"
+};
+#define NTF_NAME_COUNT (sizeof(g_ntf_names) / sizeof(g_ntf_names[0]))
+
 /* ─── Gain helpers ─── */
 
 static inline float gain_to_db(float linear) {
@@ -64,6 +90,62 @@ static inline float db_to_gain(float db) {
     if (db <= -120.0f) return 0.0f;
     return powf(10.0f, db / 20.0f);
 }
+
+/* ─── Volume tracking (main thread → DSP thread) ─── */
+/* playback_control is main-thread-only; we cache volume via play_callback */
+
+static volatile LONG g_volume_gain_x1000 = 1000;  /* linear gain * 1000 */
+static volatile LONG g_volume_muted = 0;
+
+static float get_cached_gain() {
+    return (float)InterlockedCompareExchange(&g_volume_gain_x1000, 0, 0) / 1000.0f;
+}
+
+static bool get_cached_muted() {
+    return InterlockedCompareExchange(&g_volume_muted, 0, 0) != 0;
+}
+
+class volume_callback_impl : public play_callback_static {
+public:
+    unsigned get_flags() override {
+        return flag_on_volume_change;
+    }
+
+    void on_playback_starting(play_control::t_track_command, bool) override {}
+    void on_playback_new_track(metadb_handle_ptr) override {}
+    void on_playback_stop(play_control::t_stop_reason) override {}
+    void on_playback_seek(double) override {}
+    void on_playback_pause(bool) override {}
+    void on_playback_edited(metadb_handle_ptr) override {}
+    void on_playback_dynamic_info(const file_info &) override {}
+    void on_playback_dynamic_info_track(const file_info &) override {}
+    void on_playback_time(double) override {}
+
+    void on_volume_change(float p_new_val) override {
+        bool muted = (p_new_val <= playback_control::volume_mute);
+        float gain = muted ? 0.0f : db_to_gain(p_new_val);
+        InterlockedExchange(&g_volume_gain_x1000, (LONG)(gain * 1000.0f));
+        InterlockedExchange(&g_volume_muted, muted ? 1 : 0);
+    }
+};
+
+static play_callback_static_factory_t<volume_callback_impl> g_volume_callback;
+
+/* Initialize cached volume from current setting (called from main thread at startup) */
+class volume_init : public initquit {
+public:
+    void on_init() override {
+        auto pc = playback_control::get();
+        float vol_db = pc->get_volume();
+        bool muted = (vol_db <= playback_control::volume_mute);
+        float gain = muted ? 0.0f : db_to_gain(vol_db);
+        InterlockedExchange(&g_volume_gain_x1000, (LONG)(gain * 1000.0f));
+        InterlockedExchange(&g_volume_muted, muted ? 1 : 0);
+    }
+    void on_quit() override {}
+};
+
+static initquit_factory_t<volume_init> g_volume_init;
 
 /* ─── File logger ─── */
 
@@ -155,10 +237,12 @@ static void log_set_enabled(bool enabled) {
     LeaveCriticalSection(&g_log_cs);
 }
 
-/* {7A3F2D1E-B4C5-4E6F-8A9B-0C1D2E3F4A5B} */
+/* Use foo_dsd_processor's GUID so foo_input_sacd's autoproxy_dsp
+ * whitelist allows us to modify DoP data.
+ * {C5F65473-79C6-466E-9F6B-AFA46F87249E} */
 static const GUID g_dsp_guid =
-    { 0x7a3f2d1e, 0xb4c5, 0x4e6f,
-      { 0x8a, 0x9b, 0x0c, 0x1d, 0x2e, 0x3f, 0x4a, 0x5b } };
+    { 0xc5f65473, 0x79c6, 0x466e,
+      { 0x9f, 0x6b, 0xaf, 0xa4, 0x6f, 0x87, 0x24, 0x9e } };
 
 /* ─── Preset serialization using dsp_preset_builder/parser ─── */
 
@@ -190,7 +274,7 @@ static dsd_config_t parse_preset(const dsp_preset &in) {
 class CDSPTrellisPopup : public CDialogImpl<CDSPTrellisPopup> {
 public:
     CDSPTrellisPopup(const dsp_preset &initData, dsp_preset_edit_callback &callback)
-        : m_initData(initData), m_callback(callback) {}
+        : m_initData(initData), m_callback(callback), m_editRow(-1), m_editCol(-1) {}
 
     enum { IDD = IDD_DSP_TRELLIS };
 
@@ -198,93 +282,61 @@ public:
         MSG_WM_INITDIALOG(OnInitDialog)
         COMMAND_HANDLER_EX(IDOK, BN_CLICKED, OnButton)
         COMMAND_HANDLER_EX(IDCANCEL, BN_CLICKED, OnButton)
-        COMMAND_HANDLER_EX(IDC_COMBO_SDM_MODE, CBN_SELCHANGE, OnSdmModeChange)
-        COMMAND_HANDLER_EX(IDC_COMBO_OUTPUT_RATE, CBN_SELCHANGE, OnChange)
-        COMMAND_HANDLER_EX(IDC_COMBO_TRELLIS_DEPTH, CBN_SELCHANGE, OnChange)
-        COMMAND_HANDLER_EX(IDC_COMBO_NTF, CBN_SELCHANGE, OnChange)
+        COMMAND_HANDLER_EX(IDC_COMBO_SDM_MODE, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_COMBO_FORMAT, CBN_SELCHANGE, OnChange)
-        COMMAND_HANDLER_EX(IDC_COMBO_OUTPUT_FORMAT, CBN_SELCHANGE, OnChange)
-        COMMAND_HANDLER_EX(IDC_CHECK_MUTE, BN_CLICKED, OnChange)
         COMMAND_HANDLER_EX(IDC_CHECK_DEBUG_LOG, BN_CLICKED, OnChange)
-        COMMAND_HANDLER_EX(IDC_EDIT_GAIN, EN_CHANGE, OnEditChange)
-        COMMAND_HANDLER_EX(IDC_EDIT_TRELLIS_CANDS, EN_CHANGE, OnEditChange)
-        COMMAND_HANDLER_EX(IDC_EDIT_TRELLIS_LAT, EN_CHANGE, OnEditChange)
         COMMAND_HANDLER_EX(IDC_EDIT_THREADS, EN_CHANGE, OnEditChange)
+        COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_EDIT, CBN_SELCHANGE, OnRateMapEditChange)
+        COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_EDIT, CBN_KILLFOCUS, OnComboKillFocus)
+        COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_EDIT, CBN_CLOSEUP, OnComboCloseUp)
+        COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_NTF_EDIT, CBN_SELCHANGE, OnNtfEditChange)
+        COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_NTF_EDIT, CBN_KILLFOCUS, OnComboKillFocus)
+        COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_NTF_EDIT, CBN_CLOSEUP, OnComboCloseUp)
+        NOTIFY_HANDLER_EX(IDC_LIST_RATEMAP, NM_CLICK, OnRateMapClick)
     END_MSG_MAP()
 
 private:
     BOOL OnInitDialog(CWindow, LPARAM) {
         m_dark.AddDialogWithControls(m_hWnd);
 
-        dsd_config_t cfg = parse_preset(m_initData);
+        m_cfg = parse_preset(m_initData);
+
+        /* Rate map ListView */
+        m_listRate = GetDlgItem(IDC_LIST_RATEMAP);
+        m_listRate.SetExtendedListViewStyle(
+            LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 65);
+        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 85);
+        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 65);
+
+        for (int i = 0; i < RATE_MAP_COUNT; i++) {
+            m_listRate.InsertItem(i, g_rate_names[i]);
+            m_listRate.SetItemText(i, 1, g_output_names[m_cfg.rate_map[i]]);
+            int ntf_idx = m_cfg.rate_ntf[i] + 1; /* NTF_AUTO=-1 → 0 */
+            if (ntf_idx < 0 || ntf_idx >= (int)NTF_NAME_COUNT) ntf_idx = 0;
+            m_listRate.SetItemText(i, 2, g_ntf_names[ntf_idx]);
+        }
+
+        /* Create in-place editor combos (children of dialog, initially hidden) */
+        CRect rc(0, 0, 85, 200);
+        m_editCombo.Create(m_hWnd, rc, NULL,
+            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+            0, IDC_COMBO_RATEMAP_EDIT);
+        m_editCombo.SetFont(GetFont());
+
+        m_ntfCombo.Create(m_hWnd, rc, NULL,
+            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+            0, IDC_COMBO_RATEMAP_NTF_EDIT);
+        m_ntfCombo.SetFont(GetFont());
 
         /* SDM Mode combo */
         CComboBox sdm(GetDlgItem(IDC_COMBO_SDM_MODE));
         sdm.AddString(L"PreCorr (low CPU)");
         sdm.AddString(L"Trellis (high quality)");
-        sdm.SetCurSel(cfg.sdm_mode);
-
-        /* Output Rate combo */
-        CComboBox rate(GetDlgItem(IDC_COMBO_OUTPUT_RATE));
-        rate.AddString(L"As Input");
-        rate.AddString(L"DSD64");
-        rate.AddString(L"DSD128");
-        rate.AddString(L"DSD256");
-        rate.AddString(L"DSD512");
-        int rate_idx = 0;
-        switch (cfg.fs_out) {
-        case DSD_RATE_64:  rate_idx = 1; break;
-        case DSD_RATE_128: rate_idx = 2; break;
-        case DSD_RATE_256: rate_idx = 3; break;
-        case DSD_RATE_512: rate_idx = 4; break;
-        }
-        rate.SetCurSel(rate_idx);
-
-        /* Gain in dB */
-        float db = gain_to_db(cfg.gain);
-        pfc::string_formatter gain_str;
-        gain_str << pfc::format_float(db, 0, 1);
-        ::uSetDlgItemText(*this, IDC_EDIT_GAIN, gain_str);
-        RefreshGainLabel(db);
-
-        /* Trellis depth combo */
-        CComboBox depth(GetDlgItem(IDC_COMBO_TRELLIS_DEPTH));
-        depth.AddString(L"4");
-        depth.AddString(L"8");
-        depth.AddString(L"16");
-        depth.AddString(L"32");
-        int depth_idx = 1;
-        if (cfg.trellis_depth <= 4) depth_idx = 0;
-        else if (cfg.trellis_depth <= 8) depth_idx = 1;
-        else if (cfg.trellis_depth <= 16) depth_idx = 2;
-        else depth_idx = 3;
-        depth.SetCurSel(depth_idx);
-
-        /* Candidates */
-        SetDlgItemInt(IDC_EDIT_TRELLIS_CANDS, cfg.trellis_cands, FALSE);
-        CUpDownCtrl(GetDlgItem(IDC_SPIN_TRELLIS_CANDS)).SetRange(4, 32);
-
-        /* Latency */
-        SetDlgItemInt(IDC_EDIT_TRELLIS_LAT, cfg.trellis_lat, FALSE);
-        CUpDownCtrl(GetDlgItem(IDC_SPIN_TRELLIS_LAT)).SetRange(16, 2048);
-
-        /* NTF filter combo */
-        CComboBox ntf(GetDlgItem(IDC_COMBO_NTF));
-        ntf.AddString(L"Auto");
-        ntf.AddString(L"CLANS-4");
-        ntf.AddString(L"SDM-4");
-        ntf.AddString(L"CLANS-5");
-        ntf.AddString(L"SDM-5");
-        ntf.AddString(L"CLANS-6");
-        ntf.AddString(L"SDM-6");
-        ntf.AddString(L"CLANS-7");
-        ntf.AddString(L"SDM-7");
-        ntf.AddString(L"CLANS-8");
-        ntf.AddString(L"SDM-8");
-        ntf.SetCurSel(cfg.ntf_filter + 1); /* NTF_AUTO = -1 → index 0 */
+        sdm.SetCurSel(m_cfg.sdm_mode);
 
         /* Threads */
-        SetDlgItemInt(IDC_EDIT_THREADS, cfg.thread_count, FALSE);
+        SetDlgItemInt(IDC_EDIT_THREADS, m_cfg.thread_count, FALSE);
         CUpDownCtrl(GetDlgItem(IDC_SPIN_THREADS)).SetRange(0, 32);
 
         /* Input format combo */
@@ -292,30 +344,19 @@ private:
         fmt.AddString(L"Auto");
         fmt.AddString(L"DoP");
         fmt.AddString(L"Native");
-        fmt.SetCurSel(cfg.format);
-
-        /* Output format combo */
-        CComboBox ofmt(GetDlgItem(IDC_COMBO_OUTPUT_FORMAT));
-        ofmt.AddString(L"DoP (DSD output)");
-        ofmt.AddString(L"PCM (for VU / non-DSD DAC)");
-        ofmt.SetCurSel(cfg.output_format);
-
-        /* Mute checkbox */
-        CheckDlgButton(IDC_CHECK_MUTE, cfg.mute ? BST_CHECKED : BST_UNCHECKED);
+        fmt.SetCurSel(m_cfg.format);
 
         /* Debug log checkbox */
-        CheckDlgButton(IDC_CHECK_DEBUG_LOG, cfg.debug_log ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(IDC_CHECK_DEBUG_LOG, m_cfg.debug_log ? BST_CHECKED : BST_UNCHECKED);
 
-        /* Show engine info */
+        /* Show initial engine info */
         const cpu_features_t *cpu = cpu_detect();
         pfc::string_formatter info;
         info << "FIR: " << fir_ipp_kernel_name()
              << " | CPU: " << (cpu->vendor == CPU_VENDOR_INTEL ? "Intel" :
-                               cpu->vendor == CPU_VENDOR_AMD   ? "AMD" : "Unknown");
-        ::uSetDlgItemText(*this, IDC_STATIC_VU_L, info);
-
-        /* Enable/disable trellis controls based on SDM mode */
-        EnableTrellisControls(cfg.sdm_mode == SDM_MODE_TRELLIS);
+                               cpu->vendor == CPU_VENDOR_AMD   ? "AMD" : "Unknown")
+             << "\nSelect a rate mapping to see path details.";
+        ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, info);
 
         return TRUE;
     }
@@ -332,91 +373,249 @@ private:
         if (!m_updating) UpdatePreset();
     }
 
-    void OnSdmModeChange(UINT, int, CWindow) {
-        int mode = CComboBox(GetDlgItem(IDC_COMBO_SDM_MODE)).GetCurSel();
-        EnableTrellisControls(mode == SDM_MODE_TRELLIS);
-        if (!m_updating) UpdatePreset();
+    /* ─── Rate map in-place editing ─── */
+
+    LRESULT OnRateMapClick(LPNMHDR pnmh) {
+        NMITEMACTIVATE *nm = (NMITEMACTIVATE *)pnmh;
+
+        /* Hide both combos first */
+        m_editCombo.ShowWindow(SW_HIDE);
+        m_ntfCombo.ShowWindow(SW_HIDE);
+
+        if (nm->iItem < 0 || nm->iItem >= RATE_MAP_COUNT)
+            return 0;
+
+        /* Always update path info on row click */
+        UpdatePathInfo(nm->iItem);
+
+        if (nm->iSubItem == 1) {
+            /* Output column — show output combo */
+            ShowOutputCombo(nm->iItem);
+        } else if (nm->iSubItem == 2) {
+            /* NTF column — show NTF combo */
+            ShowNtfCombo(nm->iItem);
+        }
+
+        return 0;
     }
 
-    void EnableTrellisControls(bool enable) {
-        BOOL en = enable ? TRUE : FALSE;
-        ::EnableWindow(GetDlgItem(IDC_COMBO_TRELLIS_DEPTH), en);
-        ::EnableWindow(GetDlgItem(IDC_EDIT_TRELLIS_CANDS), en);
-        ::EnableWindow(GetDlgItem(IDC_SPIN_TRELLIS_CANDS), en);
-        ::EnableWindow(GetDlgItem(IDC_EDIT_TRELLIS_LAT), en);
-        ::EnableWindow(GetDlgItem(IDC_SPIN_TRELLIS_LAT), en);
+    void ShowOutputCombo(int row) {
+        CRect cellRC;
+        m_listRate.GetSubItemRect(row, 1, LVIR_BOUNDS, &cellRC);
+        m_listRate.MapWindowPoints(m_hWnd, &cellRC);
+
+        m_editCombo.ResetContent();
+        for (int j = 0; j < RATE_OUT_COUNT; j++) {
+            if (rate_map_valid_output(row, (uint8_t)j)) {
+                int idx = m_editCombo.AddString(g_output_names[j]);
+                m_editCombo.SetItemData(idx, (DWORD_PTR)j);
+            }
+        }
+
+        uint8_t cur = m_cfg.rate_map[row];
+        for (int j = 0; j < m_editCombo.GetCount(); j++) {
+            if ((int)m_editCombo.GetItemData(j) == cur) {
+                m_editCombo.SetCurSel(j);
+                break;
+            }
+        }
+
+        m_editRow = row;
+        m_editCol = 1;
+        m_editCombo.SetWindowPos(HWND_TOP,
+                                 cellRC.left, cellRC.top,
+                                 cellRC.Width(), 200,
+                                 SWP_SHOWWINDOW);
+        m_editCombo.SetFocus();
+        m_editCombo.ShowDropDown(TRUE);
+    }
+
+    void ShowNtfCombo(int row) {
+        CRect cellRC;
+        m_listRate.GetSubItemRect(row, 2, LVIR_BOUNDS, &cellRC);
+        m_listRate.MapWindowPoints(m_hWnd, &cellRC);
+
+        m_ntfCombo.ResetContent();
+        for (int j = 0; j < (int)NTF_NAME_COUNT; j++) {
+            int idx = m_ntfCombo.AddString(g_ntf_names[j]);
+            m_ntfCombo.SetItemData(idx, (DWORD_PTR)(j - 1)); /* 0→-1(Auto), 1→0(CLANS-4), etc */
+        }
+
+        int8_t cur = m_cfg.rate_ntf[row];
+        m_ntfCombo.SetCurSel(cur + 1); /* NTF_AUTO=-1 → index 0 */
+
+        m_editRow = row;
+        m_editCol = 2;
+        m_ntfCombo.SetWindowPos(HWND_TOP,
+                                cellRC.left, cellRC.top,
+                                cellRC.Width(), 200,
+                                SWP_SHOWWINDOW);
+        m_ntfCombo.SetFocus();
+        m_ntfCombo.ShowDropDown(TRUE);
+    }
+
+    void OnRateMapEditChange(UINT, int, CWindow) {
+        int sel = m_editCombo.GetCurSel();
+        if (sel >= 0 && m_editRow >= 0 && m_editRow < RATE_MAP_COUNT) {
+            uint8_t out_idx = (uint8_t)m_editCombo.GetItemData(sel);
+            m_cfg.rate_map[m_editRow] = out_idx;
+            m_listRate.SetItemText(m_editRow, 1, g_output_names[out_idx]);
+            UpdatePathInfo(m_editRow);
+            if (!m_updating) UpdatePreset();
+        }
+    }
+
+    void OnNtfEditChange(UINT, int, CWindow) {
+        int sel = m_ntfCombo.GetCurSel();
+        if (sel >= 0 && m_editRow >= 0 && m_editRow < RATE_MAP_COUNT) {
+            int8_t ntf_val = (int8_t)(sel - 1); /* index 0 → NTF_AUTO (-1) */
+            m_cfg.rate_ntf[m_editRow] = ntf_val;
+            m_listRate.SetItemText(m_editRow, 2, g_ntf_names[sel]);
+            UpdatePathInfo(m_editRow);
+            if (!m_updating) UpdatePreset();
+        }
+    }
+
+    void OnComboKillFocus(UINT, int, CWindow) {
+        m_editCombo.ShowWindow(SW_HIDE);
+        m_ntfCombo.ShowWindow(SW_HIDE);
+    }
+
+    void OnComboCloseUp(UINT, int, CWindow) {
+        /* Hide combo after dropdown closes */
+        m_editCombo.ShowWindow(SW_HIDE);
+        m_ntfCombo.ShowWindow(SW_HIDE);
+    }
+
+    /* ─── Contextual path info panel ─── */
+
+    void UpdatePathInfo(int row) {
+        if (row < 0 || row >= RATE_MAP_COUNT) return;
+
+        uint8_t out_idx = m_cfg.rate_map[row];
+        pfc::string_formatter info;
+
+        if (out_idx == RATE_OUT_BYPASS) {
+            info << g_rate_names[row] << ": Passthrough (no processing)";
+            ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, info);
+            return;
+        }
+
+        /* Determine input/output rates */
+        uint32_t fs_in = 0;
+        bool is_dsd_input = (row >= RATE_MAP_PCM_COUNT);
+        switch (row) {
+        case RATEIDX_44100:  fs_in = 44100;       break;
+        case RATEIDX_48000:  fs_in = 48000;       break;
+        case RATEIDX_88200:  fs_in = 88200;       break;
+        case RATEIDX_96000:  fs_in = 96000;       break;
+        case RATEIDX_176400: fs_in = 176400;      break;
+        case RATEIDX_192000: fs_in = 192000;      break;
+        case RATEIDX_352800: fs_in = 352800;      break;
+        case RATEIDX_384000: fs_in = 384000;      break;
+        case RATEIDX_DSD64:  fs_in = DSD_RATE_64; break;
+        case RATEIDX_DSD128: fs_in = DSD_RATE_128; break;
+        case RATEIDX_DSD256: fs_in = DSD_RATE_256; break;
+        case RATEIDX_DSD512: fs_in = DSD_RATE_512; break;
+        }
+
+        uint32_t fs_out = rate_out_to_hz(out_idx);
+        if (fs_out == 0) {
+            info << "Invalid output configuration";
+            ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, info);
+            return;
+        }
+
+        /* Query path info from engine */
+        int8_t ntf_val = m_cfg.rate_ntf[row];
+        int sdm_mode = m_cfg.sdm_mode;
+        engine_path_info_t pi;
+        engine_get_path_info(fs_in, fs_out, (int)ntf_val, sdm_mode, &m_cfg, &pi);
+
+        /* Format info text */
+        info << g_rate_names[row];
+        if (is_dsd_input && rate_out_is_dsd(out_idx)) {
+            /* DSD → DSD */
+            if (fs_in == fs_out)
+                info << " -> " << g_output_names[out_idx] << " (re-encode)";
+            else if (fs_out > fs_in)
+                info << " -> " << g_output_names[out_idx] << " (" << (fs_out/fs_in) << "x upsample)";
+            else
+                info << " -> " << g_output_names[out_idx] << " (1/" << (fs_in/fs_out) << " downsample)";
+        } else if (is_dsd_input && rate_out_is_pcm(out_idx)) {
+            /* DSD → PCM */
+            info << " -> " << g_output_names[out_idx] << " (1/" << (fs_in/fs_out) << " decimation)";
+        } else {
+            /* PCM → DSD */
+            info << " -> " << g_output_names[out_idx] << " (" << (fs_out/fs_in) << "x upsample)";
+        }
+
+        info << "\nFIR: " << pi.fir_stages << " stages, " << fir_ipp_kernel_name();
+
+        if (pi.fir_only) {
+            info << "\nFIR decimation only (no SDM)";
+        } else {
+            const char *sdm_name = (sdm_mode == SDM_MODE_TRELLIS) ? "Trellis" : "PreCorr";
+            info << "\nSDM: " << sdm_name;
+            if (sdm_mode == SDM_MODE_TRELLIS)
+                info << ", depth=" << pi.depth << ", cands=" << pi.cands << ", lat=" << pi.lat;
+
+            /* NTF display */
+            int ntf_display = pi.ntf_filter;
+            info << "\nNTF: ";
+            if (ntf_val == NTF_AUTO) {
+                info << "Auto";
+                if (ntf_display >= 0 && ntf_display < (int)(NTF_NAME_COUNT - 1))
+                    info << " (" << g_ntf_names[ntf_display + 1] << ")";
+            } else {
+                int idx = ntf_val + 1;
+                if (idx >= 0 && idx < (int)NTF_NAME_COUNT)
+                    info << g_ntf_names[idx];
+            }
+
+            if (pi.state_limit > 0.0)
+                info << "\nState limiter: " << pfc::format_float(pi.state_limit, 0, 1);
+        }
+
+        ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, info);
     }
 
     void UpdatePreset() {
         m_updating = true;
 
-        dsd_config_t cfg;
-        dsd_config_defaults(&cfg);
-
         /* Read SDM mode */
-        cfg.sdm_mode = CComboBox(GetDlgItem(IDC_COMBO_SDM_MODE)).GetCurSel();
-
-        /* Read output rate */
-        int rate_idx = CComboBox(GetDlgItem(IDC_COMBO_OUTPUT_RATE)).GetCurSel();
-        static const uint32_t rates[] = { 0, DSD_RATE_64, DSD_RATE_128, DSD_RATE_256, DSD_RATE_512 };
-        cfg.fs_out = (rate_idx >= 0 && rate_idx < 5) ? rates[rate_idx] : 0;
-
-        /* Read gain */
-        pfc::string8 gain_text;
-        uGetDlgItemText(*this, IDC_EDIT_GAIN, gain_text);
-        float db = (float)atof(gain_text.c_str());
-        if (db > 0.0f) db = 0.0f;
-        if (db < -120.0f) db = -120.0f;
-        cfg.gain = db_to_gain(db);
-        RefreshGainLabel(db);
-
-        /* Read trellis depth */
-        static const int depths[] = { 4, 8, 16, 32 };
-        int depth_idx = CComboBox(GetDlgItem(IDC_COMBO_TRELLIS_DEPTH)).GetCurSel();
-        cfg.trellis_depth = (depth_idx >= 0 && depth_idx < 4) ? depths[depth_idx] : 8;
-
-        /* Read candidates and latency */
-        cfg.trellis_cands = (int)GetDlgItemInt(IDC_EDIT_TRELLIS_CANDS, NULL, FALSE);
-        cfg.trellis_lat = (int)GetDlgItemInt(IDC_EDIT_TRELLIS_LAT, NULL, FALSE);
-
-        /* NTF filter */
-        int ntf_idx = CComboBox(GetDlgItem(IDC_COMBO_NTF)).GetCurSel();
-        cfg.ntf_filter = ntf_idx - 1; /* index 0 = Auto = -1 */
+        m_cfg.sdm_mode = CComboBox(GetDlgItem(IDC_COMBO_SDM_MODE)).GetCurSel();
 
         /* Threads */
-        cfg.thread_count = (int)GetDlgItemInt(IDC_EDIT_THREADS, NULL, FALSE);
+        m_cfg.thread_count = (int)GetDlgItemInt(IDC_EDIT_THREADS, NULL, FALSE);
 
         /* Input format */
-        cfg.format = CComboBox(GetDlgItem(IDC_COMBO_FORMAT)).GetCurSel();
-
-        /* Output format */
-        cfg.output_format = CComboBox(GetDlgItem(IDC_COMBO_OUTPUT_FORMAT)).GetCurSel();
-
-        /* Mute */
-        cfg.mute = IsDlgButtonChecked(IDC_CHECK_MUTE) == BST_CHECKED;
+        m_cfg.format = CComboBox(GetDlgItem(IDC_COMBO_FORMAT)).GetCurSel();
 
         /* Debug log */
-        cfg.debug_log = IsDlgButtonChecked(IDC_CHECK_DEBUG_LOG) == BST_CHECKED;
+        m_cfg.debug_log = IsDlgButtonChecked(IDC_CHECK_DEBUG_LOG) == BST_CHECKED;
 
-        config_validate(&cfg);
+        /* rate_map and rate_ntf are maintained via OnRateMapEditChange/OnNtfEditChange */
+
+        config_validate(&m_cfg);
 
         dsp_preset_impl preset;
-        make_preset(cfg, preset);
+        make_preset(m_cfg, preset);
         m_callback.on_preset_changed(preset);
 
         m_updating = false;
-    }
-
-    void RefreshGainLabel(float db) {
-        pfc::string_formatter msg;
-        msg << pfc::format_float(db, 0, 2) << " dB";
-        ::uSetDlgItemText(*this, IDC_STATIC_GAIN_DB, msg);
     }
 
     const dsp_preset & m_initData;
     dsp_preset_edit_callback & m_callback;
     fb2k::CDarkModeHooks m_dark;
     bool m_updating = false;
+    dsd_config_t m_cfg;
+    CListViewCtrl m_listRate;
+    CComboBox m_editCombo;
+    CComboBox m_ntfCombo;
+    int m_editRow;
+    int m_editCol;
 };
 
 static void RunDSPConfigPopup(const dsp_preset &p_data, HWND p_parent,
@@ -441,23 +640,14 @@ public:
         if (m_state)
             plugin_set_config(m_state, &m_config);
 
-        log_set_enabled(m_config.debug_log);
-
         /* Log version, build hash, and build time */
         trellis_log("DSD Trellis v%s (build %s, %s %s)",
                     BUILD_VERSION, BUILD_GIT_HASH, BUILD_DATE, BUILD_TIME);
 
-        uint32_t fs = m_config.fs_out;
         const char *sdm_mode_str = m_config.sdm_mode == SDM_MODE_TRELLIS
                                    ? "Trellis" : "PreCorr";
-        trellis_log("initialized (sdm=%s, fir=%s, output=%s, depth=%d, cands=%d)",
-                    sdm_mode_str, fir_ipp_kernel_name(),
-                    fs == 0 ? "as-input" :
-                    fs == DSD_RATE_64  ? "DSD64" :
-                    fs == DSD_RATE_128 ? "DSD128" :
-                    fs == DSD_RATE_256 ? "DSD256" :
-                    fs == DSD_RATE_512 ? "DSD512" : "?",
-                    m_config.trellis_depth, m_config.trellis_cands);
+        trellis_log("initialized (sdm=%s, fir=%s)",
+                    sdm_mode_str, fir_ipp_kernel_name());
 
         /* Start REST API server */
         if (m_config.api_port > 0) {
@@ -509,7 +699,6 @@ public:
         {
             dsd_config_t pending;
             if (httpapi_get_pending_config(m_httpapi, &pending)) {
-                /* Preserve runtime-detected fs_in — it's not user-settable */
                 const dsd_config_t *current = plugin_get_config(m_state);
                 if (current)
                     pending.fs_in = current->fs_in;
@@ -518,8 +707,7 @@ public:
                 plugin_reconfigure(m_state, &m_config);
                 httpapi_update_config(m_httpapi, &m_config);
                 log_set_enabled(m_config.debug_log);
-                trellis_log("config updated via REST API (cands=%d, depth=%d, gain=%.3f)",
-                            m_config.trellis_cands, m_config.trellis_depth, (double)m_config.gain);
+                trellis_log("config updated via REST API");
             }
         }
 
@@ -530,18 +718,25 @@ public:
         if (channels == 0 || pcm_frames == 0)
             return true;
 
-        /* Log first chunk detection */
-        if (m_pcm_rate != pcm_rate || m_channels != (int)channels) {
-            uint32_t dsd_rate = pcm_rate * 16;
-            unsigned dsd_mult = dsd_rate / 44100;
-            trellis_log("detected DSD%u (%u Hz) via DoP @ %u Hz, %uch",
-                        dsd_mult, dsd_rate, pcm_rate, channels);
+        /* ─── Volume / mute ─── */
+        m_config.mute = get_cached_muted();
+        m_config.gain = get_cached_gain();
+
+        /* ─── Rate map dispatch ─── */
+
+        /* Check if input could be DoP */
+        bool is_dop = false;
+        uint32_t dsd_rate = 0;
+        {
+            uint32_t candidate_dsd = pcm_rate * 16u;
+            switch (candidate_dsd) {
+            case DSD_RATE_64: case DSD_RATE_128: case DSD_RATE_256: case DSD_RATE_512:
+                dsd_rate = candidate_dsd;
+                break;
+            }
         }
 
-        m_channels = (int)channels;
-        m_pcm_rate = pcm_rate;
-
-        /* Convert audio_sample (double on x64) to float for C engine */
+        /* Convert audio_sample to float for detection */
         const audio_sample *src = chunk->get_data();
         size_t total_in = pcm_frames * channels;
         pfc::array_staticsize_t<float> in_f32;
@@ -549,17 +744,68 @@ public:
         for (size_t i = 0; i < total_in; i++)
             in_f32[i] = (float)src[i];
 
-        /* Allocate output buffer: worst case is 8x rate conversion */
-        size_t max_out_frames = pcm_frames * 8;
+        if (dsd_rate != 0 && pcm_frames >= 8 &&
+            dop_detect_interleaved(in_f32.get_ptr(), pcm_frames, (int)channels)) {
+            is_dop = true;
+        }
+
+        /* Look up rate in rate map */
+        uint32_t lookup_rate = is_dop ? dsd_rate : pcm_rate;
+        int map_idx = rate_map_index(lookup_rate);
+        if (map_idx < 0 || m_config.rate_map[map_idx] == RATE_OUT_BYPASS)
+            return true;  /* Bypass: pass through unchanged */
+
+        uint8_t out_idx = m_config.rate_map[map_idx];
+        bool out_is_pcm = rate_out_is_pcm(out_idx);
+        uint32_t out_rate = rate_out_to_hz(out_idx);
+
+        if (out_rate == 0)
+            return true;
+
+        /* Apply per-rate NTF override */
+        m_config.ntf_filter = (int)m_config.rate_ntf[map_idx];
+
+        /* Set output rate for this chunk */
+        m_config.fs_out = out_rate;
+        plugin_set_config(m_state, &m_config);
+
+        m_channels = (int)channels;
+        m_pcm_rate = pcm_rate;
+
+        /* Allocate output buffer */
+        size_t max_ratio = is_dop ? 8 : (out_rate > pcm_rate ? out_rate / pcm_rate : 1);
+        if (max_ratio < 8) max_ratio = 8;
+        size_t max_out_frames = pcm_frames * max_ratio;
         pfc::array_staticsize_t<float> out_buf;
         out_buf.set_size_discard(max_out_frames * channels);
 
         LARGE_INTEGER t0, t1, freq;
         QueryPerformanceCounter(&t0);
 
-        size_t out_frames = plugin_process(
-            m_state, in_f32.get_ptr(), out_buf.get_ptr(),
-            pcm_frames, (int)channels, pcm_rate);
+        size_t out_frames = 0;
+
+        if (is_dop) {
+            /* DSD input via DoP */
+            if (!m_logged_processing) {
+                unsigned dsd_mult = dsd_rate / 44100;
+                if (out_is_pcm)
+                    trellis_log("DSD%u -> PCM %uHz, %uch", dsd_mult, out_rate, channels);
+                else if (dsd_rate == out_rate)
+                    trellis_log("DSD%u re-encode, %uch", dsd_mult, channels);
+                else
+                    trellis_log("DSD%u -> DSD%u, %uch", dsd_mult, out_rate / 44100, channels);
+            }
+            out_frames = plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
+                                        pcm_frames, (int)channels, pcm_rate);
+        } else {
+            /* PCM input — convert to DSD */
+            if (!m_logged_processing) {
+                unsigned out_mult = out_rate / 44100;
+                trellis_log("PCM %uHz -> DSD%u, %uch", pcm_rate, out_mult, channels);
+            }
+            out_frames = plugin_process_pcm(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
+                                             pcm_frames, (int)channels, pcm_rate);
+        }
 
         QueryPerformanceCounter(&t1);
         QueryPerformanceFrequency(&freq);
@@ -568,23 +814,21 @@ public:
         if (out_frames == 0) {
             m_chunk_count++;
             if (!m_logged_passthrough) {
-                trellis_log("no DoP detected, passing through (chunk #%u, %.1fms)",
+                trellis_log("no output produced, passing through (chunk #%u, %.1fms)",
                             m_chunk_count, process_ms);
                 m_logged_passthrough = true;
             }
-            /* Log first 5 passthrough chunks for diagnostics */
-            if (m_chunk_count <= 5) {
-                trellis_log("chunk #%u: out_frames=0, process_ms=%.1f, pcm_frames=%zu",
-                            m_chunk_count, process_ms, pcm_frames);
-            }
-            return true;  /* Not DoP or processing failed — pass through */
+            return true;
         }
         m_logged_passthrough = false;
 
-        /* Determine output PCM sample rate */
-        uint32_t dsd_rate_in = pcm_rate * 16;
-        uint32_t dsd_rate_out = m_config.fs_out ? m_config.fs_out : dsd_rate_in;
-        uint32_t out_pcm_rate = dsd_rate_out / 16;
+        /* Determine output sample rate */
+        uint32_t out_pcm_rate;
+        if (out_is_pcm) {
+            out_pcm_rate = out_rate;  /* Direct PCM output rate */
+        } else {
+            out_pcm_rate = out_rate / 16;  /* DoP PCM rate */
+        }
 
         /* Convert float output back to audio_sample */
         size_t total_out = out_frames * channels;
@@ -594,20 +838,10 @@ public:
             out_as[i] = (audio_sample)out_buf[i];
 
         {
-            unsigned out_mult = dsd_rate_out / 44100;
-            unsigned in_mult  = dsd_rate_in  / 44100;
             double chunk_ms = (double)pcm_frames / (double)pcm_rate * 1000.0;
             double ratio = chunk_ms > 0 ? process_ms / chunk_ms : 0;
 
             if (!m_logged_processing) {
-                if (dsd_rate_in != dsd_rate_out)
-                    trellis_log("processing DSD%u -> DSD%u (%zu -> %zu frames, %.1fms/%.1fms = %.1fx RT)",
-                                in_mult, out_mult, pcm_frames, out_frames,
-                                process_ms, chunk_ms, ratio);
-                else
-                    trellis_log("processing DSD%u (%zu -> %zu frames, %.1fms/%.1fms = %.1fx RT)",
-                                in_mult, pcm_frames, out_frames,
-                                process_ms, chunk_ms, ratio);
                 m_logged_processing = true;
 
                 /* Log topology after first successful processing */
@@ -617,7 +851,6 @@ public:
                     cpuset_summary(topo, topo_buf, sizeof(topo_buf));
                     trellis_log("CPU: %s", topo_buf);
 
-                    /* Detailed per-core info when debug log is enabled */
                     if (g_log_enabled) {
                         cpuset_log_detail(topo, [](const char *line, void *) {
                             trellis_log("  topo: %s", line);
@@ -625,7 +858,6 @@ public:
                     }
                 }
 
-                /* Log initial workload and phase timing */
                 int wl_threads = 0, wl_segments = 0;
                 bool wl_changed = false;
                 plugin_get_workload(m_state, &wl_threads, &wl_segments, &wl_changed);
@@ -638,7 +870,7 @@ public:
                             t_unpack, t_fir, t_sdm, t_pack);
             }
 
-            /* Log CPUSET changes (CPUDoc dynamic core management) */
+            /* Log CPUSET changes */
             {
                 uint64_t cpuset_mask = 0;
                 if (plugin_get_cpuset_change(m_state, &cpuset_mask)) {
@@ -650,7 +882,7 @@ public:
                 }
             }
 
-            /* Log workload changes (thread count / segment count) */
+            /* Log workload changes */
             {
                 int wl_threads = 0, wl_segments = 0;
                 bool wl_changed = false;
@@ -661,7 +893,7 @@ public:
                 }
             }
 
-            /* Log periodic timing every 100 chunks when debug log is enabled */
+            /* Log periodic timing */
             m_chunk_count++;
             if (g_log_enabled && (m_chunk_count <= 5 || (m_chunk_count % 100) == 0)) {
                 double t_unpack, t_fir, t_sdm, t_pack;
@@ -677,8 +909,8 @@ public:
                 httpapi_status_t st;
                 memset(&st, 0, sizeof(st));
                 st.playing = true;
-                st.dsd_rate_in = dsd_rate_in;
-                st.dsd_rate_out = dsd_rate_out;
+                st.dsd_rate_in = is_dop ? dsd_rate : 0;
+                st.dsd_rate_out = out_is_pcm ? 0 : out_rate;
                 st.channels = (int)channels;
                 int wl_t = 0, wl_s = 0;
                 bool wl_c = false;
@@ -704,15 +936,7 @@ public:
             }
         }
 
-        if (m_config.output_format == OUTPUT_PCM) {
-            /* PCM output mode: decimate DoP to PCM for visualization.
-             * Simple average of 16 DSD bits → 1 PCM sample.
-             * Output rate = out_pcm_rate (same as DoP rate). */
-            chunk->set_data(out_as.get_ptr(), out_frames, channels, out_pcm_rate);
-        } else {
-            /* DoP output (default) */
-            chunk->set_data(out_as.get_ptr(), out_frames, channels, out_pcm_rate);
-        }
+        chunk->set_data(out_as.get_ptr(), out_frames, channels, out_pcm_rate);
 
         return true;
     }
@@ -729,10 +953,9 @@ public:
                                            m_channels);
 
         if (drain_frames > 0 && m_pcm_rate > 0) {
-            uint32_t dsd_rate_in = m_pcm_rate * 16;
-            uint32_t dsd_rate_out = m_config.fs_out ? m_config.fs_out
-                                                     : dsd_rate_in;
-            uint32_t out_pcm_rate = dsd_rate_out / 16;
+            uint32_t out_pcm_rate = m_config.fs_out / 16;
+            if (out_pcm_rate == 0)
+                out_pcm_rate = m_pcm_rate;
 
             size_t total = drain_frames * (unsigned)m_channels;
             pfc::array_staticsize_t<audio_sample> drain_as;
@@ -780,7 +1003,7 @@ DECLARE_COMPONENT_VERSION(
     "DSD Trellis SDM",
     BUILD_VERSION,
     "DSD Trellis (Viterbi) Sigma-Delta Modulator\n"
-    "Rate conversion, volume control, and noise shaping for DSD streams.\n"
+    "Rate conversion and noise shaping for DSD streams.\n"
     "Supports DoP and native DSD input from foo_input_sacd / foo_input_udsd.\n\n"
     "NTF coefficients ported from mansr/sox sdm.c (LGPL v2.1+)"
 );

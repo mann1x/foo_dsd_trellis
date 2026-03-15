@@ -9,7 +9,7 @@ A native foobar2000 DSP plugin that converts PCM and DSD audio to DSD using sigm
 | SDM Modes | PreCorr (default, ~0.01x RT) and Trellis (high quality, configurable depth/candidates) |
 | Rate Conversion | DSD64 / DSD128 / DSD256 / DSD512 via Intel IPP FIRSR (63-tap Kaiser half-band) |
 | PCM to DSD | Float32 PCM input upsampled via FIR then quantised to 1-bit DSD |
-| Volume Control | Linear gain multiply before SDM requantiser |
+| Volume Control | DSD-Wide: boxcar smoothing + gain + SDM re-encode (no PCM decimation) |
 | Passthrough | Repack only -- bypass FIR and SDM when input/output rate and gain are identical |
 | Mute | Silence pattern substitution (0x69/0x96) |
 | DoP Detection | Auto-detect DoP markers (0x05/0xFA) in 24-bit PCM frames; falls back to native ASIO |
@@ -48,9 +48,19 @@ Thread pool (`threadpool.c`) provides per-channel parallelism with MMCSS "Pro Au
 | DSD256 | 11,289,600 Hz | 256 x 44.1 kHz |
 | DSD512 | 22,579,200 Hz | 512 x 44.1 kHz |
 
-## SINAD Measurements
+## SINAD Measurement Methodology
 
-All measurements use bin-aligned 1 kHz sine at amplitude 0.5, measured via Goertzel algorithm on the DSD output stream (0-22.05 kHz noise floor). Auto-selected NTF filters per rate.
+**Signal**: Bin-aligned 1 kHz sine wave at amplitude 0.5 (50% full scale). The test frequency is adjusted slightly from 1000 Hz so that it falls exactly on a DFT bin boundary at the output sample rate — this prevents spectral leakage from corrupting the signal power measurement.
+
+**Generation**: The test signal is encoded to DSD at the input rate using a Trellis SDM (depth=8, candidates=16, latency=512) with the auto-selected NTF filter for that rate. This produces a 1-bit DSD representation of the sine wave.
+
+**Processing pipeline** (for rate conversion tests): DSD encode at `fs_in` → FIR rate conversion (63-tap Kaiser half-band, beta=12) → SDM re-encode at `fs_out`. The FIR performs zero-stuff + lowpass (upsample) or lowpass + decimate (downsample), chained for multi-stage conversions (e.g., 8x = three 2x stages).
+
+**Measurement**: Goertzel algorithm on the output DSD stream. Signal power is measured at the test frequency bin. Noise power is the sum of all DFT bins from DC to 22,050 Hz (audio band), excluding the signal bin ±1 neighbour. SINAD = 10 × log10(signal_power / noise_power).
+
+**Sample counts**: 262,144 samples (DSD64), 524,288 (DSD128), 1,048,576 (DSD256), 2,097,152 (DSD512) — approximately 93 ms of audio at each rate.
+
+## SINAD Results
 
 ### Trellis SDM (depth=8, candidates=8, latency=512)
 
@@ -74,31 +84,33 @@ Greedy quantiser with trained prediction table. Near-zero CPU (~0.01x realtime).
 | DSD256 | CLANS-8 (order 8) | 125.6 |
 | DSD512 | CLANS-7 (order 7) | 137.5 |
 
-### DSD Rate Conversion (IPP FIRSR, 63-tap Kaiser half-band)
+### DSD Rate Conversion — Path-Adaptive Tuning
 
-End-to-end SINAD through FIR + Trellis SDM pipeline. Measures combined degradation from rate conversion and requantisation.
+Rate conversion SINAD depends heavily on the combination of NTF filter, integrator limiter, trellis candidates, and latency. A comprehensive sweep (1,152 measurements across 12 paths × 10 filters × 8 limiter values × 4 candidate counts × 4 latencies) identified the optimal configuration per path. These are applied automatically when `NTF filter = Auto`.
 
-**Upsample:**
+**Optimal configuration per rate conversion path:**
 
-| Conversion | SINAD (dB) |
-|------------|------------|
-| DSD64 -> DSD128 | 51.2 |
-| DSD64 -> DSD256 | 90.2 |
-| DSD64 -> DSD512 | 57.3 |
-| DSD128 -> DSD256 | 107.5 |
-| DSD128 -> DSD512 | 63.2 |
-| DSD256 -> DSD512 | 106.1 |
+| Conversion | NTF Filter | Limiter | Cands | Latency | SINAD (dB) |
+|------------|------------|---------|-------|---------|------------|
+| DSD64 -> DSD128 | CLANS-6 | off | 8 | 256 | 97.6 |
+| DSD64 -> DSD256 | SDM-7 | off | 8 | 256 | 80.6 |
+| DSD64 -> DSD512 | SDM-8 | 10.0 | 8 | 256 | 54.4 |
+| DSD128 -> DSD256 | SDM-4 | 12.0 | 8 | 256 | 113.3 |
+| DSD128 -> DSD512 | CLANS-8 | 12.0 | 8 | 512 | 120.3 |
+| DSD256 -> DSD512 | CLANS-8 | 6.0 | 16 | 512 | 121.0 |
+| DSD128 -> DSD64 | CLANS-4 | off | 32 | 128 | 83.3 |
+| DSD256 -> DSD64 | CLANS-8 | off | 8 | 64 | 92.7 |
+| DSD256 -> DSD128 | CLANS-4 | off | 8 | 256 | 112.0 |
+| DSD512 -> DSD64 | SDM-6 | off | 8 | 256 | 85.5 |
+| DSD512 -> DSD128 | SDM-4 | 16.0 | 16 | 128 | 99.4 |
+| DSD512 -> DSD256 | SDM-6 | 16.0 | 8 | 256 | 116.1 |
 
-**Downsample:**
-
-| Conversion | SINAD (dB) |
-|------------|------------|
-| DSD128 -> DSD64 | 75.4 |
-| DSD256 -> DSD64 | 79.4 |
-| DSD512 -> DSD64 | 91.2 |
-| DSD256 -> DSD128 | 106.9 |
-| DSD512 -> DSD128 | 118.3 |
-| DSD512 -> DSD256 | 103.0 |
+**Key observations:**
+- Downsample paths generally prefer no limiter and lower-order filters (CLANS-4/CLANS-8)
+- Upsample paths benefit from moderate limiters (6-16) to prevent integrator overload from FIR image noise
+- DSD64 -> DSD512 remains limited at ~54 dB due to 3-stage FIR image accumulation
+- Higher-order SDM filters (SDM-8) are unstable without limiters (-37 to -49 dB)
+- Some paths benefit from non-default candidates/latency (e.g., DSD256->DSD64 improves +10 dB with lat=64)
 
 ## Module Details
 
@@ -173,11 +185,37 @@ Intel IPP FIRSR-based half-band FIR for power-of-2 DSD rate conversion:
 
 **Multi-stage chaining:** up to 3 stages (8x ratio) with ping-pong scratch buffers.
 
+### DSD-Wide Volume Control (`engine.c`)
+
+Digital volume control for DSD without leaving the DSD domain. Traditional approaches decimate DSD to multi-bit PCM, apply gain, then re-modulate back to DSD -- this introduces unnecessary latency and quality loss from the round-trip rate conversion. DSD-Wide stays at the original DSD sample rate throughout.
+
+**The problem:** DSD is a 1-bit stream (values are strictly +1.0 or -1.0). Multiplying by a gain factor (e.g., 0.5) produces values like +0.5/-0.5, but the signal is still binary -- it carries the full ultrasonic quantisation noise of the original DSD encoding. Feeding this directly into an SDM causes it to saturate, producing constant -1.0 output (silence).
+
+**The solution -- boxcar smoothing:**
+
+```
+DSD ±1.0 @ Fs  -->  boxcar(N)  -->  multi-bit @ Fs  -->  × gain  -->  SDM  -->  DSD ±1.0 @ Fs
+```
+
+1. **Boxcar filter** (N=8 taps): A running average over N consecutive DSD samples. Converts the 1-bit stream to ~4-bit resolution ({-1.0, -0.75, -0.5, ..., +0.75, +1.0}) at the **same** sample rate. This smooths the ultrasonic quantisation noise just enough for the SDM to track the signal.
+
+2. **Gain multiply**: Applied to the multi-bit smoothed signal. The SDM now receives a properly-shaped waveform it can encode, not raw binary noise.
+
+3. **SDM re-encode**: Trellis or PreCorr converts back to 1-bit DSD. The NTF reshapes quantisation noise optimally regardless of the boxcar's crude frequency response.
+
+**Why a boxcar and not a proper FIR?** The boxcar is O(1) per sample (one add, one subtract, one multiply) regardless of tap count. Its frequency response has deep nulls and poor stopband -- but this doesn't matter. We're not producing a final PCM output; the SDM's noise-shaping will dominate the output spectrum. The boxcar only needs to provide enough multi-bit resolution for the SDM to converge, which 4 bits achieves comfortably.
+
+**Performance:** The boxcar adds negligible CPU overhead. At DSD64 (2.8 MHz), the 8-tap boxcar is ~3 integer ops per sample vs ~50+ ops for the SDM. The dominant cost remains the Trellis/PreCorr SDM itself.
+
+**Dynamic passthrough:** When gain = 1.0 (volume 100%), the engine bypasses both the boxcar and SDM entirely -- a simple sign-only requantise copies input to output with zero processing cost. Volume changes take effect immediately on the next audio block with no reinitialisation.
+
 ### Processing Engine (`engine.c`)
 
 Per-channel orchestrator:
 - Configures FIR chain based on input/output rate ratio
-- Applies gain multiply after FIR, before SDM
+- **Path-adaptive SDM tuning**: When `NTF filter = Auto` and rate converting, selects optimal NTF filter, integrator limiter, candidates, and latency per conversion path from a lookup table derived from comprehensive sweep measurements
+- **DSD-Wide volume control**: Boxcar smoothing + gain + SDM for same-rate DSD with gain != 1.0
+- Applies gain multiply after FIR, before SDM (for rate conversion paths)
 - Dispatches to Trellis or PreCorr based on `sdm_mode` config
 - Detects passthrough (same rate, unity gain) to bypass FIR+SDM entirely
 - Handles mute (silence pattern substitution)
@@ -194,8 +232,8 @@ Runtime parameters serialized to foobar2000 config store:
 | Mute | bool | on/off | off |
 | NTF filter | enum | Auto / CLANS-4..8 / SDM-4..8 | Auto |
 | Trellis depth (N) | int | 4, 8, 16, 32 | 8 |
-| Trellis candidates (M) | int | 4 - 32 | 8 |
-| Trellis latency | int | 16 - 2048 | 64 |
+| Trellis candidates (M) | int | 4 - 32 | 4 |
+| Trellis latency | int | 16 - 2048 | 128 |
 | Output format | enum | DoP / PCM | DoP |
 | Thread count | int | 0 (auto) - cores | 0 |
 
@@ -279,7 +317,7 @@ foo_dsd_trellis/
 
 ## Test Results
 
-635 tests across 11 suites, all passing:
+694 tests across 12 suites, all passing:
 
 | Suite | Tag | Tests | Coverage |
 |-------|-----|-------|----------|
@@ -292,7 +330,8 @@ foo_dsd_trellis/
 | Config | `config` | 8 | Serialization, versioning, validation |
 | CPU & IPP | `simd` | 5 | CPU detection, IPP kernel, FIR correctness |
 | Hardening | `hardening` | 22 | Edge cases, robustness |
-| Thread Pool | `threadpool` | 3 | Concurrent SDM processing |
+| Thread Pool | `threadpool` | 8 | Create/destroy, concurrent SDM, stress |
+| Rate Conv Sweep | `sweep` | 4 | FIR-only SINAD, limiter sweep, NTF×limiter sweep, cands×lat sweep (extended) |
 | SINAD Diagnostics | `diag` | 7 | NTF sweeps, warmup analysis (extended) |
 
 ## References

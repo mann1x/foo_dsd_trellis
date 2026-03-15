@@ -22,6 +22,14 @@ typedef struct {
     size_t      scratch_size;
     bool        upsample;       /* Direction for all stages */
 
+    /* DSD-Wide demodulation (pre-rate-conversion LP filter) */
+    bool        has_demod;      /* true when demod stage is active */
+    void       *demod_spec;     /* IppsFIRSpec_32f* */
+    void       *demod_buf;      /* Ipp8u* work buffer */
+    float      *demod_dly;      /* Delay line (tapsLen-1 floats) */
+    float      *demod_tmp;      /* Temp output buffer (same size as input) */
+    size_t      demod_tmp_sz;
+
     /* IPP FIRSR state (per stage) */
     void       *ipp_spec[FIR_MAX_STAGES];   /* IppsFIRSpec_32f* */
     void       *ipp_buf[FIR_MAX_STAGES];    /* Ipp8u* work buffer */

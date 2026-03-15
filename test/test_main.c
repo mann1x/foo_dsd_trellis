@@ -41,6 +41,7 @@ static const suite_entry_t suites[] = {
     { "precorr",   "PreCorr SDM",       test_precorr_suite,    0 },
     { "hardening", "Hardening",         test_hardening_suite,  0 },
     { "threadpool","Thread Pool",       test_threadpool_suite,  0 },
+    { "sweep",     "Rate Conv Sweep",   test_rate_sweep_suite, 1 },
     { "diag",      "SINAD Diagnostics", test_sinad_diag_suite, 1 },
 };
 

@@ -48,6 +48,7 @@ typedef struct {
     const ntf_filter_t *filter;
     double         prev_y;
     uint64_t       conv_fail;
+    double         state_limit;     /* Integrator state clamp (0 = disabled) */
     uint8_t        hist[2 * SDM_TRELLIS_MAX_NUM][SDM_TRELLIS_MAX_LAT / 8];
 } sdm_context_t;
 

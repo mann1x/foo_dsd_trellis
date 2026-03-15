@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -61,10 +62,131 @@ typedef enum {
     NTF_COUNT
 } ntf_filter_id_t;
 
+/* ─── Per-rate configuration table ─── */
+
+/* Rate map: per-input-rate output configuration.
+ * Each entry maps an input rate to a DSD output rate (or bypass). */
+#define RATE_MAP_COUNT      12
+#define RATE_MAP_PCM_COUNT  8
+#define RATE_MAP_DSD_COUNT  4
+
+/* Rate map input indices */
+#define RATEIDX_44100    0
+#define RATEIDX_48000    1
+#define RATEIDX_88200    2
+#define RATEIDX_96000    3
+#define RATEIDX_176400   4
+#define RATEIDX_192000   5
+#define RATEIDX_352800   6
+#define RATEIDX_384000   7
+#define RATEIDX_DSD64    8
+#define RATEIDX_DSD128   9
+#define RATEIDX_DSD256  10
+#define RATEIDX_DSD512  11
+
+/* Rate map output encoding: stored in rate_map[i] */
+#define RATE_OUT_BYPASS  0
+#define RATE_OUT_DSD64   1
+#define RATE_OUT_DSD128  2
+#define RATE_OUT_DSD256  3
+#define RATE_OUT_DSD512  4
+#define RATE_OUT_PCM44   5    /* Decimate to 44100 Hz PCM */
+#define RATE_OUT_PCM88   6    /* Decimate to 88200 Hz PCM */
+#define RATE_OUT_PCM176  7    /* Decimate to 176400 Hz PCM */
+#define RATE_OUT_PCM352  8    /* Decimate to 352800 Hz PCM */
+#define RATE_OUT_COUNT   9
+
+/* Lookup rate map index for a given input rate. Returns -1 if unknown. */
+static inline int rate_map_index(uint32_t rate) {
+    switch (rate) {
+    case 44100:        return RATEIDX_44100;
+    case 48000:        return RATEIDX_48000;
+    case 88200:        return RATEIDX_88200;
+    case 96000:        return RATEIDX_96000;
+    case 176400:       return RATEIDX_176400;
+    case 192000:       return RATEIDX_192000;
+    case 352800:       return RATEIDX_352800;
+    case 384000:       return RATEIDX_384000;
+    case DSD_RATE_64:  return RATEIDX_DSD64;
+    case DSD_RATE_128: return RATEIDX_DSD128;
+    case DSD_RATE_256: return RATEIDX_DSD256;
+    case DSD_RATE_512: return RATEIDX_DSD512;
+    default:           return -1;
+    }
+}
+
+/* Convert rate_map output index to DSD rate. Returns 0 for non-DSD outputs. */
+static inline uint32_t rate_out_to_dsd(uint8_t out_idx) {
+    switch (out_idx) {
+    case RATE_OUT_DSD64:  return DSD_RATE_64;
+    case RATE_OUT_DSD128: return DSD_RATE_128;
+    case RATE_OUT_DSD256: return DSD_RATE_256;
+    case RATE_OUT_DSD512: return DSD_RATE_512;
+    default:              return 0;
+    }
+}
+
+/* Convert rate_map output index to PCM rate. Returns 0 for non-PCM outputs. */
+static inline uint32_t rate_out_to_pcm(uint8_t out_idx) {
+    switch (out_idx) {
+    case RATE_OUT_PCM44:  return 44100;
+    case RATE_OUT_PCM88:  return 88200;
+    case RATE_OUT_PCM176: return 176400;
+    case RATE_OUT_PCM352: return 352800;
+    default:              return 0;
+    }
+}
+
+/* Convert rate_map output index to sample rate (DSD or PCM). Returns 0 for bypass. */
+static inline uint32_t rate_out_to_hz(uint8_t out_idx) {
+    uint32_t r = rate_out_to_dsd(out_idx);
+    return r ? r : rate_out_to_pcm(out_idx);
+}
+
+static inline bool rate_out_is_dsd(uint8_t out_idx) {
+    return out_idx >= RATE_OUT_DSD64 && out_idx <= RATE_OUT_DSD512;
+}
+
+static inline bool rate_out_is_pcm(uint8_t out_idx) {
+    return out_idx >= RATE_OUT_PCM44 && out_idx <= RATE_OUT_PCM352;
+}
+
+/* Convert DSD rate to rate_map output index. Returns RATE_OUT_BYPASS if unknown. */
+static inline uint8_t dsd_to_rate_out(uint32_t dsd_rate) {
+    switch (dsd_rate) {
+    case DSD_RATE_64:  return RATE_OUT_DSD64;
+    case DSD_RATE_128: return RATE_OUT_DSD128;
+    case DSD_RATE_256: return RATE_OUT_DSD256;
+    case DSD_RATE_512: return RATE_OUT_DSD512;
+    default:           return RATE_OUT_BYPASS;
+    }
+}
+
+/* Check if an output is valid for the given input rate index.
+ * Rules:
+ * - 48000-family PCM inputs can only bypass (no DSD rate is power-of-2 ratio)
+ * - 44100-family PCM inputs can convert to DSD only
+ * - DSD inputs can convert to DSD or decimate to PCM (44100-family only) */
+static inline bool rate_map_valid_output(int input_idx, uint8_t output_idx) {
+    if (output_idx == RATE_OUT_BYPASS) return true;
+    if (output_idx >= RATE_OUT_COUNT) return false;
+
+    bool is_pcm_input = (input_idx < RATE_MAP_PCM_COUNT);
+    bool is_48k_family = (input_idx == RATEIDX_48000  || input_idx == RATEIDX_96000 ||
+                          input_idx == RATEIDX_192000 || input_idx == RATEIDX_384000);
+
+    if (is_pcm_input) {
+        if (is_48k_family) return false;  /* 48k family: bypass only */
+        return rate_out_is_dsd(output_idx);  /* 44.1k family: DSD output only */
+    }
+    /* DSD input: DSD or PCM output */
+    return rate_out_is_dsd(output_idx) || rate_out_is_pcm(output_idx);
+}
+
 /* Runtime configuration (populated from property page) */
 typedef struct {
-    uint32_t  fs_in;          /* Input DSD rate */
-    uint32_t  fs_out;         /* Output DSD rate */
+    uint32_t  fs_in;          /* Input rate (set at runtime) */
+    uint32_t  fs_out;         /* Output DSD rate (set at runtime from rate_map) */
     float     gain;           /* Linear volume gain [0.0f - 1.0f] */
     bool      mute;           /* Substitute silence pattern, skip SDM */
     int       trellis_depth;  /* Look-ahead N: 4, 8, 16, or 32 */
@@ -80,11 +202,13 @@ typedef struct {
     int       ccd_mode;       /* 0=Auto (prefer first CCD), 1=All CCDs */
     int       ecore_mode;     /* 0=Auto, 1=Exclude E-cores, 2=E-cores only */
     uint16_t  api_port;       /* REST API port (0=disabled, default 8881) */
-    int       sdm_mode;      /* sdm_mode_t: PreCorr or Trellis */
+    int       sdm_mode;       /* sdm_mode_t: PreCorr or Trellis */
+    uint8_t   rate_map[RATE_MAP_COUNT]; /* Per-input-rate output config */
+    int8_t    rate_ntf[RATE_MAP_COUNT]; /* Per-input-rate NTF override, NTF_AUTO = auto */
 } dsd_config_t;
 
 /* Config serialization version */
-#define DSD_CONFIG_VERSION 5
+#define DSD_CONFIG_VERSION 9
 
 /* Default REST API port */
 #define DSD_DEFAULT_API_PORT 8881
@@ -98,7 +222,7 @@ typedef struct {
 
 static inline void dsd_config_defaults(dsd_config_t *cfg) {
     cfg->fs_in          = 0;  /* determined at runtime */
-    cfg->fs_out         = 0;  /* 0 = same as input */
+    cfg->fs_out         = 0;  /* set at runtime from rate_map */
     cfg->gain           = DSD_DEFAULT_GAIN;
     cfg->mute           = false;
     cfg->trellis_depth  = DSD_DEFAULT_TRELLIS_N;
@@ -115,6 +239,8 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     cfg->ecore_mode     = 0;  /* ECORE_AUTO */
     cfg->api_port       = DSD_DEFAULT_API_PORT;
     cfg->sdm_mode       = SDM_MODE_PRECORR;
+    memset(cfg->rate_map, RATE_OUT_BYPASS, sizeof(cfg->rate_map));
+    memset(cfg->rate_ntf, 0xFF, sizeof(cfg->rate_ntf)); /* NTF_AUTO = -1 = 0xFF */
 }
 
 #endif /* DSD_TYPES_H */

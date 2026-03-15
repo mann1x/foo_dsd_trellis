@@ -101,9 +101,11 @@ void dop_pack(const float *bits, float *pcm24, size_t bit_count) {
                 dsd_bits |= (uint16_t)(1u << b);
         }
 
-        /* Add DoP marker in upper 8 bits */
+        /* Add DoP marker in upper 8 bits, sign-extend 24→32 bit */
         uint8_t marker = (i & 1) ? DOP_MARKER_B : DOP_MARKER_A;
         int32_t val = ((int32_t)marker << 16) | (int32_t)dsd_bits;
+        if (val & 0x800000)
+            val |= (int32_t)0xFF000000;
 
         pcm24[i] = int24_to_float(val);
     }

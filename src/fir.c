@@ -126,6 +126,78 @@ static void ipp_firsr_stage_free(fir_chain_t *chain, int stage_idx) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * DSD-Wide demodulation stage init/free
+ *
+ * Applies the same half-band LP filter at the input DSD rate to convert
+ * 1-bit ±1.0 into multi-bit "DSD-Wide" before rate conversion.
+ * This suppresses the massive out-of-band noise that otherwise creates
+ * un-filterable spectral images during zero-stuff upsampling.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static int ipp_firsr_demod_init(fir_chain_t *chain) {
+    double hd[IPP_HB_NTAPS];
+    design_halfband_kaiser(hd, IPP_HB_NTAPS, IPP_HB_KAISER_BETA);
+
+    Ipp32f taps[IPP_HB_NTAPS];
+    for (int i = 0; i < IPP_HB_NTAPS; i++)
+        taps[i] = (Ipp32f)hd[i];
+
+    int specSize = 0, bufSize = 0;
+    IppStatus st = ippsFIRSRGetSize(IPP_HB_NTAPS, ipp32f, &specSize, &bufSize);
+    if (st != ippStsNoErr)
+        return -1;
+
+    IppsFIRSpec_32f *spec = (IppsFIRSpec_32f *)ippsMalloc_8u(specSize);
+    if (!spec)
+        return -1;
+
+    st = ippsFIRSRInit_32f(taps, IPP_HB_NTAPS, ippAlgDirect, spec);
+    if (st != ippStsNoErr) {
+        ippsFree(spec);
+        return -1;
+    }
+
+    Ipp8u *buf = ippsMalloc_8u(bufSize);
+    if (!buf) {
+        ippsFree(spec);
+        return -1;
+    }
+
+    int dlyLen = IPP_HB_NTAPS - 1;
+    Ipp32f *dly = ippsMalloc_32f(dlyLen);
+    if (!dly) {
+        ippsFree(buf);
+        ippsFree(spec);
+        return -1;
+    }
+    ippsZero_32f(dly, dlyLen);
+
+    chain->demod_spec = spec;
+    chain->demod_buf = buf;
+    chain->demod_dly = dly;
+    return 0;
+}
+
+static void ipp_firsr_demod_free(fir_chain_t *chain) {
+    if (chain->demod_spec) { ippsFree(chain->demod_spec); chain->demod_spec = NULL; }
+    if (chain->demod_buf)  { ippsFree(chain->demod_buf);  chain->demod_buf = NULL; }
+    if (chain->demod_dly)  { ippsFree(chain->demod_dly);  chain->demod_dly = NULL; }
+    if (chain->demod_tmp)  { ippsFree(chain->demod_tmp);  chain->demod_tmp = NULL; }
+    chain->demod_tmp_sz = 0;
+    chain->has_demod = false;
+}
+
+static int ensure_demod_tmp(fir_chain_t *chain, size_t need) {
+    if (chain->demod_tmp_sz >= need)
+        return 0;
+    if (chain->demod_tmp)
+        ippsFree(chain->demod_tmp);
+    chain->demod_tmp = ippsMalloc_32f((int)need);
+    chain->demod_tmp_sz = chain->demod_tmp ? need : 0;
+    return chain->demod_tmp ? 0 : -1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  * Zero-stuff temp buffer
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -252,6 +324,10 @@ int fir_chain_init(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out) {
         }
     }
 
+    /* DSD-Wide demod disabled: the unfiltered DSD noise acts as natural
+     * dithering for the SDM re-encoder, producing better end-to-end SINAD
+     * than pre-filtered (demod) input despite worse FIR-only SINAD. */
+
     return 0;
 }
 
@@ -263,12 +339,24 @@ size_t fir_chain_process(fir_chain_t *chain,
         return in_count;
     }
 
-    /* Single stage: direct in → out */
+    /* DSD-Wide demod: LP filter at input rate to convert 1-bit → multi-bit */
+    const float *rate_in = in;
+    if (chain->has_demod) {
+        if (ensure_demod_tmp(chain, in_count) != 0)
+            return 0;
+        ippsFIRSR_32f(in, chain->demod_tmp, (int)in_count,
+                       (IppsFIRSpec_32f *)chain->demod_spec,
+                       chain->demod_dly, chain->demod_dly,
+                       (Ipp8u *)chain->demod_buf);
+        rate_in = chain->demod_tmp;
+    }
+
+    /* Single stage: direct rate_in → out */
     if (chain->num_stages == 1) {
         if (chain->upsample)
-            return ipp_upsample2(chain, 0, in, out, in_count);
+            return ipp_upsample2(chain, 0, rate_in, out, in_count);
         else
-            return ipp_downsample2(chain, 0, in, out, in_count);
+            return ipp_downsample2(chain, 0, rate_in, out, in_count);
     }
 
     /* Multi-stage: ping-pong between scratch and out */
@@ -282,7 +370,7 @@ size_t fir_chain_process(fir_chain_t *chain,
         return 0;
 
     float *bufs[2] = { out, chain->scratch };
-    const float *src = in;
+    const float *src = rate_in;
     size_t count = in_count;
 
     for (int i = 0; i < chain->num_stages; i++) {
@@ -301,6 +389,9 @@ size_t fir_chain_process(fir_chain_t *chain,
 }
 
 void fir_chain_reset(fir_chain_t *chain) {
+    if (chain->has_demod && chain->demod_dly)
+        ippsZero_32f(chain->demod_dly, chain->ipp_taps_len - 1);
+
     int dlyLen = chain->ipp_taps_len - 1;
     for (int i = 0; i < chain->num_stages; i++) {
         if (chain->ipp_dly[i])
@@ -309,6 +400,8 @@ void fir_chain_reset(fir_chain_t *chain) {
 }
 
 void fir_chain_free(fir_chain_t *chain) {
+    ipp_firsr_demod_free(chain);
+
     for (int i = 0; i < FIR_MAX_STAGES; i++)
         ipp_firsr_stage_free(chain, i);
 

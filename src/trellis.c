@@ -136,7 +136,8 @@ static __forceinline double sdm_filter_calc(const double *s, double *d,
 }
 
 static __forceinline void sdm_filter_calc2(sdm_state_t *src, sdm_state_t *dst,
-                                             const ntf_filter_t *f, double x)
+                                             const ntf_filter_t *f, double x,
+                                             double state_limit)
 {
     const double *a = f->a;
     double v;
@@ -159,6 +160,16 @@ static __forceinline void sdm_filter_calc2(sdm_state_t *src, sdm_state_t *dst,
 
     dst[0].state[0] += 1.0;
     dst[1].state[0] -= 1.0;
+
+    /* SDM limiter: clamp integrator states to prevent overload instability */
+    if (state_limit > 0.0) {
+        for (int i = 0; i < f->order; i++) {
+            if (dst[0].state[i] > state_limit)       dst[0].state[i] = state_limit;
+            else if (dst[0].state[i] < -state_limit)  dst[0].state[i] = -state_limit;
+            if (dst[1].state[i] > state_limit)       dst[1].state[i] = state_limit;
+            else if (dst[1].state[i] < -state_limit)  dst[1].state[i] = -state_limit;
+        }
+    }
 
     dst[0].cost = src->cost + sqr(v + a[0]);
     dst[1].cost = src->cost + sqr(v - a[0]);
@@ -304,6 +315,27 @@ static __forceinline void sdm_step_4x_o8(
     _mm256_storeu_pd(dst3[1].state + 4, out3_hi);
     dst3[0].state[0] += 1.0;
     dst3[1].state[0] -= 1.0;
+
+    /* SDM limiter: clamp integrator states (AVX2 vectorized) */
+    if (p->state_limit > 0.0) {
+        __m256d lim_p = _mm256_set1_pd(p->state_limit);
+        __m256d lim_n = _mm256_set1_pd(-p->state_limit);
+        #define CLAMP_STATE_AVX2(dst_pair) do { \
+            for (int _b = 0; _b < 2; _b++) { \
+                __m256d lo = _mm256_loadu_pd((dst_pair)[_b].state); \
+                __m256d hi = _mm256_loadu_pd((dst_pair)[_b].state + 4); \
+                lo = _mm256_min_pd(_mm256_max_pd(lo, lim_n), lim_p); \
+                hi = _mm256_min_pd(_mm256_max_pd(hi, lim_n), lim_p); \
+                _mm256_storeu_pd((dst_pair)[_b].state, lo); \
+                _mm256_storeu_pd((dst_pair)[_b].state + 4, hi); \
+            } \
+        } while(0)
+        CLAMP_STATE_AVX2(dst0);
+        CLAMP_STATE_AVX2(dst1);
+        CLAMP_STATE_AVX2(dst2);
+        CLAMP_STATE_AVX2(dst3);
+        #undef CLAMP_STATE_AVX2
+    }
 
     /* ── Costs: extract v values and compute per-candidate ── */
     {
@@ -508,7 +540,7 @@ static unsigned sdm_sort_cands(sdm_context_t *p, sdm_trellis_t *st)
 static __forceinline void sdm_step(sdm_context_t *p, sdm_state_t *cur,
                                     sdm_state_t *next, double x)
 {
-    sdm_filter_calc2(cur, next, p->filter, x);
+    sdm_filter_calc2(cur, next, p->filter, x, p->state_limit);
 
     for (int i = 0; i < 2; i++) {
         next[i].path = (cur->path << 1 | (unsigned)i) & p->trellis_mask;
@@ -628,6 +660,7 @@ int sdm_context_init(sdm_context_t *ctx, const ntf_filter_t *filter,
     ctx->trellis_lat = (uint32_t)trellis_lat;
     ctx->trellis_mask = ((uint64_t)1 << trellis_depth) - 1;
     ctx->num_cands = 1;
+    ctx->state_limit = 0.0;  /* 0 = disabled; set by caller if needed */
 
     /* Init history buffer free list */
     for (unsigned i = 0; i < 2u * (unsigned)trellis_cands; i++)
