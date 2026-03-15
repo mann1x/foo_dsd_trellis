@@ -640,6 +640,8 @@ public:
         if (m_state)
             plugin_set_config(m_state, &m_config);
 
+        log_set_enabled(m_config.debug_log);
+
         /* Log version, build hash, and build time */
         trellis_log("DSD Trellis v%s (build %s, %s %s)",
                     BUILD_VERSION, BUILD_GIT_HASH, BUILD_DATE, BUILD_TIME);
@@ -767,6 +769,10 @@ public:
 
         /* Set output rate for this chunk */
         m_config.fs_out = out_rate;
+        if (!m_logged_processing) {
+            trellis_log("rate_map: lookup_rate=%u map_idx=%d out_idx=%u out_rate=%u is_dop=%d gain=%.3f fs_in=%u fs_out=%u",
+                        lookup_rate, map_idx, (unsigned)out_idx, out_rate, is_dop, m_config.gain, m_config.fs_in, m_config.fs_out);
+        }
         plugin_set_config(m_state, &m_config);
 
         m_channels = (int)channels;
@@ -976,6 +982,7 @@ public:
         plugin_flush(m_state);
         m_logged_passthrough = false;
         m_logged_processing = false;
+        m_chunk_count = 0;
     }
 
     double get_latency() override {

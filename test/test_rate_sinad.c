@@ -9,6 +9,7 @@
 #include "../include/trellis.h"
 #include "../include/ntf.h"
 #include "../include/fir.h"
+#include "../include/engine.h"
 #include <math.h>
 
 #ifndef M_PI
@@ -119,13 +120,29 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
         return -999.0;
     }
 
-    size_t est_in_produced = n_in - SINAD_TRELLIS_LAT;
+    /* Query path-adaptive settings (mirrors production engine behavior) */
+    dsd_config_t test_cfg;
+    memset(&test_cfg, 0, sizeof(test_cfg));
+    test_cfg.fs_in = fs_in;
+    test_cfg.fs_out = fs_out;
+    test_cfg.trellis_depth = SINAD_TRELLIS_DEPTH;
+    test_cfg.trellis_cands = SINAD_TRELLIS_CANDS;
+    test_cfg.trellis_lat = SINAD_TRELLIS_LAT;
+
+    engine_path_info_t pi;
+    engine_get_path_info(fs_in, fs_out, NTF_AUTO, SDM_MODE_TRELLIS, &test_cfg, &pi);
+
+    /* Use test-quality cands/lat (path_table values are perf trade-offs) */
+    int cands = SINAD_TRELLIS_CANDS;
+    int lat   = SINAD_TRELLIS_LAT;
+
+    size_t est_in_produced = n_in - (size_t)lat;
     size_t est_fir_out;
     if (fs_out >= fs_in)
         est_fir_out = est_in_produced * (fs_out / fs_in);
     else
         est_fir_out = est_in_produced / (fs_in / fs_out);
-    size_t est_sdm_out = est_fir_out - SINAD_TRELLIS_LAT;
+    size_t est_sdm_out = est_fir_out - (size_t)lat;
     double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm_out);
     size_t dsd_in_count = generate_dsd_sine(fs_in, freq, 0.5, n_in, dsd_in);
 
@@ -148,18 +165,29 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
         return -999.0;
     }
 
-    /* SDM requantize at fs_out */
-    const ntf_filter_t *f_out = ntf_auto_select(fs_out);
+    /* Apply path-adaptive FIR gain */
+    if (pi.fir_gain != 1.0f) {
+        for (size_t i = 0; i < fir_count; i++)
+            fir_buf[i] *= pi.fir_gain;
+    }
+
+    /* SDM requantize at fs_out with path-adaptive NTF/cands/lat */
+    const ntf_filter_t *f_out;
+    if (pi.ntf_filter != NTF_AUTO)
+        f_out = ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, fs_out);
+    else
+        f_out = ntf_auto_select(fs_out);
     if (!f_out) {
         free(dsd_in); free(fir_buf); free(dsd_out);
         return -999.0;
     }
     sdm_context_t sdm;
-    if (sdm_context_init(&sdm, f_out, SINAD_TRELLIS_DEPTH, SINAD_TRELLIS_CANDS,
-                         SINAD_TRELLIS_LAT) != 0) {
+    if (sdm_context_init(&sdm, f_out, SINAD_TRELLIS_DEPTH, cands, lat) != 0) {
         free(dsd_in); free(fir_buf); free(dsd_out);
         return -999.0;
     }
+    if (pi.state_limit > 0.0)
+        sdm.state_limit = pi.state_limit;
     size_t out_count = sdm_process_block(&sdm, fir_buf, dsd_out, fir_count);
     sdm_context_free(&sdm);
 
@@ -173,8 +201,12 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     unsigned rate_in_mult  = fs_in  / 44100;
     unsigned rate_out_mult = fs_out / 44100;
     const char *dir = (fs_out > fs_in) ? "UP" : "DN";
-    printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB\n",
-           rate_in_mult, rate_out_mult, dir, sinad_db);
+    printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB  [%s, gain=%.2f, lim=%s]\n",
+           rate_in_mult, rate_out_mult, dir, sinad_db,
+           pi.ntf_filter != NTF_AUTO ?
+               ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, fs_out)->name : "auto",
+           pi.fir_gain,
+           pi.state_limit > 0.0 ? "on" : "off");
 
     free(dsd_in);
     free(fir_buf);
@@ -257,6 +289,223 @@ static void test_sinad_dn_512_256(void) {
     double sinad = measure_rate_sinad(DSD_RATE_512, DSD_RATE_256);
     TEST_ASSERT_TRUE(sinad > 50.0,
                      "DSD512->DSD256 SINAD should exceed 50 dB");
+}
+
+/* ─── DSD → PCM decimation tests (FIR only, no SDM) ─── */
+
+static double measure_dsd_to_pcm_sinad(uint32_t dsd_rate, uint32_t pcm_rate) {
+    unsigned mult_in = dsd_rate / 44100;
+    size_t n_in;
+    if (mult_in <= 64)       n_in = 262144;
+    else if (mult_in <= 128) n_in = 524288;
+    else if (mult_in <= 256) n_in = 1048576;
+    else                     n_in = 2097152;
+
+    uint32_t ratio = dsd_rate / pcm_rate;
+    /* fir_chain_process uses out buffer for intermediate stages (ping-pong),
+     * so it must be large enough for the first intermediate result (n_in/2) */
+    size_t max_out = n_in / 2 + 4096;
+
+    float *dsd_in  = (float *)malloc(n_in * sizeof(float));
+    float *pcm_out = (float *)malloc(max_out * sizeof(float));
+    if (!dsd_in || !pcm_out) {
+        free(dsd_in); free(pcm_out);
+        return -999.0;
+    }
+
+    /* Skip FIR startup transient: 63-tap filter × num_stages × 2 (safety margin)
+     * at the output rate */
+    size_t fir_stages = 0;
+    { uint32_t r = ratio; while (r > 1) { fir_stages++; r >>= 1; } }
+    size_t skip = IPP_HB_NTAPS * fir_stages * 2;
+
+    size_t est_in_produced = n_in - SINAD_TRELLIS_LAT;
+    size_t est_pcm_out = est_in_produced / ratio;
+    size_t est_measured = (est_pcm_out > skip) ? est_pcm_out - skip : est_pcm_out;
+    double freq = bin_align_freq(1000.0, (double)pcm_rate, est_measured);
+
+    size_t dsd_in_count = generate_dsd_sine(dsd_rate, freq, 0.5, n_in, dsd_in);
+    if (dsd_in_count < 1024) {
+        free(dsd_in); free(pcm_out);
+        return -999.0;
+    }
+
+    /* FIR decimation (no SDM — output is multi-bit PCM) */
+    fir_chain_t fir;
+    if (fir_chain_init(&fir, dsd_rate, pcm_rate) != 0) {
+        free(dsd_in); free(pcm_out);
+        return -999.0;
+    }
+    size_t pcm_count = fir_chain_process(&fir, dsd_in, pcm_out, dsd_in_count);
+    fir_chain_free(&fir);
+
+    if (pcm_count <= skip + 1024) {
+        free(dsd_in); free(pcm_out);
+        return -999.0;
+    }
+
+    /* Measure on steady-state portion (skip startup transient) */
+    float *meas_ptr = pcm_out + skip;
+    size_t meas_count = pcm_count - skip;
+
+    float mn = meas_ptr[0], mx = meas_ptr[0];
+    for (size_t i = 0; i < meas_count; i++) {
+        if (meas_ptr[i] < mn) mn = meas_ptr[i];
+        if (meas_ptr[i] > mx) mx = meas_ptr[i];
+    }
+
+    double sig_pwr = goertzel_power(meas_ptr, meas_count, freq, (double)pcm_rate);
+    double pcm_amp = sqrt(sig_pwr * 4.0);
+    double sinad_db = measure_sinad(meas_ptr, meas_count, freq, (double)pcm_rate);
+
+    unsigned rate_mult = dsd_rate / 44100;
+    printf("    [SINAD] DSD%u->PCM%u: SINAD=%.1f dB  [%ux, n=%zu, skip=%zu, amp=%.4f, range=[%.4f,%.4f]]\n",
+           rate_mult, pcm_rate, sinad_db, ratio, meas_count, skip, pcm_amp, mn, mx);
+
+    free(dsd_in);
+    free(pcm_out);
+    return sinad_db;
+}
+
+static void test_sinad_dsd64_pcm44(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD_RATE_64, 44100);
+    TEST_ASSERT_TRUE(sinad > 90.0, "DSD64->PCM44 SINAD should exceed 90 dB");
+}
+
+static void test_sinad_dsd64_pcm88(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD_RATE_64, 88200);
+    TEST_ASSERT_TRUE(sinad > 90.0, "DSD64->PCM88 SINAD should exceed 90 dB");
+}
+
+static void test_sinad_dsd64_pcm176(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD_RATE_64, 176400);
+    TEST_ASSERT_TRUE(sinad > 85.0, "DSD64->PCM176 SINAD should exceed 85 dB");
+}
+
+static void test_sinad_dsd128_pcm44(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD_RATE_128, 44100);
+    TEST_ASSERT_TRUE(sinad > 100.0, "DSD128->PCM44 SINAD should exceed 100 dB");
+}
+
+static void test_sinad_dsd128_pcm88(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD_RATE_128, 88200);
+    TEST_ASSERT_TRUE(sinad > 100.0, "DSD128->PCM88 SINAD should exceed 100 dB");
+}
+
+static void test_sinad_dsd128_pcm176(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD_RATE_128, 176400);
+    TEST_ASSERT_TRUE(sinad > 90.0, "DSD128->PCM176 SINAD should exceed 90 dB");
+}
+
+static void test_sinad_dsd256_pcm44(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD_RATE_256, 44100);
+    TEST_ASSERT_TRUE(sinad > 100.0, "DSD256->PCM44 SINAD should exceed 100 dB");
+}
+
+static void test_sinad_dsd256_pcm88(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD_RATE_256, 88200);
+    TEST_ASSERT_TRUE(sinad > 100.0, "DSD256->PCM88 SINAD should exceed 100 dB");
+}
+
+static void test_sinad_dsd256_pcm176(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD_RATE_256, 176400);
+    TEST_ASSERT_TRUE(sinad > 100.0, "DSD256->PCM176 SINAD should exceed 100 dB");
+}
+
+static void test_sinad_dsd512_pcm44(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD_RATE_512, 44100);
+    TEST_ASSERT_TRUE(sinad > 100.0, "DSD512->PCM44 SINAD should exceed 100 dB");
+}
+
+static void test_sinad_dsd512_pcm88(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD_RATE_512, 88200);
+    TEST_ASSERT_TRUE(sinad > 100.0, "DSD512->PCM88 SINAD should exceed 100 dB");
+}
+
+static void test_sinad_dsd512_pcm176(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD_RATE_512, 176400);
+    TEST_ASSERT_TRUE(sinad > 100.0, "DSD512->PCM176 SINAD should exceed 100 dB");
+}
+
+static void test_sinad_dsd512_pcm352(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD_RATE_512, 352800);
+    TEST_ASSERT_TRUE(sinad > 100.0, "DSD512->PCM352 SINAD should exceed 100 dB");
+}
+
+/* ─── Diagnostic: PCM sine through FIR decimation (control test) ─── */
+
+static void test_diag_pcm_fir_control(void) {
+    printf("\n    --- PCM sine through FIR decimation (control) ---\n");
+
+    /* Generate a pure multi-bit PCM sine at DSD64 rate, decimate to PCM44100 */
+    uint32_t fs_in = DSD_RATE_64;   /* 2822400 */
+    uint32_t fs_out = 44100;
+    uint32_t ratio = fs_in / fs_out; /* 64 */
+    size_t n_in = 262144;
+    size_t max_out = n_in / 2 + 4096;
+
+    float *pcm_in  = (float *)malloc(n_in * sizeof(float));
+    float *pcm_out = (float *)malloc(max_out * sizeof(float));
+    if (!pcm_in || !pcm_out) { free(pcm_in); free(pcm_out); return; }
+
+    size_t est_out = n_in / ratio;
+    double freq = bin_align_freq(1000.0, (double)fs_out, est_out);
+
+    /* Skip FIR startup transient */
+    size_t skip = IPP_HB_NTAPS * 6 * 2;  /* 6 stages, safety margin */
+    size_t est_measured = est_out > skip ? est_out - skip : est_out;
+    freq = bin_align_freq(1000.0, (double)fs_out, est_measured);
+
+    /* Generate multi-bit sine (NOT ±1.0 DSD) at the DSD rate */
+    for (size_t i = 0; i < n_in; i++)
+        pcm_in[i] = (float)(0.5 * sin(2.0 * M_PI * freq * (double)i / (double)fs_in));
+
+    /* FIR decimate */
+    fir_chain_t fir;
+    fir_chain_init(&fir, fs_in, fs_out);
+    size_t out_count = fir_chain_process(&fir, pcm_in, pcm_out, n_in);
+    fir_chain_free(&fir);
+
+    /* Measure on steady-state portion */
+    float *meas = pcm_out + skip;
+    size_t meas_n = out_count - skip;
+    double out_sig = goertzel_power(meas, meas_n, freq, (double)fs_out);
+    double out_amp = sqrt(out_sig * 4.0);
+    double sinad = measure_sinad(meas, meas_n, freq, (double)fs_out);
+
+    printf("    PCM sine 2822400->44100: out_amp=%.4f, SINAD=%.1f dB (no-skip: %.1f dB), n=%zu, skip=%zu\n",
+           out_amp, sinad,
+           measure_sinad(pcm_out, out_count, freq, (double)fs_out),
+           meas_n, skip);
+
+    /* Also test single-stage: 88200 -> 44100 */
+    size_t n_in2 = 262144;
+    float *pcm_in2 = (float *)malloc(n_in2 * sizeof(float));
+    float *pcm_out2 = (float *)malloc((n_in2 / 2 + 4096) * sizeof(float));
+    if (pcm_in2 && pcm_out2) {
+        size_t skip2 = IPP_HB_NTAPS * 2;  /* 1 stage */
+        size_t est2 = n_in2 / 2 - skip2;
+        double freq2 = bin_align_freq(1000.0, 44100.0, est2);
+        for (size_t i = 0; i < n_in2; i++)
+            pcm_in2[i] = (float)(0.5 * sin(2.0 * M_PI * freq2 * (double)i / 88200.0));
+
+        fir_chain_t fir2;
+        fir_chain_init(&fir2, 88200, 44100);
+        size_t out_count2 = fir_chain_process(&fir2, pcm_in2, pcm_out2, n_in2);
+        fir_chain_free(&fir2);
+
+        float *meas2 = pcm_out2 + skip2;
+        size_t meas_n2 = out_count2 - skip2;
+        double sinad2 = measure_sinad(meas2, meas_n2, freq2, 44100.0);
+
+        printf("    PCM sine 88200->44100: SINAD=%.1f dB (no-skip: %.1f dB), n=%zu\n",
+               sinad2,
+               measure_sinad(pcm_out2, out_count2, freq2, 44100.0),
+               meas_n2);
+    }
+
+    free(pcm_in); free(pcm_out); free(pcm_in2); free(pcm_out2);
+    TEST_ASSERT_TRUE(1, "PCM FIR control diagnostic completed");
 }
 
 /* ─── Diagnostic: FIR-only SINAD (no SDM re-encode) ─── */
@@ -848,6 +1097,136 @@ static void test_cands_latency_sweep(void) {
     TEST_ASSERT_TRUE(1, "Candidates x latency sweep completed");
 }
 
+/* ─── Diagnostic: input gain + limiter effect on problem paths ─── */
+
+static double measure_rate_sinad_gain_limit(uint32_t fs_in, uint32_t fs_out,
+                                              ntf_filter_id_t filter_id,
+                                              float input_gain,
+                                              double state_limit) {
+    unsigned mult_in = fs_in / 44100;
+    size_t n_in;
+    if (mult_in <= 64)       n_in = 262144;
+    else if (mult_in <= 128) n_in = 524288;
+    else if (mult_in <= 256) n_in = 1048576;
+    else                     n_in = 2097152;
+
+    size_t max_out;
+    if (fs_out >= fs_in)
+        max_out = n_in * (fs_out / fs_in) + 4096;
+    else
+        max_out = n_in / 2 + 4096;
+
+    float *dsd_in  = (float *)malloc(n_in * sizeof(float));
+    float *fir_buf = (float *)malloc(max_out * sizeof(float));
+    float *dsd_out = (float *)malloc(max_out * sizeof(float));
+    if (!dsd_in || !fir_buf || !dsd_out) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+
+    size_t est_in_produced = n_in - SINAD_TRELLIS_LAT;
+    size_t est_fir_out;
+    if (fs_out >= fs_in)
+        est_fir_out = est_in_produced * (fs_out / fs_in);
+    else
+        est_fir_out = est_in_produced / (fs_in / fs_out);
+    size_t est_sdm_out = est_fir_out - SINAD_TRELLIS_LAT;
+    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm_out);
+    size_t dsd_in_count = generate_dsd_sine(fs_in, freq, 0.5, n_in, dsd_in);
+
+    if (dsd_in_count < 1024) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+
+    fir_chain_t fir;
+    if (fir_chain_init(&fir, fs_in, fs_out) != 0) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+    size_t fir_count = fir_chain_process(&fir, dsd_in, fir_buf, dsd_in_count);
+    fir_chain_free(&fir);
+
+    if (fir_count < 1024) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+
+    /* Apply input gain to FIR output */
+    if (input_gain != 1.0f) {
+        for (size_t i = 0; i < fir_count; i++)
+            fir_buf[i] *= input_gain;
+    }
+
+    const ntf_filter_t *f_out = ntf_get_filter(filter_id, fs_out);
+    if (!f_out) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+    sdm_context_t sdm;
+    if (sdm_context_init(&sdm, f_out, SINAD_TRELLIS_DEPTH, SINAD_TRELLIS_CANDS,
+                         SINAD_TRELLIS_LAT) != 0) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+    sdm.state_limit = state_limit;
+    size_t out_count = sdm_process_block(&sdm, fir_buf, dsd_out, fir_count);
+    sdm_context_free(&sdm);
+
+    if (out_count < 1024) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+
+    double sinad_db = measure_sinad(dsd_out, out_count, freq, (double)fs_out);
+    free(dsd_in); free(fir_buf); free(dsd_out);
+    return sinad_db;
+}
+
+static void test_diag_gain_limiter(void) {
+    typedef struct {
+        uint32_t fs_in, fs_out;
+        const char *name;
+    } path_t;
+
+    static const path_t paths[] = {
+        { DSD_RATE_64,  DSD_RATE_128, "DSD64->128"  },
+        { DSD_RATE_64,  DSD_RATE_256, "DSD64->256"  },
+        { DSD_RATE_64,  DSD_RATE_512, "DSD64->512"  },
+        { DSD_RATE_128, DSD_RATE_256, "DSD128->256" },
+        { DSD_RATE_128, DSD_RATE_512, "DSD128->512" },
+        { DSD_RATE_256, DSD_RATE_512, "DSD256->512" },
+    };
+    int n_paths = sizeof(paths) / sizeof(paths[0]);
+
+    static const float gains[] = { 1.0f, 0.5f, 0.25f };
+    static const double limits[] = { 0.0, 10.0 };
+    static const ntf_filter_id_t filters[] = { NTF_CLANS_6, NTF_CLANS_8 };
+    static const char *fnames[] = { "CLANS6", "CLANS8" };
+
+    printf("\n    --- Input Gain × Limiter × NTF diagnostic ---\n");
+
+    for (int p = 0; p < n_paths; p++) {
+        printf("\n    %s:\n", paths[p].name);
+        printf("    %-7s %-5s %-5s  SINAD\n", "Filter", "Gain", "Limit");
+
+        for (int f = 0; f < 2; f++) {
+            for (int g = 0; g < 3; g++) {
+                for (int l = 0; l < 2; l++) {
+                    double sinad = measure_rate_sinad_gain_limit(
+                        paths[p].fs_in, paths[p].fs_out,
+                        filters[f], gains[g], limits[l]);
+                    printf("    %-7s %-5.2f %-5s  %.1f dB\n",
+                           fnames[f], gains[g],
+                           limits[l] == 0.0 ? "off" : "10.0",
+                           sinad);
+                }
+            }
+        }
+    }
+    TEST_ASSERT_TRUE(1, "Gain/limiter diagnostic completed");
+}
+
 /* ─── Suites ─── */
 
 void test_rate_sinad_suite(void) {
@@ -865,12 +1244,27 @@ void test_rate_sinad_suite(void) {
     TEST_RUN(test_sinad_dn_256_128);
     TEST_RUN(test_sinad_dn_512_128);
     TEST_RUN(test_sinad_dn_512_256);
+    TEST_RUN(test_sinad_dsd64_pcm44);
+    TEST_RUN(test_sinad_dsd64_pcm88);
+    TEST_RUN(test_sinad_dsd64_pcm176);
+    TEST_RUN(test_sinad_dsd128_pcm44);
+    TEST_RUN(test_sinad_dsd128_pcm88);
+    TEST_RUN(test_sinad_dsd128_pcm176);
+    TEST_RUN(test_sinad_dsd256_pcm44);
+    TEST_RUN(test_sinad_dsd256_pcm88);
+    TEST_RUN(test_sinad_dsd256_pcm176);
+    TEST_RUN(test_sinad_dsd512_pcm44);
+    TEST_RUN(test_sinad_dsd512_pcm88);
+    TEST_RUN(test_sinad_dsd512_pcm176);
+    TEST_RUN(test_sinad_dsd512_pcm352);
 }
 
 void test_rate_sweep_suite(void) {
     TEST_SUITE("Rate Conversion Sweep");
 
+    TEST_RUN(test_diag_pcm_fir_control);
     TEST_RUN(test_diag_fir_only);
+    TEST_RUN(test_diag_gain_limiter);
     TEST_RUN(test_diag_limiter_sweep);
     TEST_RUN(test_comprehensive_ntf_limiter_sweep);
     TEST_RUN(test_cands_latency_sweep);

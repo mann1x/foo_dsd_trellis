@@ -234,7 +234,14 @@ size_t precorr_process_block(precorr_context_t *ctx,
         /* Greedy quantize */
         float y = (v >= 0.0f) ? 1.0f : -1.0f;
 
-        /* Update NTF state */
+        /* Update NTF state (with optional integrator limiting) */
+        if (ctx->state_limit > 0.0f) {
+            float lim = ctx->state_limit;
+            for (int k = 0; k < order; k++) {
+                if (d[k] > lim) d[k] = lim;
+                else if (d[k] < -lim) d[k] = -lim;
+            }
+        }
         memcpy(ctx->state, d, (size_t)order * sizeof(float));
 
         /* Apply prediction correction and re-quantize */

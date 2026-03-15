@@ -40,6 +40,7 @@ typedef struct {
     uint8_t history;                   /* 8-bit output history register */
     int     phase;                     /* Phase counter 0-7 */
     float   prev_y;                    /* Previous output for NTF feedback */
+    float   state_limit;               /* Integrator state clamp (0 = disabled) */
     const ntf_filter_t *filter;        /* Reference for reset */
 } precorr_context_t;
 

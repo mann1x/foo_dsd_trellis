@@ -54,9 +54,9 @@ Thread pool (`threadpool.c`) provides per-channel parallelism with MMCSS "Pro Au
 
 **Generation**: The test signal is encoded to DSD at the input rate using a Trellis SDM (depth=8, candidates=16, latency=512) with the auto-selected NTF filter for that rate. This produces a 1-bit DSD representation of the sine wave.
 
-**Processing pipeline** (for rate conversion tests): DSD encode at `fs_in` → FIR rate conversion (63-tap Kaiser half-band, beta=12) → SDM re-encode at `fs_out`. The FIR performs zero-stuff + lowpass (upsample) or lowpass + decimate (downsample), chained for multi-stage conversions (e.g., 8x = three 2x stages).
+**Processing pipeline** (for rate conversion tests): DSD encode at `fs_in` → FIR rate conversion (63-tap Kaiser half-band, beta=12) → SDM re-encode at `fs_out`. For DSD-to-PCM tests: DSD encode → FIR decimation only (no SDM re-encode, output is multi-bit float32 PCM). The FIR performs zero-stuff + lowpass (upsample) or lowpass + decimate (downsample), chained for multi-stage conversions (e.g., 64x = six 2x stages).
 
-**Measurement**: Goertzel algorithm on the output DSD stream. Signal power is measured at the test frequency bin. Noise power is the sum of all DFT bins from DC to 22,050 Hz (audio band), excluding the signal bin ±1 neighbour. SINAD = 10 × log10(signal_power / noise_power).
+**Measurement**: Goertzel algorithm on the output stream. Signal power is measured at the test frequency bin. Noise power is the sum of all DFT bins from DC to 22,050 Hz (audio band), excluding the signal bin ±1 neighbour. SINAD = 10 × log10(signal_power / noise_power). For DSD-to-PCM tests, the FIR startup transient is skipped before measurement.
 
 **Sample counts**: 262,144 samples (DSD64), 524,288 (DSD128), 1,048,576 (DSD256), 2,097,152 (DSD512) — approximately 93 ms of audio at each rate.
 
@@ -86,31 +86,61 @@ Greedy quantiser with trained prediction table. Near-zero CPU (~0.01x realtime).
 
 ### DSD Rate Conversion — Path-Adaptive Tuning
 
-Rate conversion SINAD depends heavily on the combination of NTF filter, integrator limiter, trellis candidates, and latency. A comprehensive sweep (1,152 measurements across 12 paths × 10 filters × 8 limiter values × 4 candidate counts × 4 latencies) identified the optimal configuration per path. These are applied automatically when `NTF filter = Auto`.
+Rate conversion SINAD depends on the combination of NTF filter, FIR output gain, and integrator limiter. FIR upsampling of ±1.0 DSD produces peaks at ±2.24 due to broadband noise energy, overloading the SDM quantizer. Path-adaptive `fir_gain` attenuates the FIR output to keep the signal within the SDM's linear operating range.
 
-**Optimal configuration per rate conversion path:**
+Settings are applied automatically when `NTF filter = Auto`. Measured with trellis depth=8, candidates=16, latency=512.
 
-| Conversion | NTF Filter | Limiter | Cands | Latency | SINAD (dB) |
-|------------|------------|---------|-------|---------|------------|
-| DSD64 -> DSD128 | CLANS-6 | off | 8 | 256 | 97.6 |
-| DSD64 -> DSD256 | SDM-7 | off | 8 | 256 | 80.6 |
-| DSD64 -> DSD512 | SDM-8 | 10.0 | 8 | 256 | 54.4 |
-| DSD128 -> DSD256 | SDM-4 | 12.0 | 8 | 256 | 113.3 |
-| DSD128 -> DSD512 | CLANS-8 | 12.0 | 8 | 512 | 120.3 |
-| DSD256 -> DSD512 | CLANS-8 | 6.0 | 16 | 512 | 121.0 |
-| DSD128 -> DSD64 | CLANS-4 | off | 32 | 128 | 83.3 |
-| DSD256 -> DSD64 | CLANS-8 | off | 8 | 64 | 92.7 |
-| DSD256 -> DSD128 | CLANS-4 | off | 8 | 256 | 112.0 |
-| DSD512 -> DSD64 | SDM-6 | off | 8 | 256 | 85.5 |
-| DSD512 -> DSD128 | SDM-4 | 16.0 | 16 | 128 | 99.4 |
-| DSD512 -> DSD256 | SDM-6 | 16.0 | 8 | 256 | 116.1 |
+**Upsample paths:**
+
+| Conversion | NTF Filter | FIR Gain | Limiter | SINAD (dB) |
+|------------|------------|----------|---------|------------|
+| DSD64 -> DSD128 | CLANS-8 | 0.50 | off | 102.6 |
+| DSD64 -> DSD256 | SDM-7 | 1.00 | off | 94.0 |
+| DSD64 -> DSD512 | SDM-8 | 0.25 | 10.0 | 90.0 |
+| DSD128 -> DSD256 | CLANS-8 | 1.00 | off | 107.5 |
+| DSD128 -> DSD512 | CLANS-8 | 0.50 | 12.0 | 108.2 |
+| DSD256 -> DSD512 | CLANS-8 | 1.00 | 6.0 | 108.6 |
+
+**Downsample paths:**
+
+| Conversion | NTF Filter | Limiter | SINAD (dB) |
+|------------|------------|---------|------------|
+| DSD128 -> DSD64 | CLANS-4 | off | 80.2 |
+| DSD256 -> DSD64 | CLANS-8 | off | 90.5 |
+| DSD512 -> DSD64 | CLANS-5 | off | 91.2 |
+| DSD256 -> DSD128 | CLANS-4 | off | 112.0 |
+| DSD512 -> DSD128 | CLANS-6 | off | 118.3 |
+| DSD512 -> DSD256 | CLANS-8 | off | 103.0 |
 
 **Key observations:**
-- Downsample paths generally prefer no limiter and lower-order filters (CLANS-4/CLANS-8)
-- Upsample paths benefit from moderate limiters (6-16) to prevent integrator overload from FIR image noise
-- DSD64 -> DSD512 remains limited at ~54 dB due to 3-stage FIR image accumulation
-- Higher-order SDM filters (SDM-8) are unstable without limiters (-37 to -49 dB)
-- Some paths benefit from non-default candidates/latency (e.g., DSD256->DSD64 improves +10 dB with lat=64)
+- FIR gain normalization is critical for upsample paths: DSD64->DSD128 improved from 51.2 to 102.6 dB (+51.4 dB) after adding gain=0.50
+- Downsample paths need no FIR gain attenuation (gain=1.00) and no integrator limiter
+- All 12 paths exceed 80 dB SINAD with path-adaptive settings
+
+### DSD to PCM Decimation
+
+FIR-only decimation (no SDM re-encoding) for DSD-to-PCM conversion. Output is multi-bit float32 PCM. Measured with Goertzel SINAD on the steady-state portion (startup transient skipped).
+
+| Input | Output | Ratio | SINAD (dB) |
+|-------|--------|-------|------------|
+| DSD64 | PCM 44.1k | 64x | 103.7 |
+| DSD64 | PCM 88.2k | 32x | 103.1 |
+| DSD64 | PCM 176.4k | 16x | 93.8 |
+| DSD128 | PCM 44.1k | 128x | 131.8 |
+| DSD128 | PCM 88.2k | 64x | 128.1 |
+| DSD128 | PCM 176.4k | 32x | 103.5 |
+| DSD256 | PCM 44.1k | 256x | 133.9 |
+| DSD256 | PCM 88.2k | 128x | 133.5 |
+| DSD256 | PCM 176.4k | 64x | 133.4 |
+| DSD512 | PCM 44.1k | 512x | 135.6 |
+| DSD512 | PCM 88.2k | 256x | 136.9 |
+| DSD512 | PCM 176.4k | 128x | 136.4 |
+| DSD512 | PCM 352.8k | 64x | 137.1 |
+
+**Key observations:**
+- Higher input DSD rates yield better SINAD (more aggressive noise shaping, lower in-band noise)
+- DSD64->PCM176.4k shows lower SINAD (93.8 dB) because 176.4k's Nyquist (88.2 kHz) reaches into the noise shaping transition region
+- DSD128+ to PCM44.1k/88.2k all exceed 100 dB — well beyond CD quality
 
 ## Module Details
 
@@ -183,7 +213,7 @@ Intel IPP FIRSR-based half-band FIR for power-of-2 DSD rate conversion:
 
 **Downsample 2x:** `ippsFIRSR_32f` -> decimate (keep every other sample)
 
-**Multi-stage chaining:** up to 3 stages (8x ratio) with ping-pong scratch buffers.
+**Multi-stage chaining:** up to 9 stages (512x ratio, e.g., PCM 44.1k → DSD512) with ping-pong scratch buffers.
 
 ### DSD-Wide Volume Control (`engine.c`)
 
@@ -317,7 +347,7 @@ foo_dsd_trellis/
 
 ## Test Results
 
-694 tests across 12 suites, all passing:
+707 tests across 12 suites, all passing:
 
 | Suite | Tag | Tests | Coverage |
 |-------|-----|-------|----------|
@@ -326,12 +356,12 @@ foo_dsd_trellis/
 | FIR | `fir` | 17 | Passband/stopband, round-trip, chain tests |
 | Trellis SDM | `trellis` | 13 | Init, reset, latency, drain, SINAD (4 rates), DC stability |
 | PreCorr SDM | `precorr` | 8 | Init, binary output, no latency, SINAD (4 rates) |
-| Rate Conversion | `rate` | 12 | SINAD for all upsample/downsample pairs |
-| Config | `config` | 8 | Serialization, versioning, validation |
+| Rate Conversion | `rate` | 25 | SINAD for all DSD upsample/downsample pairs + DSD-to-PCM decimation |
+| Config | `config` | 14 | Serialization, versioning, validation, rate/NTF maps |
 | CPU & IPP | `simd` | 5 | CPU detection, IPP kernel, FIR correctness |
-| Hardening | `hardening` | 22 | Edge cases, robustness |
+| Hardening | `hardening` | 24 | Edge cases, robustness |
 | Thread Pool | `threadpool` | 8 | Create/destroy, concurrent SDM, stress |
-| Rate Conv Sweep | `sweep` | 4 | FIR-only SINAD, limiter sweep, NTF×limiter sweep, cands×lat sweep (extended) |
+| Rate Conv Sweep | `sweep` | 5 | FIR-only SINAD, PCM control, limiter sweep, NTF×limiter sweep, cands×lat sweep (extended) |
 | SINAD Diagnostics | `diag` | 7 | NTF sweeps, warmup analysis (extended) |
 
 ## References

@@ -28,6 +28,7 @@ typedef struct {
     float           *fir_buf;    /* Post-FIR intermediate buffer */
     size_t           fir_buf_sz; /* Allocated size of fir_buf */
     int              channel;    /* Channel index (0=L, 1=R, ...) */
+    float            fir_gain;   /* FIR output attenuation (path-adaptive) */
     int              sdm_mode;   /* Cached sdm_mode_t for dispatch */
     bool             passthrough;/* true if no processing needed */
     bool             fir_only;   /* true for DSD→PCM decimation (no SDM) */
@@ -100,6 +101,7 @@ typedef struct {
     int  lat;           /* Trellis latency */
     int  depth;         /* Trellis depth */
     double state_limit; /* State limiter (0 = disabled) */
+    float fir_gain;     /* FIR output gain (1.0 = no attenuation) */
     int  fir_stages;    /* Number of FIR 2x stages */
     bool fir_only;      /* True if FIR decimation only (DSD→PCM) */
 } engine_path_info_t;

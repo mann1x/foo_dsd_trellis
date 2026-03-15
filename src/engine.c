@@ -22,23 +22,29 @@ typedef struct {
     double          state_limit;  /* 0.0 = disabled */
     int             cands;
     int             lat;
+    float           fir_gain;     /* FIR output gain (attenuate to prevent SDM overload) */
 } path_config_t;
 
+/* Optimal per-path configuration derived from comprehensive NTF × limiter × gain sweep.
+ * FIR upsampling of ±1.0 DSD produces peaks at ±2.24 due to broadband noise energy.
+ * Multi-stage upsampling concentrates this noise in the low-frequency region,
+ * overloading the SDM quantizer (output ±1.0). fir_gain attenuates the FIR output
+ * to keep the signal within the SDM's linear operating range. */
 static const path_config_t path_table[] = {
-    /* Upsample paths */
-    { DSD_RATE_64,  DSD_RATE_128, NTF_CLANS_6, 0.0,  8,  256 },
-    { DSD_RATE_64,  DSD_RATE_256, NTF_SDM_7,   0.0,  8,  256 },
-    { DSD_RATE_64,  DSD_RATE_512, NTF_SDM_8,   10.0, 8,  256 },
-    { DSD_RATE_128, DSD_RATE_256, NTF_SDM_4,   12.0, 8,  256 },
-    { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_8, 12.0, 8,  512 },
-    { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  16, 512 },
-    /* Downsample paths */
-    { DSD_RATE_128, DSD_RATE_64,  NTF_CLANS_4, 0.0,  32, 128 },
-    { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  64  },
-    { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_4, 0.0,  8,  256 },
-    { DSD_RATE_512, DSD_RATE_64,  NTF_SDM_6,   0.0,  8,  256 },
-    { DSD_RATE_512, DSD_RATE_128, NTF_SDM_4,   16.0, 16, 128 },
-    { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,   16.0, 8,  256 },
+    /* Upsample paths (fir_gain < 1.0 where SDM overload was observed) */
+    { DSD_RATE_64,  DSD_RATE_128, NTF_CLANS_8, 0.0,  8,  256, 0.5f  },
+    { DSD_RATE_64,  DSD_RATE_256, NTF_SDM_7,   0.0,  8,  256, 1.0f  },
+    { DSD_RATE_64,  DSD_RATE_512, NTF_SDM_8,   10.0, 8,  256, 0.25f },
+    { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_8, 0.0,  8,  256, 1.0f  },
+    { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_8, 12.0, 8,  512, 0.5f  },
+    { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  16, 512, 1.0f  },
+    /* Downsample paths (FIR output already ≤ ±0.75, no gain reduction needed) */
+    { DSD_RATE_128, DSD_RATE_64,  NTF_CLANS_4, 0.0,  32, 128, 1.0f },
+    { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  64,  1.0f },
+    { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_4, 0.0,  8,  256, 1.0f },
+    { DSD_RATE_512, DSD_RATE_64,  NTF_CLANS_5, 0.0,  8,  256, 1.0f },
+    { DSD_RATE_512, DSD_RATE_128, NTF_CLANS_6, 0.0,  16, 128, 1.0f },
+    { DSD_RATE_512, DSD_RATE_256, NTF_CLANS_8, 0.0,  8,  256, 1.0f },
 };
 
 #define PATH_TABLE_COUNT (sizeof(path_table) / sizeof(path_table[0]))
@@ -62,6 +68,7 @@ int engine_channel_init(engine_channel_t *eng, int channel,
     eng->passthrough = false;
 
     eng->sdm_mode = cfg->sdm_mode;
+    eng->fir_gain = 1.0f;  /* default, may be overridden by path_table */
 
     /* DSD→PCM decimation: FIR only, no SDM */
     eng->fir_only = (fs_out < DSD_RATE_64 && cfg->fs_in >= DSD_RATE_64);
@@ -80,9 +87,10 @@ int engine_channel_init(engine_channel_t *eng, int channel,
         /* Path-adaptive lookup for rate conversion with NTF_AUTO */
         bool is_rate_conv = (cfg->fs_in != fs_out);
         const path_config_t *pc = NULL;
-        if (is_rate_conv && cfg->ntf_filter == NTF_AUTO &&
-            cfg->sdm_mode == SDM_MODE_TRELLIS) {
+        if (is_rate_conv && cfg->ntf_filter == NTF_AUTO) {
             pc = path_config_lookup(cfg->fs_in, fs_out);
+            if (pc)
+                eng->fir_gain = pc->fir_gain;
         }
 
         /* Select NTF filter */
@@ -106,6 +114,10 @@ int engine_channel_init(engine_channel_t *eng, int channel,
         if (cfg->sdm_mode == SDM_MODE_PRECORR) {
             if (precorr_context_init(&eng->precorr, filter) != 0)
                 return -1;
+            if (pc && pc->state_limit > 0.0)
+                eng->precorr.state_limit = (float)pc->state_limit;
+            else if (is_rate_conv)
+                eng->precorr.state_limit = 12.0f;
         } else {
             int cands = pc ? pc->cands : cfg->trellis_cands;
             int lat   = pc ? pc->lat   : cfg->trellis_lat;
@@ -198,10 +210,12 @@ size_t engine_process_block(engine_channel_t *eng,
 
     size_t fir_out = fir_chain_process(&eng->fir, in, eng->fir_buf, count);
 
-    /* Apply gain */
-    if (cfg->gain != 1.0f) {
+    /* Apply FIR output attenuation (path-adaptive SDM overload prevention)
+     * and user gain in a single pass */
+    float combined_gain = eng->fir_gain * cfg->gain;
+    if (combined_gain != 1.0f) {
         for (size_t i = 0; i < fir_out; i++)
-            eng->fir_buf[i] *= cfg->gain;
+            eng->fir_buf[i] *= combined_gain;
     }
 
     /* SDM (PreCorr or Trellis) */
@@ -270,9 +284,10 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
 
     size_t fir_count = fir_chain_process(&eng->fir, in, eng->fir_buf, count);
 
-    if (cfg->gain != 1.0f) {
+    float combined_gain = eng->fir_gain * cfg->gain;
+    if (combined_gain != 1.0f) {
         for (size_t i = 0; i < fir_count; i++)
-            eng->fir_buf[i] *= cfg->gain;
+            eng->fir_buf[i] *= combined_gain;
     }
 
     *fir_out_ptr = eng->fir_buf;
@@ -370,11 +385,13 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
         info->cands = pc->cands;
         info->lat = pc->lat;
         info->state_limit = pc->state_limit;
+        info->fir_gain = pc->fir_gain;
     } else {
         /* Auto-select or user override */
         info->ntf_filter = ntf_override; /* keep NTF_AUTO or user value */
         info->cands = cfg->trellis_cands;
         info->lat = cfg->trellis_lat;
+        info->fir_gain = 1.0f;
     }
 
     return 0;
