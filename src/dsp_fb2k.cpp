@@ -345,7 +345,7 @@ static const GUID g_dsp_guid =
 /* ─── Preset serialization using dsp_preset_builder/parser ─── */
 
 static void make_preset(const dsd_config_t &cfg, dsp_preset &out) {
-    uint8_t buf[128];
+    uint8_t buf[256];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     out.set_owner(g_dsp_guid);
     out.set_data(buf, len);
