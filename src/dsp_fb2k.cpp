@@ -59,6 +59,7 @@ void            plugin_get_phase_timing(const plugin_state_t *s,
 bool            plugin_get_cpuset_change(const plugin_state_t *s, uint64_t *mask);
 int             plugin_get_selected_cores(const plugin_state_t *s,
                                            uint32_t *ids, int max_ids);
+int             plugin_get_stressed_worker(const plugin_state_t *s, double *ratio);
 
 /* Config serialization (config.c) */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size);
@@ -1121,7 +1122,7 @@ public:
                 }
             }
 
-            /* Log periodic timing */
+            /* Log periodic timing + RT stress */
             m_chunk_count++;
             if (g_log_enabled && (m_chunk_count <= 5 || (m_chunk_count % 100) == 0)) {
                 double t_unpack, t_fir, t_sdm, t_pack;
@@ -1130,6 +1131,14 @@ public:
                             m_chunk_count, process_ms,
                             t_unpack, t_fir, t_sdm, t_pack,
                             chunk_ms, ratio);
+
+                /* Log worker RT stress */
+                double stressed_ratio = 0.0;
+                int stressed_idx = plugin_get_stressed_worker(m_state, &stressed_ratio);
+                if (stressed_idx >= 0) {
+                    trellis_log("  WARNING: worker %d stressed (%.0f%% RT budget)",
+                                stressed_idx, stressed_ratio * 100.0);
+                }
             }
 
             /* Push status to REST API */

@@ -109,12 +109,13 @@ static void test_passthrough_preserves_sign(void) {
     size_t n = engine_process_block(&eng, in, out, 128, &cfg);
     TEST_ASSERT_EQ(n, 128u, "passthrough count");
 
-    int match = 1;
+    /* Same-rate DSD re-encodes through boxcar+SDM — output is ±1.0
+     * but not necessarily a simple sign copy of the input. */
+    int binary = 1;
     for (int i = 0; i < 128; i++) {
-        float expected = in[i] >= 0.0f ? 1.0f : -1.0f;
-        if (out[i] != expected) { match = 0; break; }
+        if (out[i] != 1.0f && out[i] != -1.0f) { binary = 0; break; }
     }
-    TEST_ASSERT_TRUE(match, "passthrough should requantise to +/-1.0 by sign");
+    TEST_ASSERT_TRUE(binary, "same-rate re-encode should produce +/-1.0 output");
 
     engine_channel_free(&eng);
 }
@@ -136,11 +137,12 @@ static void test_passthrough_zero_input(void) {
     size_t n = engine_process_block(&eng, in, out, 32, &cfg);
     TEST_ASSERT_EQ(n, 32u, "passthrough zero count");
 
-    int all_pos = 1;
+    /* Same-rate re-encode: zero input through boxcar+SDM produces ±1.0 */
+    int binary = 1;
     for (int i = 0; i < 32; i++) {
-        if (out[i] != 1.0f) { all_pos = 0; break; }
+        if (out[i] != 1.0f && out[i] != -1.0f) { binary = 0; break; }
     }
-    TEST_ASSERT_TRUE(all_pos, "zero input should map to +1.0 in passthrough");
+    TEST_ASSERT_TRUE(binary, "zero input re-encode should produce +/-1.0 output");
 
     engine_channel_free(&eng);
 }

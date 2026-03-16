@@ -143,16 +143,12 @@ size_t engine_process_block(engine_channel_t *eng,
         return count;
     }
 
-    /* Dynamic passthrough / DSD-Wide volume control for same-rate DSD */
+    /* Same-rate DSD: always re-encode through SDM (boxcar → gain → SDM).
+     * Bypass is handled at the rate_map level ("-" = RATE_OUT_BYPASS).
+     * When user explicitly selects same-rate output, they want SDM processing. */
     {
         uint32_t fs_out = cfg->fs_out ? cfg->fs_out : cfg->fs_in;
         if (cfg->fs_in == fs_out) {
-            if (cfg->gain == 1.0f) {
-                /* Sign-only requantise: passthrough */
-                for (size_t i = 0; i < count; i++)
-                    out[i] = in[i] >= 0.0f ? 1.0f : -1.0f;
-                return count;
-            }
             /* DSD-Wide: boxcar smooth ±1.0 → multi-bit, apply gain, re-encode via SDM */
             if (eng->fir_buf_sz < count * sizeof(float)) {
                 free(eng->fir_buf);

@@ -141,16 +141,14 @@ static void test_threadpool_passthrough_concurrent(void) {
     TEST_ASSERT_EQ(blocks[0].out_count, 256u, "L passthrough count");
     TEST_ASSERT_EQ(blocks[1].out_count, 256u, "R passthrough count");
 
-    /* Passthrough sign-requantises: output should be +/-1.0 matching input sign */
-    int match_l = 1, match_r = 1;
+    /* Same-rate re-encode: output should be ±1.0 (binary DSD) */
+    int binary_l = 1, binary_r = 1;
     for (int i = 0; i < 256; i++) {
-        float expected_l = in_l[i] >= 0.0f ? 1.0f : -1.0f;
-        float expected_r = in_r[i] >= 0.0f ? 1.0f : -1.0f;
-        if (out_l[i] != expected_l) match_l = 0;
-        if (out_r[i] != expected_r) match_r = 0;
+        if (out_l[i] != 1.0f && out_l[i] != -1.0f) binary_l = 0;
+        if (out_r[i] != 1.0f && out_r[i] != -1.0f) binary_r = 0;
     }
-    TEST_ASSERT_TRUE(match_l, "L passthrough should preserve sign");
-    TEST_ASSERT_TRUE(match_r, "R passthrough should preserve sign");
+    TEST_ASSERT_TRUE(binary_l, "L same-rate should produce +/-1.0");
+    TEST_ASSERT_TRUE(binary_r, "R same-rate should produce +/-1.0");
 
     engine_channel_free(&eng_l);
     engine_channel_free(&eng_r);

@@ -407,6 +407,13 @@ int plugin_get_selected_cores(const plugin_state_t *s,
     return n;
 }
 
+/* Query RT stress from the threadpool */
+int plugin_get_stressed_worker(const plugin_state_t *s, double *ratio) {
+    if (!s || !s->pool)
+        return -1;
+    return threadpool_get_stressed_thread(s->pool, ratio);
+}
+
 /* Query CPUSET change info for debug logging */
 bool plugin_get_cpuset_change(const plugin_state_t *s, uint64_t *mask) {
     if (!s) {
