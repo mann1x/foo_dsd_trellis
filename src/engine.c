@@ -34,11 +34,11 @@ typedef struct {
 static const path_config_t path_table[] = {
     /*                                            lim  cands lat  depth gain  */
     /* All paths use 0.708 (-3 dB) gain for uniform volume across rates */
-    /* Same-rate re-encode (boxcar → SDM, uses Trellis auto-select NTF) */
-    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  4,  128, 8, 0.708f },
-    { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_6, 0.0,  4,  128, 8, 0.708f },
-    { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_8, 0.0,  4,  256, 8, 0.708f },
-    { DSD_RATE_512, DSD_RATE_512, NTF_CLANS_8, 0.0,  4,  256, 8, 0.708f },
+    /* Same-rate re-encode (boxcar → SDM) */
+    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  4,  256, 8, 0.708f },
+    { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_6, 0.0,  4,  256, 8, 0.708f },
+    { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_8, 0.0,  4,  512, 8, 0.708f },
+    { DSD_RATE_512, DSD_RATE_512, NTF_CLANS_8, 0.0,  4,  512, 8, 0.708f },
     /* Upsample paths */
     { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_4,   0.0,  2,  512, 4, 0.708f },
     { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  512, 4, 0.708f },
@@ -107,13 +107,14 @@ int engine_channel_init(engine_channel_t *eng, int channel,
         if (cfg->fir_gain_db != FIR_GAIN_AUTO)
             eng->fir_gain = fir_gain_db_to_linear(cfg->fir_gain_db);
 
-        /* Select NTF filter */
+        /* Select NTF filter — PreCorr uses its own auto-select even when
+         * path_config exists (path_config NTF is Trellis-optimized) */
         const ntf_filter_t *filter = NULL;
         if (cfg->ntf_filter == NTF_AUTO) {
-            if (pc) {
-                filter = ntf_get_filter(pc->filter, fs_out);
-            } else if (cfg->sdm_mode == SDM_MODE_PRECORR) {
+            if (cfg->sdm_mode == SDM_MODE_PRECORR) {
                 filter = ntf_auto_select_precorr(fs_out);
+            } else if (pc) {
+                filter = ntf_get_filter(pc->filter, fs_out);
             } else {
                 filter = ntf_auto_select(fs_out);
             }

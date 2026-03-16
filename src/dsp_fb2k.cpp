@@ -979,11 +979,6 @@ private:
             if (pi_trellis.state_limit > 0.0)
                 info << ", state limiter: " << pfc::format_float(pi_trellis.state_limit, 0, 1);
 
-            /* Always show Trellis defaults (useful even when PreCorr selected) */
-            info << "\nTrellis defaults: cands=" << pi_trellis.cands
-                 << ", depth=" << pi_trellis.depth
-                 << ", lat=" << pi_trellis.lat;
-
             /* ML filter status */
             bool ml_active = (m_cfg.rate_ml[row] >= 0) ? (m_cfg.rate_ml[row] != 0) : m_cfg.ml_enabled;
             info << "\nML filter: " << (ml_active ? "On" : "Off");
