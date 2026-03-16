@@ -82,12 +82,30 @@ struct threadpool {
     HANDLE       done_event;        /* Signaled when batch complete */
     volatile LONG pending;          /* Items remaining in current batch */
     volatile LONG shutdown;         /* Non-zero = workers should exit */
+
+    /* Per-thread RT stress tracking */
+    double      *last_rt_ratio;     /* [thread_count] last RT ratio per worker */
+    uint32_t    *cpuset_ids;        /* [thread_count] current CPU set IDs */
+    int          cpuset_id_count;
 };
+
+/* SetThreadSelectedCpuSets — loaded dynamically (Windows 10+) */
+typedef BOOL (WINAPI *PFN_SetThreadSelectedCpuSets)(
+    HANDLE Thread, const ULONG *CpuSetIds, ULONG CpuSetIdCount);
+
+/* Per-worker context passed to the thread function */
+typedef struct {
+    threadpool_t *pool;
+    int           thread_index;
+} worker_context_t;
 
 /* ─── Worker thread function ─── */
 
 static DWORD WINAPI worker_func(LPVOID param) {
-    threadpool_t *pool = (threadpool_t *)param;
+    worker_context_t *ctx = (worker_context_t *)param;
+    threadpool_t *pool = ctx->pool;
+    int my_index = ctx->thread_index;
+    free(ctx);  /* context was heap-allocated */
 
     /* Register with MMCSS for real-time audio scheduling */
     HANDLE mmcss_handle = mmcss_register();
@@ -113,7 +131,10 @@ static DWORD WINAPI worker_func(LPVOID param) {
         if (!block)
             continue;
 
-        /* Process the block based on mode */
+        /* Process the block based on mode, with RT headroom measurement */
+        LARGE_INTEGER t_start, t_end, freq;
+        QueryPerformanceCounter(&t_start);
+
         if (block->mode == BLOCK_MODE_SDM) {
             block->out_count = sdm_segment_process(block->sdm_ctx,
                                                      block->in, block->out,
@@ -126,6 +147,28 @@ static DWORD WINAPI worker_func(LPVOID param) {
             block->out_count = engine_process_block(block->eng, block->in,
                                                      block->out, block->count,
                                                      block->cfg);
+        }
+
+        QueryPerformanceCounter(&t_end);
+        QueryPerformanceFrequency(&freq);
+
+        /* Compute RT ratio: how much of the real-time budget was consumed.
+         * audio_duration = out_count / fs_out (seconds)
+         * processing_time = (t_end - t_start) / freq (seconds)
+         * rt_ratio = processing_time / audio_duration
+         * rt_ratio < 1.0 = OK, >= 1.0 = can't keep up */
+        {
+            uint32_t fs_out = block->cfg->fs_out ? block->cfg->fs_out : block->cfg->fs_in;
+            double audio_sec = (fs_out > 0 && block->out_count > 0)
+                ? (double)block->out_count / (double)fs_out
+                : 0.0;
+            double proc_sec = (double)(t_end.QuadPart - t_start.QuadPart) / (double)freq.QuadPart;
+            block->rt_ratio = (audio_sec > 0.0) ? proc_sec / audio_sec : 0.0;
+            block->stressed = (block->rt_ratio > 0.7);
+
+            /* Record per-thread stress for engine to query */
+            if (my_index >= 0 && my_index < pool->thread_count && pool->last_rt_ratio)
+                pool->last_rt_ratio[my_index] = block->rt_ratio;
         }
 
         /* Decrement pending counter; if zero, signal done */
@@ -175,9 +218,12 @@ threadpool_t *threadpool_create(int thread_count, DWORD affinity_mask) {
         return NULL;
     }
 
-    /* Create worker threads */
+    /* Create worker threads + tracking arrays */
     pool->threads = (HANDLE *)calloc((size_t)thread_count, sizeof(HANDLE));
-    if (!pool->threads) {
+    pool->last_rt_ratio = (double *)calloc((size_t)thread_count, sizeof(double));
+    if (!pool->threads || !pool->last_rt_ratio) {
+        free(pool->threads);
+        free(pool->last_rt_ratio);
         CloseHandle(pool->done_event);
         CloseHandle(pool->work_sem);
         DeleteCriticalSection(&pool->queue_cs);
@@ -186,7 +232,11 @@ threadpool_t *threadpool_create(int thread_count, DWORD affinity_mask) {
     }
 
     for (int i = 0; i < thread_count; i++) {
-        pool->threads[i] = CreateThread(NULL, 0, worker_func, pool, 0, NULL);
+        worker_context_t *wctx = (worker_context_t *)malloc(sizeof(worker_context_t));
+        if (!wctx) break;
+        wctx->pool = pool;
+        wctx->thread_index = i;
+        pool->threads[i] = CreateThread(NULL, 0, worker_func, wctx, 0, NULL);
         if (!pool->threads[i]) {
             /* Cleanup already-created threads */
             InterlockedExchange(&pool->shutdown, 1);
@@ -267,6 +317,8 @@ void threadpool_destroy(threadpool_t *pool) {
         CloseHandle(pool->threads[i]);
 
     free(pool->threads);
+    free(pool->last_rt_ratio);
+    free(pool->cpuset_ids);
     CloseHandle(pool->done_event);
     CloseHandle(pool->work_sem);
     DeleteCriticalSection(&pool->queue_cs);
@@ -277,10 +329,49 @@ int threadpool_get_thread_count(threadpool_t *pool) {
     return pool ? pool->thread_count : 0;
 }
 
-/* ─── CPUSET-aware thread pool creation ─── */
+int threadpool_get_stressed_thread(threadpool_t *pool, double *stressed_ratio) {
+    if (!pool || !pool->last_rt_ratio)
+        return -1;
 
-typedef BOOL (WINAPI *PFN_SetThreadSelectedCpuSets2)(
-    HANDLE Thread, const ULONG *CpuSetIds, ULONG CpuSetIdCount);
+    int worst = -1;
+    double worst_ratio = 0.0;
+    for (int i = 0; i < pool->thread_count; i++) {
+        if (pool->last_rt_ratio[i] > worst_ratio) {
+            worst_ratio = pool->last_rt_ratio[i];
+            worst = i;
+        }
+    }
+
+    if (stressed_ratio)
+        *stressed_ratio = worst_ratio;
+
+    return (worst_ratio > 0.7) ? worst : -1;
+}
+
+int threadpool_migrate_thread(threadpool_t *pool, int thread_index, uint32_t new_cpuset_id) {
+    if (!pool || thread_index < 0 || thread_index >= pool->thread_count)
+        return -1;
+    if (!pool->threads[thread_index])
+        return -1;
+
+    PFN_SetThreadSelectedCpuSets pfn_set_cpusets =
+        (PFN_SetThreadSelectedCpuSets)GetProcAddress(
+            GetModuleHandleW(L"kernel32.dll"), "SetThreadSelectedCpuSets");
+    if (!pfn_set_cpusets)
+        return -1;
+
+    ULONG id = new_cpuset_id;
+    if (!pfn_set_cpusets(pool->threads[thread_index], &id, 1))
+        return -1;
+
+    /* Update tracked cpuset ID */
+    if (pool->cpuset_ids && thread_index < pool->cpuset_id_count)
+        pool->cpuset_ids[thread_index] = new_cpuset_id;
+
+    return 0;
+}
+
+/* ─── CPUSET-aware thread pool creation ─── */
 
 threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids, int cpuset_count) {
     if (!cpuset_ids || cpuset_count < 1)
@@ -313,21 +404,32 @@ threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids, int cpuset_co
     }
 
     pool->threads = (HANDLE *)calloc((size_t)cpuset_count, sizeof(HANDLE));
-    if (!pool->threads) {
+    pool->last_rt_ratio = (double *)calloc((size_t)cpuset_count, sizeof(double));
+    pool->cpuset_ids = (uint32_t *)malloc((size_t)cpuset_count * sizeof(uint32_t));
+    if (!pool->threads || !pool->last_rt_ratio || !pool->cpuset_ids) {
+        free(pool->threads);
+        free(pool->last_rt_ratio);
+        free(pool->cpuset_ids);
         CloseHandle(pool->done_event);
         CloseHandle(pool->work_sem);
         DeleteCriticalSection(&pool->queue_cs);
         free(pool);
         return NULL;
     }
+    memcpy(pool->cpuset_ids, cpuset_ids, (size_t)cpuset_count * sizeof(uint32_t));
+    pool->cpuset_id_count = cpuset_count;
 
     /* Load SetThreadSelectedCpuSets dynamically */
-    PFN_SetThreadSelectedCpuSets2 pfn_set_cpusets =
-        (PFN_SetThreadSelectedCpuSets2)GetProcAddress(
+    PFN_SetThreadSelectedCpuSets pfn_set_cpusets =
+        (PFN_SetThreadSelectedCpuSets)GetProcAddress(
             GetModuleHandleW(L"kernel32.dll"), "SetThreadSelectedCpuSets");
 
     for (int i = 0; i < cpuset_count; i++) {
-        pool->threads[i] = CreateThread(NULL, 0, worker_func, pool, 0, NULL);
+        worker_context_t *wctx = (worker_context_t *)malloc(sizeof(worker_context_t));
+        if (!wctx) break;
+        wctx->pool = pool;
+        wctx->thread_index = i;
+        pool->threads[i] = CreateThread(NULL, 0, worker_func, wctx, 0, NULL);
         if (!pool->threads[i]) {
             InterlockedExchange(&pool->shutdown, 1);
             ReleaseSemaphore(pool->work_sem, i, NULL);

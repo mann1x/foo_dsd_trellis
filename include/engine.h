@@ -55,6 +55,9 @@ typedef struct {
     sdm_context_t      *sdm_ctx;   /* SDM context for segment processing */
     size_t              discard;    /* Output samples to discard (warmup) */
     float              *fir_out;   /* [FIR mode] pointer to FIR output buffer */
+    /* RT headroom monitoring (set by worker, read by engine) */
+    double              rt_ratio;    /* processing_time / audio_duration (0=instant, 1=realtime limit) */
+    bool                stressed;    /* true if rt_ratio > threshold */
 } channel_block_t;
 
 /* Initialise engine for a channel with given config.

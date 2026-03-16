@@ -37,4 +37,14 @@ void threadpool_destroy(threadpool_t *pool);
 /* Get number of active worker threads. */
 int threadpool_get_thread_count(threadpool_t *pool);
 
+/* Check if any worker reported RT stress after the last batch.
+ * Returns the index of the most stressed thread, or -1 if none.
+ * stressed_ratio receives the worst RT ratio. */
+int threadpool_get_stressed_thread(threadpool_t *pool, double *stressed_ratio);
+
+/* Migrate a specific worker thread to a new CPU set ID.
+ * thread_index: 0-based index of the worker to migrate.
+ * new_cpuset_id: the CPU set ID to assign. */
+int threadpool_migrate_thread(threadpool_t *pool, int thread_index, uint32_t new_cpuset_id);
+
 #endif /* THREADPOOL_H */
