@@ -400,7 +400,7 @@ public:
         MSG_WM_INITDIALOG(OnInitDialog)
         COMMAND_HANDLER_EX(IDOK, BN_CLICKED, OnButton)
         COMMAND_HANDLER_EX(IDCANCEL, BN_CLICKED, OnButton)
-        COMMAND_HANDLER_EX(IDC_COMBO_SDM_MODE, CBN_SELCHANGE, OnChange)
+        /* IDC_COMBO_SDM_MODE removed — SDM is per-rate now */
         COMMAND_HANDLER_EX(IDC_COMBO_FORMAT, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_CHECK_DEBUG_LOG, BN_CLICKED, OnChange)
         COMMAND_HANDLER_EX(IDC_CHECK_ANTIPOP, BN_CLICKED, OnChange)
@@ -528,11 +528,7 @@ private:
             0, IDC_COMBO_RATEMAP_NTF_EDIT);
         m_ntfCombo.SetFont(GetFont());
 
-        /* SDM Mode combo */
-        CComboBox sdm(GetDlgItem(IDC_COMBO_SDM_MODE));
-        sdm.AddString(L"PreCorr (low CPU)");
-        sdm.AddString(L"Trellis (high quality)");
-        sdm.SetCurSel(m_cfg.sdm_mode);
+        /* SDM Mode is now per-rate (in the ListView), no global combo */
 
         /* Threads */
         SetDlgItemInt(IDC_EDIT_THREADS, m_cfg.thread_count, FALSE);
@@ -934,7 +930,7 @@ private:
         m_updating = true;
 
         /* Read SDM mode */
-        m_cfg.sdm_mode = CComboBox(GetDlgItem(IDC_COMBO_SDM_MODE)).GetCurSel();
+        /* SDM mode is per-rate now, global kept at default */
 
         /* Threads */
         m_cfg.thread_count = (int)GetDlgItemInt(IDC_EDIT_THREADS, NULL, FALSE);
