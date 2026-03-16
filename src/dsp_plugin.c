@@ -309,14 +309,9 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         s->topology_detected = true;
     }
 
-    /* Select threads based on topology and config.
-     * Cap to actual need: channels * max_segments_per_ch.
-     * For stereo with 4 segments = 8 threads max. */
-    int max_segments = 4;
-    int needed = num_channels * max_segments;
-
+    /* Select threads based on topology and config */
     uint32_t selected_ids[CPUSET_MAX_CPUS];
-    int max_t = s->config.thread_count > 0 ? s->config.thread_count : needed;
+    int max_t = s->config.thread_count > 0 ? s->config.thread_count : 0;
     int selected = cpuset_select(&s->topology,
                                   (smt_mode_t)s->config.smt_mode,
                                   (ccd_mode_t)s->config.ccd_mode,
@@ -333,7 +328,7 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     if (selected > 0 && s->topology.initialized) {
         s->pool = threadpool_create_cpuset(selected_ids, selected);
     } else {
-        int tc = s->config.thread_count > 0 ? s->config.thread_count : needed;
+        int tc = s->config.thread_count > 0 ? s->config.thread_count : 0;
         s->pool = threadpool_create(tc, s->config.affinity_mask);
     }
     if (!s->pool) {
@@ -719,10 +714,13 @@ size_t plugin_process(plugin_state_t *s,
             size_t base_seg = fir_count / (size_t)segments_per_ch;
             size_t remainder = fir_count % (size_t)segments_per_ch;
 
-            /* Compute segment 0 expected output for offset calculation */
+            /* Compute segment 0 expected output for offset calculation.
+             * Use the persistent SDM's actual trellis_lat (from path_config),
+             * not the global config value which may differ. */
+            size_t actual_lat = s->channels[ch].sdm.trellis_lat;
+            if (actual_lat == 0) actual_lat = (size_t)s->config.trellis_lat;
             size_t pending = s->channels[ch].sdm.pending;
-            size_t lat_rem = (pending < (size_t)s->config.trellis_lat) ?
-                ((size_t)s->config.trellis_lat - pending) : 0;
+            size_t lat_rem = (pending < actual_lat) ? (actual_lat - pending) : 0;
             size_t seg0_size = base_seg + (0 < remainder ? 1 : 0);
             size_t seg0_out = (seg0_size > lat_rem) ? (seg0_size - lat_rem) : 0;
 
@@ -1036,12 +1034,7 @@ double plugin_get_latency(const plugin_state_t *s) {
     /* Processing buffer: report extra latency so fb2k prefetches
      * more audio, preventing output underruns during heavy SDM work.
      * Scale with output rate — DSD512 needs more buffer than DSD64. */
-    double proc_buf = 0.0;
-    if (fs_out >= 22579200)      proc_buf = 5.0;  /* DSD512: borderline RT */
-    else if (fs_out >= 11289600) proc_buf = 2.0;  /* DSD256 */
-    else if (fs_out >= 5644800)  proc_buf = 1.0;  /* DSD128 */
-
-    return sdm_lat + proc_buf;
+    return sdm_lat;
 }
 
 /* Reset all channel states (on seek / discontinuity) */
