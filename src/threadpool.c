@@ -164,7 +164,8 @@ static DWORD WINAPI worker_func(LPVOID param) {
             block->rt_ratio = (audio_sec > 0.0) ? proc_sec / audio_sec : 0.0;
             block->stressed = (block->rt_ratio > 0.7);
 
-            /* Record per-thread stress for engine to query */
+            /* Record per-thread stress and which worker processed this block */
+            block->worker_index = my_index;
             if (my_index >= 0 && my_index < pool->thread_count && pool->last_rt_ratio)
                 pool->last_rt_ratio[my_index] = block->rt_ratio;
         }

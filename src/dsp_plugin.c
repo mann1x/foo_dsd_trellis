@@ -596,7 +596,9 @@ size_t plugin_process(plugin_state_t *s,
         overlap = 2 * (size_t)s->config.trellis_lat;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
-        if (segments_per_ch > 4) segments_per_ch = 4;  /* limit parallelism overhead */
+        /* DSD512 needs more parallelism (borderline RT) */
+        int max_seg = (fs_out >= DSD_RATE_512) ? 6 : 4;
+        if (segments_per_ch > max_seg) segments_per_ch = max_seg;
 
         /* Ensure minimum segment size (at least 4x overlap) */
         size_t min_seg = overlap * 4;

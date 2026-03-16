@@ -711,10 +711,10 @@ int cpuset_select(const cpu_topology_t *topo,
         if (e->smt_thread > 0)
             prio += 1000;
 
-        /* CCD/cluster preference */
+        /* CCD/cluster preference — minimal penalty.
+         * Idle cores on any cluster beat loaded cores on preferred cluster. */
         if (ccd_mode == CCD_AUTO) {
-            /* Spread across clusters for thermal balance */
-            prio += e->cluster * 5;
+            prio += e->cluster * 1;
         }
         /* CCD_ALL: all clusters equally preferred (no cluster penalty) */
 

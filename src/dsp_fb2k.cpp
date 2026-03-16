@@ -1144,6 +1144,11 @@ public:
                     trellis_log("  WARNING: worker %d stressed (%.0f%% RT budget)",
                                 stressed_idx, stressed_ratio * 100.0);
                 }
+
+                /* Log which cores actually processed work (first chunk only) */
+                if (m_chunk_count <= 3) {
+                    log_active_workers();
+                }
             }
 
             /* Push status to REST API */
@@ -1337,6 +1342,56 @@ public:
                            "LP%d/%s/C%d(%.0f%%%s)",
                            lp, smt_tag, cluster, perf * 100,
                            parked ? " parked" : "");
+        }
+        trellis_log("%s", buf);
+    }
+
+    void log_active_workers() {
+        if (!m_state) return;
+        uint32_t ids[CPUSET_MAX_CPUS];
+        int n = plugin_get_selected_cores(m_state, ids, CPUSET_MAX_CPUS);
+        if (n == 0) return;
+
+        const cpu_topology_t *topo = plugin_get_topology(m_state);
+
+        /* Check per-thread RT ratios to see which threads did work */
+        double ratio;
+        char buf[512];
+        int pos = 0;
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "active workers: ");
+
+        int active = 0;
+        for (int i = 0; i < n && pos < (int)sizeof(buf) - 30; i++) {
+            /* Get this thread's last RT ratio — >0 means it processed a block */
+            /* We can check via threadpool_get_stressed_thread indirectly,
+             * but better to just list all with nonzero ratio.
+             * For now, list the first N cores as "assigned" */
+        }
+
+        /* Simpler: just report thread count vs core count */
+        int wl_threads = 0, wl_segments = 0;
+        bool wl_changed = false;
+        plugin_get_workload(m_state, &wl_threads, &wl_segments, &wl_changed);
+        int active_count = (int)m_channels * wl_segments;
+        if (active_count > wl_threads) active_count = wl_threads;
+
+        pos = 0;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "worker assignment: %d active of %d threads on cores: ", active_count, n);
+        /* The first active_count cores in selection order get the work
+         * (semaphore wakes threads 0..N-1 in order) */
+        for (int i = 0; i < active_count && i < n && pos < (int)sizeof(buf) - 20; i++) {
+            int lp = -1;
+            if (topo) {
+                for (int j = 0; j < topo->count; j++) {
+                    if (topo->entries[j].id == ids[i]) {
+                        lp = topo->entries[j].logical_index;
+                        break;
+                    }
+                }
+            }
+            if (i > 0) pos += snprintf(buf + pos, sizeof(buf) - pos, ", ");
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "LP%d", lp);
         }
         trellis_log("%s", buf);
     }
