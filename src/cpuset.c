@@ -703,9 +703,10 @@ int cpuset_select(const cpu_topology_t *topo,
          * time most cores appear parked even when they'll be active
          * under load. Treat all enabled cores equally. */
 
-        /* Scheduling class: higher = Windows uses more = avoid.
-         * Range 0-15: high sched_class → high prio → selected last. */
-        prio += e->scheduling_class;
+        /* Don't use scheduling_class for priority — it pushes all
+         * workers to CCD1 which has cross-CCD memory latency penalty.
+         * The perf benchmark (tie-breaker) already captures core speed.
+         * Just avoid SMT siblings and spread across clusters. */
 
         /* SMT: T0 preferred over T1 */
         if (e->smt_thread > 0)
