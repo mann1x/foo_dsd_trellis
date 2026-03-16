@@ -641,14 +641,12 @@ size_t plugin_process(plugin_state_t *s,
     int segments_per_ch = 1;
     size_t overlap = 0;
 
-    /* Parallel SDM only for actual rate conversion (not same-rate re-encode).
-     * Same-rate goes through engine_process_block which does boxcar→SDM.
-     * The parallel path does FIR→SDM and would skip the boxcar. */
-    uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
-    bool is_rate_conv = (s->config.fs_in != fs_out);
-
-    if (need_rate_conv && is_rate_conv && num_threads > num_channels &&
+    /* Parallel SDM segmentation for Trellis mode.
+     * For same-rate: engine_process_fir_gain does boxcar→gain (not FIR).
+     * For rate conv: engine_process_fir_gain does FIR→gain. */
+    if (need_rate_conv && num_threads > num_channels &&
         s->config.sdm_mode == SDM_MODE_TRELLIS) {
+        uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
         size_t fir_out_est = dsd_in_count;
         if (fs_out > s->config.fs_in)
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);

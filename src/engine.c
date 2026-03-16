@@ -34,11 +34,13 @@ typedef struct {
 static const path_config_t path_table[] = {
     /*                                            lim  cands lat  depth gain  */
     /* All paths use 0.708 (-3 dB) gain for uniform volume across rates */
-    /* Same-rate re-encode (boxcar → SDM) */
-    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  4,  256, 8, 0.708f },
-    { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_6, 0.0,  4,  256, 8, 0.708f },
-    { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_8, 0.0,  4,  512, 8, 0.708f },
-    { DSD_RATE_512, DSD_RATE_512, NTF_CLANS_8, 0.0,  4,  512, 8, 0.708f },
+    /* Same-rate re-encode (boxcar → SDM, sequential single-thread).
+     * Lower cands/depth for real-time at high DSD rates.
+     * CLANS_5: only stable NTF with crude boxcar input. */
+    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  2,  256, 4, 0.708f },
+    { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_5, 0.0,  2,  256, 4, 0.708f },
+    { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_5, 0.0,  2,  512, 4, 0.708f },
+    { DSD_RATE_512, DSD_RATE_512, NTF_CLANS_5, 0.0,  2,  512, 4, 0.708f },
     /* Upsample paths */
     { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_4,   0.0,  2,  512, 4, 0.708f },
     { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  512, 4, 0.708f },
@@ -313,7 +315,24 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
         eng->fir_buf_sz = buf_need * sizeof(float);
     }
 
-    size_t fir_count = fir_chain_process(&eng->fir, in, eng->fir_buf, count);
+    size_t fir_count;
+    uint32_t fs_out_actual = cfg->fs_out ? cfg->fs_out : cfg->fs_in;
+    if (cfg->fs_in == fs_out_actual) {
+        /* Same-rate: boxcar smooth ±1.0 → multi-bit (same as engine_process_block) */
+        boxcar_t *bc = &eng->boxcar;
+        const float inv_n = 1.0f / BOXCAR_TAPS;
+        for (size_t i = 0; i < count; i++) {
+            float s = in[i] >= 0.0f ? 1.0f : -1.0f;
+            bc->sum -= bc->ring[bc->pos];
+            bc->ring[bc->pos] = s;
+            bc->sum += s;
+            bc->pos = (bc->pos + 1) % BOXCAR_TAPS;
+            eng->fir_buf[i] = bc->sum * inv_n;
+        }
+        fir_count = count;
+    } else {
+        fir_count = fir_chain_process(&eng->fir, in, eng->fir_buf, count);
+    }
 
     float combined_gain = eng->fir_gain * cfg->gain;
     if (combined_gain != 1.0f) {
