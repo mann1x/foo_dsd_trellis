@@ -28,6 +28,10 @@ threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids, int cpuset_co
  * Non-blocking; the block is queued for a worker thread. */
 int threadpool_submit(threadpool_t *pool, channel_block_t *block);
 
+/* Submit multiple blocks and wake all workers simultaneously.
+ * Returns number of blocks submitted. */
+int threadpool_submit_batch(threadpool_t *pool, channel_block_t **blocks, int count);
+
 /* Wait for all submitted blocks in the current batch to complete. */
 void threadpool_wait(threadpool_t *pool);
 

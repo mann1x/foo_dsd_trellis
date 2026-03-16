@@ -1073,6 +1073,17 @@ public:
         if (channels == 0 || pcm_frames == 0)
             return true;
 
+        /* Pin DSP thread to a non-hot core (once) */
+        if (!m_thread_pinned && m_state) {
+            uint32_t ids[CPUSET_MAX_CPUS];
+            int n = plugin_get_selected_cores(m_state, ids, CPUSET_MAX_CPUS);
+            if (n > 0) {
+                /* Pick the first selected core (lowest sched_class) for the DSP thread */
+                cpuset_pin_thread(GetCurrentThread(), ids, 1);
+                m_thread_pinned = true;
+            }
+        }
+
         /* ─── Volume / mute ─── */
         m_config.mute = get_cached_muted();
         m_config.gain = get_cached_gain();
@@ -1610,6 +1621,7 @@ private:
     int              m_channels;
     unsigned         m_pcm_rate;
     bool             m_logged_passthrough = false;
+    bool             m_thread_pinned = false;
     bool             m_logged_processing = false;
     unsigned         m_chunk_count = 0;
 

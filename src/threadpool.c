@@ -281,21 +281,47 @@ int threadpool_submit(threadpool_t *pool, channel_block_t *block) {
     return 0;
 }
 
-void threadpool_wait(threadpool_t *pool) {
-    /* If nothing was submitted, return immediately */
-    if (InterlockedCompareExchange(&pool->pending, 0, 0) == 0)
-        return;
+/* Submit multiple blocks at once and wake all workers simultaneously.
+ * Much faster than N individual submit+wake cycles. */
+int threadpool_submit_batch(threadpool_t *pool, channel_block_t **blocks, int count) {
+    EnterCriticalSection(&pool->queue_cs);
 
-    /* Reset done event before waiting (it's manual-reset) */
-    ResetEvent(pool->done_event);
-
-    /* Check again after reset to avoid race */
-    if (InterlockedCompareExchange(&pool->pending, 0, 0) == 0) {
-        SetEvent(pool->done_event);
-        return;
+    for (int i = 0; i < count; i++) {
+        if (pool->queue_count >= MAX_QUEUE_SIZE) {
+            LeaveCriticalSection(&pool->queue_cs);
+            return i;  /* partial submit */
+        }
+        pool->queue[pool->queue_tail] = blocks[i];
+        pool->queue_tail = (pool->queue_tail + 1) % MAX_QUEUE_SIZE;
+        pool->queue_count++;
     }
 
-    WaitForSingleObject(pool->done_event, INFINITE);
+    LeaveCriticalSection(&pool->queue_cs);
+
+    /* Wake all workers at once */
+    InterlockedAdd(&pool->pending, count);
+    ReleaseSemaphore(pool->work_sem, count, NULL);
+
+    return count;
+}
+
+void threadpool_wait(threadpool_t *pool) {
+    /* Spin-check first — if workers are fast, avoid kernel wait overhead */
+    for (int spin = 0; spin < 1000; spin++) {
+        if (InterlockedCompareExchange(&pool->pending, 0, 0) == 0)
+            return;
+        YieldProcessor();
+    }
+
+    /* Fall back to event wait */
+    for (;;) {
+        ResetEvent(pool->done_event);
+        if (InterlockedCompareExchange(&pool->pending, 0, 0) == 0) {
+            SetEvent(pool->done_event);
+            return;
+        }
+        WaitForSingleObject(pool->done_event, 10);  /* 10ms timeout to recheck */
+    }
 }
 
 void threadpool_destroy(threadpool_t *pool) {
