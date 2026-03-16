@@ -306,22 +306,17 @@ int threadpool_submit_batch(threadpool_t *pool, channel_block_t **blocks, int co
 }
 
 void threadpool_wait(threadpool_t *pool) {
-    /* Spin-check first — if workers are fast, avoid kernel wait overhead */
-    for (int spin = 0; spin < 1000; spin++) {
-        if (InterlockedCompareExchange(&pool->pending, 0, 0) == 0)
-            return;
-        YieldProcessor();
+    if (InterlockedCompareExchange(&pool->pending, 0, 0) == 0)
+        return;
+
+    ResetEvent(pool->done_event);
+
+    if (InterlockedCompareExchange(&pool->pending, 0, 0) == 0) {
+        SetEvent(pool->done_event);
+        return;
     }
 
-    /* Fall back to event wait */
-    for (;;) {
-        ResetEvent(pool->done_event);
-        if (InterlockedCompareExchange(&pool->pending, 0, 0) == 0) {
-            SetEvent(pool->done_event);
-            return;
-        }
-        WaitForSingleObject(pool->done_event, 10);  /* 10ms timeout to recheck */
-    }
+    WaitForSingleObject(pool->done_event, INFINITE);
 }
 
 void threadpool_destroy(threadpool_t *pool) {

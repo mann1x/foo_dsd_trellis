@@ -641,12 +641,7 @@ size_t plugin_process(plugin_state_t *s,
             fir_blocks[ch].count   = dsd_in_count;
             fir_blocks[ch].cfg     = &s->config;
             fir_blocks[ch].channel = ch;
-        }
-        {
-            channel_block_t *fir_ptrs[32];
-            for (int ch = 0; ch < num_channels; ch++)
-                fir_ptrs[ch] = &fir_blocks[ch];
-            threadpool_submit_batch(s->pool, fir_ptrs, num_channels);
+            threadpool_submit(s->pool, &fir_blocks[ch]);
         }
         threadpool_wait(s->pool);
 
@@ -771,13 +766,8 @@ size_t plugin_process(plugin_state_t *s,
         LARGE_INTEGER t_sdm_start, t_sdm_end;
         QueryPerformanceCounter(&t_sdm_start);
 
-        /* Batch submit all SDM segments — wakes all workers at once */
-        {
-            channel_block_t *block_ptrs[64];
-            for (int i = 0; i < total_blocks && i < 64; i++)
-                block_ptrs[i] = &blocks[i];
-            threadpool_submit_batch(s->pool, block_ptrs, total_blocks);
-        }
+        for (int i = 0; i < total_blocks; i++)
+            threadpool_submit(s->pool, &blocks[i]);
         threadpool_wait(s->pool);
 
         QueryPerformanceCounter(&t_sdm_end);
