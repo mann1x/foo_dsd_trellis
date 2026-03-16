@@ -1208,6 +1208,7 @@ public:
          * This prevents stale values (cands, lat, depth) from leaking
          * between chunks at different rates. */
         dsd_config_t chunk_cfg = m_config;
+        chunk_cfg.fs_in = is_dop ? dsd_rate : pcm_rate;  /* must set before path lookup */
 
         chunk_cfg.ntf_filter = (int)m_config.rate_ntf[map_idx];
         if (m_config.rate_sdm[map_idx] >= 0)
@@ -1253,10 +1254,10 @@ public:
         if (!m_logged_processing) {
             trellis_log("rate_map: lookup_rate=%u map_idx=%d out_idx=%u out_rate=%u is_dop=%d gain=%.3f fs_in=%u fs_out=%u",
                         lookup_rate, map_idx, (unsigned)out_idx, out_rate, is_dop, chunk_cfg.gain, chunk_cfg.fs_in, chunk_cfg.fs_out);
-            trellis_log("resolved: sdm=%s cands=%d depth=%d lat=%d fir_gain_db=%d",
+            trellis_log("resolved: sdm=%s cands=%d depth=%d lat=%d fir_gain_db=%d fs_in=%u fs_out=%u",
                         chunk_cfg.sdm_mode == SDM_MODE_TRELLIS ? "Trellis" : "PreCorr",
                         chunk_cfg.trellis_cands, chunk_cfg.trellis_depth, chunk_cfg.trellis_lat,
-                        (int)chunk_cfg.fir_gain_db);
+                        (int)chunk_cfg.fir_gain_db, chunk_cfg.fs_in, chunk_cfg.fs_out);
         }
         plugin_set_config(m_state, &chunk_cfg);
 

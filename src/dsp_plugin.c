@@ -645,7 +645,7 @@ size_t plugin_process(plugin_state_t *s,
      * Same-rate re-encode stays sequential (boxcar→SDM is fast at cands=2).
      * Rate conversion uses parallel segments (FIR+SDM is the bottleneck). */
     uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
-    bool skip_parallel = (s->config.fs_in == fs_out);
+    bool skip_parallel = false;  /* parallel for all Trellis paths */
 
     if (need_rate_conv && !skip_parallel && num_threads > num_channels &&
         s->config.sdm_mode == SDM_MODE_TRELLIS) {
