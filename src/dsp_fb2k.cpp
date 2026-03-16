@@ -452,13 +452,17 @@ private:
         m_listRate = GetDlgItem(IDC_LIST_RATEMAP);
         m_listRate.SetExtendedListViewStyle(
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 60);
-        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 65);
-        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 65);
-        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 60);
-        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 50);
-        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 50);
-        m_listRate.InsertColumn(6, L"ML", LVCFMT_LEFT, 40);
+        /* Column widths sized to fit longest content:
+         * Input: "176400" (6ch), Output: "DSD512" (6ch), NTF: "CLANS-8" (7ch),
+         * SDM: "Auto (PreCorr)" (14ch), Cands: "Auto (32)" (9ch),
+         * Depth: "Auto (8)" (8ch), ML: "Auto (Off)" (10ch) */
+        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 52);
+        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 52);
+        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 62);
+        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 95);
+        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 62);
+        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 58);
+        m_listRate.InsertColumn(6, L"ML", LVCFMT_LEFT, 68);
 
         for (int i = 0; i < RATE_MAP_COUNT; i++) {
             m_listRate.InsertItem(i, g_rate_names[i]);
@@ -466,28 +470,46 @@ private:
             int ntf_idx = m_cfg.rate_ntf[i] + 1; /* NTF_AUTO=-1 → 0 */
             if (ntf_idx < 0 || ntf_idx >= (int)NTF_NAME_COUNT) ntf_idx = 0;
             m_listRate.SetItemText(i, 2, g_ntf_names[ntf_idx]);
-            /* SDM mode */
-            m_listRate.SetItemText(i, 3,
-                m_cfg.rate_sdm[i] < 0 ? L"Auto" :
-                m_cfg.rate_sdm[i] == SDM_MODE_PRECORR ? L"PreCorr" : L"Trellis");
+            /* SDM mode — show resolved default for Auto */
+            {
+                wchar_t buf[32];
+                if (m_cfg.rate_sdm[i] < 0)
+                    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%s)",
+                                 m_cfg.sdm_mode == SDM_MODE_PRECORR ? L"PreCorr" : L"Trellis");
+                else if (m_cfg.rate_sdm[i] == SDM_MODE_PRECORR)
+                    wcscpy_s(buf, L"PreCorr");
+                else
+                    wcscpy_s(buf, L"Trellis");
+                m_listRate.SetItemText(i, 3, buf);
+            }
             /* Candidates */
             {
-                wchar_t buf[16];
-                if (m_cfg.rate_cands[i] < 0) wcscpy_s(buf, L"Auto");
-                else _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_cands[i]);
+                wchar_t buf[32];
+                if (m_cfg.rate_cands[i] < 0)
+                    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%d)", m_cfg.trellis_cands);
+                else
+                    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_cands[i]);
                 m_listRate.SetItemText(i, 4, buf);
             }
             /* Depth */
             {
-                wchar_t buf[16];
-                if (m_cfg.rate_depth[i] < 0) wcscpy_s(buf, L"Auto");
-                else _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_depth[i]);
+                wchar_t buf[32];
+                if (m_cfg.rate_depth[i] < 0)
+                    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%d)", m_cfg.trellis_depth);
+                else
+                    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_depth[i]);
                 m_listRate.SetItemText(i, 5, buf);
             }
             /* ML */
-            m_listRate.SetItemText(i, 6,
-                m_cfg.rate_ml[i] < 0 ? L"Auto" :
-                m_cfg.rate_ml[i] == 0 ? L"Off" : L"On");
+            {
+                wchar_t buf[32];
+                if (m_cfg.rate_ml[i] < 0)
+                    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%s)",
+                                 m_cfg.ml_enabled ? L"On" : L"Off");
+                else
+                    wcscpy_s(buf, m_cfg.rate_ml[i] == 0 ? L"Off" : L"On");
+                m_listRate.SetItemText(i, 6, buf);
+            }
         }
 
         /* Create in-place editor combos (children of dialog, initially hidden) */
