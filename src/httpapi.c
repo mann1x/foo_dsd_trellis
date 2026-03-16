@@ -639,7 +639,7 @@ static void handle_request(httpapi_t *api, SOCKET client) {
     /* Parse method and path */
     char method[8] = {0};
     char path[256] = {0};
-    if (sscanf(req, "%7s %255s", method, path) != 2)
+    if (sscanf_s(req, "%7s %255s", method, (unsigned)sizeof(method), path, (unsigned)sizeof(path)) != 2)
         return;
 
     /* CORS preflight */

@@ -15,6 +15,9 @@
 #include <stdarg.h>
 #include <commctrl.h>
 
+/* DoP: 16 DSD bits packed per PCM frame */
+#define DOP_BITS_PER_FRAME 16
+
 extern "C" {
 #include "../include/dsd_types.h"
 #include "../include/simd_detect.h"
@@ -147,6 +150,97 @@ public:
 
 static initquit_factory_t<volume_init> g_volume_init;
 
+/* Forward declaration for logger (defined below) */
+static void trellis_log(const char *fmt, ...);
+
+/* ─── Output device detection ─── */
+/* Caches the current output module type (ASIO, WASAPI, DS, etc.)
+ * and device name. Updated on init and via output_config_change_callback. */
+
+static CRITICAL_SECTION g_output_cs;
+static bool g_output_cs_init = false;
+static char g_output_type[64] = "";     /* "ASIO+DSD", "DS", "WASAPI", etc. */
+static char g_output_device[256] = "";  /* device name within the module */
+static bool g_output_is_asio = false;
+
+static void update_output_info() {
+    try {
+        auto cfg = output_manager::get()->getCoreConfig();
+        output_entry::ptr entry;
+        const char *type_name = "Unknown";
+        if (output_entry::g_find(cfg.m_output, entry))
+            type_name = entry->get_name();
+
+        pfc::string8 device_name;
+        if (output_entry::g_find(cfg.m_output, entry))
+            device_name = entry->get_device_name(cfg.m_device);
+
+        if (g_output_cs_init) EnterCriticalSection(&g_output_cs);
+        strncpy_s(g_output_type, sizeof(g_output_type), type_name, _TRUNCATE);
+        strncpy_s(g_output_device, sizeof(g_output_device),
+                  device_name.get_ptr(), _TRUNCATE);
+        g_output_is_asio = (strstr(type_name, "ASIO") != nullptr);
+        if (g_output_cs_init) LeaveCriticalSection(&g_output_cs);
+    } catch (...) {}
+}
+
+static bool is_output_asio() {
+    if (g_output_cs_init) {
+        EnterCriticalSection(&g_output_cs);
+        bool result = g_output_is_asio;
+        LeaveCriticalSection(&g_output_cs);
+        return result;
+    }
+    return g_output_is_asio;
+}
+
+static void get_output_info(char *type_buf, size_t type_size,
+                             char *device_buf, size_t device_size) {
+    if (g_output_cs_init) EnterCriticalSection(&g_output_cs);
+    if (type_buf)
+        strncpy_s(type_buf, type_size, g_output_type, _TRUNCATE);
+    if (device_buf)
+        strncpy_s(device_buf, device_size, g_output_device, _TRUNCATE);
+    if (g_output_cs_init) LeaveCriticalSection(&g_output_cs);
+}
+
+class output_change_callback_impl : public output_config_change_callback {
+public:
+    void outputConfigChanged() override {
+        update_output_info();
+        trellis_log("output changed: %s [%s]%s",
+                    g_output_type, g_output_device,
+                    g_output_is_asio ? " (ASIO)" : "");
+    }
+};
+
+static output_change_callback_impl g_output_change_cb;
+
+class output_init : public initquit {
+public:
+    void on_init() override {
+        InitializeCriticalSection(&g_output_cs);
+        g_output_cs_init = true;
+        update_output_info();
+
+        /* Register for output config change notifications */
+        try {
+            auto mgr = output_manager_v2::get();
+            mgr->addCallback(&g_output_change_cb);
+        } catch (...) {}
+    }
+    void on_quit() override {
+        try {
+            auto mgr = output_manager_v2::get();
+            mgr->removeCallback(&g_output_change_cb);
+        } catch (...) {}
+        g_output_cs_init = false;
+        DeleteCriticalSection(&g_output_cs);
+    }
+};
+
+static initquit_factory_t<output_init> g_output_init;
+
 /* ─── File logger ─── */
 
 static CRITICAL_SECTION g_log_cs;
@@ -180,7 +274,7 @@ static pfc::string8 get_log_path() {
 static void log_open() {
     if (g_log_file) return;
     pfc::string8 path = get_log_path();
-    g_log_file = fopen(path.c_str(), "a");
+    fopen_s(&g_log_file, path.c_str(), "a");
     if (g_log_file) {
         SYSTEMTIME st;
         GetLocalTime(&st);
@@ -269,6 +363,26 @@ static dsd_config_t parse_preset(const dsp_preset &in) {
     return cfg;
 }
 
+/* ─── ML EP combo ↔ enum mapping ─── */
+/* Combo order: Auto(0), CPU(1), DirectML(2) */
+/* Enum order:  CPU(0), DirectML(1), Auto(2) */
+static int ml_ep_to_combo(int ep) {
+    switch (ep) {
+    case 2:  return 0;  /* Auto → first */
+    case 0:  return 1;  /* CPU → second */
+    case 1:  return 2;  /* DirectML → third */
+    default: return 0;
+    }
+}
+static int combo_to_ml_ep(int idx) {
+    switch (idx) {
+    case 0:  return 2;  /* first → Auto */
+    case 1:  return 0;  /* second → CPU */
+    case 2:  return 1;  /* third → DirectML */
+    default: return 2;
+    }
+}
+
 /* ─── Property page dialog ─── */
 
 class CDSPTrellisPopup : public CDialogImpl<CDSPTrellisPopup> {
@@ -285,6 +399,9 @@ public:
         COMMAND_HANDLER_EX(IDC_COMBO_SDM_MODE, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_COMBO_FORMAT, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_CHECK_DEBUG_LOG, BN_CLICKED, OnChange)
+        COMMAND_HANDLER_EX(IDC_CHECK_ANTIPOP, BN_CLICKED, OnChange)
+        COMMAND_HANDLER_EX(IDC_CHECK_ML_ENABLED, BN_CLICKED, OnMlChange)
+        COMMAND_HANDLER_EX(IDC_COMBO_ML_EP, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_EDIT_THREADS, EN_CHANGE, OnEditChange)
         COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_EDIT, CBN_SELCHANGE, OnRateMapEditChange)
         COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_EDIT, CBN_KILLFOCUS, OnComboKillFocus)
@@ -298,8 +415,34 @@ public:
 private:
     BOOL OnInitDialog(CWindow, LPARAM) {
         m_dark.AddDialogWithControls(m_hWnd);
+        m_updating = true;  /* Prevent OnChange during init */
+
+        /* Debug: log incoming preset data */
+        {
+            const void *pdata = m_initData.get_data();
+            t_size psize = m_initData.get_data_size();
+            pfc::string_formatter hex;
+            hex << "preset init: " << (unsigned)psize << " bytes [";
+            const uint8_t *pb = (const uint8_t *)pdata;
+            for (t_size i = 0; i < psize && i < 84; i++) {
+                if (i > 0) hex << " ";
+                hex << pfc::format_hex(pb[i], 2);
+            }
+            hex << "]";
+            console::print(hex);
+        }
 
         m_cfg = parse_preset(m_initData);
+
+        /* Debug: log parsed config */
+        {
+            pfc::string_formatter dbg;
+            dbg << "parsed config: debug_log=" << (int)m_cfg.debug_log
+                << " ml_enabled=" << (int)m_cfg.ml_enabled
+                << " ml_ep=" << m_cfg.ml_ep
+                << " rate_map[9]=" << (int)m_cfg.rate_map[9];
+            console::print(dbg);
+        }
 
         /* Rate map ListView */
         m_listRate = GetDlgItem(IDC_LIST_RATEMAP);
@@ -349,6 +492,22 @@ private:
         /* Debug log checkbox */
         CheckDlgButton(IDC_CHECK_DEBUG_LOG, m_cfg.debug_log ? BST_CHECKED : BST_UNCHECKED);
 
+        /* Anti-pop checkbox */
+        CheckDlgButton(IDC_CHECK_ANTIPOP, m_cfg.antipop ? BST_CHECKED : BST_UNCHECKED);
+
+        /* ML Noise Filter */
+        CheckDlgButton(IDC_CHECK_ML_ENABLED, m_cfg.ml_enabled ? BST_CHECKED : BST_UNCHECKED);
+        {
+            CComboBox mlep(GetDlgItem(IDC_COMBO_ML_EP));
+            /* Display order: Auto(0), CPU(1), DirectML(2) */
+            mlep.AddString(L"Auto");
+            mlep.AddString(L"CPU");
+            mlep.AddString(L"DirectML (GPU)");
+            mlep.SetCurSel(ml_ep_to_combo(m_cfg.ml_ep));
+            mlep.EnableWindow(m_cfg.ml_enabled);
+        }
+        UpdateMlStatus();
+
         /* Show initial engine info */
         const cpu_features_t *cpu = cpu_detect();
         pfc::string_formatter info;
@@ -358,10 +517,12 @@ private:
              << "\nSelect a rate mapping to see path details.";
         ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, info);
 
+        m_updating = false;  /* Init done — allow OnChange to fire */
         return TRUE;
     }
 
     void OnButton(UINT, int id, CWindow) {
+        if (id == IDOK) UpdatePreset();  /* Ensure final state is saved */
         EndDialog(id);
     }
 
@@ -371,6 +532,40 @@ private:
 
     void OnEditChange(UINT, int, CWindow) {
         if (!m_updating) UpdatePreset();
+    }
+
+    void OnMlChange(UINT, int, CWindow) {
+        if (m_updating) return;
+        bool enabled = IsDlgButtonChecked(IDC_CHECK_ML_ENABLED) == BST_CHECKED;
+        CComboBox(GetDlgItem(IDC_COMBO_ML_EP)).EnableWindow(enabled);
+        UpdateMlStatus();
+        UpdatePreset();
+    }
+
+    void UpdateMlStatus() {
+        bool enabled = IsDlgButtonChecked(IDC_CHECK_ML_ENABLED) == BST_CHECKED;
+        const char *status = "";
+        if (enabled) {
+            if (!onnx_runtime_available()) {
+                status = "onnxruntime.dll not found";
+            } else {
+                int ep = combo_to_ml_ep(
+                    CComboBox(GetDlgItem(IDC_COMBO_ML_EP)).GetCurSel());
+                bool has_dml = false;
+                if (ep == 1 || ep == 2) {  /* DirectML or Auto */
+                    HMODULE hort = LoadLibraryW(L"onnxruntime.dll");
+                    if (hort) {
+                        has_dml = (GetProcAddress(hort,
+                            "OrtSessionOptionsAppendExecutionProvider_DML") != NULL);
+                        FreeLibrary(hort);
+                    }
+                }
+                if (ep == 0)       status = "Ready (CPU)";
+                else if (ep == 1)  status = has_dml ? "Ready (GPU)" : "Ready (CPU)";
+                else               status = has_dml ? "Ready (GPU)" : "Ready (CPU)";
+            }
+        }
+        ::uSetDlgItemText(*this, IDC_STATIC_ML_STATUS, status);
     }
 
     /* ─── Rate map in-place editing ─── */
@@ -595,6 +790,13 @@ private:
         /* Debug log */
         m_cfg.debug_log = IsDlgButtonChecked(IDC_CHECK_DEBUG_LOG) == BST_CHECKED;
 
+        /* Anti-pop */
+        m_cfg.antipop = IsDlgButtonChecked(IDC_CHECK_ANTIPOP) == BST_CHECKED;
+
+        /* ML filter */
+        m_cfg.ml_enabled = IsDlgButtonChecked(IDC_CHECK_ML_ENABLED) == BST_CHECKED;
+        m_cfg.ml_ep = combo_to_ml_ep(CComboBox(GetDlgItem(IDC_COMBO_ML_EP)).GetCurSel());
+
         /* rate_map and rate_ntf are maintained via OnRateMapEditChange/OnNtfEditChange */
 
         config_validate(&m_cfg);
@@ -811,6 +1013,10 @@ public:
             }
             out_frames = plugin_process_pcm(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
                                              pcm_frames, (int)channels, pcm_rate);
+            if (!m_logged_processing)
+                trellis_log("PCM->DSD: in=%u frames @ %uHz, out=%u frames @ %uHz (ratio=%u)",
+                            (unsigned)pcm_frames, pcm_rate, (unsigned)out_frames,
+                            out_rate / 16, out_rate / pcm_rate);
         }
 
         QueryPerformanceCounter(&t1);
@@ -835,6 +1041,13 @@ public:
         } else {
             out_pcm_rate = out_rate / 16;  /* DoP PCM rate */
         }
+
+        /* Track output format for anti-pop trailing silence */
+        m_last_out_pcm_rate = out_pcm_rate;
+        m_last_out_is_dop = !out_is_pcm;
+        m_last_channels = (int)channels;
+        m_last_pcm_rate = pcm_rate;
+        m_last_is_dop_input = is_dop;
 
         /* Convert float output back to audio_sample */
         size_t total_out = out_frames * channels;
@@ -942,6 +1155,60 @@ public:
             }
         }
 
+        /* ─── Anti-pop lead-in (configurable) ───
+         * On rate change, output PCM zeros at the new rate to let the
+         * output device reconfigure silently. Buffer the real audio
+         * and prepend it to the next chunk. Never use insert_chunk
+         * during rate transitions — it confuses fb2k's output pipeline. */
+        if (m_config.antipop && m_antipop_pending && out_frames > 0 && is_dop) {
+            m_antipop_pending = false;
+
+            const int LEADIN_MS = 100;
+            size_t sil_frames = (size_t)(out_pcm_rate * LEADIN_MS / 1000);
+
+            /* Buffer real audio for next chunk */
+            m_deferred_frames = out_frames;
+            m_deferred_rate = out_pcm_rate;
+            m_deferred_channels = channels;
+            m_deferred_buf.set_size_discard(out_frames * channels);
+            for (size_t i = 0; i < out_frames * channels; i++)
+                m_deferred_buf[i] = (audio_sample)out_buf[i];
+
+            /* Output PCM zeros at target rate — true silence,
+             * no DoP markers, inaudible during ASIO rate transition */
+            chunk->set_silence(sil_frames, out_pcm_rate, channels);
+
+            trellis_log("anti-pop: %dms silence at %u Hz, buffered %u frames",
+                        LEADIN_MS, out_pcm_rate, (unsigned)out_frames);
+            return true;
+        }
+
+        /* Output deferred audio from anti-pop buffer */
+        if (m_deferred_frames > 0) {
+            size_t df = m_deferred_frames;
+            m_deferred_frames = 0;
+
+            /* Prepend buffered audio before current chunk's audio */
+            size_t total = df + out_frames;
+            pfc::array_staticsize_t<audio_sample> combined;
+            combined.set_size_discard(total * channels);
+            for (size_t i = 0; i < df * channels; i++)
+                combined[i] = m_deferred_buf[i];
+            for (size_t i = 0; i < out_frames * channels; i++)
+                combined[df * channels + i] = (audio_sample)out_buf[i];
+
+            chunk->set_data(combined.get_ptr(), total, channels, out_pcm_rate);
+
+            trellis_log("anti-pop: output deferred %u + current %u = %u frames",
+                        (unsigned)df, (unsigned)out_frames, (unsigned)total);
+            return true;
+        }
+
+        if (m_chunk_count < 10)
+            trellis_log("chunk #%u output: %u frames, %u ch, %u Hz (out_rate=%u, is_pcm=%d, is_dop_in=%d)",
+                        m_chunk_count, (unsigned)out_frames, channels, out_pcm_rate,
+                        out_rate, (int)out_is_pcm, (int)is_dop);
+
         chunk->set_data(out_as.get_ptr(), out_frames, channels, out_pcm_rate);
 
         return true;
@@ -958,7 +1225,11 @@ public:
         size_t drain_frames = plugin_drain(m_state, drain_buf.get_ptr(),
                                            m_channels);
 
-        if (drain_frames > 0 && m_pcm_rate > 0) {
+        if (drain_frames > 0 && m_pcm_rate > 0 && m_last_is_dop_input) {
+            /* Only drain for DSD→DSD path. For PCM→DSD, the SDM latency
+             * samples are negligible and insert_chunk at DoP rate leaves
+             * fb2k's output configured at 176400, causing a glitch on
+             * the next PCM playback. */
             uint32_t out_pcm_rate = m_config.fs_out / 16;
             if (out_pcm_rate == 0)
                 out_pcm_rate = m_pcm_rate;
@@ -974,6 +1245,11 @@ public:
                                (unsigned)m_channels, out_pcm_rate);
             insert_chunk(chunk_out);
         }
+
+        /* ─── Anti-pop trailing silence (DSD→DSD only) ─── */
+        if (m_config.antipop && m_last_is_dop_input) {
+            insert_antipop_trail();
+        }
     }
 
     void on_endoftrack(abort_callback & /*abort*/) override {}
@@ -983,6 +1259,7 @@ public:
         m_logged_passthrough = false;
         m_logged_processing = false;
         m_chunk_count = 0;
+        m_antipop_pending = true;
     }
 
     double get_latency() override {
@@ -994,6 +1271,58 @@ public:
     }
 
 private:
+    static const int ANTIPOP_MS = 50;  /* ms of silence for anti-pop */
+
+    /* Insert a silence chunk directly (no engine needed).
+     * For DoP: generates DSD idle pattern via dop_pack.
+     * For PCM: zeros. */
+    void insert_silence_chunk(int num_channels, uint32_t out_pcm_rate,
+                               bool is_dop_output, int ms) {
+        if (out_pcm_rate == 0 || num_channels == 0)
+            return;
+
+        size_t sil_frames = (size_t)(out_pcm_rate * ms / 1000);
+        if (sil_frames == 0)
+            return;
+
+        size_t sil_total = sil_frames * (size_t)num_channels;
+        pfc::array_staticsize_t<audio_sample> sil_as;
+        sil_as.set_size_discard(sil_total);
+
+        if (is_dop_output) {
+            /* DoP silence: DSD idle pattern (alternating ±1.0) → dop_pack */
+            size_t dsd_per_frame = sil_frames * DOP_BITS_PER_FRAME;
+            pfc::array_staticsize_t<float> dsd_idle;
+            dsd_idle.set_size_discard(dsd_per_frame);
+            for (size_t i = 0; i < dsd_per_frame; i++)
+                dsd_idle[i] = (i & 1) ? 1.0f : -1.0f;
+
+            pfc::array_staticsize_t<float> dop_pcm;
+            dop_pcm.set_size_discard(sil_frames);
+            dop_pack(dsd_idle.get_ptr(), dop_pcm.get_ptr(), dsd_per_frame);
+
+            for (size_t f = 0; f < sil_frames; f++)
+                for (int ch = 0; ch < num_channels; ch++)
+                    sil_as[f * num_channels + ch] = (audio_sample)dop_pcm[f];
+        } else {
+            memset(sil_as.get_ptr(), 0, sil_total * sizeof(audio_sample));
+        }
+
+        audio_chunk_impl chunk_out;
+        chunk_out.set_data(sil_as.get_ptr(), sil_frames,
+                           (unsigned)num_channels, out_pcm_rate);
+        insert_chunk(chunk_out);
+    }
+
+    /* Insert trailing silence to flush ASIO buffer before stop */
+    void insert_antipop_trail() {
+        if (m_last_out_pcm_rate == 0 || m_last_channels == 0)
+            return;
+        trellis_log("anti-pop: %dms trailing silence", ANTIPOP_MS);
+        insert_silence_chunk(m_last_channels, m_last_out_pcm_rate,
+                              m_last_out_is_dop, ANTIPOP_MS);
+    }
+
     dsd_config_t     m_config;
     plugin_state_t  *m_state;
     httpapi_t       *m_httpapi;
@@ -1002,6 +1331,18 @@ private:
     bool             m_logged_passthrough = false;
     bool             m_logged_processing = false;
     unsigned         m_chunk_count = 0;
+
+    /* Anti-pop / deferred output state */
+    bool             m_antipop_pending = true;         /* insert lead-in silence before first chunk */
+    size_t           m_deferred_frames = 0;            /* PCM→DSD: buffered frames from first chunk */
+    uint32_t         m_deferred_rate = 0;
+    unsigned         m_deferred_channels = 0;
+    pfc::array_staticsize_t<audio_sample> m_deferred_buf;
+    uint32_t         m_last_out_pcm_rate = 0;          /* last output PCM rate */
+    uint32_t         m_last_pcm_rate = 0;              /* last input PCM rate */
+    int              m_last_channels = 0;              /* last channel count */
+    bool             m_last_out_is_dop = false;        /* last output was DoP */
+    bool             m_last_is_dop_input = false;      /* last input was DoP */
 };
 
 static dsp_factory_t<dsp_dsd_trellis> g_dsp_factory;

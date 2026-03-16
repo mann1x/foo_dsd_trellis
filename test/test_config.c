@@ -72,10 +72,10 @@ static void test_config_v4_compat(void) {
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should work");
 
-    /* Patch to look like v4: set version=4, truncate to 51 bytes */
+    /* Patch to look like v4: set version=4, truncate to 55 bytes */
     uint32_t v4 = 4;
     memcpy(buf, &v4, 4);
-    size_t v4_len = 51;
+    size_t v4_len = 55;
 
     dsd_config_t cfg2;
     int ret = config_deserialize(&cfg2, buf, v4_len);
@@ -206,8 +206,8 @@ static void test_config_v7_migration(void) {
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should work");
 
-    /* Truncate to remove rate_ntf + rate_map (v9 added both) → v7 size */
-    size_t v7_len = len - 2 * RATE_MAP_COUNT;
+    /* Truncate to v7 size (58 bytes) */
+    size_t v7_len = 58;
 
     /* Patch version to 7 */
     uint32_t v7 = 7;
@@ -282,8 +282,8 @@ static void test_config_v8_migration(void) {
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should work");
 
-    /* Truncate to remove rate_ntf → v8 size */
-    size_t v8_len = len - RATE_MAP_COUNT;
+    /* Truncate to v8 size (70 bytes) */
+    size_t v8_len = 70;
 
     /* Patch version to 8 */
     uint32_t v8 = 8;

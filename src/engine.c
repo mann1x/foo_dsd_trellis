@@ -175,6 +175,8 @@ size_t engine_process_block(engine_channel_t *eng,
                 sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
             else
                 sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, count);
+            if (eng->ml_filter)
+                onnx_filter_process(eng->ml_filter, out, sdm_out);
             return sdm_out;
         }
     }
@@ -224,6 +226,8 @@ size_t engine_process_block(engine_channel_t *eng,
         sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, fir_out);
     else
         sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, fir_out);
+    if (eng->ml_filter)
+        onnx_filter_process(eng->ml_filter, out, sdm_out);
     return sdm_out;
 }
 
@@ -236,6 +240,8 @@ void engine_channel_reset(engine_channel_t *eng) {
         else
             sdm_context_reset(&eng->sdm);
     }
+    if (eng->ml_filter)
+        onnx_filter_reset(eng->ml_filter);
 }
 
 void engine_channel_free(engine_channel_t *eng) {
@@ -249,6 +255,10 @@ void engine_channel_free(engine_channel_t *eng) {
     free(eng->fir_buf);
     eng->fir_buf = NULL;
     eng->fir_buf_sz = 0;
+    if (eng->ml_filter) {
+        onnx_filter_free(eng->ml_filter);
+        eng->ml_filter = NULL;
+    }
 }
 
 int engine_channel_reconfigure(engine_channel_t *eng,

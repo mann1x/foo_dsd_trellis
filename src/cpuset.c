@@ -339,11 +339,12 @@ int cpuset_detect(cpu_topology_t *topo) {
         e->allocated_to_target = info->AllocatedToTarget ? true : false;
         e->realtime = info->RealTime ? true : false;
         e->raw_flags = info->AllFlags;
-        /* A core is enabled if it's not parked AND not allocated
-         * (i.e., it's in the general scheduling pool).
+        /* A core is enabled if it's not allocated to a specific process.
          * "Allocated" means reserved/removed from general pool
-         * (e.g., by CPUDoc's system CPUSET management). */
-        e->enabled = !e->parked && !e->allocated;
+         * (e.g., by CPUDoc's system CPUSET management).
+         * Parked cores are still enabled — they're just idle and will
+         * unpark when assigned work via SetThreadSelectedCpuSets. */
+        e->enabled = !e->allocated;
         e->perf_score = 1.0;
 
         if (info->EfficiencyClass > max_eff)
@@ -476,7 +477,7 @@ uint64_t cpuset_refresh(cpu_topology_t *topo, bool *changed) {
                 topo->entries[i].allocated = info->Allocated ? true : false;
                 topo->entries[i].realtime = info->RealTime ? true : false;
                 topo->entries[i].raw_flags = info->AllFlags;
-                topo->entries[i].enabled = !info->Parked && !info->Allocated;
+                topo->entries[i].enabled = !info->Allocated;
 
                 if (topo->entries[i].enabled) {
                     uint8_t lp = topo->entries[i].logical_index;
@@ -568,7 +569,7 @@ void cpuset_benchmark(cpu_topology_t *topo) {
 
     int bench_count = 0;
     for (int i = 0; i < topo->count; i++) {
-        if (!topo->entries[i].enabled || topo->entries[i].parked)
+        if (!topo->entries[i].enabled)
             continue;
         if (topo->entries[i].smt_thread != 0)
             continue;  /* Only benchmark T0 */
@@ -597,7 +598,7 @@ void cpuset_benchmark(cpu_topology_t *topo) {
     /* Assign normalized scores. T1 threads get same score as their T0. */
     int bi = 0;
     for (int i = 0; i < topo->count; i++) {
-        if (!topo->entries[i].enabled || topo->entries[i].parked) {
+        if (!topo->entries[i].enabled) {
             topo->entries[i].perf_score = 0.0;
             continue;
         }
@@ -662,8 +663,12 @@ int cpuset_select(const cpu_topology_t *topo,
 
     for (int i = 0; i < topo->count; i++) {
         const cpuset_entry_t *e = &topo->entries[i];
-        if (!e->enabled || e->parked)
+        if (!e->enabled)
             continue;
+        /* Don't exclude parked cores — SetThreadSelectedCpuSets will
+         * cause the OS to unpark them when needed. Excluding parked
+         * cores means we'd only use the busy/hot cores, which is the
+         * opposite of what we want. */
 
         /* SMT filtering */
         if (smt_mode == SMT_T0_ONLY && e->smt_thread != 0)
@@ -677,8 +682,20 @@ int cpuset_select(const cpu_topology_t *topo,
                 continue;
         }
 
-        /* Compute priority: lower = more preferred */
+        /* Compute priority: lower = more preferred.
+         *
+         * Priority bands (non-overlapping):
+         *   0-99:    T0 threads on non-parked cores (best)
+         *   100-199: T0 threads on parked cores (OS will unpark)
+         *   1000+:   T1 (SMT sibling) threads — last resort
+         *
+         * Within each band, sort by perf_score (higher = better). */
         int prio = 0;
+
+        /* Parked cores: usable but less preferred (avoids stealing
+         * from other workloads on the active cores) */
+        if (e->parked)
+            prio += 100;
 
         /* SMT: T0 preferred over T1 */
         if (e->smt_thread > 0)
@@ -687,7 +704,7 @@ int cpuset_select(const cpu_topology_t *topo,
         /* CCD/cluster preference */
         if (ccd_mode == CCD_AUTO) {
             /* Prefer first cluster, then overflow */
-            prio += e->cluster * 100;
+            prio += e->cluster * 10;
         }
         /* CCD_ALL: all clusters equally preferred (no cluster penalty) */
 
@@ -706,10 +723,20 @@ int cpuset_select(const cpu_topology_t *topo,
     /* Sort by priority then by performance */
     qsort(cands, (size_t)ncands, sizeof(select_candidate_t), cmp_candidate);
 
-    /* Determine how many to select */
+    /* Determine how many to select.
+     * max_threads=0 (auto): use physical core count as default.
+     * This avoids over-subscribing with SMT threads, which adds
+     * overhead without proportional SDM throughput benefit. */
     int select_count = ncands;
-    if (max_threads > 0 && max_threads < select_count)
-        select_count = max_threads;
+    if (max_threads > 0) {
+        if (max_threads < select_count)
+            select_count = max_threads;
+    } else {
+        /* Auto: cap to physical core count (or candidate count if fewer) */
+        int phys = topo->num_physical_cores > 0 ? topo->num_physical_cores : ncands;
+        if (phys < select_count)
+            select_count = phys;
+    }
     if (select_count > max_ids)
         select_count = max_ids;
 

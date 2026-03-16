@@ -42,6 +42,7 @@ static const suite_entry_t suites[] = {
     { "hardening", "Hardening",         test_hardening_suite,  0 },
     { "threadpool","Thread Pool",       test_threadpool_suite,  0 },
     { "sweep",     "Rate Conv Sweep",   test_rate_sweep_suite, 1 },
+    { "onnx",      "ONNX Filter",       test_onnx_filter_suite, 0 },
     { "diag",      "SINAD Diagnostics", test_sinad_diag_suite, 1 },
 };
 
@@ -115,6 +116,10 @@ static void list_suites(void) {
 }
 
 int main(int argc, char **argv) {
+    /* Dispatch to dsd_encode tool if --encode is first arg */
+    if (argc >= 2 && strcmp(argv[1], "--encode") == 0)
+        return dsd_encode_main(argc - 1, argv + 1);
+
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--all") == 0) {

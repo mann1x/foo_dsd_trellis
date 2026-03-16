@@ -204,6 +204,9 @@
     <ClCompile Include="src\precorr.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\onnx_filter.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\foo_dsd_trellis.rc" />
@@ -224,6 +227,7 @@
     <ClInclude Include="include\wav_io.h" />
     <ClInclude Include="include\cpuset.h" />
     <ClInclude Include="include\precorr.h" />
+    <ClInclude Include="include\onnx_filter.h" />
   </ItemGroup>
   <!-- SDK project references -->
   <ItemGroup>

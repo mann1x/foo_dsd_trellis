@@ -205,10 +205,13 @@ typedef struct {
     int       sdm_mode;       /* sdm_mode_t: PreCorr or Trellis */
     uint8_t   rate_map[RATE_MAP_COUNT]; /* Per-input-rate output config */
     int8_t    rate_ntf[RATE_MAP_COUNT]; /* Per-input-rate NTF override, NTF_AUTO = auto */
+    bool      antipop;        /* Enable anti-pop lead-in silence */
+    bool      ml_enabled;     /* Enable ONNX ML post-filter */
+    int       ml_ep;          /* ml_ep_t: CPU (0) or DirectML (1) */
 } dsd_config_t;
 
 /* Config serialization version */
-#define DSD_CONFIG_VERSION 9
+#define DSD_CONFIG_VERSION 10
 
 /* Default REST API port */
 #define DSD_DEFAULT_API_PORT 8881
@@ -241,6 +244,9 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     cfg->sdm_mode       = SDM_MODE_PRECORR;
     memset(cfg->rate_map, RATE_OUT_BYPASS, sizeof(cfg->rate_map));
     memset(cfg->rate_ntf, 0xFF, sizeof(cfg->rate_ntf)); /* NTF_AUTO = -1 = 0xFF */
+    cfg->antipop    = false;  /* disabled by default for testing */
+    cfg->ml_enabled = false;
+    cfg->ml_ep      = 2;  /* ML_EP_AUTO */
 }
 
 #endif /* DSD_TYPES_H */

@@ -78,52 +78,56 @@ static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
  * 4  affinity_mask
  * 4  format
  * 4  output_format
- * Total v1: 45 bytes
+ * Total v1: 49 bytes
  *
  * Version 2 adds:
  * 1  debug_log (bool)
- * Total: 46 bytes
+ * Total: 50 bytes
  *
  * Version 3 adds:
  * 1  smt_mode
  * 1  ccd_mode
  * 1  ecore_mode
- * Total: 49 bytes
+ * Total: 53 bytes
  *
  * Version 4 adds:
  * 2  api_port (uint16_t)
- * Total: 51 bytes
+ * Total: 55 bytes
  *
  * Version 5 adds:
  * 1  sdm_mode
- * Total: 52 bytes
+ * Total: 56 bytes
  *
  * Version 6 added fir_mode (1 byte, now removed — read and discard)
- * Total: 53 bytes
+ * Total: 57 bytes
  *
  * Version 7 added proc_mode (1 byte, now superseded by rate_map)
- * Total: 54 bytes
+ * Total: 58 bytes
  *
  * Version 8 adds:
  * 12  rate_map[12] (per-input-rate output config)
- * Total: 66 bytes
+ * Total: 70 bytes
  *
  * Version 9 adds:
  * 12  rate_ntf[12] (per-input-rate NTF override, int8_t, -1=auto)
- * Total: 78 bytes */
-#define CONFIG_V1_SIZE 45
-#define CONFIG_V2_SIZE 46
-#define CONFIG_V3_SIZE 49
-#define CONFIG_V4_SIZE 51
-#define CONFIG_V5_SIZE 52
-#define CONFIG_V6_SIZE 53
-#define CONFIG_V7_SIZE 54
-#define CONFIG_V8_SIZE 66
-#define CONFIG_V9_SIZE 78
+ * Total: 82 bytes */
+/* Correct byte counts: 4(ver)+4(fs_in)+4(fs_out)+4(gain)+1(mute)
+ * +4(depth)+4(cands)+4(lat)+4(ntf)+4(threads)+4(affinity)
+ * +4(format)+4(output_format) = 49 for v1 */
+#define CONFIG_V1_SIZE 49
+#define CONFIG_V2_SIZE 50
+#define CONFIG_V3_SIZE 53
+#define CONFIG_V4_SIZE 55
+#define CONFIG_V5_SIZE 56
+#define CONFIG_V6_SIZE 57
+#define CONFIG_V7_SIZE 58
+#define CONFIG_V8_SIZE 70
+#define CONFIG_V9_SIZE 82
+#define CONFIG_V10_SIZE 84
 
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
-    if (buf_size < CONFIG_V9_SIZE)
+    if (buf_size < CONFIG_V10_SIZE)
         return 0;
 
     size_t pos = 0;
@@ -154,6 +158,10 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     /* v9: rate_ntf */
     memcpy(buf + pos, cfg->rate_ntf, RATE_MAP_COUNT);
     pos += RATE_MAP_COUNT;
+    /* v10: ML filter settings + antipop */
+    pos = write_u8(buf, pos, cfg->ml_enabled ? 1 : 0);
+    pos = write_u8(buf, pos, (uint8_t)cfg->ml_ep);
+    pos = write_u8(buf, pos, cfg->antipop ? 1 : 0);
 
     return pos;
 }
@@ -237,7 +245,17 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
                 memcpy(cfg->rate_ntf, buf + pos, RATE_MAP_COUNT);
                 pos += RATE_MAP_COUNT;
             }
-            /* else: rate_ntf stays at default (all NTF_AUTO) */
+            /* Version 10 adds ml_enabled, ml_ep, antipop */
+            if (version >= 10 && buf_size >= CONFIG_V10_SIZE) {
+                uint8_t u8;
+                pos = read_u8(buf, pos, &u8); cfg->ml_enabled = (u8 != 0);
+                pos = read_u8(buf, pos, &u8); cfg->ml_ep = (int)u8;
+                /* antipop: read if available (85+ bytes), else keep default */
+                if (pos < buf_size) {
+                    pos = read_u8(buf, pos, &u8); cfg->antipop = (u8 != 0);
+                }
+            }
+            /* else: ml_enabled/ml_ep/antipop stay at defaults */
         } else {
             /* Migrate from v1-v7: use fs_out + proc_mode to populate rate_map */
             uint8_t out_idx = dsd_to_rate_out(fs_out_raw);
@@ -327,6 +345,10 @@ void config_validate(dsd_config_t *cfg) {
         if (!rate_map_valid_output(i, cfg->rate_map[i]))
             cfg->rate_map[i] = RATE_OUT_BYPASS;
     }
+
+    /* Validate ML settings */
+    if (cfg->ml_ep < 0 || cfg->ml_ep > 2)
+        cfg->ml_ep = 2;  /* ML_EP_AUTO */
 
     /* Validate per-rate NTF overrides */
     for (int i = 0; i < RATE_MAP_COUNT; i++) {

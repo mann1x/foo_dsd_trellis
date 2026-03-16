@@ -24,6 +24,7 @@
 #include "../include/dop.h"
 #include "../include/threadpool.h"
 #include "../include/cpuset.h"
+#include "../include/onnx_filter.h"
 
 /*
  * Plugin identity
@@ -66,6 +67,10 @@ typedef struct plugin_state {
     bool               workload_changed;
     bool               cpuset_changed;
     uint64_t           last_cpuset_mask;
+
+    /* CPUSET change hysteresis — avoid rebuilding threadpool on transient OS parking */
+    uint64_t           pending_cpuset_mask;  /* mask we're considering switching to */
+    int                cpuset_stable_count;  /* how many chunks the pending mask has been stable */
 
     /* Per-phase timing (milliseconds) */
     double             time_unpack_ms;
@@ -241,6 +246,26 @@ void plugin_destroy(plugin_state_t *s) {
     free(s);
 }
 
+/* Resolve ML model path from DLL directory.
+ * Returns true if path was built; does not check if file exists. */
+static bool resolve_ml_model_path(wchar_t *path, size_t path_size) {
+    HMODULE hmod = GetModuleHandleW(L"foo_dsd_trellis.dll");
+    if (!hmod)
+        return false;
+    DWORD len = GetModuleFileNameW(hmod, path, (DWORD)path_size);
+    if (len == 0 || len >= path_size)
+        return false;
+    /* Strip filename, keep directory */
+    wchar_t *sep = wcsrchr(path, L'\\');
+    if (!sep) sep = wcsrchr(path, L'/');
+    if (sep)
+        sep[1] = L'\0';
+    else
+        path[0] = L'\0';
+    wcscat_s(path, path_size, L"foo_dsd_trellis_ml.onnx");
+    return true;
+}
+
 /* Initialize engine for given channel count and config.
  * Called when we first detect DSD rate in on_chunk. */
 static int plugin_init_engine(plugin_state_t *s, int num_channels,
@@ -248,7 +273,9 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     if (s->initialized)
         return 0;
 
-    s->config.fs_in = dsd_rate;
+    /* Don't overwrite fs_in — caller sets it appropriately:
+     * DSD path: fs_in = detected DSD rate
+     * PCM path: fs_in = PCM sample rate (for FIR upsample ratio) */
     s->num_channels = num_channels;
     s->detected_dsd_rate = dsd_rate;
     s->active_fs_out = s->config.fs_out;
@@ -298,6 +325,19 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         free(s->channels);
         s->channels = NULL;
         return -1;
+    }
+
+    /* Create ML post-filters if enabled and ONNX Runtime is available */
+    if (s->config.ml_enabled && onnx_runtime_available()) {
+        wchar_t model_path[MAX_PATH];
+        if (resolve_ml_model_path(model_path, MAX_PATH)) {
+            uint32_t fs_out = s->config.fs_out ? s->config.fs_out : dsd_rate;
+            for (int i = 0; i < num_channels; i++) {
+                s->channels[i].ml_filter = onnx_filter_create(
+                    model_path, fs_out, (ml_ep_t)s->config.ml_ep);
+                /* NULL is fine — filter is just unavailable */
+            }
+        }
     }
 
     s->initialized = true;
@@ -409,32 +449,49 @@ size_t plugin_process(plugin_state_t *s,
             return 0;
     }
 
-    /* Check for system CPUSET changes (CPUDoc dynamic core management) */
+    /* Check for system CPUSET changes (CPUDoc dynamic core management).
+     * Hysteresis: only rebuild threadpool when the new mask has been
+     * stable for CPUSET_STABLE_THRESHOLD consecutive chunks. This avoids
+     * choppy audio from transient OS core parking/unparking. */
+    #define CPUSET_STABLE_THRESHOLD 50  /* ~50 chunks ≈ 1-2 seconds */
     s->cpuset_changed = false;
     if (s->topology_detected) {
         bool mask_changed = false;
         uint64_t new_mask = cpuset_refresh(&s->topology, &mask_changed);
         if (mask_changed && s->pool) {
-            s->cpuset_changed = true;
-            s->last_cpuset_mask = new_mask;
+            if (new_mask == s->pending_cpuset_mask) {
+                s->cpuset_stable_count++;
+            } else {
+                s->pending_cpuset_mask = new_mask;
+                s->cpuset_stable_count = 1;
+            }
 
-            /* Rebuild thread pool with new set of enabled cores */
-            threadpool_destroy(s->pool);
-            s->pool = NULL;
+            if (s->cpuset_stable_count >= CPUSET_STABLE_THRESHOLD) {
+                s->cpuset_changed = true;
+                s->last_cpuset_mask = new_mask;
+                s->cpuset_stable_count = 0;
 
-            uint32_t selected_ids[CPUSET_MAX_CPUS];
-            int max_t = s->config.thread_count > 0 ? s->config.thread_count : 0;
-            int selected = cpuset_select(&s->topology,
-                                          (smt_mode_t)s->config.smt_mode,
-                                          (ccd_mode_t)s->config.ccd_mode,
-                                          (ecore_mode_t)s->config.ecore_mode,
-                                          max_t, selected_ids, CPUSET_MAX_CPUS);
-            if (selected > 0)
-                s->pool = threadpool_create_cpuset(selected_ids, selected);
-            if (!s->pool)
-                s->pool = threadpool_create(
-                    s->config.thread_count > 0 ? s->config.thread_count : 0,
-                    s->config.affinity_mask);
+                /* Rebuild thread pool with new set of enabled cores */
+                threadpool_destroy(s->pool);
+                s->pool = NULL;
+
+                uint32_t selected_ids[CPUSET_MAX_CPUS];
+                int max_t = s->config.thread_count > 0 ? s->config.thread_count : 0;
+                int selected = cpuset_select(&s->topology,
+                                              (smt_mode_t)s->config.smt_mode,
+                                              (ccd_mode_t)s->config.ccd_mode,
+                                              (ecore_mode_t)s->config.ecore_mode,
+                                              max_t, selected_ids, CPUSET_MAX_CPUS);
+                if (selected > 0)
+                    s->pool = threadpool_create_cpuset(selected_ids, selected);
+                if (!s->pool)
+                    s->pool = threadpool_create(
+                        s->config.thread_count > 0 ? s->config.thread_count : 0,
+                        s->config.affinity_mask);
+            }
+        } else {
+            /* Mask didn't change — reset hysteresis counter */
+            s->cpuset_stable_count = 0;
         }
     }
 

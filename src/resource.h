@@ -13,6 +13,10 @@
 #define IDC_COMBO_FORMAT            1013
 #define IDC_CHECK_DEBUG_LOG         1018
 #define IDC_STATIC_PATH_INFO        1023
+#define IDC_CHECK_ML_ENABLED        1024
+#define IDC_COMBO_ML_EP             1025
+#define IDC_STATIC_ML_STATUS        1026
+#define IDC_CHECK_ANTIPOP           1027
 
 // Next default values for new objects
 //
@@ -20,7 +24,7 @@
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE    102
 #define _APS_NEXT_COMMAND_VALUE     40001
-#define _APS_NEXT_CONTROL_VALUE     1024
+#define _APS_NEXT_CONTROL_VALUE     1027
 #define _APS_NEXT_SYMED_VALUE       101
 #endif
 #endif

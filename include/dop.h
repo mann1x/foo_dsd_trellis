@@ -30,6 +30,12 @@ void dop_unpack(const float *pcm24, float *bits, size_t frames);
  * pcm24 buffer must hold bit_count / 16 frames. */
 void dop_pack(const float *bits, float *pcm24, size_t bit_count);
 
+/* Pack float32 +/-1.0 DSD bits into 24-bit LE integer DoP frames.
+ * Output: 3 bytes per frame [dsd_lo, dsd_hi, marker].
+ * out buffer must hold bit_count / 16 * 3 bytes.
+ * Use with set_data_fixedpoint(out, bytes, rate, ch, 24, ch_config). */
+void dop_pack_i24(const float *bits, uint8_t *out, size_t bit_count);
+
 /* Unpack raw bitstream bytes to float32 ±1.0 (native ASIO path).
  * Each bit becomes one float: 1 → +1.0f, 0 → -1.0f */
 void bits_unpack(const uint8_t *src, float *dst, size_t n_bits);

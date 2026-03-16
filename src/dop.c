@@ -111,6 +111,29 @@ void dop_pack(const float *bits, float *pcm24, size_t bit_count) {
     }
 }
 
+void dop_pack_i24(const float *bits, uint8_t *out, size_t bit_count) {
+    if (!bits || !out || bit_count == 0)
+        return;
+
+    size_t frames = bit_count / 16;
+
+    for (size_t i = 0; i < frames; i++) {
+        uint16_t dsd_bits = 0;
+
+        /* Pack 16 float +/-1.0 -> 16 bits, MSB first */
+        for (int b = 15; b >= 0; b--) {
+            if (*bits++ >= 0.0f)
+                dsd_bits |= (uint16_t)(1u << b);
+        }
+
+        /* DoP 24-bit LE: [dsd_lo, dsd_hi, marker] */
+        uint8_t marker = (i & 1) ? DOP_MARKER_B : DOP_MARKER_A;
+        out[i * 3 + 0] = (uint8_t)(dsd_bits & 0xFF);
+        out[i * 3 + 1] = (uint8_t)((dsd_bits >> 8) & 0xFF);
+        out[i * 3 + 2] = marker;
+    }
+}
+
 void bits_unpack(const uint8_t *src, float *dst, size_t n_bits) {
     if (!src || !dst || n_bits == 0)
         return;

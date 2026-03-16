@@ -139,6 +139,7 @@
     <ClCompile Include="test\test_rate_sinad.c" />
     <ClCompile Include="test\test_precorr.c" />
     <ClCompile Include="test\test_sinad_diag.c" />
+    <ClCompile Include="test\test_onnx_filter.c" />
     <!-- Library sources (linked directly, no DLL dependency) -->
     <ClCompile Include="src\config.c" />
     <ClCompile Include="src\dop.c" />
@@ -152,6 +153,9 @@
     <ClCompile Include="src\cpuset.c" />
     <ClCompile Include="src\precorr.c" />
     <ClCompile Include="src\wav_io.c" />
+    <ClCompile Include="src\onnx_filter.c" />
+    <!-- Tools -->
+    <ClCompile Include="tools\dsd_encode.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\dsd_types.h" />
@@ -162,6 +166,7 @@
     <ClInclude Include="include\dop.h" />
     <ClInclude Include="include\engine.h" />
     <ClInclude Include="include\threadpool.h" />
+    <ClInclude Include="include\onnx_filter.h" />
     <ClInclude Include="test\test.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
