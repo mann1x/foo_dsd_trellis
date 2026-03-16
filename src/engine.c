@@ -34,6 +34,11 @@ typedef struct {
 static const path_config_t path_table[] = {
     /*                                            lim  cands lat  depth gain  */
     /* All paths use 0.708 (-3 dB) gain for uniform volume across rates */
+    /* Same-rate re-encode (boxcar → SDM, uses Trellis auto-select NTF) */
+    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  4,  128, 8, 0.708f },
+    { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_6, 0.0,  4,  128, 8, 0.708f },
+    { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_8, 0.0,  4,  256, 8, 0.708f },
+    { DSD_RATE_512, DSD_RATE_512, NTF_CLANS_8, 0.0,  4,  256, 8, 0.708f },
     /* Upsample paths */
     { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_4,   0.0,  2,  512, 4, 0.708f },
     { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  512, 4, 0.708f },
@@ -90,7 +95,7 @@ int engine_channel_init(engine_channel_t *eng, int channel,
         /* Path-adaptive lookup for rate conversion with NTF_AUTO */
         bool is_rate_conv = (cfg->fs_in != fs_out);
         const path_config_t *pc = NULL;
-        if (is_rate_conv && cfg->ntf_filter == NTF_AUTO) {
+        if (cfg->ntf_filter == NTF_AUTO) {
             pc = path_config_lookup(cfg->fs_in, fs_out);
             if (pc)
                 eng->fir_gain = pc->fir_gain;
@@ -397,11 +402,9 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
 
     info->fir_only = false;
 
-    /* Path-adaptive lookup */
-    bool is_rate_conv = (fs_in != fs_out);
+    /* Path-adaptive lookup (includes same-rate re-encode entries) */
     const path_config_t *pc = NULL;
-    if (is_rate_conv && ntf_override == NTF_AUTO &&
-        sdm_mode == SDM_MODE_TRELLIS) {
+    if (ntf_override == NTF_AUTO && sdm_mode == SDM_MODE_TRELLIS) {
         pc = path_config_lookup(fs_in, fs_out);
     }
 
