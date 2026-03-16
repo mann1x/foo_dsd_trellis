@@ -1087,8 +1087,10 @@ public:
                 int wl_threads = 0, wl_segments = 0;
                 bool wl_changed = false;
                 plugin_get_workload(m_state, &wl_threads, &wl_segments, &wl_changed);
-                trellis_log("workload: %d threads, %d segments/ch",
-                            wl_threads, wl_segments);
+                int active_workers = (int)channels * wl_segments;
+                if (active_workers > wl_threads) active_workers = wl_threads;
+                trellis_log("workload: %d threads (%d active: %uch x %d seg), %d segments/ch",
+                            wl_threads, active_workers, channels, wl_segments, wl_segments);
                 log_selected_cores();
 
                 double t_unpack, t_fir, t_sdm, t_pack;
