@@ -698,10 +698,10 @@ int cpuset_select(const cpu_topology_t *topo,
          * Ties broken by perf_score (higher = better). */
         int prio = 0;
 
-        /* Parked cores: slightly less preferred but still good —
-         * they're guaranteed to be idle. */
-        if (e->parked)
-            prio += 100;
+        /* Don't penalize parked cores — the Parked flag is transient
+         * (Windows parks idle cores and unparks on demand). At query
+         * time most cores appear parked even when they'll be active
+         * under load. Treat all enabled cores equally. */
 
         /* Scheduling class: higher = Windows uses more = avoid.
          * Range 0-15: high sched_class → high prio → selected last. */
