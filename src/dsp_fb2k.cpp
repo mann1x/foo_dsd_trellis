@@ -458,19 +458,19 @@ private:
         m_listRate = GetDlgItem(IDC_LIST_RATEMAP);
         m_listRate.SetExtendedListViewStyle(
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 48);
-        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 50);
+        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 52);
+        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 56);
         m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 50);
-        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 88);
-        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 55);
-        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 52);
+        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 100);
+        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 62);
+        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 60);
         /* Last column: fill remaining width to avoid horizontal scrollbar */
         {
             CRect rc;
             m_listRate.GetClientRect(&rc);
-            int used = 48 + 50 + 50 + 88 + 55 + 52;
+            int used = 52 + 56 + 50 + 100 + 62 + 60;
             int remain = rc.Width() - used - 4;
-            if (remain < 55) remain = 55;
+            if (remain < 60) remain = 60;
             m_listRate.InsertColumn(6, L"ML", LVCFMT_LEFT, remain);
         }
 
@@ -868,16 +868,15 @@ private:
             return;
         }
 
-        /* Query path info from engine */
+        /* Query path info from engine — use per-rate SDM mode if set */
         int8_t ntf_val = m_cfg.rate_ntf[row];
-        int sdm_mode = m_cfg.sdm_mode;
+        int sdm_mode = (m_cfg.rate_sdm[row] >= 0) ? (int)m_cfg.rate_sdm[row] : m_cfg.sdm_mode;
         engine_path_info_t pi;
         engine_get_path_info(fs_in, fs_out, (int)ntf_val, sdm_mode, &m_cfg, &pi);
 
         /* Format info text */
         info << g_rate_names[row];
         if (is_dsd_input && rate_out_is_dsd(out_idx)) {
-            /* DSD → DSD */
             if (fs_in == fs_out)
                 info << " -> " << g_output_names[out_idx] << " (re-encode)";
             else if (fs_out > fs_in)
@@ -885,10 +884,8 @@ private:
             else
                 info << " -> " << g_output_names[out_idx] << " (1/" << (fs_in/fs_out) << " downsample)";
         } else if (is_dsd_input && rate_out_is_pcm(out_idx)) {
-            /* DSD → PCM */
             info << " -> " << g_output_names[out_idx] << " (1/" << (fs_in/fs_out) << " decimation)";
         } else {
-            /* PCM → DSD */
             info << " -> " << g_output_names[out_idx] << " (" << (fs_out/fs_in) << "x upsample)";
         }
 
@@ -900,74 +897,44 @@ private:
             const char *sdm_name = (sdm_mode == SDM_MODE_TRELLIS) ? "Trellis" : "PreCorr";
             info << "\nSDM: " << sdm_name;
             if (sdm_mode == SDM_MODE_TRELLIS)
-                info << ", depth=" << pi.depth << ", cands=" << pi.cands << ", lat=" << pi.lat;
+                info << ", cands=" << pi.cands << ", depth=" << pi.depth << ", lat=" << pi.lat;
 
             /* NTF display */
             int ntf_display = pi.ntf_filter;
             info << "\nNTF: ";
-            if (ntf_val == NTF_AUTO) {
+            if (ntf_display >= 0 && ntf_display < (int)(NTF_NAME_COUNT - 1))
+                info << g_ntf_names[ntf_display + 1];
+            else
                 info << "Auto";
-                if (ntf_display >= 0 && ntf_display < (int)(NTF_NAME_COUNT - 1))
-                    info << " (" << g_ntf_names[ntf_display + 1] << ")";
-            } else {
-                int idx = ntf_val + 1;
-                if (idx >= 0 && idx < (int)NTF_NAME_COUNT)
-                    info << g_ntf_names[idx];
-            }
 
+            if (pi.fir_gain != 1.0f)
+                info << "\nFIR gain: " << pfc::format_float(pi.fir_gain, 0, 2);
             if (pi.state_limit > 0.0)
-                info << "\nState limiter: " << pfc::format_float(pi.state_limit, 0, 1);
+                info << ", state limiter: " << pfc::format_float(pi.state_limit, 0, 1);
+
+            /* Show resolved Auto defaults */
+            bool has_auto = (m_cfg.rate_sdm[row] < 0 || m_cfg.rate_cands[row] < 0 ||
+                             m_cfg.rate_depth[row] < 0 || m_cfg.rate_ntf[row] == NTF_AUTO);
+            if (has_auto && sdm_mode == SDM_MODE_TRELLIS) {
+                info << "\nAuto defaults: cands=" << pi.cands << ", depth=" << pi.depth
+                     << ", lat=" << pi.lat;
+            }
         }
 
         ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, info);
     }
 
-    /* Refresh Auto text for a row's Cands/Depth/SDM columns using path info.
-     * Called when Output changes so the resolved defaults update. */
+    /* Set Auto text (plain "Auto") for any Auto columns in a row. */
     void RefreshAutoText(int row) {
         if (row < 0 || row >= RATE_MAP_COUNT) return;
-        uint8_t out_idx = m_cfg.rate_map[row];
-        uint32_t fs_in = g_input_rates[row];
-        uint32_t fs_out = rate_out_to_hz(out_idx);
-
-        /* Get path-optimal values */
-        int def_cands = m_cfg.trellis_cands;
-        int def_depth = m_cfg.trellis_depth;
-        const wchar_t *def_sdm = (m_cfg.sdm_mode == SDM_MODE_PRECORR) ? L"PreCorr" : L"Trellis";
-
-        if (out_idx != RATE_OUT_BYPASS && fs_out > 0) {
-            engine_path_info_t pi;
-            int sdm_mode = (m_cfg.rate_sdm[row] >= 0) ? (int)m_cfg.rate_sdm[row] : m_cfg.sdm_mode;
-            if (engine_get_path_info(fs_in, fs_out,
-                    (int)m_cfg.rate_ntf[row], sdm_mode, &m_cfg, &pi) == 0 && !pi.fir_only) {
-                if (pi.cands > 0) def_cands = pi.cands;
-                if (pi.depth > 0) def_depth = pi.depth;
-            }
-        }
-
-        wchar_t buf[32];
-
-        /* SDM mode */
-        if (m_cfg.rate_sdm[row] < 0) {
-            _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%s)", def_sdm);
-            m_listRate.SetItemText(row, 3, buf);
-        }
-        /* Candidates */
-        if (m_cfg.rate_cands[row] < 0) {
-            _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%d)", def_cands);
-            m_listRate.SetItemText(row, 4, buf);
-        }
-        /* Depth */
-        if (m_cfg.rate_depth[row] < 0) {
-            _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%d)", def_depth);
-            m_listRate.SetItemText(row, 5, buf);
-        }
-        /* ML */
-        if (m_cfg.rate_ml[row] < 0) {
-            _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%s)",
-                         m_cfg.ml_enabled ? L"On" : L"Off");
-            m_listRate.SetItemText(row, 6, buf);
-        }
+        if (m_cfg.rate_sdm[row] < 0)
+            m_listRate.SetItemText(row, 3, L"Auto");
+        if (m_cfg.rate_cands[row] < 0)
+            m_listRate.SetItemText(row, 4, L"Auto");
+        if (m_cfg.rate_depth[row] < 0)
+            m_listRate.SetItemText(row, 5, L"Auto");
+        if (m_cfg.rate_ml[row] < 0)
+            m_listRate.SetItemText(row, 6, L"Auto");
     }
 
     void UpdatePreset() {
