@@ -124,8 +124,8 @@ static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
 #define CONFIG_V8_SIZE 70
 #define CONFIG_V9_SIZE 82
 #define CONFIG_V10_SIZE 84
-/* v11: +48 bytes (4 × RATE_MAP_COUNT for rate_sdm/cands/depth/ml) */
-#define CONFIG_V11_SIZE (CONFIG_V10_SIZE + 3 + 4 * RATE_MAP_COUNT)
+/* v11: antipop(1) + 4 × RATE_MAP_COUNT(12) for rate_sdm/cands/depth/ml */
+#define CONFIG_V11_SIZE (CONFIG_V10_SIZE + 1 + 4 * RATE_MAP_COUNT)
 
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
