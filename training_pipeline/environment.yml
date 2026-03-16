@@ -1,0 +1,23 @@
+name: foo_dsd_trellis
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch>=2.2
+  - torchaudio>=2.2
+  - pytorch-cuda=12.4
+  - pip
+  - pip:
+    - numpy
+    - scipy
+    - soundfile
+    - librosa
+    - onnx
+    - onnxruntime
+    - onnxruntime-directml
+    - matplotlib
+    - tqdm
+    - tensorboard
