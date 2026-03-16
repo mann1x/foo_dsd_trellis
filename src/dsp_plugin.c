@@ -1013,15 +1013,22 @@ double plugin_get_latency(const plugin_state_t *s) {
     if (!s || !s->initialized || s->detected_dsd_rate == 0)
         return 0.0;
 
-    /* PreCorr has no latency */
-    if (s->config.sdm_mode == SDM_MODE_PRECORR)
-        return 0.0;
-
     uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
-    /* Latency is trellis_lat DSD samples at the output DSD rate,
-     * expressed as DoP PCM frames / DoP PCM rate */
-    double dsd_lat_sec = (double)s->config.trellis_lat / (double)fs_out;
-    return dsd_lat_sec;
+
+    /* SDM latency (trellis only) */
+    double sdm_lat = 0.0;
+    if (s->config.sdm_mode != SDM_MODE_PRECORR)
+        sdm_lat = (double)s->config.trellis_lat / (double)fs_out;
+
+    /* Processing buffer: report extra latency so fb2k prefetches
+     * more audio, preventing output underruns during heavy SDM work.
+     * Scale with output rate — DSD512 needs more buffer than DSD64. */
+    double proc_buf = 0.0;
+    if (fs_out >= 22579200)      proc_buf = 5.0;  /* DSD512: borderline RT */
+    else if (fs_out >= 11289600) proc_buf = 2.0;  /* DSD256 */
+    else if (fs_out >= 5644800)  proc_buf = 1.0;  /* DSD128 */
+
+    return sdm_lat + proc_buf;
 }
 
 /* Reset all channel states (on seek / discontinuity) */
