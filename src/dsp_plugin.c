@@ -311,14 +311,9 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         s->topology_detected = true;
     }
 
-    /* Select threads based on topology and config.
-     * Cap to actual need: channels * max_segments_per_ch.
-     * For stereo with 4 segments = 8 threads max. */
-    int max_segments = 4;
-    int needed = num_channels * max_segments;
-
+    /* Select threads based on topology and config */
     uint32_t selected_ids[CPUSET_MAX_CPUS];
-    int max_t = s->config.thread_count > 0 ? s->config.thread_count : needed;
+    int max_t = s->config.thread_count > 0 ? s->config.thread_count : 0;
     int selected = cpuset_select(&s->topology,
                                   (smt_mode_t)s->config.smt_mode,
                                   (ccd_mode_t)s->config.ccd_mode,
@@ -335,7 +330,7 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     if (selected > 0 && s->topology.initialized) {
         s->pool = threadpool_create_cpuset(selected_ids, selected);
     } else {
-        int tc = s->config.thread_count > 0 ? s->config.thread_count : needed;
+        int tc = s->config.thread_count > 0 ? s->config.thread_count : 0;
         s->pool = threadpool_create(tc, s->config.affinity_mask);
     }
     if (!s->pool) {
