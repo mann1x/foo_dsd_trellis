@@ -22,7 +22,7 @@ static void test_config_roundtrip(void) {
     cfg.format = FORMAT_DOP;
     cfg.output_format = OUTPUT_PCM;
 
-    uint8_t buf[128];
+    uint8_t buf[256];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should write bytes");
 
@@ -52,7 +52,7 @@ static void test_config_sdm_mode_roundtrip(void) {
     dsd_config_defaults(&cfg);
     cfg.sdm_mode = SDM_MODE_TRELLIS;
 
-    uint8_t buf[128];
+    uint8_t buf[256];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should write bytes");
 
@@ -68,7 +68,7 @@ static void test_config_v4_compat(void) {
     dsd_config_defaults(&cfg);
     cfg.sdm_mode = SDM_MODE_PRECORR;
 
-    uint8_t buf[128];
+    uint8_t buf[256];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should work");
 
@@ -89,7 +89,7 @@ static void test_config_defaults_roundtrip(void) {
     dsd_config_t cfg;
     dsd_config_defaults(&cfg);
 
-    uint8_t buf[128];
+    uint8_t buf[256];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
 
     dsd_config_t cfg2;
@@ -163,7 +163,7 @@ static void test_config_rate_map_roundtrip(void) {
     cfg.rate_map[RATEIDX_DSD64]  = RATE_OUT_DSD256;
     cfg.rate_map[RATEIDX_DSD128] = RATE_OUT_DSD512;
 
-    uint8_t buf[128];
+    uint8_t buf[256];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should write bytes");
 
@@ -202,7 +202,7 @@ static void test_config_v7_migration(void) {
     dsd_config_t cfg;
     dsd_config_defaults(&cfg);
 
-    uint8_t buf[128];
+    uint8_t buf[256];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should work");
 
@@ -240,7 +240,7 @@ static void test_config_rate_ntf_roundtrip(void) {
     cfg.rate_ntf[RATEIDX_DSD128] = 5;
     cfg.rate_ntf[RATEIDX_44100]  = 0;  /* first NTF */
 
-    uint8_t buf[128];
+    uint8_t buf[256];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should write bytes");
 
@@ -278,7 +278,7 @@ static void test_config_v8_migration(void) {
     dsd_config_defaults(&cfg);
     cfg.rate_ntf[RATEIDX_DSD64] = 3;  /* will be lost in truncation */
 
-    uint8_t buf[128];
+    uint8_t buf[256];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should work");
 

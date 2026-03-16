@@ -205,13 +205,17 @@ typedef struct {
     int       sdm_mode;       /* sdm_mode_t: PreCorr or Trellis */
     uint8_t   rate_map[RATE_MAP_COUNT]; /* Per-input-rate output config */
     int8_t    rate_ntf[RATE_MAP_COUNT]; /* Per-input-rate NTF override, NTF_AUTO = auto */
+    int8_t    rate_sdm[RATE_MAP_COUNT]; /* Per-input-rate SDM mode: -1=Auto, 0=PreCorr, 1=Trellis */
+    int8_t    rate_cands[RATE_MAP_COUNT]; /* Per-input-rate candidates: -1=Auto, 4/8/16/32 */
+    int8_t    rate_depth[RATE_MAP_COUNT]; /* Per-input-rate depth: -1=Auto, 4/5/6/7/8 */
+    int8_t    rate_ml[RATE_MAP_COUNT];    /* Per-input-rate ML filter: -1=Auto, 0=Off, 1=On */
     bool      antipop;        /* Enable anti-pop lead-in silence */
     bool      ml_enabled;     /* Enable ONNX ML post-filter */
     int       ml_ep;          /* ml_ep_t: CPU (0) or DirectML (1) */
 } dsd_config_t;
 
 /* Config serialization version */
-#define DSD_CONFIG_VERSION 10
+#define DSD_CONFIG_VERSION 11
 
 /* Default REST API port */
 #define DSD_DEFAULT_API_PORT 8881
@@ -244,6 +248,10 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     cfg->sdm_mode       = SDM_MODE_PRECORR;
     memset(cfg->rate_map, RATE_OUT_BYPASS, sizeof(cfg->rate_map));
     memset(cfg->rate_ntf, 0xFF, sizeof(cfg->rate_ntf)); /* NTF_AUTO = -1 = 0xFF */
+    memset(cfg->rate_sdm, 0xFF, sizeof(cfg->rate_sdm)); /* -1 = Auto (use global) */
+    memset(cfg->rate_cands, 0xFF, sizeof(cfg->rate_cands)); /* -1 = Auto */
+    memset(cfg->rate_depth, 0xFF, sizeof(cfg->rate_depth)); /* -1 = Auto */
+    memset(cfg->rate_ml, 0xFF, sizeof(cfg->rate_ml)); /* -1 = Auto (use global) */
     cfg->antipop    = true;   /* enabled by default */
     cfg->ml_enabled = false;
     cfg->ml_ep      = 2;  /* ML_EP_AUTO */

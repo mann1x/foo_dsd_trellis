@@ -452,9 +452,13 @@ private:
         m_listRate = GetDlgItem(IDC_LIST_RATEMAP);
         m_listRate.SetExtendedListViewStyle(
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 65);
-        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 85);
-        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 65);
+        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 50);
+        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 55);
+        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 45);
+        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 45);
+        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 35);
+        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 35);
+        m_listRate.InsertColumn(6, L"ML", LVCFMT_LEFT, 30);
 
         for (int i = 0; i < RATE_MAP_COUNT; i++) {
             m_listRate.InsertItem(i, g_rate_names[i]);
@@ -462,6 +466,28 @@ private:
             int ntf_idx = m_cfg.rate_ntf[i] + 1; /* NTF_AUTO=-1 → 0 */
             if (ntf_idx < 0 || ntf_idx >= (int)NTF_NAME_COUNT) ntf_idx = 0;
             m_listRate.SetItemText(i, 2, g_ntf_names[ntf_idx]);
+            /* SDM mode */
+            m_listRate.SetItemText(i, 3,
+                m_cfg.rate_sdm[i] < 0 ? L"Auto" :
+                m_cfg.rate_sdm[i] == SDM_MODE_PRECORR ? L"PreCorr" : L"Trellis");
+            /* Candidates */
+            {
+                wchar_t buf[16];
+                if (m_cfg.rate_cands[i] < 0) wcscpy_s(buf, L"Auto");
+                else _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_cands[i]);
+                m_listRate.SetItemText(i, 4, buf);
+            }
+            /* Depth */
+            {
+                wchar_t buf[16];
+                if (m_cfg.rate_depth[i] < 0) wcscpy_s(buf, L"Auto");
+                else _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_depth[i]);
+                m_listRate.SetItemText(i, 5, buf);
+            }
+            /* ML */
+            m_listRate.SetItemText(i, 6,
+                m_cfg.rate_ml[i] < 0 ? L"Auto" :
+                m_cfg.rate_ml[i] == 0 ? L"Off" : L"On");
         }
 
         /* Create in-place editor combos (children of dialog, initially hidden) */
@@ -588,11 +614,11 @@ private:
         UpdatePathInfo(nm->iItem);
 
         if (nm->iSubItem == 1) {
-            /* Output column — show output combo */
             ShowOutputCombo(nm->iItem);
         } else if (nm->iSubItem == 2) {
-            /* NTF column — show NTF combo */
             ShowNtfCombo(nm->iItem);
+        } else if (nm->iSubItem >= 3 && nm->iSubItem <= 6) {
+            ShowPerRateCombo(nm->iItem, nm->iSubItem);
         }
 
         return 0;
@@ -653,6 +679,59 @@ private:
         m_ntfCombo.ShowDropDown(TRUE);
     }
 
+    void ShowPerRateCombo(int row, int col) {
+        CRect cellRC;
+        m_listRate.GetSubItemRect(row, col, LVIR_BOUNDS, &cellRC);
+        m_listRate.MapWindowPoints(m_hWnd, &cellRC);
+
+        m_ntfCombo.ResetContent();
+
+        if (col == 3) {
+            /* SDM mode: Auto(*), PreCorr, Trellis */
+            m_ntfCombo.AddString(L"Auto (*)");
+            m_ntfCombo.AddString(L"PreCorr");
+            m_ntfCombo.AddString(L"Trellis");
+            int cur = m_cfg.rate_sdm[row];
+            m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
+        } else if (col == 4) {
+            /* Candidates: Auto(*), 4, 8, 16, 32 */
+            m_ntfCombo.AddString(L"Auto (*)");
+            m_ntfCombo.AddString(L"4"); m_ntfCombo.AddString(L"8");
+            m_ntfCombo.AddString(L"16"); m_ntfCombo.AddString(L"32");
+            int cur = m_cfg.rate_cands[row];
+            int sel = 0;
+            if (cur == 4) sel = 1; else if (cur == 8) sel = 2;
+            else if (cur == 16) sel = 3; else if (cur == 32) sel = 4;
+            m_ntfCombo.SetCurSel(sel);
+        } else if (col == 5) {
+            /* Depth: Auto(*), 4, 5, 6, 7, 8 */
+            m_ntfCombo.AddString(L"Auto (*)");
+            m_ntfCombo.AddString(L"4"); m_ntfCombo.AddString(L"5");
+            m_ntfCombo.AddString(L"6"); m_ntfCombo.AddString(L"7");
+            m_ntfCombo.AddString(L"8");
+            int cur = m_cfg.rate_depth[row];
+            int sel = 0;
+            if (cur >= 4 && cur <= 8) sel = cur - 3;
+            m_ntfCombo.SetCurSel(sel);
+        } else if (col == 6) {
+            /* ML: Auto(*), Off, On */
+            m_ntfCombo.AddString(L"Auto (*)");
+            m_ntfCombo.AddString(L"Off");
+            m_ntfCombo.AddString(L"On");
+            int cur = m_cfg.rate_ml[row];
+            m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
+        }
+
+        m_editRow = row;
+        m_editCol = col;
+        m_ntfCombo.SetWindowPos(HWND_TOP,
+                                cellRC.left, cellRC.top,
+                                cellRC.Width(), 200,
+                                SWP_SHOWWINDOW);
+        m_ntfCombo.SetFocus();
+        m_ntfCombo.ShowDropDown(TRUE);
+    }
+
     void OnRateMapEditChange(UINT, int, CWindow) {
         int sel = m_editCombo.GetCurSel();
         if (sel >= 0 && m_editRow >= 0 && m_editRow < RATE_MAP_COUNT) {
@@ -666,13 +745,47 @@ private:
 
     void OnNtfEditChange(UINT, int, CWindow) {
         int sel = m_ntfCombo.GetCurSel();
-        if (sel >= 0 && m_editRow >= 0 && m_editRow < RATE_MAP_COUNT) {
-            int8_t ntf_val = (int8_t)(sel - 1); /* index 0 → NTF_AUTO (-1) */
+        if (sel < 0 || m_editRow < 0 || m_editRow >= RATE_MAP_COUNT)
+            return;
+
+        if (m_editCol == 2) {
+            /* NTF */
+            int8_t ntf_val = (int8_t)(sel - 1);
             m_cfg.rate_ntf[m_editRow] = ntf_val;
             m_listRate.SetItemText(m_editRow, 2, g_ntf_names[sel]);
-            UpdatePathInfo(m_editRow);
-            if (!m_updating) UpdatePreset();
+        } else if (m_editCol == 3) {
+            /* SDM mode: 0=Auto, 1=PreCorr, 2=Trellis */
+            int8_t val = (int8_t)(sel == 0 ? -1 : sel - 1);
+            m_cfg.rate_sdm[m_editRow] = val;
+            const wchar_t *names[] = { L"Auto", L"PreCorr", L"Trellis" };
+            m_listRate.SetItemText(m_editRow, 3, names[sel < 3 ? sel : 0]);
+        } else if (m_editCol == 4) {
+            /* Candidates: 0=Auto, 1=4, 2=8, 3=16, 4=32 */
+            static const int8_t cvals[] = { -1, 4, 8, 16, 32 };
+            int8_t val = (sel >= 0 && sel < 5) ? cvals[sel] : -1;
+            m_cfg.rate_cands[m_editRow] = val;
+            wchar_t buf[16];
+            if (val < 0) wcscpy_s(buf, L"Auto");
+            else _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", val);
+            m_listRate.SetItemText(m_editRow, 4, buf);
+        } else if (m_editCol == 5) {
+            /* Depth: 0=Auto, 1=4, 2=5, 3=6, 4=7, 5=8 */
+            int8_t val = (sel == 0) ? -1 : (int8_t)(sel + 3);
+            m_cfg.rate_depth[m_editRow] = val;
+            wchar_t buf[16];
+            if (val < 0) wcscpy_s(buf, L"Auto");
+            else _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", val);
+            m_listRate.SetItemText(m_editRow, 5, buf);
+        } else if (m_editCol == 6) {
+            /* ML: 0=Auto, 1=Off, 2=On */
+            int8_t val = (int8_t)(sel == 0 ? -1 : sel - 1);
+            m_cfg.rate_ml[m_editRow] = val;
+            const wchar_t *names[] = { L"Auto", L"Off", L"On" };
+            m_listRate.SetItemText(m_editRow, 6, names[sel < 3 ? sel : 0]);
         }
+
+        UpdatePathInfo(m_editRow);
+        if (!m_updating) UpdatePreset();
     }
 
     void OnComboKillFocus(UINT, int, CWindow) {
@@ -970,8 +1083,16 @@ public:
         if (out_rate == 0)
             return true;
 
-        /* Apply per-rate NTF override */
+        /* Apply per-rate overrides (Auto = -1 falls back to global) */
         m_config.ntf_filter = (int)m_config.rate_ntf[map_idx];
+        if (m_config.rate_sdm[map_idx] >= 0)
+            m_config.sdm_mode = (int)m_config.rate_sdm[map_idx];
+        if (m_config.rate_cands[map_idx] > 0)
+            m_config.trellis_cands = (int)m_config.rate_cands[map_idx];
+        if (m_config.rate_depth[map_idx] > 0)
+            m_config.trellis_depth = (int)m_config.rate_depth[map_idx];
+        if (m_config.rate_ml[map_idx] >= 0)
+            m_config.ml_enabled = (m_config.rate_ml[map_idx] != 0);
 
         /* Set output rate for this chunk */
         m_config.fs_out = out_rate;

@@ -124,10 +124,12 @@ static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
 #define CONFIG_V8_SIZE 70
 #define CONFIG_V9_SIZE 82
 #define CONFIG_V10_SIZE 84
+/* v11: +48 bytes (4 × RATE_MAP_COUNT for rate_sdm/cands/depth/ml) */
+#define CONFIG_V11_SIZE (CONFIG_V10_SIZE + 3 + 4 * RATE_MAP_COUNT)
 
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
-    if (buf_size < CONFIG_V10_SIZE)
+    if (buf_size < CONFIG_V11_SIZE)
         return 0;
 
     size_t pos = 0;
@@ -162,6 +164,15 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     pos = write_u8(buf, pos, cfg->ml_enabled ? 1 : 0);
     pos = write_u8(buf, pos, (uint8_t)cfg->ml_ep);
     pos = write_u8(buf, pos, cfg->antipop ? 1 : 0);
+    /* v11: per-rate SDM mode, cands, depth, ML */
+    memcpy(buf + pos, cfg->rate_sdm, RATE_MAP_COUNT);
+    pos += RATE_MAP_COUNT;
+    memcpy(buf + pos, cfg->rate_cands, RATE_MAP_COUNT);
+    pos += RATE_MAP_COUNT;
+    memcpy(buf + pos, cfg->rate_depth, RATE_MAP_COUNT);
+    pos += RATE_MAP_COUNT;
+    memcpy(buf + pos, cfg->rate_ml, RATE_MAP_COUNT);
+    pos += RATE_MAP_COUNT;
 
     return pos;
 }
@@ -255,7 +266,18 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
                     pos = read_u8(buf, pos, &u8); cfg->antipop = (u8 != 0);
                 }
             }
-            /* else: ml_enabled/ml_ep/antipop stay at defaults */
+            /* Version 11 adds per-rate SDM, cands, depth, ML */
+            if (version >= 11 && buf_size >= CONFIG_V11_SIZE) {
+                memcpy(cfg->rate_sdm, buf + pos, RATE_MAP_COUNT);
+                pos += RATE_MAP_COUNT;
+                memcpy(cfg->rate_cands, buf + pos, RATE_MAP_COUNT);
+                pos += RATE_MAP_COUNT;
+                memcpy(cfg->rate_depth, buf + pos, RATE_MAP_COUNT);
+                pos += RATE_MAP_COUNT;
+                memcpy(cfg->rate_ml, buf + pos, RATE_MAP_COUNT);
+                pos += RATE_MAP_COUNT;
+            }
+            /* else: rate_sdm/cands/depth/ml stay at defaults (all Auto) */
         } else {
             /* Migrate from v1-v7: use fs_out + proc_mode to populate rate_map */
             uint8_t out_idx = dsd_to_rate_out(fs_out_raw);
