@@ -594,7 +594,12 @@ size_t plugin_process(plugin_state_t *s,
         if (fs_out > s->config.fs_in)
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);
 
-        overlap = 2 * (size_t)s->config.trellis_lat;
+        /* Use the actual SDM latency from channel 0 (path_config value),
+         * not the global config value which may differ */
+        int actual_lat = (s->channels && s->channels[0].sdm.trellis_lat > 0)
+            ? (int)s->channels[0].sdm.trellis_lat
+            : s->config.trellis_lat;
+        overlap = 2 * (size_t)actual_lat;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
         if (segments_per_ch > 4) segments_per_ch = 4;  /* limit parallelism overhead */
@@ -712,7 +717,7 @@ size_t plugin_process(plugin_state_t *s,
             return 0;
         memset(blocks, 0, (size_t)total_blocks * sizeof(channel_block_t));
 
-        size_t discard = (size_t)s->config.trellis_lat;
+        size_t discard = (size_t)actual_lat;
 
         for (int ch = 0; ch < num_channels; ch++) {
             size_t fir_count = fir_counts[ch];
@@ -721,8 +726,8 @@ size_t plugin_process(plugin_state_t *s,
 
             /* Compute segment 0 expected output for offset calculation */
             size_t pending = s->channels[ch].sdm.pending;
-            size_t lat_rem = (pending < (size_t)s->config.trellis_lat) ?
-                ((size_t)s->config.trellis_lat - pending) : 0;
+            size_t lat_rem = (pending < (size_t)actual_lat) ?
+                ((size_t)actual_lat - pending) : 0;
             size_t seg0_size = base_seg + (0 < remainder ? 1 : 0);
             size_t seg0_out = (seg0_size > lat_rem) ? (seg0_size - lat_rem) : 0;
 
