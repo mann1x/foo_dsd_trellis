@@ -670,16 +670,22 @@ size_t plugin_process(plugin_state_t *s,
         if (!temp_sdms)
             return 0;
 
-        /* Re-init temp SDM contexts (must reset state each chunk) */
+        /* Reset temp SDM contexts (init once, reset each chunk).
+         * Only re-init if not yet initialized or config changed. */
         bool init_ok = true;
         for (int i = 0; i < temp_sdm_count; i++) {
-            sdm_context_free(&temp_sdms[i]);
-            if (sdm_context_init(&temp_sdms[i], filter,
-                                  s->config.trellis_depth,
-                                  s->config.trellis_cands,
-                                  s->config.trellis_lat) != 0) {
-                init_ok = false;
-                break;
+            if (temp_sdms[i].filter == NULL) {
+                /* First use — initialize */
+                if (sdm_context_init(&temp_sdms[i], filter,
+                                      s->config.trellis_depth,
+                                      s->config.trellis_cands,
+                                      s->config.trellis_lat) != 0) {
+                    init_ok = false;
+                    break;
+                }
+            } else {
+                /* Already initialized — just reset state */
+                sdm_context_reset(&temp_sdms[i]);
             }
         }
 
