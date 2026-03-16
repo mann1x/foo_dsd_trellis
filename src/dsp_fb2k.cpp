@@ -1100,19 +1100,7 @@ public:
                 }
             }
 
-            /* Log CPUSET changes */
-            {
-                uint64_t cpuset_mask = 0;
-                if (plugin_get_cpuset_change(m_state, &cpuset_mask)) {
-                    int enabled = 0;
-                    for (int b = 0; b < 64; b++)
-                        if (cpuset_mask & ((uint64_t)1 << b)) enabled++;
-                    trellis_log("cpuset changed: 0x%016llX (%d cores enabled)",
-                                (unsigned long long)cpuset_mask, enabled);
-                }
-            }
-
-            /* Log workload changes */
+            /* Log workload changes (thread count only, not segments) */
             {
                 int wl_threads = 0, wl_segments = 0;
                 bool wl_changed = false;
@@ -1120,6 +1108,15 @@ public:
                 if (wl_changed && m_logged_processing) {
                     trellis_log("workload changed: %d threads, %d segments/ch",
                                 wl_threads, wl_segments);
+                }
+            }
+
+            /* Log CPUSET rebuild (threadpool actually rebuilt with new cores) */
+            {
+                uint64_t cpuset_mask = 0;
+                if (plugin_get_cpuset_change(m_state, &cpuset_mask)) {
+                    trellis_log("cpuset rebuild: new mask 0x%016llX",
+                                (unsigned long long)cpuset_mask);
                     log_selected_cores();
                 }
             }

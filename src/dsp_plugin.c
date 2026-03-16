@@ -474,7 +474,7 @@ size_t plugin_process(plugin_state_t *s,
      * Hysteresis: only rebuild threadpool when the new mask has been
      * stable for CPUSET_STABLE_THRESHOLD consecutive chunks. This avoids
      * choppy audio from transient OS core parking/unparking. */
-    #define CPUSET_STABLE_THRESHOLD 50  /* ~50 chunks ≈ 1-2 seconds */
+    #define CPUSET_STABLE_THRESHOLD 500  /* ~500 chunks ≈ 10-20 seconds */
     s->cpuset_changed = false;
     if (s->topology_detected) {
         bool mask_changed = false;
@@ -597,9 +597,9 @@ size_t plugin_process(plugin_state_t *s,
             segments_per_ch--;
     }
 
-    /* Track workload changes */
-    s->workload_changed = (num_threads != s->last_num_threads ||
-                            segments_per_ch != s->last_segments_per_ch);
+    /* Track workload changes — only log on thread count change,
+     * NOT on segment count fluctuations (those are normal). */
+    s->workload_changed = (num_threads != s->last_num_threads);
     s->last_num_threads = num_threads;
     s->last_segments_per_ch = segments_per_ch;
     s->last_dsd_in_count = dsd_in_count;
