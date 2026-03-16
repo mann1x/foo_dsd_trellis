@@ -452,17 +452,21 @@ private:
         m_listRate = GetDlgItem(IDC_LIST_RATEMAP);
         m_listRate.SetExtendedListViewStyle(
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-        /* Column widths sized to fit longest content:
-         * Input: "176400" (6ch), Output: "DSD512" (6ch), NTF: "CLANS-8" (7ch),
-         * SDM: "Auto (PreCorr)" (14ch), Cands: "Auto (32)" (9ch),
-         * Depth: "Auto (8)" (8ch), ML: "Auto (Off)" (10ch) */
-        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 52);
-        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 52);
-        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 62);
-        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 95);
-        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 62);
-        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 58);
-        m_listRate.InsertColumn(6, L"ML", LVCFMT_LEFT, 68);
+        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 48);
+        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 50);
+        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 50);
+        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 88);
+        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 55);
+        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 52);
+        /* Last column: fill remaining width to avoid horizontal scrollbar */
+        {
+            CRect rc;
+            m_listRate.GetClientRect(&rc);
+            int used = 48 + 50 + 50 + 88 + 55 + 52;
+            int remain = rc.Width() - used - 4;
+            if (remain < 55) remain = 55;
+            m_listRate.InsertColumn(6, L"ML", LVCFMT_LEFT, remain);
+        }
 
         for (int i = 0; i < RATE_MAP_COUNT; i++) {
             m_listRate.InsertItem(i, g_rate_names[i]);
