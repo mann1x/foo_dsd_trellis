@@ -868,11 +868,20 @@ private:
             return;
         }
 
-        /* Query path info from engine — use per-rate SDM mode if set */
+        /* Query path info — always query Trellis path for resolved defaults */
         int8_t ntf_val = m_cfg.rate_ntf[row];
         int sdm_mode = (m_cfg.rate_sdm[row] >= 0) ? (int)m_cfg.rate_sdm[row] : m_cfg.sdm_mode;
+
+        /* Always get Trellis path info for resolved defaults */
+        engine_path_info_t pi_trellis;
+        engine_get_path_info(fs_in, fs_out, (int)ntf_val, SDM_MODE_TRELLIS, &m_cfg, &pi_trellis);
+
+        /* Also get current mode's path info */
         engine_path_info_t pi;
-        engine_get_path_info(fs_in, fs_out, (int)ntf_val, sdm_mode, &m_cfg, &pi);
+        if (sdm_mode == SDM_MODE_TRELLIS)
+            pi = pi_trellis;
+        else
+            engine_get_path_info(fs_in, fs_out, (int)ntf_val, sdm_mode, &m_cfg, &pi);
 
         /* Format info text */
         info << g_rate_names[row];
@@ -899,26 +908,25 @@ private:
             if (sdm_mode == SDM_MODE_TRELLIS)
                 info << ", cands=" << pi.cands << ", depth=" << pi.depth << ", lat=" << pi.lat;
 
-            /* NTF display */
-            int ntf_display = pi.ntf_filter;
+            /* NTF: always show resolved filter name */
+            int ntf_id = pi_trellis.ntf_filter;  /* Trellis path has best NTF resolution */
+            if (sdm_mode != SDM_MODE_TRELLIS && pi.ntf_filter >= 0)
+                ntf_id = pi.ntf_filter;
             info << "\nNTF: ";
-            if (ntf_display >= 0 && ntf_display < (int)(NTF_NAME_COUNT - 1))
-                info << g_ntf_names[ntf_display + 1];
+            if (ntf_id >= 0 && ntf_id < (int)(NTF_NAME_COUNT - 1))
+                info << g_ntf_names[ntf_id + 1];
             else
                 info << "Auto";
 
-            if (pi.fir_gain != 1.0f)
-                info << "\nFIR gain: " << pfc::format_float(pi.fir_gain, 0, 2);
-            if (pi.state_limit > 0.0)
-                info << ", state limiter: " << pfc::format_float(pi.state_limit, 0, 1);
+            if (pi_trellis.fir_gain != 1.0f)
+                info << "\nFIR gain: " << pfc::format_float(pi_trellis.fir_gain, 0, 2);
+            if (pi_trellis.state_limit > 0.0)
+                info << ", state limiter: " << pfc::format_float(pi_trellis.state_limit, 0, 1);
 
-            /* Show resolved Auto defaults */
-            bool has_auto = (m_cfg.rate_sdm[row] < 0 || m_cfg.rate_cands[row] < 0 ||
-                             m_cfg.rate_depth[row] < 0 || m_cfg.rate_ntf[row] == NTF_AUTO);
-            if (has_auto && sdm_mode == SDM_MODE_TRELLIS) {
-                info << "\nAuto defaults: cands=" << pi.cands << ", depth=" << pi.depth
-                     << ", lat=" << pi.lat;
-            }
+            /* Always show Trellis defaults (useful even when PreCorr selected) */
+            info << "\nTrellis defaults: cands=" << pi_trellis.cands
+                 << ", depth=" << pi_trellis.depth
+                 << ", lat=" << pi_trellis.lat;
         }
 
         ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, info);
