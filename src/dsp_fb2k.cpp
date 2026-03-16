@@ -1465,10 +1465,9 @@ public:
          * output device reconfigure silently. Buffer the real audio
          * and prepend it to the next chunk. Never use insert_chunk
          * during rate transitions — it confuses fb2k's output pipeline. */
-        /* Anti-pop disabled for DSD output — PCM zeros break DoP marker
-         * detection in the ASIO+DSD output plugin, causing "rate not supported"
-         * errors for high DSD rates (DSD256+). */
-        if (false && m_config.antipop && m_antipop_pending && out_frames > 0 && is_dop) {
+        /* Anti-pop lead-in: output PCM silence at target rate before first audio.
+         * Only for DSD→DSD input (DoP); disabled for PCM→DSD to avoid rate confusion. */
+        if (m_config.antipop && m_antipop_pending && out_frames > 0 && is_dop) {
             m_antipop_pending = false;
 
             const int LEADIN_MS = 100;
