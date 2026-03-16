@@ -86,6 +86,12 @@ static const wchar_t *g_ntf_names[] = {
 };
 #define NTF_NAME_COUNT (sizeof(g_ntf_names) / sizeof(g_ntf_names[0]))
 
+/* Input rates by rate_map index (for path_info lookup in UI) */
+static const uint32_t g_input_rates[RATE_MAP_COUNT] = {
+    44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000,
+    DSD_RATE_64, DSD_RATE_128, DSD_RATE_256, DSD_RATE_512
+};
+
 /* ─── Gain helpers ─── */
 
 static inline float gain_to_db(float linear) {
@@ -474,46 +480,28 @@ private:
             int ntf_idx = m_cfg.rate_ntf[i] + 1; /* NTF_AUTO=-1 → 0 */
             if (ntf_idx < 0 || ntf_idx >= (int)NTF_NAME_COUNT) ntf_idx = 0;
             m_listRate.SetItemText(i, 2, g_ntf_names[ntf_idx]);
-            /* SDM mode — show resolved default for Auto */
+            /* Set explicit (non-Auto) values first */
             {
                 wchar_t buf[32];
-                if (m_cfg.rate_sdm[i] < 0)
-                    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%s)",
-                                 m_cfg.sdm_mode == SDM_MODE_PRECORR ? L"PreCorr" : L"Trellis");
-                else if (m_cfg.rate_sdm[i] == SDM_MODE_PRECORR)
-                    wcscpy_s(buf, L"PreCorr");
-                else
-                    wcscpy_s(buf, L"Trellis");
-                m_listRate.SetItemText(i, 3, buf);
-            }
-            /* Candidates */
-            {
-                wchar_t buf[32];
-                if (m_cfg.rate_cands[i] < 0)
-                    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%d)", m_cfg.trellis_cands);
-                else
+                if (m_cfg.rate_sdm[i] >= 0) {
+                    wcscpy_s(buf, m_cfg.rate_sdm[i] == SDM_MODE_PRECORR ? L"PreCorr" : L"Trellis");
+                    m_listRate.SetItemText(i, 3, buf);
+                }
+                if (m_cfg.rate_cands[i] >= 0) {
                     _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_cands[i]);
-                m_listRate.SetItemText(i, 4, buf);
-            }
-            /* Depth */
-            {
-                wchar_t buf[32];
-                if (m_cfg.rate_depth[i] < 0)
-                    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%d)", m_cfg.trellis_depth);
-                else
+                    m_listRate.SetItemText(i, 4, buf);
+                }
+                if (m_cfg.rate_depth[i] >= 0) {
                     _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_depth[i]);
-                m_listRate.SetItemText(i, 5, buf);
-            }
-            /* ML */
-            {
-                wchar_t buf[32];
-                if (m_cfg.rate_ml[i] < 0)
-                    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%s)",
-                                 m_cfg.ml_enabled ? L"On" : L"Off");
-                else
+                    m_listRate.SetItemText(i, 5, buf);
+                }
+                if (m_cfg.rate_ml[i] >= 0) {
                     wcscpy_s(buf, m_cfg.rate_ml[i] == 0 ? L"Off" : L"On");
-                m_listRate.SetItemText(i, 6, buf);
+                    m_listRate.SetItemText(i, 6, buf);
+                }
             }
+            /* Resolve Auto values using path-optimal defaults */
+            RefreshAutoText(i);
         }
 
         /* Create in-place editor combos (children of dialog, initially hidden) */
@@ -774,6 +762,7 @@ private:
             uint8_t out_idx = (uint8_t)m_editCombo.GetItemData(sel);
             m_cfg.rate_map[m_editRow] = out_idx;
             m_listRate.SetItemText(m_editRow, 1, g_output_names[out_idx]);
+            RefreshAutoText(m_editRow);
             UpdatePathInfo(m_editRow);
             if (!m_updating) UpdatePreset();
         }
@@ -800,18 +789,22 @@ private:
             static const int8_t cvals[] = { -1, 2, 4, 8, 16, 32 };
             int8_t val = (sel >= 0 && sel < 6) ? cvals[sel] : -1;
             m_cfg.rate_cands[m_editRow] = val;
-            wchar_t buf[16];
-            if (val < 0) wcscpy_s(buf, L"Auto");
-            else _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", val);
-            m_listRate.SetItemText(m_editRow, 4, buf);
+            if (val >= 0) {
+                wchar_t buf[16];
+                _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", val);
+                m_listRate.SetItemText(m_editRow, 4, buf);
+            }
+            /* Auto text refreshed by RefreshAutoText below */
         } else if (m_editCol == 5) {
             /* Depth: 0=Auto, 1=4, 2=5, 3=6, 4=7, 5=8 */
             int8_t val = (sel == 0) ? -1 : (int8_t)(sel + 3);
             m_cfg.rate_depth[m_editRow] = val;
-            wchar_t buf[16];
-            if (val < 0) wcscpy_s(buf, L"Auto");
-            else _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", val);
-            m_listRate.SetItemText(m_editRow, 5, buf);
+            if (val >= 0) {
+                wchar_t buf[16];
+                _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", val);
+                m_listRate.SetItemText(m_editRow, 5, buf);
+            }
+            /* Auto text refreshed by RefreshAutoText below */
         } else if (m_editCol == 6) {
             /* ML: 0=Auto, 1=Off, 2=On */
             int8_t val = (int8_t)(sel == 0 ? -1 : sel - 1);
@@ -820,6 +813,7 @@ private:
             m_listRate.SetItemText(m_editRow, 6, names[sel < 3 ? sel : 0]);
         }
 
+        RefreshAutoText(m_editRow);
         UpdatePathInfo(m_editRow);
         if (!m_updating) UpdatePreset();
     }
@@ -926,6 +920,54 @@ private:
         }
 
         ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, info);
+    }
+
+    /* Refresh Auto text for a row's Cands/Depth/SDM columns using path info.
+     * Called when Output changes so the resolved defaults update. */
+    void RefreshAutoText(int row) {
+        if (row < 0 || row >= RATE_MAP_COUNT) return;
+        uint8_t out_idx = m_cfg.rate_map[row];
+        uint32_t fs_in = g_input_rates[row];
+        uint32_t fs_out = rate_out_to_hz(out_idx);
+
+        /* Get path-optimal values */
+        int def_cands = m_cfg.trellis_cands;
+        int def_depth = m_cfg.trellis_depth;
+        const wchar_t *def_sdm = (m_cfg.sdm_mode == SDM_MODE_PRECORR) ? L"PreCorr" : L"Trellis";
+
+        if (out_idx != RATE_OUT_BYPASS && fs_out > 0) {
+            engine_path_info_t pi;
+            int sdm_mode = (m_cfg.rate_sdm[row] >= 0) ? (int)m_cfg.rate_sdm[row] : m_cfg.sdm_mode;
+            if (engine_get_path_info(fs_in, fs_out,
+                    (int)m_cfg.rate_ntf[row], sdm_mode, &m_cfg, &pi) == 0 && !pi.fir_only) {
+                if (pi.cands > 0) def_cands = pi.cands;
+                if (pi.depth > 0) def_depth = pi.depth;
+            }
+        }
+
+        wchar_t buf[32];
+
+        /* SDM mode */
+        if (m_cfg.rate_sdm[row] < 0) {
+            _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%s)", def_sdm);
+            m_listRate.SetItemText(row, 3, buf);
+        }
+        /* Candidates */
+        if (m_cfg.rate_cands[row] < 0) {
+            _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%d)", def_cands);
+            m_listRate.SetItemText(row, 4, buf);
+        }
+        /* Depth */
+        if (m_cfg.rate_depth[row] < 0) {
+            _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%d)", def_depth);
+            m_listRate.SetItemText(row, 5, buf);
+        }
+        /* ML */
+        if (m_cfg.rate_ml[row] < 0) {
+            _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Auto (%s)",
+                         m_cfg.ml_enabled ? L"On" : L"Off");
+            m_listRate.SetItemText(row, 6, buf);
+        }
     }
 
     void UpdatePreset() {
@@ -1143,6 +1185,8 @@ public:
 
                 if (m_config.rate_depth[map_idx] > 0)
                     m_config.trellis_depth = (int)m_config.rate_depth[map_idx];
+                else if (pi.depth > 0)
+                    m_config.trellis_depth = pi.depth;
 
                 /* Always use path-optimal lat for consistency */
                 if (pi.lat > 0)
@@ -1540,6 +1584,8 @@ public:
         const cpu_topology_t *topo = plugin_get_topology(m_state);
 
         /* Report thread count vs core count */
+        char buf[512];
+        int pos = 0;
         int wl_threads = 0, wl_segments = 0;
         bool wl_changed = false;
         plugin_get_workload(m_state, &wl_threads, &wl_segments, &wl_changed);

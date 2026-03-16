@@ -132,9 +132,10 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     engine_path_info_t pi;
     engine_get_path_info(fs_in, fs_out, NTF_AUTO, SDM_MODE_TRELLIS, &test_cfg, &pi);
 
-    /* Use test-quality cands/lat (path_table values are perf trade-offs) */
-    int cands = SINAD_TRELLIS_CANDS;
-    int lat   = SINAD_TRELLIS_LAT;
+    /* Use path-optimal values (matching real production behavior) */
+    int cands = pi.cands > 0 ? pi.cands : SINAD_TRELLIS_CANDS;
+    int lat   = pi.lat > 0 ? pi.lat : SINAD_TRELLIS_LAT;
+    int depth = pi.depth > 0 ? pi.depth : SINAD_TRELLIS_DEPTH;
 
     size_t est_in_produced = n_in - (size_t)lat;
     size_t est_fir_out;
@@ -182,7 +183,7 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
         return -999.0;
     }
     sdm_context_t sdm;
-    if (sdm_context_init(&sdm, f_out, SINAD_TRELLIS_DEPTH, cands, lat) != 0) {
+    if (sdm_context_init(&sdm, f_out, depth, cands, lat) != 0) {
         free(dsd_in); free(fir_buf); free(dsd_out);
         return -999.0;
     }
@@ -201,12 +202,13 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     unsigned rate_in_mult  = fs_in  / 44100;
     unsigned rate_out_mult = fs_out / 44100;
     const char *dir = (fs_out > fs_in) ? "UP" : "DN";
-    printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB  [%s, gain=%.2f, lim=%s]\n",
+    printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB  [%s, gain=%.2f, lim=%s, cands=%d, depth=%d]\n",
            rate_in_mult, rate_out_mult, dir, sinad_db,
            pi.ntf_filter != NTF_AUTO ?
                ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, fs_out)->name : "auto",
            pi.fir_gain,
-           pi.state_limit > 0.0 ? "on" : "off");
+           pi.state_limit > 0.0 ? "on" : "off",
+           cands, depth);
 
     free(dsd_in);
     free(fir_buf);

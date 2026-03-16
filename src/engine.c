@@ -22,6 +22,7 @@ typedef struct {
     double          state_limit;  /* 0.0 = disabled */
     int             cands;
     int             lat;
+    int             depth;        /* trellis depth (0 = use global default) */
     float           fir_gain;     /* FIR output gain (attenuate to prevent SDM overload) */
 } path_config_t;
 
@@ -31,20 +32,21 @@ typedef struct {
  * overloading the SDM quantizer (output ±1.0). fir_gain attenuates the FIR output
  * to keep the signal within the SDM's linear operating range. */
 static const path_config_t path_table[] = {
-    /* Upsample paths (fir_gain < 1.0 where SDM overload was observed) */
-    { DSD_RATE_64,  DSD_RATE_128, NTF_CLANS_8, 0.0,  8,  256, 0.5f  },
-    { DSD_RATE_64,  DSD_RATE_256, NTF_SDM_7,   0.0,  8,  256, 1.0f  },
-    { DSD_RATE_64,  DSD_RATE_512, NTF_CLANS_6, 10.0, 4,  256, 0.25f },
-    { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_8, 0.0,  8,  256, 1.0f  },
-    { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_8, 12.0, 8,  512, 0.5f  },
-    { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  16, 512, 1.0f  },
-    /* Downsample paths (FIR output already ≤ ±0.75, no gain reduction needed) */
-    { DSD_RATE_128, DSD_RATE_64,  NTF_CLANS_4, 0.0,  32, 128, 1.0f },
-    { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  64,  1.0f },
-    { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_4, 0.0,  8,  256, 1.0f },
-    { DSD_RATE_512, DSD_RATE_64,  NTF_CLANS_5, 0.0,  8,  256, 1.0f },
-    { DSD_RATE_512, DSD_RATE_128, NTF_CLANS_6, 0.0,  16, 128, 1.0f },
-    { DSD_RATE_512, DSD_RATE_256, NTF_CLANS_8, 0.0,  8,  256, 1.0f },
+    /*                                            lim  cands lat  depth gain  */
+    /* Upsample paths */
+    { DSD_RATE_64,  DSD_RATE_128, NTF_CLANS_8, 0.0,  8,  512, 0, 0.5f  },
+    { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  512, 4, 1.0f  },
+    { DSD_RATE_64,  DSD_RATE_512, NTF_CLANS_6, 10.0, 2,  512, 4, 0.25f },
+    { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  512, 4, 1.0f  },
+    { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_8, 12.0, 2,  512, 4, 0.5f  },
+    { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  2,  512, 4, 1.0f  },
+    /* Downsample paths */
+    { DSD_RATE_128, DSD_RATE_64,  NTF_CLANS_4, 0.0,  32, 512, 0, 1.0f },
+    { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  512, 0, 1.0f },
+    { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_4, 0.0,  8,  512, 0, 1.0f },
+    { DSD_RATE_512, DSD_RATE_64,  NTF_CLANS_5, 0.0,  8,  512, 0, 1.0f },
+    { DSD_RATE_512, DSD_RATE_128, NTF_CLANS_6, 0.0,  16, 512, 0, 1.0f },
+    { DSD_RATE_512, DSD_RATE_256, NTF_CLANS_8, 0.0,  8,  512, 0, 1.0f },
 };
 
 #define PATH_TABLE_COUNT (sizeof(path_table) / sizeof(path_table[0]))
@@ -397,6 +399,7 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
         info->ntf_filter = (int)pc->filter;
         info->cands = pc->cands;
         info->lat = pc->lat;
+        info->depth = pc->depth ? pc->depth : cfg->trellis_depth;
         info->state_limit = pc->state_limit;
         info->fir_gain = pc->fir_gain;
     } else {
