@@ -335,7 +335,7 @@ size_t sdm_segment_process(sdm_context_t *sdm,
         return 0;
     }
 
-    float *trash = get_trash_buf(discard);
+    float *trash = get_trash_buf(warmup_in);  /* must fit trellis_lat + discard */
     if (!trash) return 0;
     sdm_process_block(sdm, in, trash, warmup_in);
 

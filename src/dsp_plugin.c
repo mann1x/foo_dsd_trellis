@@ -474,6 +474,14 @@ size_t plugin_process(plugin_state_t *s,
                 free(s->channels);
                 s->channels = NULL;
             }
+            /* Free cached temp SDMs — they have stale params */
+            if (s->cached_temp_sdms) {
+                for (int i = 0; i < s->cached_temp_sdm_count; i++)
+                    sdm_context_free(&s->cached_temp_sdms[i]);
+                free(s->cached_temp_sdms);
+                s->cached_temp_sdms = NULL;
+                s->cached_temp_sdm_count = 0;
+            }
             s->initialized = false;
         }
         if (plugin_init_engine(s, num_channels, dsd_rate) != 0)
@@ -903,6 +911,13 @@ size_t plugin_process_pcm(plugin_state_t *s,
                     engine_channel_free(&s->channels[i]);
                 free(s->channels);
                 s->channels = NULL;
+            }
+            if (s->cached_temp_sdms) {
+                for (int i = 0; i < s->cached_temp_sdm_count; i++)
+                    sdm_context_free(&s->cached_temp_sdms[i]);
+                free(s->cached_temp_sdms);
+                s->cached_temp_sdms = NULL;
+                s->cached_temp_sdm_count = 0;
             }
             s->initialized = false;
         }
