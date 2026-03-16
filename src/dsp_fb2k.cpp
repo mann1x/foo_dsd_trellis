@@ -697,21 +697,15 @@ private:
         m_ntfCombo.ResetContent();
 
         if (col == 3) {
-            /* SDM mode: show global default in Auto label */
-            wchar_t auto_label[32];
-            _snwprintf_s(auto_label, _countof(auto_label), _TRUNCATE,
-                         L"Auto (%s)", m_cfg.sdm_mode == SDM_MODE_PRECORR ? L"PreCorr" : L"Trellis");
-            m_ntfCombo.AddString(auto_label);
+            /* SDM mode */
+            m_ntfCombo.AddString(L"Auto");
             m_ntfCombo.AddString(L"PreCorr");
             m_ntfCombo.AddString(L"Trellis");
             int cur = m_cfg.rate_sdm[row];
             m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
         } else if (col == 4) {
-            /* Candidates: show global default */
-            wchar_t auto_label[32];
-            _snwprintf_s(auto_label, _countof(auto_label), _TRUNCATE,
-                         L"Auto (%d)", m_cfg.trellis_cands);
-            m_ntfCombo.AddString(auto_label);
+            /* Candidates */
+            m_ntfCombo.AddString(L"Auto");
             m_ntfCombo.AddString(L"2"); m_ntfCombo.AddString(L"4");
             m_ntfCombo.AddString(L"8"); m_ntfCombo.AddString(L"16");
             m_ntfCombo.AddString(L"32");
@@ -722,11 +716,8 @@ private:
             else if (cur == 32) sel = 5;
             m_ntfCombo.SetCurSel(sel);
         } else if (col == 5) {
-            /* Depth: show global default */
-            wchar_t auto_label[32];
-            _snwprintf_s(auto_label, _countof(auto_label), _TRUNCATE,
-                         L"Auto (%d)", m_cfg.trellis_depth);
-            m_ntfCombo.AddString(auto_label);
+            /* Depth */
+            m_ntfCombo.AddString(L"Auto");
             m_ntfCombo.AddString(L"4"); m_ntfCombo.AddString(L"5");
             m_ntfCombo.AddString(L"6"); m_ntfCombo.AddString(L"7");
             m_ntfCombo.AddString(L"8");
@@ -735,11 +726,8 @@ private:
             if (cur >= 4 && cur <= 8) sel = cur - 3;
             m_ntfCombo.SetCurSel(sel);
         } else if (col == 6) {
-            /* ML: show global default */
-            wchar_t auto_label[32];
-            _snwprintf_s(auto_label, _countof(auto_label), _TRUNCATE,
-                         L"Auto (%s)", m_cfg.ml_enabled ? L"On" : L"Off");
-            m_ntfCombo.AddString(auto_label);
+            /* ML */
+            m_ntfCombo.AddString(L"Auto");
             m_ntfCombo.AddString(L"Off");
             m_ntfCombo.AddString(L"On");
             int cur = m_cfg.rate_ml[row];
@@ -927,6 +915,10 @@ private:
             info << "\nTrellis defaults: cands=" << pi_trellis.cands
                  << ", depth=" << pi_trellis.depth
                  << ", lat=" << pi_trellis.lat;
+
+            /* ML filter status */
+            bool ml_active = (m_cfg.rate_ml[row] >= 0) ? (m_cfg.rate_ml[row] != 0) : m_cfg.ml_enabled;
+            info << "\nML filter: " << (ml_active ? "On" : "Off");
         }
 
         ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, info);
