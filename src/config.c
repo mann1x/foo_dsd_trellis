@@ -126,10 +126,12 @@ static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
 #define CONFIG_V10_SIZE 84
 /* v11: antipop(1) + 4 × RATE_MAP_COUNT(12) for rate_sdm/cands/depth/ml */
 #define CONFIG_V11_SIZE (CONFIG_V10_SIZE + 1 + 4 * RATE_MAP_COUNT)
+/* v12: rate_limiter(12) + fir_gain_db(1) */
+#define CONFIG_V12_SIZE (CONFIG_V11_SIZE + RATE_MAP_COUNT + 1)
 
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
-    if (buf_size < CONFIG_V11_SIZE)
+    if (buf_size < CONFIG_V12_SIZE)
         return 0;
 
     size_t pos = 0;
@@ -173,6 +175,10 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     pos += RATE_MAP_COUNT;
     memcpy(buf + pos, cfg->rate_ml, RATE_MAP_COUNT);
     pos += RATE_MAP_COUNT;
+    /* v12: per-rate state limiter + global FIR gain */
+    memcpy(buf + pos, cfg->rate_limiter, RATE_MAP_COUNT);
+    pos += RATE_MAP_COUNT;
+    pos = write_u8(buf, pos, (uint8_t)(int8_t)cfg->fir_gain_db);
 
     return pos;
 }
@@ -277,7 +283,14 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
                 memcpy(cfg->rate_ml, buf + pos, RATE_MAP_COUNT);
                 pos += RATE_MAP_COUNT;
             }
-            /* else: rate_sdm/cands/depth/ml stay at defaults (all Auto) */
+            /* Version 12 adds per-rate state limiter + global FIR gain */
+            if (version >= 12 && buf_size >= CONFIG_V12_SIZE) {
+                memcpy(cfg->rate_limiter, buf + pos, RATE_MAP_COUNT);
+                pos += RATE_MAP_COUNT;
+                uint8_t u8;
+                pos = read_u8(buf, pos, &u8);
+                cfg->fir_gain_db = (int8_t)u8;
+            }
         } else {
             /* Migrate from v1-v7: use fs_out + proc_mode to populate rate_map */
             uint8_t out_idx = dsd_to_rate_out(fs_out_raw);
@@ -377,5 +390,11 @@ void config_validate(dsd_config_t *cfg) {
         if (cfg->rate_ntf[i] != NTF_AUTO &&
             (cfg->rate_ntf[i] < 0 || cfg->rate_ntf[i] >= NTF_COUNT))
             cfg->rate_ntf[i] = (int8_t)NTF_AUTO;
+    }
+
+    /* Validate FIR gain: Auto or 0 to -12 dB */
+    if (cfg->fir_gain_db != FIR_GAIN_AUTO) {
+        if (cfg->fir_gain_db > 0) cfg->fir_gain_db = 0;
+        if (cfg->fir_gain_db < -12) cfg->fir_gain_db = -12;
     }
 }

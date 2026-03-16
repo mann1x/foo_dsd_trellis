@@ -17,6 +17,8 @@
 #define IDC_COMBO_ML_EP             1025
 #define IDC_STATIC_ML_STATUS        1026
 #define IDC_CHECK_ANTIPOP           1027
+#define IDC_COMBO_FIR_GAIN          1028
+#define IDC_STATIC_FIR_GAIN         1029
 
 // Next default values for new objects
 //

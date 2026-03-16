@@ -33,20 +33,21 @@ typedef struct {
  * to keep the signal within the SDM's linear operating range. */
 static const path_config_t path_table[] = {
     /*                                            lim  cands lat  depth gain  */
+    /* All paths use 0.708 (-3 dB) gain for uniform volume across rates */
     /* Upsample paths */
-    { DSD_RATE_64,  DSD_RATE_128, NTF_CLANS_8, 0.0,  8,  512, 0, 0.5f  },
-    { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  512, 4, 1.0f  },
-    { DSD_RATE_64,  DSD_RATE_512, NTF_CLANS_6, 10.0, 2,  512, 4, 0.25f },
-    { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  512, 4, 1.0f  },
-    { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_8, 12.0, 2,  512, 4, 0.5f  },
-    { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  2,  512, 4, 1.0f  },
+    { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_4,   0.0,  2,  512, 4, 0.708f },
+    { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  512, 4, 0.708f },
+    { DSD_RATE_64,  DSD_RATE_512, NTF_CLANS_6, 10.0, 2,  512, 4, 0.708f },
+    { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  512, 4, 0.708f },
+    { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_8, 12.0, 2,  512, 4, 0.708f },
+    { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  2,  512, 4, 0.708f },
     /* Downsample paths */
-    { DSD_RATE_128, DSD_RATE_64,  NTF_CLANS_4, 0.0,  32, 512, 0, 1.0f },
-    { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  512, 0, 1.0f },
-    { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_4, 0.0,  8,  512, 0, 1.0f },
-    { DSD_RATE_512, DSD_RATE_64,  NTF_CLANS_5, 0.0,  8,  512, 0, 1.0f },
-    { DSD_RATE_512, DSD_RATE_128, NTF_CLANS_6, 0.0,  16, 512, 0, 1.0f },
-    { DSD_RATE_512, DSD_RATE_256, NTF_CLANS_8, 0.0,  8,  512, 0, 1.0f },
+    { DSD_RATE_128, DSD_RATE_64,  NTF_CLANS_4, 0.0,  32, 512, 0, 0.708f },
+    { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  512, 0, 0.708f },
+    { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_4, 0.0,  8,  512, 0, 0.708f },
+    { DSD_RATE_512, DSD_RATE_64,  NTF_SDM_6,   0.0,  8,  512, 0, 0.708f },
+    { DSD_RATE_512, DSD_RATE_128, NTF_SDM_4,  16.0, 16,  512, 0, 0.708f },
+    { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,  16.0,  8,  512, 0, 0.708f },
 };
 
 #define PATH_TABLE_COUNT (sizeof(path_table) / sizeof(path_table[0]))
@@ -95,6 +96,12 @@ int engine_channel_init(engine_channel_t *eng, int channel,
                 eng->fir_gain = pc->fir_gain;
         }
 
+        /* Apply user FIR gain override.
+         * Auto: use path_config gain (0.708 = -3 dB for all paths).
+         * Explicit: replace path_config gain with user's choice. */
+        if (cfg->fir_gain_db != FIR_GAIN_AUTO)
+            eng->fir_gain = fir_gain_db_to_linear(cfg->fir_gain_db);
+
         /* Select NTF filter */
         const ntf_filter_t *filter = NULL;
         if (cfg->ntf_filter == NTF_AUTO) {
@@ -113,25 +120,29 @@ int engine_channel_init(engine_channel_t *eng, int channel,
             return -1;
 
         /* Init SDM with path-adaptive or user-configured parameters */
+        /* Resolve state limiter: user override > path_config > default */
+        double resolved_limit = 0.0;
+        if (cfg->state_limit >= 0.0f)
+            resolved_limit = (double)cfg->state_limit;  /* user set explicit value */
+        else if (pc && pc->state_limit > 0.0)
+            resolved_limit = pc->state_limit;  /* path_config default */
+        else if (is_rate_conv && cfg->sdm_mode == SDM_MODE_PRECORR)
+            resolved_limit = 12.0;  /* PreCorr default for rate conversion */
+
         if (cfg->sdm_mode == SDM_MODE_PRECORR) {
             if (precorr_context_init(&eng->precorr, filter) != 0)
                 return -1;
-            if (pc && pc->state_limit > 0.0)
-                eng->precorr.state_limit = (float)pc->state_limit;
-            else if (is_rate_conv)
-                eng->precorr.state_limit = 12.0f;
+            if (resolved_limit > 0.0)
+                eng->precorr.state_limit = (float)resolved_limit;
         } else {
-            /* Always use cfg values — caller (dsp_fb2k) resolves Auto
-             * to path-optimal via engine_get_path_info() before calling us.
-             * This ensures persistent SDM matches temp SDMs and overlap. */
             int cands = cfg->trellis_cands;
             int lat   = cfg->trellis_lat;
             if (sdm_context_init(&eng->sdm, filter,
                                  cfg->trellis_depth,
                                  cands, lat) != 0)
                 return -1;
-            if (pc && pc->state_limit > 0.0)
-                eng->sdm.state_limit = pc->state_limit;
+            if (resolved_limit > 0.0)
+                eng->sdm.state_limit = resolved_limit;
         }
     }
 

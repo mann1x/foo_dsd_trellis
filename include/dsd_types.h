@@ -209,13 +209,42 @@ typedef struct {
     int8_t    rate_cands[RATE_MAP_COUNT]; /* Per-input-rate candidates: -1=Auto, 4/8/16/32 */
     int8_t    rate_depth[RATE_MAP_COUNT]; /* Per-input-rate depth: -1=Auto, 4/5/6/7/8 */
     int8_t    rate_ml[RATE_MAP_COUNT];    /* Per-input-rate ML filter: -1=Auto, 0=Off, 1=On */
+    int8_t    rate_limiter[RATE_MAP_COUNT]; /* Per-input-rate state limiter: -1=Auto, 0=Off, 1-20=limit */
     bool      antipop;        /* Enable anti-pop lead-in silence */
     bool      ml_enabled;     /* Enable ONNX ML post-filter */
     int       ml_ep;          /* ml_ep_t: CPU (0) or DirectML (1) */
+    int8_t    fir_gain_db;    /* Global FIR gain limit in dB (0 to -12). FIR_GAIN_AUTO = use path_config */
+    float     state_limit;   /* Runtime: resolved state limiter (0=off, >0=limit). Set per-chunk. */
 } dsd_config_t;
 
 /* Config serialization version */
-#define DSD_CONFIG_VERSION 11
+#define DSD_CONFIG_VERSION 12
+
+/* FIR gain Auto sentinel and default */
+#define FIR_GAIN_AUTO    (-128)
+#define FIR_GAIN_DEFAULT (-3)   /* -3 dB = 0.71 linear */
+
+/* Convert FIR gain dB to linear. Handles Auto sentinel. */
+static inline float fir_gain_db_to_linear(int8_t db) {
+    int d = (db == FIR_GAIN_AUTO) ? FIR_GAIN_DEFAULT : (int)db;
+    if (d >= 0) return 1.0f;
+    /* Quick lookup for common values, avoids powf */
+    switch (d) {
+    case -1:  return 0.891f;
+    case -2:  return 0.794f;
+    case -3:  return 0.708f;
+    case -4:  return 0.631f;
+    case -5:  return 0.562f;
+    case -6:  return 0.501f;
+    case -7:  return 0.447f;
+    case -8:  return 0.398f;
+    case -9:  return 0.355f;
+    case -10: return 0.316f;
+    case -11: return 0.282f;
+    case -12: return 0.251f;
+    default:  return 0.251f;  /* clamp to -12 dB */
+    }
+}
 
 /* Default REST API port */
 #define DSD_DEFAULT_API_PORT 8881
@@ -252,9 +281,12 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     memset(cfg->rate_cands, 0xFF, sizeof(cfg->rate_cands)); /* -1 = Auto */
     memset(cfg->rate_depth, 0xFF, sizeof(cfg->rate_depth)); /* -1 = Auto */
     memset(cfg->rate_ml, 0xFF, sizeof(cfg->rate_ml)); /* -1 = Auto (use global) */
+    memset(cfg->rate_limiter, 0xFF, sizeof(cfg->rate_limiter)); /* -1 = Auto (use path_config) */
     cfg->antipop    = true;   /* enabled by default */
     cfg->ml_enabled = false;
     cfg->ml_ep      = 2;  /* ML_EP_AUTO */
+    cfg->fir_gain_db = FIR_GAIN_AUTO;  /* Auto = -3 dB */
+    cfg->state_limit = -1.0f;         /* -1 = Auto (use path_config) */
 }
 
 #endif /* DSD_TYPES_H */

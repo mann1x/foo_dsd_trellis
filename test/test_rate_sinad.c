@@ -1229,6 +1229,213 @@ static void test_diag_gain_limiter(void) {
     TEST_ASSERT_TRUE(1, "Gain/limiter diagnostic completed");
 }
 
+/* ─── Gain Sweep: NTF × fir_gain × state_limit for problematic paths ─── */
+
+/* Production-like settings */
+#define GAIN_SWEEP_DEPTH  4
+#define GAIN_SWEEP_CANDS  2
+#define GAIN_SWEEP_LAT    512
+
+static double measure_gain_sweep_sinad(uint32_t fs_in, uint32_t fs_out,
+                                        ntf_filter_id_t filter_id,
+                                        float fir_gain,
+                                        double state_limit) {
+    unsigned mult_in = fs_in / 44100;
+    size_t n_in;
+    if (mult_in <= 64)       n_in = 262144;
+    else if (mult_in <= 128) n_in = 524288;
+    else if (mult_in <= 256) n_in = 1048576;
+    else                     n_in = 2097152;
+
+    size_t max_out;
+    if (fs_out >= fs_in)
+        max_out = n_in * (fs_out / fs_in) + 4096;
+    else
+        max_out = n_in / 2 + 4096;
+
+    float *dsd_in  = (float *)malloc(n_in * sizeof(float));
+    float *fir_buf = (float *)malloc(max_out * sizeof(float));
+    float *dsd_out = (float *)malloc(max_out * sizeof(float));
+    if (!dsd_in || !fir_buf || !dsd_out) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+
+    size_t est_in_produced = n_in - GAIN_SWEEP_LAT;
+    size_t est_fir_out;
+    if (fs_out >= fs_in)
+        est_fir_out = est_in_produced * (fs_out / fs_in);
+    else
+        est_fir_out = est_in_produced / (fs_in / fs_out);
+    size_t est_sdm_out = est_fir_out - GAIN_SWEEP_LAT;
+    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm_out);
+    size_t dsd_in_count = generate_dsd_sine(fs_in, freq, 0.5, n_in, dsd_in);
+
+    if (dsd_in_count < 1024) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+
+    fir_chain_t fir;
+    if (fir_chain_init(&fir, fs_in, fs_out) != 0) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+    size_t fir_count = fir_chain_process(&fir, dsd_in, fir_buf, dsd_in_count);
+    fir_chain_free(&fir);
+
+    if (fir_count < 1024) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+
+    /* Apply FIR gain */
+    if (fir_gain != 1.0f) {
+        for (size_t i = 0; i < fir_count; i++)
+            fir_buf[i] *= fir_gain;
+    }
+
+    const ntf_filter_t *f_out = ntf_get_filter(filter_id, fs_out);
+    if (!f_out) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+    sdm_context_t sdm;
+    if (sdm_context_init(&sdm, f_out, GAIN_SWEEP_DEPTH, GAIN_SWEEP_CANDS,
+                         GAIN_SWEEP_LAT) != 0) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+    if (state_limit > 0.0)
+        sdm.state_limit = state_limit;
+    size_t out_count = sdm_process_block(&sdm, fir_buf, dsd_out, fir_count);
+    sdm_context_free(&sdm);
+
+    if (out_count < 1024) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+
+    double sinad_db = measure_sinad(dsd_out, out_count, freq, (double)fs_out);
+    free(dsd_in); free(fir_buf); free(dsd_out);
+    return sinad_db;
+}
+
+static void test_gain_sweep(void) {
+    typedef struct {
+        uint32_t fs_in, fs_out;
+        const char *name;
+    } path_t;
+
+    static const path_t paths[] = {
+        { DSD_RATE_64,  DSD_RATE_128, "DSD64->DSD128"  },
+        { DSD_RATE_128, DSD_RATE_512, "DSD128->DSD512"  },
+        { DSD_RATE_64,  DSD_RATE_512, "DSD64->DSD512"  },
+    };
+    static const int n_paths = sizeof(paths) / sizeof(paths[0]);
+
+    static const ntf_filter_id_t filter_ids[] = {
+        NTF_CLANS_4, NTF_SDM_4,
+        NTF_CLANS_5, NTF_SDM_5,
+        NTF_CLANS_6, NTF_SDM_6,
+        NTF_CLANS_7, NTF_SDM_7,
+        NTF_CLANS_8, NTF_SDM_8,
+    };
+    static const char *filter_names[] = {
+        "clans-4", "sdm-4",
+        "clans-5", "sdm-5",
+        "clans-6", "sdm-6",
+        "clans-7", "sdm-7",
+        "clans-8", "sdm-8",
+    };
+    static const int n_filters = sizeof(filter_ids) / sizeof(filter_ids[0]);
+
+    static const float gains[] = { 1.0f, 0.9f, 0.8f, 0.71f };
+    static const int n_gains = sizeof(gains) / sizeof(gains[0]);
+
+    static const double limits[] = { 0.0, 3.0, 6.0, 10.0, 15.0, 20.0 };
+    static const int n_limits = sizeof(limits) / sizeof(limits[0]);
+
+    int total = n_paths * n_filters * n_gains * n_limits;
+    printf("\n    ╔══════════════════════════════════════════════════════════════╗\n");
+    printf("    ║  Gain Sweep: problematic paths (cands=%d, depth=%d, lat=%d)  ║\n",
+           GAIN_SWEEP_CANDS, GAIN_SWEEP_DEPTH, GAIN_SWEEP_LAT);
+    printf("    ║  %d paths x %d filters x %d gains x %d limits = %d combos       ║\n",
+           n_paths, n_filters, n_gains, n_limits, total);
+    printf("    ║  Only showing results with SINAD > 50 dB                    ║\n");
+    printf("    ╚══════════════════════════════════════════════════════════════╝\n");
+
+    /* Track best per path */
+    double best_sinad[3] = { -999.0, -999.0, -999.0 };
+    int    best_filter[3], best_gain[3], best_limit[3];
+    memset(best_filter, 0, sizeof(best_filter));
+    memset(best_gain, 0, sizeof(best_gain));
+    memset(best_limit, 0, sizeof(best_limit));
+
+    int count = 0;
+    for (int p = 0; p < n_paths; p++) {
+        printf("\n    --- %s ---\n", paths[p].name);
+        printf("    %-10s %-6s %-6s  SINAD\n", "Filter", "Gain", "Limit");
+
+        int hits = 0;
+        for (int f = 0; f < n_filters; f++) {
+            for (int g = 0; g < n_gains; g++) {
+                for (int l = 0; l < n_limits; l++) {
+                    double sinad = measure_gain_sweep_sinad(
+                        paths[p].fs_in, paths[p].fs_out,
+                        filter_ids[f], gains[g], limits[l]);
+                    count++;
+
+                    if (sinad > 50.0) {
+                        char lim_str[16];
+                        if (limits[l] == 0.0)
+                            sprintf_s(lim_str, sizeof(lim_str), "off");
+                        else
+                            sprintf_s(lim_str, sizeof(lim_str), "%.1f", limits[l]);
+
+                        printf("    %-10s %-6.2f %-6s  %.1f dB\n",
+                               filter_names[f], gains[g], lim_str, sinad);
+                        hits++;
+                    }
+
+                    if (sinad > best_sinad[p]) {
+                        best_sinad[p] = sinad;
+                        best_filter[p] = f;
+                        best_gain[p] = g;
+                        best_limit[p] = l;
+                    }
+                }
+            }
+        }
+        if (hits == 0)
+            printf("    (no combinations exceeded 50 dB)\n");
+
+        printf("    [%d/%d done]\n", count, total);
+    }
+
+    /* Summary */
+    printf("\n    ╔══════════════════════════════════════════════════════════════╗\n");
+    printf("    ║  BEST CONFIGURATION PER PATH                                ║\n");
+    printf("    ╠══════════════════════════════════════════════════════════════╣\n");
+    printf("    ║  %-16s %-10s %-6s %-6s %8s         ║\n",
+           "Path", "Filter", "Gain", "Limit", "SINAD");
+    printf("    ╠══════════════════════════════════════════════════════════════╣\n");
+    for (int p = 0; p < n_paths; p++) {
+        char lim_str[16];
+        if (limits[best_limit[p]] == 0.0)
+            sprintf_s(lim_str, sizeof(lim_str), "off");
+        else
+            sprintf_s(lim_str, sizeof(lim_str), "%.1f", limits[best_limit[p]]);
+
+        printf("    ║  %-16s %-10s %-6.2f %-6s %7.1f dB       ║\n",
+               paths[p].name, filter_names[best_filter[p]],
+               gains[best_gain[p]], lim_str, best_sinad[p]);
+    }
+    printf("    ╚══════════════════════════════════════════════════════════════╝\n");
+
+    TEST_ASSERT_TRUE(1, "Gain sweep completed");
+}
+
 /* ─── Suites ─── */
 
 void test_rate_sinad_suite(void) {
@@ -1270,4 +1477,5 @@ void test_rate_sweep_suite(void) {
     TEST_RUN(test_diag_limiter_sweep);
     TEST_RUN(test_comprehensive_ntf_limiter_sweep);
     TEST_RUN(test_cands_latency_sweep);
+    TEST_RUN(test_gain_sweep);
 }

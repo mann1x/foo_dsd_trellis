@@ -410,6 +410,7 @@ public:
         COMMAND_HANDLER_EX(IDC_COMBO_FORMAT, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_CHECK_DEBUG_LOG, BN_CLICKED, OnChange)
         COMMAND_HANDLER_EX(IDC_CHECK_ANTIPOP, BN_CLICKED, OnChange)
+        COMMAND_HANDLER_EX(IDC_COMBO_FIR_GAIN, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_CHECK_ML_ENABLED, BN_CLICKED, OnMlChange)
         COMMAND_HANDLER_EX(IDC_COMBO_ML_EP, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_EDIT_THREADS, EN_CHANGE, OnEditChange)
@@ -458,20 +459,21 @@ private:
         m_listRate = GetDlgItem(IDC_LIST_RATEMAP);
         m_listRate.SetExtendedListViewStyle(
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 52);
-        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 56);
-        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 50);
-        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 100);
-        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 62);
-        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 60);
+        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 50);
+        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 54);
+        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 46);
+        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 68);
+        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 44);
+        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 44);
+        m_listRate.InsertColumn(6, L"Limiter", LVCFMT_LEFT, 48);
         /* Last column: fill remaining width to avoid horizontal scrollbar */
         {
             CRect rc;
             m_listRate.GetClientRect(&rc);
-            int used = 52 + 56 + 50 + 100 + 62 + 60;
+            int used = 50 + 54 + 46 + 68 + 44 + 44 + 48;
             int remain = rc.Width() - used - 4;
-            if (remain < 60) remain = 60;
-            m_listRate.InsertColumn(6, L"ML", LVCFMT_LEFT, remain);
+            if (remain < 40) remain = 40;
+            m_listRate.InsertColumn(7, L"ML", LVCFMT_LEFT, remain);
         }
 
         for (int i = 0; i < RATE_MAP_COUNT; i++) {
@@ -495,9 +497,14 @@ private:
                     _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_depth[i]);
                     m_listRate.SetItemText(i, 5, buf);
                 }
+                if (m_cfg.rate_limiter[i] >= 0) {
+                    if (m_cfg.rate_limiter[i] == 0) wcscpy_s(buf, L"Off");
+                    else _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%.1f", (float)m_cfg.rate_limiter[i]);
+                    m_listRate.SetItemText(i, 6, buf);
+                }
                 if (m_cfg.rate_ml[i] >= 0) {
                     wcscpy_s(buf, m_cfg.rate_ml[i] == 0 ? L"Off" : L"On");
-                    m_listRate.SetItemText(i, 6, buf);
+                    m_listRate.SetItemText(i, 7, buf);
                 }
             }
             /* Resolve Auto values using path-optimal defaults */
@@ -534,6 +541,27 @@ private:
 
         /* Anti-pop checkbox */
         CheckDlgButton(IDC_CHECK_ANTIPOP, m_cfg.antipop ? BST_CHECKED : BST_UNCHECKED);
+
+        /* FIR Gain combo: Auto(-3dB), 0dB, -1dB, ... -12dB */
+        {
+            CComboBox firg(GetDlgItem(IDC_COMBO_FIR_GAIN));
+            firg.AddString(L"Auto (-3 dB)");
+            firg.AddString(L"0 dB");
+            for (int i = -1; i >= -12; i--) {
+                wchar_t buf[16];
+                _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d dB", i);
+                firg.AddString(buf);
+            }
+            /* Map fir_gain_db to combo index: Auto=0, 0dB=1, -1dB=2, ... -12dB=13 */
+            int sel = 0;
+            if (m_cfg.fir_gain_db != FIR_GAIN_AUTO) {
+                int db = (int)m_cfg.fir_gain_db;
+                if (db >= 0) sel = 1;
+                else if (db >= -12) sel = 1 - db;  /* -1→2, -2→3, ..., -12→13 */
+                else sel = 13;
+            }
+            firg.SetCurSel(sel);
+        }
 
         /* ML Noise Filter */
         CheckDlgButton(IDC_CHECK_ML_ENABLED, m_cfg.ml_enabled ? BST_CHECKED : BST_UNCHECKED);
@@ -627,7 +655,7 @@ private:
             ShowOutputCombo(nm->iItem);
         } else if (nm->iSubItem == 2) {
             ShowNtfCombo(nm->iItem);
-        } else if (nm->iSubItem >= 3 && nm->iSubItem <= 6) {
+        } else if (nm->iSubItem >= 3 && nm->iSubItem <= 7) {
             ShowPerRateCombo(nm->iItem, nm->iSubItem);
         }
 
@@ -726,6 +754,22 @@ private:
             if (cur >= 4 && cur <= 8) sel = cur - 3;
             m_ntfCombo.SetCurSel(sel);
         } else if (col == 6) {
+            /* Limiter: Auto, Off, 3, 6, 8, 10, 12, 16, 20 */
+            m_ntfCombo.AddString(L"Auto");
+            m_ntfCombo.AddString(L"Off");
+            m_ntfCombo.AddString(L"3"); m_ntfCombo.AddString(L"6");
+            m_ntfCombo.AddString(L"8"); m_ntfCombo.AddString(L"10");
+            m_ntfCombo.AddString(L"12"); m_ntfCombo.AddString(L"16");
+            m_ntfCombo.AddString(L"20");
+            int cur = m_cfg.rate_limiter[row];
+            int sel = 0;
+            if (cur == 0) sel = 1;
+            else if (cur == 3) sel = 2; else if (cur == 6) sel = 3;
+            else if (cur == 8) sel = 4; else if (cur == 10) sel = 5;
+            else if (cur == 12) sel = 6; else if (cur == 16) sel = 7;
+            else if (cur == 20) sel = 8;
+            m_ntfCombo.SetCurSel(sel);
+        } else if (col == 7) {
             /* ML */
             m_ntfCombo.AddString(L"Auto");
             m_ntfCombo.AddString(L"Off");
@@ -794,11 +838,23 @@ private:
             }
             /* Auto text refreshed by RefreshAutoText below */
         } else if (m_editCol == 6) {
+            /* Limiter: 0=Auto, 1=Off, 2=3, 3=6, 4=8, 5=10, 6=12, 7=16, 8=20 */
+            static const int8_t lvals[] = { -1, 0, 3, 6, 8, 10, 12, 16, 20 };
+            int8_t val = (sel >= 0 && sel < 9) ? lvals[sel] : -1;
+            m_cfg.rate_limiter[m_editRow] = val;
+            if (val > 0) {
+                wchar_t buf[16];
+                _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%.1f", (float)val);
+                m_listRate.SetItemText(m_editRow, 6, buf);
+            } else if (val == 0) {
+                m_listRate.SetItemText(m_editRow, 6, L"Off");
+            }
+        } else if (m_editCol == 7) {
             /* ML: 0=Auto, 1=Off, 2=On */
             int8_t val = (int8_t)(sel == 0 ? -1 : sel - 1);
             m_cfg.rate_ml[m_editRow] = val;
             const wchar_t *names[] = { L"Auto", L"Off", L"On" };
-            m_listRate.SetItemText(m_editRow, 6, names[sel < 3 ? sel : 0]);
+            m_listRate.SetItemText(m_editRow, 7, names[sel < 3 ? sel : 0]);
         }
 
         RefreshAutoText(m_editRow);
@@ -906,8 +962,10 @@ private:
             else
                 info << "Auto";
 
-            if (pi_trellis.fir_gain != 1.0f)
-                info << "\nFIR gain: " << pfc::format_float(pi_trellis.fir_gain, 0, 2);
+            /* Show effective FIR gain (global setting) */
+            int eff_db = (m_cfg.fir_gain_db == FIR_GAIN_AUTO) ? FIR_GAIN_DEFAULT : (int)m_cfg.fir_gain_db;
+            float eff_gain = fir_gain_db_to_linear(m_cfg.fir_gain_db);
+            info << "\nFIR gain: " << eff_db << " dB (" << pfc::format_float(eff_gain, 0, 3) << ")";
             if (pi_trellis.state_limit > 0.0)
                 info << ", state limiter: " << pfc::format_float(pi_trellis.state_limit, 0, 1);
 
@@ -933,8 +991,10 @@ private:
             m_listRate.SetItemText(row, 4, L"Auto");
         if (m_cfg.rate_depth[row] < 0)
             m_listRate.SetItemText(row, 5, L"Auto");
-        if (m_cfg.rate_ml[row] < 0)
+        if (m_cfg.rate_limiter[row] < 0)
             m_listRate.SetItemText(row, 6, L"Auto");
+        if (m_cfg.rate_ml[row] < 0)
+            m_listRate.SetItemText(row, 7, L"Auto");
     }
 
     void UpdatePreset() {
@@ -954,6 +1014,17 @@ private:
 
         /* Anti-pop */
         m_cfg.antipop = IsDlgButtonChecked(IDC_CHECK_ANTIPOP) == BST_CHECKED;
+
+        /* FIR Gain: combo index 0=Auto, 1=0dB, 2=-1dB, ..., 13=-12dB */
+        {
+            int sel = CComboBox(GetDlgItem(IDC_COMBO_FIR_GAIN)).GetCurSel();
+            if (sel <= 0)
+                m_cfg.fir_gain_db = FIR_GAIN_AUTO;
+            else if (sel == 1)
+                m_cfg.fir_gain_db = 0;
+            else
+                m_cfg.fir_gain_db = (int8_t)(1 - sel);  /* 2→-1, 3→-2, ..., 13→-12 */
+        }
 
         /* ML filter */
         m_cfg.ml_enabled = IsDlgButtonChecked(IDC_CHECK_ML_ENABLED) == BST_CHECKED;
@@ -1135,6 +1206,12 @@ public:
         if (m_config.rate_ml[map_idx] >= 0)
             m_config.ml_enabled = (m_config.rate_ml[map_idx] != 0);
 
+        /* Per-rate state limiter: -1=Auto (engine uses path_config), 0=Off, >0=value */
+        if (m_config.rate_limiter[map_idx] >= 0)
+            m_config.state_limit = (float)m_config.rate_limiter[map_idx];
+        else
+            m_config.state_limit = -1.0f;  /* Auto: let engine use path_config */
+
         /* Resolve cands/lat/depth from path_config when Auto.
          * This ensures persistent SDM, temp SDMs, overlap, and discard
          * all use the same values — fixing the DSD256 segment mismatch. */
@@ -1166,14 +1243,18 @@ public:
             }
         }
 
+        /* fir_gain_db is passed to engine_channel_init which applies it
+         * uniformly to all paths for volume consistency */
+
         /* Set output rate for this chunk */
         m_config.fs_out = out_rate;
         if (!m_logged_processing) {
             trellis_log("rate_map: lookup_rate=%u map_idx=%d out_idx=%u out_rate=%u is_dop=%d gain=%.3f fs_in=%u fs_out=%u",
                         lookup_rate, map_idx, (unsigned)out_idx, out_rate, is_dop, m_config.gain, m_config.fs_in, m_config.fs_out);
-            trellis_log("resolved: sdm=%s cands=%d depth=%d lat=%d",
+            trellis_log("resolved: sdm=%s cands=%d depth=%d lat=%d fir_gain_db=%d",
                         m_config.sdm_mode == SDM_MODE_TRELLIS ? "Trellis" : "PreCorr",
-                        m_config.trellis_cands, m_config.trellis_depth, m_config.trellis_lat);
+                        m_config.trellis_cands, m_config.trellis_depth, m_config.trellis_lat,
+                        (int)m_config.fir_gain_db);
         }
         plugin_set_config(m_state, &m_config);
 
