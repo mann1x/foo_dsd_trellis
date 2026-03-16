@@ -817,7 +817,7 @@ const ntf_filter_t *ntf_auto_select_precorr(unsigned dsd_rate) {
     if (dsd_rate >= DSD_RATE_512)
         id = NTF_CLANS_7;
     else if (dsd_rate >= DSD_RATE_256)
-        id = NTF_CLANS_8;
+        id = NTF_CLANS_7;  /* clans-8 unstable with boxcar input at DSD256 */
     else if (dsd_rate >= DSD_RATE_128)
         id = NTF_CLANS_7;
     else

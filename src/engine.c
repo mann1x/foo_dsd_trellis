@@ -250,9 +250,11 @@ size_t engine_process_block(engine_channel_t *eng,
 void engine_channel_reset(engine_channel_t *eng) {
     fir_chain_reset(&eng->fir);
     memset(&eng->boxcar, 0, sizeof(eng->boxcar));
-    /* Do NOT reset SDM/PreCorr state — preserving integrator state across
-     * stop/play prevents the startup transient pop. The SDM continues from
-     * its previous state, just like track-to-track transitions. */
+    /* PreCorr must be reset (crashes with stale state).
+     * Trellis SDM state is preserved to prevent startup pop —
+     * integrators keep their values so playback resumes smoothly. */
+    if (!eng->fir_only && eng->sdm_mode == SDM_MODE_PRECORR)
+        precorr_context_reset(&eng->precorr);
     if (eng->ml_filter)
         onnx_filter_reset(eng->ml_filter);
 }

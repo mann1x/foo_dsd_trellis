@@ -26,6 +26,7 @@ extern "C" {
 #include "../include/httpapi.h"
 #include "../include/dop.h"
 #include "../include/engine.h"
+#include "../include/ntf.h"
 #include "../include/tusbaudio.h"
 #include "build_version.h"
 
@@ -952,15 +953,24 @@ private:
             if (sdm_mode == SDM_MODE_TRELLIS)
                 info << ", cands=" << pi.cands << ", depth=" << pi.depth << ", lat=" << pi.lat;
 
-            /* NTF: always show resolved filter name */
-            int ntf_id = pi_trellis.ntf_filter;  /* Trellis path has best NTF resolution */
-            if (sdm_mode != SDM_MODE_TRELLIS && pi.ntf_filter >= 0)
-                ntf_id = pi.ntf_filter;
-            info << "\nNTF: ";
-            if (ntf_id >= 0 && ntf_id < (int)(NTF_NAME_COUNT - 1))
-                info << g_ntf_names[ntf_id + 1];
-            else
-                info << "Auto";
+            /* NTF: resolve and show actual filter name */
+            {
+                int ntf_id = (sdm_mode == SDM_MODE_TRELLIS) ? pi_trellis.ntf_filter : pi.ntf_filter;
+                const char *ntf_name = NULL;
+                if (ntf_id >= 0 && ntf_id < (int)(NTF_NAME_COUNT - 1)) {
+                    /* Resolved from path_config */
+                    const ntf_filter_t *f = ntf_get_filter((ntf_filter_id_t)ntf_id, fs_out);
+                    if (f) ntf_name = f->name;
+                }
+                if (!ntf_name) {
+                    /* Auto — resolve via auto-select */
+                    const ntf_filter_t *f = (sdm_mode == SDM_MODE_PRECORR)
+                        ? ntf_auto_select_precorr(fs_out)
+                        : ntf_auto_select(fs_out);
+                    if (f) ntf_name = f->name;
+                }
+                info << "\nNTF: " << (ntf_name ? ntf_name : "Auto");
+            }
 
             /* Show effective FIR gain (global setting) */
             int eff_db = (m_cfg.fir_gain_db == FIR_GAIN_AUTO) ? FIR_GAIN_DEFAULT : (int)m_cfg.fir_gain_db;
