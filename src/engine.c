@@ -34,7 +34,7 @@ static const path_config_t path_table[] = {
     /* Upsample paths (fir_gain < 1.0 where SDM overload was observed) */
     { DSD_RATE_64,  DSD_RATE_128, NTF_CLANS_8, 0.0,  8,  256, 0.5f  },
     { DSD_RATE_64,  DSD_RATE_256, NTF_SDM_7,   0.0,  8,  256, 1.0f  },
-    { DSD_RATE_64,  DSD_RATE_512, NTF_SDM_8,   10.0, 4,  256, 0.25f },
+    { DSD_RATE_64,  DSD_RATE_512, NTF_CLANS_6, 10.0, 4,  256, 0.25f },
     { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_8, 0.0,  8,  256, 1.0f  },
     { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_8, 12.0, 8,  512, 0.5f  },
     { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  16, 512, 1.0f  },
