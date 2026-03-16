@@ -985,6 +985,7 @@ public:
         m_pcm_rate = pcm_rate;
 
         /* Allocate output buffer */
+        /* Output is DoP-encoded. DSD→DSD upsample ratio determines buffer. */
         size_t max_ratio = is_dop ? 8 : (out_rate > pcm_rate ? out_rate / pcm_rate : 1);
         if (max_ratio < 8) max_ratio = 8;
         size_t max_out_frames = pcm_frames * max_ratio;
@@ -1038,7 +1039,9 @@ public:
         }
         m_logged_passthrough = false;
 
-        /* Determine output sample rate */
+        /* Determine output sample rate.
+         * DSD output: DoP encoding at out_rate/16. The ASIO+DSD output
+         * plugin detects DoP markers and sends native DSD to the driver. */
         uint32_t out_pcm_rate;
         if (out_is_pcm) {
             out_pcm_rate = out_rate;  /* Direct PCM output rate */
@@ -1178,7 +1181,10 @@ public:
          * output device reconfigure silently. Buffer the real audio
          * and prepend it to the next chunk. Never use insert_chunk
          * during rate transitions — it confuses fb2k's output pipeline. */
-        if (m_config.antipop && m_antipop_pending && out_frames > 0 && is_dop) {
+        /* Anti-pop disabled for DSD output — PCM zeros break DoP marker
+         * detection in the ASIO+DSD output plugin, causing "rate not supported"
+         * errors for high DSD rates (DSD256+). */
+        if (false && m_config.antipop && m_antipop_pending && out_frames > 0 && is_dop) {
             m_antipop_pending = false;
 
             const int LEADIN_MS = 100;

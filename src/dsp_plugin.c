@@ -810,29 +810,25 @@ size_t plugin_process(plugin_state_t *s,
         return dsd_out_count;
     }
 
-    /* Repack DSD floats to DoP PCM, then interleave into output.
-     * Output PCM frames = dsd_out_count / 16 */
+    /* Pack DSD to DoP and interleave. ASIO+DSD output plugin detects
+     * DoP markers and sends native DSD to the driver. */
     size_t out_pcm_frames = dsd_out_count / DOP_BITS_PER_FRAME;
     if (out_pcm_frames == 0)
         return 0;
 
-    /* Reuse cached pcm_temp, ensure it's large enough for output */
     if (s->cached_pcm_temp_sz < out_pcm_frames) {
         free(s->cached_pcm_temp);
         s->cached_pcm_temp = (float *)malloc(out_pcm_frames * sizeof(float));
         s->cached_pcm_temp_sz = s->cached_pcm_temp ? out_pcm_frames : 0;
     }
-    pcm_temp = s->cached_pcm_temp;
-    if (!pcm_temp)
+    float *pcm_temp2 = s->cached_pcm_temp;
+    if (!pcm_temp2)
         return 0;
 
     for (int ch = 0; ch < num_channels; ch++) {
-        /* Pack DSD bits to DoP PCM */
-        dop_pack(s->ch_out[ch], pcm_temp, dsd_out_count);
-
-        /* Interleave into output */
+        dop_pack(s->ch_out[ch], pcm_temp2, dsd_out_count);
         for (size_t f = 0; f < out_pcm_frames; f++)
-            out_pcm[f * (size_t)num_channels + (size_t)ch] = pcm_temp[f];
+            out_pcm[f * (size_t)num_channels + (size_t)ch] = pcm_temp2[f];
     }
 
     QueryPerformanceCounter(&t_pack_end);
@@ -935,7 +931,7 @@ size_t plugin_process_pcm(plugin_state_t *s,
     if (sdm_out_count == 0)
         return 0;
 
-    /* Pack DSD floats to DoP PCM, then interleave into output */
+    /* Pack DSD to DoP and interleave. */
     size_t out_pcm_frames = sdm_out_count / DOP_BITS_PER_FRAME;
     if (out_pcm_frames == 0)
         return 0;
@@ -943,7 +939,6 @@ size_t plugin_process_pcm(plugin_state_t *s,
     LARGE_INTEGER t_pack_start, t_pack_end;
     QueryPerformanceCounter(&t_pack_start);
 
-    /* Ensure cached pcm_temp buffer is large enough */
     if (s->cached_pcm_temp_sz < out_pcm_frames) {
         free(s->cached_pcm_temp);
         s->cached_pcm_temp = (float *)malloc(out_pcm_frames * sizeof(float));
