@@ -452,13 +452,13 @@ private:
         m_listRate = GetDlgItem(IDC_LIST_RATEMAP);
         m_listRate.SetExtendedListViewStyle(
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 50);
-        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 55);
-        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 45);
-        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 45);
-        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 35);
-        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 35);
-        m_listRate.InsertColumn(6, L"ML", LVCFMT_LEFT, 30);
+        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 60);
+        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 65);
+        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 65);
+        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 60);
+        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 50);
+        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 50);
+        m_listRate.InsertColumn(6, L"ML", LVCFMT_LEFT, 40);
 
         for (int i = 0; i < RATE_MAP_COUNT; i++) {
             m_listRate.InsertItem(i, g_rate_names[i]);
@@ -687,15 +687,21 @@ private:
         m_ntfCombo.ResetContent();
 
         if (col == 3) {
-            /* SDM mode: Auto(*), PreCorr, Trellis */
-            m_ntfCombo.AddString(L"Auto (*)");
+            /* SDM mode: show global default in Auto label */
+            wchar_t auto_label[32];
+            _snwprintf_s(auto_label, _countof(auto_label), _TRUNCATE,
+                         L"Auto (%s)", m_cfg.sdm_mode == SDM_MODE_PRECORR ? L"PreCorr" : L"Trellis");
+            m_ntfCombo.AddString(auto_label);
             m_ntfCombo.AddString(L"PreCorr");
             m_ntfCombo.AddString(L"Trellis");
             int cur = m_cfg.rate_sdm[row];
             m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
         } else if (col == 4) {
-            /* Candidates: Auto(*), 4, 8, 16, 32 */
-            m_ntfCombo.AddString(L"Auto (*)");
+            /* Candidates: show global default */
+            wchar_t auto_label[32];
+            _snwprintf_s(auto_label, _countof(auto_label), _TRUNCATE,
+                         L"Auto (%d)", m_cfg.trellis_cands);
+            m_ntfCombo.AddString(auto_label);
             m_ntfCombo.AddString(L"4"); m_ntfCombo.AddString(L"8");
             m_ntfCombo.AddString(L"16"); m_ntfCombo.AddString(L"32");
             int cur = m_cfg.rate_cands[row];
@@ -704,8 +710,11 @@ private:
             else if (cur == 16) sel = 3; else if (cur == 32) sel = 4;
             m_ntfCombo.SetCurSel(sel);
         } else if (col == 5) {
-            /* Depth: Auto(*), 4, 5, 6, 7, 8 */
-            m_ntfCombo.AddString(L"Auto (*)");
+            /* Depth: show global default */
+            wchar_t auto_label[32];
+            _snwprintf_s(auto_label, _countof(auto_label), _TRUNCATE,
+                         L"Auto (%d)", m_cfg.trellis_depth);
+            m_ntfCombo.AddString(auto_label);
             m_ntfCombo.AddString(L"4"); m_ntfCombo.AddString(L"5");
             m_ntfCombo.AddString(L"6"); m_ntfCombo.AddString(L"7");
             m_ntfCombo.AddString(L"8");
@@ -714,8 +723,11 @@ private:
             if (cur >= 4 && cur <= 8) sel = cur - 3;
             m_ntfCombo.SetCurSel(sel);
         } else if (col == 6) {
-            /* ML: Auto(*), Off, On */
-            m_ntfCombo.AddString(L"Auto (*)");
+            /* ML: show global default */
+            wchar_t auto_label[32];
+            _snwprintf_s(auto_label, _countof(auto_label), _TRUNCATE,
+                         L"Auto (%s)", m_cfg.ml_enabled ? L"On" : L"Off");
+            m_ntfCombo.AddString(auto_label);
             m_ntfCombo.AddString(L"Off");
             m_ntfCombo.AddString(L"On");
             int cur = m_cfg.rate_ml[row];
