@@ -26,6 +26,7 @@ extern "C" {
 #include "../include/httpapi.h"
 #include "../include/dop.h"
 #include "../include/engine.h"
+#include "../include/tusbaudio.h"
 #include "build_version.h"
 
 /* Per-instance plugin state (opaque, defined in dsp_plugin.c) */
@@ -1090,6 +1091,13 @@ public:
                 plugin_get_phase_timing(m_state, &t_unpack, &t_fir, &t_sdm, &t_pack);
                 trellis_log("phase timing: unpack=%.1fms fir=%.1fms sdm=%.1fms pack=%.1fms",
                             t_unpack, t_fir, t_sdm, t_pack);
+
+                /* Log TUSBAudio DAC status if available */
+                if (tusb_available()) {
+                    tusb_log_status([](const char *line, void *) {
+                        trellis_log("  dac: %s", line);
+                    }, nullptr);
+                }
             }
 
             /* Log CPUSET changes */

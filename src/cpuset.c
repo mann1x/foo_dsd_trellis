@@ -684,18 +684,28 @@ int cpuset_select(const cpu_topology_t *topo,
 
         /* Compute priority: lower = more preferred.
          *
-         * Priority bands (non-overlapping):
-         *   0-99:    T0 threads on non-parked cores (best)
+         * Strategy: avoid cores that Windows uses heavily (high
+         * scheduling_class). Prefer parked/idle cores that will be
+         * unparked on demand — they're less likely to compete with
+         * the OS and other apps for the same cores.
+         *
+         * Priority bands:
+         *   0-99:    T0 threads, sorted by scheduling_class (low = idle)
          *   100-199: T0 threads on parked cores (OS will unpark)
          *   1000+:   T1 (SMT sibling) threads — last resort
          *
-         * Within each band, sort by perf_score (higher = better). */
+         * Within each band, lower scheduling_class = preferred.
+         * Ties broken by perf_score (higher = better). */
         int prio = 0;
 
-        /* Parked cores: usable but less preferred (avoids stealing
-         * from other workloads on the active cores) */
+        /* Parked cores: slightly less preferred but still good —
+         * they're guaranteed to be idle. */
         if (e->parked)
             prio += 100;
+
+        /* Scheduling class: higher = Windows uses more = avoid.
+         * Range 0-15: high sched_class → high prio → selected last. */
+        prio += e->scheduling_class;
 
         /* SMT: T0 preferred over T1 */
         if (e->smt_thread > 0)
@@ -703,8 +713,8 @@ int cpuset_select(const cpu_topology_t *topo,
 
         /* CCD/cluster preference */
         if (ccd_mode == CCD_AUTO) {
-            /* Prefer first cluster, then overflow */
-            prio += e->cluster * 10;
+            /* Spread across clusters for thermal balance */
+            prio += e->cluster * 5;
         }
         /* CCD_ALL: all clusters equally preferred (no cluster penalty) */
 

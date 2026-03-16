@@ -207,6 +207,9 @@
     <ClCompile Include="src\onnx_filter.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\tusbaudio.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\foo_dsd_trellis.rc" />
