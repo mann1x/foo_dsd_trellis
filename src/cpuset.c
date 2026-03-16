@@ -747,18 +747,14 @@ int cpuset_select(const cpu_topology_t *topo,
     qsort(cands, (size_t)ncands, sizeof(select_candidate_t), cmp_candidate);
 
     /* Determine how many to select.
-     * max_threads=0 (auto): use physical core count as default.
-     * This avoids over-subscribing with SMT threads, which adds
-     * overhead without proportional SDM throughput benefit. */
+     * max_threads=0 (auto): use all logical processors. T1 (SMT)
+     * threads are sorted last (prio +1000) so they only get work
+     * when all T0 cores are occupied. This allows DSD512 to use
+     * SMT when it needs more parallelism. */
     int select_count = ncands;
     if (max_threads > 0) {
         if (max_threads < select_count)
             select_count = max_threads;
-    } else {
-        /* Auto: cap to physical core count (or candidate count if fewer) */
-        int phys = topo->num_physical_cores > 0 ? topo->num_physical_cores : ncands;
-        if (phys < select_count)
-            select_count = phys;
     }
     if (select_count > max_ids)
         select_count = max_ids;

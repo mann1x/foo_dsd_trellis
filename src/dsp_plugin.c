@@ -74,7 +74,8 @@ typedef struct plugin_state {
 
     /* CPUSET change hysteresis — avoid rebuilding threadpool on transient OS parking */
     uint64_t           pending_cpuset_mask;  /* mask we're considering switching to */
-    int                cpuset_stable_count;  /* how many chunks the pending mask has been stable */
+    int                cpuset_stable_count;  /* how many checks the pending mask has been stable */
+    int                cpuset_check_counter; /* throttle: only check every N chunks */
 
     /* Per-phase timing (milliseconds) */
     double             time_unpack_ms;
@@ -478,12 +479,13 @@ size_t plugin_process(plugin_state_t *s,
     }
 
     /* Check for system CPUSET changes (CPUDoc dynamic core management).
-     * Hysteresis: only rebuild threadpool when the new mask has been
-     * stable for CPUSET_STABLE_THRESHOLD consecutive chunks. This avoids
-     * choppy audio from transient OS core parking/unparking. */
-    #define CPUSET_STABLE_THRESHOLD 500  /* ~500 chunks ≈ 10-20 seconds */
+     * Only check every CPUSET_CHECK_INTERVAL chunks to avoid
+     * kernel syscall overhead on every audio chunk. */
+    #define CPUSET_CHECK_INTERVAL   100  /* check every ~100 chunks */
+    #define CPUSET_STABLE_THRESHOLD 5    /* 5 consecutive checks stable = rebuild */
     s->cpuset_changed = false;
-    if (s->topology_detected) {
+    s->cpuset_check_counter++;
+    if (s->topology_detected && (s->cpuset_check_counter % CPUSET_CHECK_INTERVAL) == 0) {
         bool mask_changed = false;
         uint64_t new_mask = cpuset_refresh(&s->topology, &mask_changed);
         if (mask_changed && s->pool) {
