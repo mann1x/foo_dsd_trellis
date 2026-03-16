@@ -48,7 +48,6 @@ typedef struct plugin_state {
     bool               initialized;
     uint32_t           detected_dsd_rate;
     uint32_t           active_fs_out;     /* Output rate engine was initialized with */
-    int                active_sdm_mode;   /* SDM mode engine was initialized with */
     float              active_gain;       /* Gain engine was initialized with */
     bool               active_mute;       /* Mute state engine was initialized with */
 
@@ -75,7 +74,8 @@ typedef struct plugin_state {
 
     /* CPUSET change hysteresis — avoid rebuilding threadpool on transient OS parking */
     uint64_t           pending_cpuset_mask;  /* mask we're considering switching to */
-    int                cpuset_stable_count;  /* how many chunks the pending mask has been stable */
+    int                cpuset_stable_count;  /* how many checks the pending mask has been stable */
+    int                cpuset_check_counter; /* throttle: only check every N chunks */
 
     /* Per-phase timing (milliseconds) */
     double             time_unpack_ms;
@@ -284,7 +284,6 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     s->num_channels = num_channels;
     s->detected_dsd_rate = dsd_rate;
     s->active_fs_out = s->config.fs_out;
-    s->active_sdm_mode = s->config.sdm_mode;
     s->active_gain = s->config.gain;
     s->active_mute = s->config.mute;
 
@@ -310,9 +309,14 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         s->topology_detected = true;
     }
 
-    /* Select threads based on topology and config */
+    /* Select threads based on topology and config.
+     * Cap to actual need: channels * max_segments_per_ch.
+     * For stereo with 4 segments = 8 threads max. */
+    int max_segments = 4;
+    int needed = num_channels * max_segments;
+
     uint32_t selected_ids[CPUSET_MAX_CPUS];
-    int max_t = s->config.thread_count > 0 ? s->config.thread_count : 0;
+    int max_t = s->config.thread_count > 0 ? s->config.thread_count : needed;
     int selected = cpuset_select(&s->topology,
                                   (smt_mode_t)s->config.smt_mode,
                                   (ccd_mode_t)s->config.ccd_mode,
@@ -329,7 +333,7 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     if (selected > 0 && s->topology.initialized) {
         s->pool = threadpool_create_cpuset(selected_ids, selected);
     } else {
-        int tc = s->config.thread_count > 0 ? s->config.thread_count : 0;
+        int tc = s->config.thread_count > 0 ? s->config.thread_count : needed;
         s->pool = threadpool_create(tc, s->config.affinity_mask);
     }
     if (!s->pool) {
@@ -460,8 +464,7 @@ size_t plugin_process(plugin_state_t *s,
     /* Initialize engine on first use, channel/rate change, or output rate change */
     if (!s->initialized || s->num_channels != num_channels ||
         s->detected_dsd_rate != dsd_rate ||
-        s->active_fs_out != s->config.fs_out ||
-        s->active_sdm_mode != s->config.sdm_mode) {
+        s->active_fs_out != s->config.fs_out) {
         /* Tear down old state */
         if (s->initialized) {
             if (s->pool) {
@@ -474,14 +477,6 @@ size_t plugin_process(plugin_state_t *s,
                 free(s->channels);
                 s->channels = NULL;
             }
-            /* Free cached temp SDMs — they have stale params */
-            if (s->cached_temp_sdms) {
-                for (int i = 0; i < s->cached_temp_sdm_count; i++)
-                    sdm_context_free(&s->cached_temp_sdms[i]);
-                free(s->cached_temp_sdms);
-                s->cached_temp_sdms = NULL;
-                s->cached_temp_sdm_count = 0;
-            }
             s->initialized = false;
         }
         if (plugin_init_engine(s, num_channels, dsd_rate) != 0)
@@ -489,12 +484,13 @@ size_t plugin_process(plugin_state_t *s,
     }
 
     /* Check for system CPUSET changes (CPUDoc dynamic core management).
-     * Hysteresis: only rebuild threadpool when the new mask has been
-     * stable for CPUSET_STABLE_THRESHOLD consecutive chunks. This avoids
-     * choppy audio from transient OS core parking/unparking. */
-    #define CPUSET_STABLE_THRESHOLD 500  /* ~500 chunks ≈ 10-20 seconds */
+     * Only check every CPUSET_CHECK_INTERVAL chunks to avoid
+     * kernel syscall overhead on every audio chunk. */
+    #define CPUSET_CHECK_INTERVAL   100  /* check every ~100 chunks */
+    #define CPUSET_STABLE_THRESHOLD 5    /* 5 consecutive checks stable = rebuild */
     s->cpuset_changed = false;
-    if (s->topology_detected) {
+    s->cpuset_check_counter++;
+    if (s->topology_detected && (s->cpuset_check_counter % CPUSET_CHECK_INTERVAL) == 0) {
         bool mask_changed = false;
         uint64_t new_mask = cpuset_refresh(&s->topology, &mask_changed);
         if (mask_changed && s->pool) {
@@ -604,17 +600,10 @@ size_t plugin_process(plugin_state_t *s,
         if (fs_out > s->config.fs_in)
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);
 
-        /* Overlap must match the ACTUAL SDM latency from the initialized
-         * engine (path_config value), not the global config default.
-         * The temp SDMs' warmup reads trellis_lat + discard samples,
-         * so overlap must be >= 2 * actual_lat to avoid buffer overread. */
-        int actual_lat = (s->channels && s->channels[0].sdm.trellis_lat > 0)
-            ? (int)s->channels[0].sdm.trellis_lat
-            : s->config.trellis_lat;
-        overlap = 2 * (size_t)actual_lat;
+        overlap = 2 * (size_t)s->config.trellis_lat;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
-        if (segments_per_ch > 4) segments_per_ch = 4;  /* limit parallelism overhead */
+        if (segments_per_ch > 4) segments_per_ch = 4;
 
         /* Ensure minimum segment size (at least 4x overlap) */
         size_t min_seg = overlap * 4;
@@ -667,21 +656,11 @@ size_t plugin_process(plugin_state_t *s,
         /* Phase 2: Get temp SDM contexts for segments 1..N-1 (cached) */
         int temp_sdm_count = num_channels * (segments_per_ch - 1);
         uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
-
-        /* Use the same cands/lat as the persistent SDM (segment 0).
-         * Read them from channel 0's SDM context which was initialized
-         * by engine_channel_init with path_config values. */
-        int seg_cands_from_eng = s->channels[0].sdm.trellis_num;
-        int seg_lat_from_eng = s->channels[0].sdm.trellis_lat;
-        const ntf_filter_t *filter = s->channels[0].sdm.filter;
-        if (!filter) {
-            if (s->config.ntf_filter == NTF_AUTO)
-                filter = ntf_auto_select(fs_out);
-            else
-                filter = ntf_get_filter((ntf_filter_id_t)s->config.ntf_filter, fs_out);
-        }
-        int seg_cands = seg_cands_from_eng > 0 ? seg_cands_from_eng : s->config.trellis_cands;
-        int seg_lat   = seg_lat_from_eng > 0 ? seg_lat_from_eng : s->config.trellis_lat;
+        const ntf_filter_t *filter = NULL;
+        if (s->config.ntf_filter == NTF_AUTO)
+            filter = ntf_auto_select(fs_out);
+        else
+            filter = ntf_get_filter((ntf_filter_id_t)s->config.ntf_filter, fs_out);
 
         /* Grow cached temp SDMs if needed */
         if (s->cached_temp_sdm_count < temp_sdm_count) {
@@ -698,17 +677,21 @@ size_t plugin_process(plugin_state_t *s,
         if (!temp_sdms)
             return 0;
 
-        /* Reset temp SDM contexts (init once, reset each chunk) */
+        /* Reset temp SDM contexts (init once, reset each chunk).
+         * Only re-init if not yet initialized or config changed. */
         bool init_ok = true;
         for (int i = 0; i < temp_sdm_count; i++) {
             if (temp_sdms[i].filter == NULL) {
+                /* First use — initialize */
                 if (sdm_context_init(&temp_sdms[i], filter,
                                       s->config.trellis_depth,
-                                      seg_cands, seg_lat) != 0) {
+                                      s->config.trellis_cands,
+                                      s->config.trellis_lat) != 0) {
                     init_ok = false;
                     break;
                 }
             } else {
+                /* Already initialized — just reset state */
                 sdm_context_reset(&temp_sdms[i]);
             }
         }
@@ -729,7 +712,7 @@ size_t plugin_process(plugin_state_t *s,
             return 0;
         memset(blocks, 0, (size_t)total_blocks * sizeof(channel_block_t));
 
-        size_t discard = (size_t)actual_lat;
+        size_t discard = (size_t)s->config.trellis_lat;
 
         for (int ch = 0; ch < num_channels; ch++) {
             size_t fir_count = fir_counts[ch];
@@ -738,8 +721,8 @@ size_t plugin_process(plugin_state_t *s,
 
             /* Compute segment 0 expected output for offset calculation */
             size_t pending = s->channels[ch].sdm.pending;
-            size_t lat_rem = (pending < (size_t)actual_lat) ?
-                ((size_t)actual_lat - pending) : 0;
+            size_t lat_rem = (pending < (size_t)s->config.trellis_lat) ?
+                ((size_t)s->config.trellis_lat - pending) : 0;
             size_t seg0_size = base_seg + (0 < remainder ? 1 : 0);
             size_t seg0_out = (seg0_size > lat_rem) ? (seg0_size - lat_rem) : 0;
 
@@ -898,8 +881,7 @@ size_t plugin_process_pcm(plugin_state_t *s,
     /* Initialize engine on first use or parameter change */
     if (!s->initialized || s->num_channels != num_channels ||
         s->detected_dsd_rate != dsd_rate ||
-        s->active_fs_out != s->config.fs_out ||
-        s->active_sdm_mode != s->config.sdm_mode) {
+        s->active_fs_out != s->config.fs_out) {
         /* Tear down old state */
         if (s->initialized) {
             if (s->pool) {
@@ -911,13 +893,6 @@ size_t plugin_process_pcm(plugin_state_t *s,
                     engine_channel_free(&s->channels[i]);
                 free(s->channels);
                 s->channels = NULL;
-            }
-            if (s->cached_temp_sdms) {
-                for (int i = 0; i < s->cached_temp_sdm_count; i++)
-                    sdm_context_free(&s->cached_temp_sdms[i]);
-                free(s->cached_temp_sdms);
-                s->cached_temp_sdms = NULL;
-                s->cached_temp_sdm_count = 0;
             }
             s->initialized = false;
         }
@@ -1051,15 +1026,22 @@ double plugin_get_latency(const plugin_state_t *s) {
     if (!s || !s->initialized || s->detected_dsd_rate == 0)
         return 0.0;
 
-    /* PreCorr has no latency */
-    if (s->config.sdm_mode == SDM_MODE_PRECORR)
-        return 0.0;
-
     uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
-    /* Latency is trellis_lat DSD samples at the output DSD rate,
-     * expressed as DoP PCM frames / DoP PCM rate */
-    double dsd_lat_sec = (double)s->config.trellis_lat / (double)fs_out;
-    return dsd_lat_sec;
+
+    /* SDM latency (trellis only) */
+    double sdm_lat = 0.0;
+    if (s->config.sdm_mode != SDM_MODE_PRECORR)
+        sdm_lat = (double)s->config.trellis_lat / (double)fs_out;
+
+    /* Processing buffer: report extra latency so fb2k prefetches
+     * more audio, preventing output underruns during heavy SDM work.
+     * Scale with output rate — DSD512 needs more buffer than DSD64. */
+    double proc_buf = 0.0;
+    if (fs_out >= 22579200)      proc_buf = 5.0;  /* DSD512: borderline RT */
+    else if (fs_out >= 11289600) proc_buf = 2.0;  /* DSD256 */
+    else if (fs_out >= 5644800)  proc_buf = 1.0;  /* DSD128 */
+
+    return sdm_lat + proc_buf;
 }
 
 /* Reset all channel states (on seek / discontinuity) */
