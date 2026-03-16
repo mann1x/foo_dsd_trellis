@@ -440,6 +440,10 @@ int cpuset_detect(cpu_topology_t *topo) {
 
 /* ─── System CPUSET refresh ─── */
 
+/* Cached buffer for cpuset_refresh to avoid per-chunk malloc/free */
+static BYTE  *g_refresh_buf = NULL;
+static ULONG  g_refresh_buf_sz = 0;
+
 uint64_t cpuset_refresh(cpu_topology_t *topo, bool *changed) {
     if (changed) *changed = false;
     if (!topo->initialized || !pfn_GetCpuSetInfo)
@@ -451,12 +455,17 @@ uint64_t cpuset_refresh(cpu_topology_t *topo, bool *changed) {
     if (buf_len == 0)
         return topo->last_cpuset_mask;
 
-    BYTE *buf = (BYTE *)malloc(buf_len);
+    /* Use cached buffer to avoid malloc/free on every chunk */
+    if (buf_len > g_refresh_buf_sz) {
+        free(g_refresh_buf);
+        g_refresh_buf = (BYTE *)malloc(buf_len);
+        g_refresh_buf_sz = g_refresh_buf ? buf_len : 0;
+    }
+    BYTE *buf = g_refresh_buf;
     if (!buf)
         return topo->last_cpuset_mask;
 
     if (!pfn_GetCpuSetInfo(buf, buf_len, &buf_len, NULL, 0)) {
-        free(buf);
         return topo->last_cpuset_mask;
     }
 
