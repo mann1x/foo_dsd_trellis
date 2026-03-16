@@ -152,13 +152,11 @@ static DWORD WINAPI worker_func(LPVOID param) {
         QueryPerformanceCounter(&t_end);
         QueryPerformanceFrequency(&freq);
 
-        /* Compute RT ratio: how much of the real-time budget was consumed.
-         * audio_duration = out_count / fs_out (seconds)
-         * processing_time = (t_end - t_start) / freq (seconds)
-         * rt_ratio = processing_time / audio_duration
-         * rt_ratio < 1.0 = OK, >= 1.0 = can't keep up */
+        /* Compute RT ratio: how much of the real-time budget was consumed. */
         {
-            uint32_t fs_out = block->cfg->fs_out ? block->cfg->fs_out : block->cfg->fs_in;
+            uint32_t fs_out = (block->cfg)
+                ? (block->cfg->fs_out ? block->cfg->fs_out : block->cfg->fs_in)
+                : 0;
             double audio_sec = (fs_out > 0 && block->out_count > 0)
                 ? (double)block->out_count / (double)fs_out
                 : 0.0;

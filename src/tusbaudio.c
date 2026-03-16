@@ -106,19 +106,19 @@ static const wchar_t *g_search_dirs[] = {
 static HMODULE try_load_dir(const wchar_t *dir, char *out_path, size_t path_size) {
     WIN32_FIND_DATAW fd;
     wchar_t pattern[MAX_PATH];
-    _snwprintf(pattern, MAX_PATH, L"%s\\*api_x64.dll", dir);
+    _snwprintf_s(pattern, MAX_PATH, L"%s\\*api_x64.dll", dir);
 
     HANDLE h = FindFirstFileW(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) {
         /* Also try *api.dll for 32-bit naming */
-        _snwprintf(pattern, MAX_PATH, L"%s\\*api.dll", dir);
+        _snwprintf_s(pattern, MAX_PATH, L"%s\\*api.dll", dir);
         h = FindFirstFileW(pattern, &fd);
     }
     if (h == INVALID_HANDLE_VALUE)
         return NULL;
 
     wchar_t full_path[MAX_PATH];
-    _snwprintf(full_path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
+    _snwprintf_s(full_path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
     FindClose(h);
 
     HMODULE dll = LoadLibraryW(full_path);
@@ -257,14 +257,14 @@ bool tusb_query_status(tusb_status_t *status) {
             return false;
     }
     status->available = true;
-    strncpy(status->dll_path, g_tusb.dll_path, sizeof(status->dll_path) - 1);
+    strncpy_s(status->dll_path, sizeof(status->dll_path), g_tusb.dll_path, _TRUNCATE);
 
     /* Device properties */
     TUsbAudioDeviceProperties props;
     memset(&props, 0, sizeof(props));
     if (g_tusb.GetDeviceProperties(g_tusb.device, &props) == TUSB_STATUS_SUCCESS) {
-        wcsncpy(status->product, props.productString, TUSB_MAX_STR - 1);
-        wcsncpy(status->manufacturer, props.manufacturerString, TUSB_MAX_STR - 1);
+        wcsncpy_s(status->product, TUSB_MAX_STR, props.productString, _TRUNCATE);
+        wcsncpy_s(status->manufacturer, TUSB_MAX_STR, props.manufacturerString, _TRUNCATE);
         status->usb_vid = props.usbVendorId;
         status->usb_pid = props.usbProductId;
     }
@@ -305,7 +305,7 @@ bool tusb_query_status(tusb_status_t *status) {
             status->formats[i].format_id = fmts[i].formatId;
             status->formats[i].bits_per_sample = fmts[i].bitsPerSample;
             status->formats[i].num_channels = fmts[i].numberOfChannels;
-            wcsncpy(status->formats[i].name, fmts[i].formatNameString, TUSB_MAX_STR - 1);
+            wcsncpy_s(status->formats[i].name, TUSB_MAX_STR, fmts[i].formatNameString, _TRUNCATE);
 
             /* Check for DSD format names or 1-bit samples */
             if (fmts[i].bitsPerSample == 1 ||
