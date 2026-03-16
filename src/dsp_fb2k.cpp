@@ -56,6 +56,8 @@ void            plugin_get_phase_timing(const plugin_state_t *s,
                                          double *unpack_ms, double *fir_ms,
                                          double *sdm_ms, double *pack_ms);
 bool            plugin_get_cpuset_change(const plugin_state_t *s, uint64_t *mask);
+int             plugin_get_selected_cores(const plugin_state_t *s,
+                                           uint32_t *ids, int max_ids);
 
 /* Config serialization (config.c) */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size);
@@ -1082,6 +1084,7 @@ public:
                 plugin_get_workload(m_state, &wl_threads, &wl_segments, &wl_changed);
                 trellis_log("workload: %d threads, %d segments/ch",
                             wl_threads, wl_segments);
+                log_selected_cores();
 
                 double t_unpack, t_fir, t_sdm, t_pack;
                 plugin_get_phase_timing(m_state, &t_unpack, &t_fir, &t_sdm, &t_pack);
@@ -1109,6 +1112,7 @@ public:
                 if (wl_changed && m_logged_processing) {
                     trellis_log("workload changed: %d threads, %d segments/ch",
                                 wl_threads, wl_segments);
+                    log_selected_cores();
                 }
             }
 
@@ -1273,6 +1277,46 @@ public:
 
     bool need_track_change_mark() override {
         return false;
+    }
+
+    void log_selected_cores() {
+        uint32_t ids[CPUSET_MAX_CPUS];
+        int n = plugin_get_selected_cores(m_state, ids, CPUSET_MAX_CPUS);
+        if (n == 0) return;
+
+        const cpu_topology_t *topo = plugin_get_topology(m_state);
+
+        /* Build a compact description: "core LP/T0(perf) ..." */
+        char buf[1024];
+        int pos = 0;
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "selected cores (%d): ", n);
+
+        for (int i = 0; i < n && pos < (int)sizeof(buf) - 40; i++) {
+            /* Find this ID in the topology */
+            const char *smt_tag = "?";
+            int lp = -1;
+            int cluster = -1;
+            double perf = 0.0;
+            bool parked = false;
+            if (topo) {
+                for (int j = 0; j < topo->count; j++) {
+                    if (topo->entries[j].id == ids[i]) {
+                        lp = topo->entries[j].logical_index;
+                        smt_tag = topo->entries[j].smt_thread == 0 ? "T0" : "T1";
+                        cluster = topo->entries[j].cluster;
+                        perf = topo->entries[j].perf_score;
+                        parked = topo->entries[j].parked;
+                        break;
+                    }
+                }
+            }
+            if (i > 0) pos += snprintf(buf + pos, sizeof(buf) - pos, ", ");
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                           "LP%d/%s/C%d(%.0f%%%s)",
+                           lp, smt_tag, cluster, perf * 100,
+                           parked ? " parked" : "");
+        }
+        trellis_log("%s", buf);
     }
 
 private:

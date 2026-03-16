@@ -68,6 +68,10 @@ typedef struct plugin_state {
     bool               cpuset_changed;
     uint64_t           last_cpuset_mask;
 
+    /* Selected core IDs for the current threadpool */
+    uint32_t           selected_core_ids[CPUSET_MAX_CPUS];
+    int                selected_core_count;
+
     /* CPUSET change hysteresis — avoid rebuilding threadpool on transient OS parking */
     uint64_t           pending_cpuset_mask;  /* mask we're considering switching to */
     int                cpuset_stable_count;  /* how many chunks the pending mask has been stable */
@@ -313,6 +317,13 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                                   (ecore_mode_t)s->config.ecore_mode,
                                   max_t, selected_ids, CPUSET_MAX_CPUS);
 
+    /* Store selected core IDs for logging */
+    s->selected_core_count = selected > 0 ? selected : 0;
+    if (selected > 0) {
+        memcpy(s->selected_core_ids, selected_ids,
+               (size_t)selected * sizeof(uint32_t));
+    }
+
     if (selected > 0 && s->topology.initialized) {
         s->pool = threadpool_create_cpuset(selected_ids, selected);
     } else {
@@ -384,6 +395,16 @@ void plugin_get_workload(const plugin_state_t *s,
     *num_threads = s->last_num_threads;
     *segments_per_ch = s->last_segments_per_ch;
     *changed = s->workload_changed;
+}
+
+/* Query selected core IDs for debug logging */
+int plugin_get_selected_cores(const plugin_state_t *s,
+                               uint32_t *ids, int max_ids) {
+    if (!s || s->selected_core_count == 0)
+        return 0;
+    int n = s->selected_core_count < max_ids ? s->selected_core_count : max_ids;
+    memcpy(ids, s->selected_core_ids, (size_t)n * sizeof(uint32_t));
+    return n;
 }
 
 /* Query CPUSET change info for debug logging */
@@ -482,8 +503,13 @@ size_t plugin_process(plugin_state_t *s,
                                               (ccd_mode_t)s->config.ccd_mode,
                                               (ecore_mode_t)s->config.ecore_mode,
                                               max_t, selected_ids, CPUSET_MAX_CPUS);
-                if (selected > 0)
+                /* Update selected core IDs for logging */
+                s->selected_core_count = selected > 0 ? selected : 0;
+                if (selected > 0) {
+                    memcpy(s->selected_core_ids, selected_ids,
+                           (size_t)selected * sizeof(uint32_t));
                     s->pool = threadpool_create_cpuset(selected_ids, selected);
+                }
                 if (!s->pool)
                     s->pool = threadpool_create(
                         s->config.thread_count > 0 ? s->config.thread_count : 0,
