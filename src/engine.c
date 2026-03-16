@@ -40,7 +40,7 @@ static const path_config_t path_table[] = {
     { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  2,  256, 4, 0.708f },
     { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_5, 0.0,  2,  256, 4, 0.708f },
     { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_5, 0.0,  2,  512, 4, 0.708f },
-    { DSD_RATE_512, DSD_RATE_512, NTF_CLANS_5, 0.0,  2,  512, 4, 0.708f },
+    { DSD_RATE_512, DSD_RATE_512, NTF_CLANS_5, 0.0,  2,  768, 4, 0.708f },
     /* Upsample paths */
     { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_4,   0.0,  2,  512, 4, 0.708f },
     { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  512, 4, 0.708f },
