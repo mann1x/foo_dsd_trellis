@@ -724,12 +724,14 @@ private:
             _snwprintf_s(auto_label, _countof(auto_label), _TRUNCATE,
                          L"Auto (%d)", m_cfg.trellis_cands);
             m_ntfCombo.AddString(auto_label);
-            m_ntfCombo.AddString(L"4"); m_ntfCombo.AddString(L"8");
-            m_ntfCombo.AddString(L"16"); m_ntfCombo.AddString(L"32");
+            m_ntfCombo.AddString(L"2"); m_ntfCombo.AddString(L"4");
+            m_ntfCombo.AddString(L"8"); m_ntfCombo.AddString(L"16");
+            m_ntfCombo.AddString(L"32");
             int cur = m_cfg.rate_cands[row];
             int sel = 0;
-            if (cur == 4) sel = 1; else if (cur == 8) sel = 2;
-            else if (cur == 16) sel = 3; else if (cur == 32) sel = 4;
+            if (cur == 2) sel = 1; else if (cur == 4) sel = 2;
+            else if (cur == 8) sel = 3; else if (cur == 16) sel = 4;
+            else if (cur == 32) sel = 5;
             m_ntfCombo.SetCurSel(sel);
         } else if (col == 5) {
             /* Depth: show global default */
@@ -794,9 +796,9 @@ private:
             const wchar_t *names[] = { L"Auto", L"PreCorr", L"Trellis" };
             m_listRate.SetItemText(m_editRow, 3, names[sel < 3 ? sel : 0]);
         } else if (m_editCol == 4) {
-            /* Candidates: 0=Auto, 1=4, 2=8, 3=16, 4=32 */
-            static const int8_t cvals[] = { -1, 4, 8, 16, 32 };
-            int8_t val = (sel >= 0 && sel < 5) ? cvals[sel] : -1;
+            /* Candidates: 0=Auto, 1=2, 2=4, 3=8, 4=16, 5=32 */
+            static const int8_t cvals[] = { -1, 2, 4, 8, 16, 32 };
+            int8_t val = (sel >= 0 && sel < 6) ? cvals[sel] : -1;
             m_cfg.rate_cands[m_editRow] = val;
             wchar_t buf[16];
             if (val < 0) wcscpy_s(buf, L"Auto");

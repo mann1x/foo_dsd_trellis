@@ -48,6 +48,7 @@ typedef struct plugin_state {
     bool               initialized;
     uint32_t           detected_dsd_rate;
     uint32_t           active_fs_out;     /* Output rate engine was initialized with */
+    int                active_sdm_mode;   /* SDM mode engine was initialized with */
     float              active_gain;       /* Gain engine was initialized with */
     bool               active_mute;       /* Mute state engine was initialized with */
 
@@ -284,6 +285,7 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     s->num_channels = num_channels;
     s->detected_dsd_rate = dsd_rate;
     s->active_fs_out = s->config.fs_out;
+    s->active_sdm_mode = s->config.sdm_mode;
     s->active_gain = s->config.gain;
     s->active_mute = s->config.mute;
 
@@ -461,10 +463,11 @@ size_t plugin_process(plugin_state_t *s,
     /* Always keep fs_in in sync (plugin_set_config may have overwritten it) */
     s->config.fs_in = dsd_rate;
 
-    /* Initialize engine on first use, channel/rate change, or output rate change */
+    /* Initialize engine on first use, channel/rate/mode change */
     if (!s->initialized || s->num_channels != num_channels ||
         s->detected_dsd_rate != dsd_rate ||
-        s->active_fs_out != s->config.fs_out) {
+        s->active_fs_out != s->config.fs_out ||
+        s->active_sdm_mode != s->config.sdm_mode) {
         /* Tear down old state */
         if (s->initialized) {
             if (s->pool) {
@@ -881,7 +884,8 @@ size_t plugin_process_pcm(plugin_state_t *s,
     /* Initialize engine on first use or parameter change */
     if (!s->initialized || s->num_channels != num_channels ||
         s->detected_dsd_rate != dsd_rate ||
-        s->active_fs_out != s->config.fs_out) {
+        s->active_fs_out != s->config.fs_out ||
+        s->active_sdm_mode != s->config.sdm_mode) {
         /* Tear down old state */
         if (s->initialized) {
             if (s->pool) {
