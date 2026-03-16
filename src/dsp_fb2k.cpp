@@ -1123,18 +1123,46 @@ public:
         m_config.ntf_filter = (int)m_config.rate_ntf[map_idx];
         if (m_config.rate_sdm[map_idx] >= 0)
             m_config.sdm_mode = (int)m_config.rate_sdm[map_idx];
-        if (m_config.rate_cands[map_idx] > 0)
-            m_config.trellis_cands = (int)m_config.rate_cands[map_idx];
-        if (m_config.rate_depth[map_idx] > 0)
-            m_config.trellis_depth = (int)m_config.rate_depth[map_idx];
         if (m_config.rate_ml[map_idx] >= 0)
             m_config.ml_enabled = (m_config.rate_ml[map_idx] != 0);
+
+        /* Resolve cands/lat/depth from path_config when Auto.
+         * This ensures persistent SDM, temp SDMs, overlap, and discard
+         * all use the same values — fixing the DSD256 segment mismatch. */
+        {
+            uint32_t pi_in = is_dop ? dsd_rate : pcm_rate;
+            engine_path_info_t pi;
+            if (engine_get_path_info(pi_in, out_rate,
+                    (int)m_config.rate_ntf[map_idx],
+                    m_config.sdm_mode, &m_config, &pi) == 0 && !pi.fir_only) {
+                /* Per-rate explicit overrides win; Auto resolves to path-optimal */
+                if (m_config.rate_cands[map_idx] > 0)
+                    m_config.trellis_cands = (int)m_config.rate_cands[map_idx];
+                else if (pi.cands > 0)
+                    m_config.trellis_cands = pi.cands;
+
+                if (m_config.rate_depth[map_idx] > 0)
+                    m_config.trellis_depth = (int)m_config.rate_depth[map_idx];
+
+                /* Always use path-optimal lat for consistency */
+                if (pi.lat > 0)
+                    m_config.trellis_lat = pi.lat;
+            } else {
+                if (m_config.rate_cands[map_idx] > 0)
+                    m_config.trellis_cands = (int)m_config.rate_cands[map_idx];
+                if (m_config.rate_depth[map_idx] > 0)
+                    m_config.trellis_depth = (int)m_config.rate_depth[map_idx];
+            }
+        }
 
         /* Set output rate for this chunk */
         m_config.fs_out = out_rate;
         if (!m_logged_processing) {
             trellis_log("rate_map: lookup_rate=%u map_idx=%d out_idx=%u out_rate=%u is_dop=%d gain=%.3f fs_in=%u fs_out=%u",
                         lookup_rate, map_idx, (unsigned)out_idx, out_rate, is_dop, m_config.gain, m_config.fs_in, m_config.fs_out);
+            trellis_log("resolved: sdm=%s cands=%d depth=%d lat=%d",
+                        m_config.sdm_mode == SDM_MODE_TRELLIS ? "Trellis" : "PreCorr",
+                        m_config.trellis_cands, m_config.trellis_depth, m_config.trellis_lat);
         }
         plugin_set_config(m_state, &m_config);
 
@@ -1511,21 +1539,7 @@ public:
 
         const cpu_topology_t *topo = plugin_get_topology(m_state);
 
-        /* Check per-thread RT ratios to see which threads did work */
-        double ratio;
-        char buf[512];
-        int pos = 0;
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "active workers: ");
-
-        int active = 0;
-        for (int i = 0; i < n && pos < (int)sizeof(buf) - 30; i++) {
-            /* Get this thread's last RT ratio — >0 means it processed a block */
-            /* We can check via threadpool_get_stressed_thread indirectly,
-             * but better to just list all with nonzero ratio.
-             * For now, list the first N cores as "assigned" */
-        }
-
-        /* Simpler: just report thread count vs core count */
+        /* Report thread count vs core count */
         int wl_threads = 0, wl_segments = 0;
         bool wl_changed = false;
         plugin_get_workload(m_state, &wl_threads, &wl_segments, &wl_changed);

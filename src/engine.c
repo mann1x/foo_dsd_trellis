@@ -119,8 +119,11 @@ int engine_channel_init(engine_channel_t *eng, int channel,
             else if (is_rate_conv)
                 eng->precorr.state_limit = 12.0f;
         } else {
-            int cands = pc ? pc->cands : cfg->trellis_cands;
-            int lat   = pc ? pc->lat   : cfg->trellis_lat;
+            /* Always use cfg values — caller (dsp_fb2k) resolves Auto
+             * to path-optimal via engine_get_path_info() before calling us.
+             * This ensures persistent SDM matches temp SDMs and overlap. */
+            int cands = cfg->trellis_cands;
+            int lat   = cfg->trellis_lat;
             if (sdm_context_init(&eng->sdm, filter,
                                  cfg->trellis_depth,
                                  cands, lat) != 0)
