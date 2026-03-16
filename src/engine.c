@@ -250,12 +250,9 @@ size_t engine_process_block(engine_channel_t *eng,
 void engine_channel_reset(engine_channel_t *eng) {
     fir_chain_reset(&eng->fir);
     memset(&eng->boxcar, 0, sizeof(eng->boxcar));
-    if (!eng->fir_only) {
-        if (eng->sdm_mode == SDM_MODE_PRECORR)
-            precorr_context_reset(&eng->precorr);
-        else
-            sdm_context_reset(&eng->sdm);
-    }
+    /* Do NOT reset SDM/PreCorr state — preserving integrator state across
+     * stop/play prevents the startup transient pop. The SDM continues from
+     * its previous state, just like track-to-track transitions. */
     if (eng->ml_filter)
         onnx_filter_reset(eng->ml_filter);
 }

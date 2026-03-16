@@ -292,6 +292,31 @@ static bool resolve_ml_model_path(wchar_t *path, size_t path_size) {
     return true;
 }
 
+/* Warm up full pipeline (FIR + SDM) with DSD silence to settle
+ * both FIR ring buffers and SDM integrator states.
+ * Without this, the first output samples have a startup transient (pop). */
+static void plugin_warmup(plugin_state_t *s) {
+    if (!s || !s->initialized || !s->channels)
+        return;
+    size_t warmup = 8192;
+    float *sil_in  = (float *)malloc(warmup * sizeof(float));
+    uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
+    size_t ratio = (fs_out > s->config.fs_in) ? (fs_out / s->config.fs_in) : 1;
+    size_t out_sz = warmup * ratio + 4096;
+    float *sil_out = (float *)malloc(out_sz * sizeof(float));
+    if (sil_in && sil_out) {
+        for (size_t j = 0; j < warmup; j++) {
+            uint8_t pat = (j / 8) & 1 ? 0x96u : 0x69u;
+            sil_in[j] = (pat >> (7 - (j & 7))) & 1 ? 1.0f : -1.0f;
+        }
+        for (int i = 0; i < s->num_channels; i++)
+            engine_process_block(&s->channels[i], sil_in, sil_out,
+                                 warmup, &s->config);
+    }
+    free(sil_in);
+    free(sil_out);
+}
+
 /* Initialize engine for given channel count and config.
  * Called when we first detect DSD rate in on_chunk. */
 static int plugin_init_engine(plugin_state_t *s, int num_channels,
@@ -322,6 +347,9 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
             return -1;
         }
     }
+
+    /* Warm up full pipeline */
+    plugin_warmup(s);
 
     /* Detect CPU topology if not already done */
     if (!s->topology_detected) {
@@ -1123,6 +1151,9 @@ void plugin_flush(plugin_state_t *s) {
         return;
     for (int i = 0; i < s->num_channels; i++)
         engine_channel_reset(&s->channels[i]);
+    /* SDM state is preserved (not reset) to avoid startup transient pop.
+     * Only FIR/boxcar are reset. FIR tail is invalidated. */
+    s->fir_tail_valid = false;
 }
 
 /* Reconfigure with new settings */

@@ -1465,56 +1465,10 @@ public:
          * output device reconfigure silently. Buffer the real audio
          * and prepend it to the next chunk. Never use insert_chunk
          * during rate transitions — it confuses fb2k's output pipeline. */
-        /* Anti-pop lead-in: output PCM silence at target rate before first audio.
-         * Only for DSD→DSD input (DoP); disabled for PCM→DSD to avoid rate confusion. */
-        if (m_config.antipop && m_antipop_pending && out_frames > 0 && is_dop) {
-            m_antipop_pending = false;
-
-            const int LEADIN_MS = 100;
-            size_t sil_frames = (size_t)(out_pcm_rate * LEADIN_MS / 1000);
-
-            /* Buffer real audio for next chunk */
-            m_deferred_frames = out_frames;
-            m_deferred_rate = out_pcm_rate;
-            m_deferred_channels = channels;
-            m_deferred_buf.set_size_discard(out_frames * channels);
-            for (size_t i = 0; i < out_frames * channels; i++)
-                m_deferred_buf[i] = (audio_sample)out_buf[i];
-
-            /* Output PCM zeros at target rate — true silence */
-            {
-                size_t sil_total = sil_frames * (size_t)channels;
-                pfc::array_staticsize_t<audio_sample> sil_as;
-                sil_as.set_size_discard(sil_total);
-                memset(sil_as.get_ptr(), 0, sil_total * sizeof(audio_sample));
-                chunk->set_data(sil_as.get_ptr(), sil_frames, channels, out_pcm_rate);
-            }
-
-            trellis_log("anti-pop: %dms silence at %u Hz, buffered %u frames",
-                        LEADIN_MS, out_pcm_rate, (unsigned)out_frames);
-            return true;
-        }
-
-        /* Output deferred audio from anti-pop buffer */
-        if (m_deferred_frames > 0) {
-            size_t df = m_deferred_frames;
-            m_deferred_frames = 0;
-
-            /* Prepend buffered audio before current chunk's audio */
-            size_t total = df + out_frames;
-            pfc::array_staticsize_t<audio_sample> combined;
-            combined.set_size_discard(total * channels);
-            for (size_t i = 0; i < df * channels; i++)
-                combined[i] = m_deferred_buf[i];
-            for (size_t i = 0; i < out_frames * channels; i++)
-                combined[df * channels + i] = (audio_sample)out_buf[i];
-
-            chunk->set_data(combined.get_ptr(), total, channels, out_pcm_rate);
-
-            trellis_log("anti-pop: output deferred %u + current %u = %u frames",
-                        (unsigned)df, (unsigned)out_frames, (unsigned)total);
-            return true;
-        }
+        /* Anti-pop lead-in is NOT needed — preserving SDM state across
+         * flush/stop eliminates the startup transient pop. The SDM integrators
+         * keep their previous values so playback resumes smoothly, just like
+         * track-to-track transitions. */
 
         if (m_chunk_count < 10)
             trellis_log("chunk #%u output: %u frames, %u ch, %u Hz (out_rate=%u, is_pcm=%d, is_dop_in=%d)",
@@ -1567,6 +1521,8 @@ public:
     void on_endoftrack(abort_callback & /*abort*/) override {}
 
     void flush() override {
+        /* Cannot insert_chunk here — output pipeline may be torn down.
+         * The first-chunk mute (in plugin_process) handles the pop instead. */
         plugin_flush(m_state);
         m_logged_passthrough = false;
         m_logged_processing = false;
@@ -1724,11 +1680,7 @@ private:
     unsigned         m_chunk_count = 0;
 
     /* Anti-pop / deferred output state */
-    bool             m_antipop_pending = true;         /* insert lead-in silence before first chunk */
-    size_t           m_deferred_frames = 0;            /* PCM→DSD: buffered frames from first chunk */
-    uint32_t         m_deferred_rate = 0;
-    unsigned         m_deferred_channels = 0;
-    pfc::array_staticsize_t<audio_sample> m_deferred_buf;
+    bool             m_antipop_pending = true;         /* legacy — kept for trailing silence */
     uint32_t         m_last_out_pcm_rate = 0;          /* last output PCM rate */
     uint32_t         m_last_pcm_rate = 0;              /* last input PCM rate */
     int              m_last_channels = 0;              /* last channel count */
