@@ -1174,9 +1174,14 @@ public:
             for (size_t i = 0; i < out_frames * channels; i++)
                 m_deferred_buf[i] = (audio_sample)out_buf[i];
 
-            /* Output PCM zeros at target rate — true silence,
-             * no DoP markers, inaudible during ASIO rate transition */
-            chunk->set_silence(sil_frames, out_pcm_rate, channels);
+            /* Output PCM zeros at target rate — true silence */
+            {
+                size_t sil_total = sil_frames * (size_t)channels;
+                pfc::array_staticsize_t<audio_sample> sil_as;
+                sil_as.set_size_discard(sil_total);
+                memset(sil_as.get_ptr(), 0, sil_total * sizeof(audio_sample));
+                chunk->set_data(sil_as.get_ptr(), sil_frames, channels, out_pcm_rate);
+            }
 
             trellis_log("anti-pop: %dms silence at %u Hz, buffered %u frames",
                         LEADIN_MS, out_pcm_rate, (unsigned)out_frames);

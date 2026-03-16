@@ -244,7 +244,7 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     cfg->sdm_mode       = SDM_MODE_PRECORR;
     memset(cfg->rate_map, RATE_OUT_BYPASS, sizeof(cfg->rate_map));
     memset(cfg->rate_ntf, 0xFF, sizeof(cfg->rate_ntf)); /* NTF_AUTO = -1 = 0xFF */
-    cfg->antipop    = false;  /* disabled by default for testing */
+    cfg->antipop    = true;   /* enabled by default */
     cfg->ml_enabled = false;
     cfg->ml_ep      = 2;  /* ML_EP_AUTO */
 }
