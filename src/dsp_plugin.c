@@ -680,12 +680,10 @@ size_t plugin_process(plugin_state_t *s,
         if (!temp_sdms)
             return 0;
 
-        /* Reset temp SDM contexts (init once, reset each chunk).
-         * Only re-init if not yet initialized or config changed. */
+        /* Reset temp SDM contexts (init once, reset each chunk) */
         bool init_ok = true;
         for (int i = 0; i < temp_sdm_count; i++) {
             if (temp_sdms[i].filter == NULL) {
-                /* First use — initialize */
                 if (sdm_context_init(&temp_sdms[i], filter,
                                       s->config.trellis_depth,
                                       s->config.trellis_cands,
@@ -694,7 +692,6 @@ size_t plugin_process(plugin_state_t *s,
                     break;
                 }
             } else {
-                /* Already initialized — just reset state */
                 sdm_context_reset(&temp_sdms[i]);
             }
         }
@@ -1037,15 +1034,7 @@ double plugin_get_latency(const plugin_state_t *s) {
     if (s->config.sdm_mode != SDM_MODE_PRECORR)
         sdm_lat = (double)s->config.trellis_lat / (double)fs_out;
 
-    /* Processing buffer: report extra latency so fb2k prefetches
-     * more audio, preventing output underruns during heavy SDM work.
-     * Scale with output rate — DSD512 needs more buffer than DSD64. */
-    double proc_buf = 0.0;
-    if (fs_out >= 22579200)      proc_buf = 5.0;  /* DSD512: borderline RT */
-    else if (fs_out >= 11289600) proc_buf = 2.0;  /* DSD256 */
-    else if (fs_out >= 5644800)  proc_buf = 1.0;  /* DSD128 */
-
-    return sdm_lat + proc_buf;
+    return sdm_lat;
 }
 
 /* Reset all channel states (on seek / discontinuity) */
