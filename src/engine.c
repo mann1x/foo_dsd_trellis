@@ -153,8 +153,10 @@ size_t engine_process_block(engine_channel_t *eng,
             if (eng->fir_buf_sz < count * sizeof(float)) {
                 free(eng->fir_buf);
                 eng->fir_buf = (float *)malloc(count * sizeof(float));
-                eng->fir_buf_sz = count * sizeof(float);
+                eng->fir_buf_sz = eng->fir_buf ? count * sizeof(float) : 0;
             }
+            if (!eng->fir_buf)
+                return 0;
             boxcar_t *bc = &eng->boxcar;
             const float inv_n = 1.0f / BOXCAR_TAPS;
             for (size_t i = 0; i < count; i++) {
@@ -203,8 +205,10 @@ size_t engine_process_block(engine_channel_t *eng,
     if (eng->fir_buf_sz < buf_need * sizeof(float)) {
         free(eng->fir_buf);
         eng->fir_buf = (float *)malloc(buf_need * sizeof(float));
-        eng->fir_buf_sz = buf_need * sizeof(float);
+        eng->fir_buf_sz = eng->fir_buf ? buf_need * sizeof(float) : 0;
     }
+    if (!eng->fir_buf)
+        return 0;
 
     size_t fir_out = fir_chain_process(&eng->fir, in, eng->fir_buf, count);
 
