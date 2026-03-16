@@ -1436,6 +1436,227 @@ static void test_gain_sweep(void) {
     TEST_ASSERT_TRUE(1, "Gain sweep completed");
 }
 
+/* ─── Weak paths sweep with cands/depth as parameters ─── */
+
+static double measure_weak_path_sinad(uint32_t fs_in, uint32_t fs_out,
+                                       ntf_filter_id_t filter_id,
+                                       float fir_gain,
+                                       double state_limit,
+                                       int cands, int depth, int lat) {
+    unsigned mult_in = fs_in / 44100;
+    size_t n_in;
+    if (mult_in <= 64)       n_in = 262144;
+    else if (mult_in <= 128) n_in = 524288;
+    else if (mult_in <= 256) n_in = 1048576;
+    else                     n_in = 2097152;
+
+    size_t max_out;
+    if (fs_out >= fs_in)
+        max_out = n_in * (fs_out / fs_in) + 4096;
+    else
+        max_out = n_in / 2 + 4096;
+
+    float *dsd_in  = (float *)malloc(n_in * sizeof(float));
+    float *fir_buf = (float *)malloc(max_out * sizeof(float));
+    float *dsd_out = (float *)malloc(max_out * sizeof(float));
+    if (!dsd_in || !fir_buf || !dsd_out) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+
+    size_t est_in_produced = n_in - (size_t)lat;
+    size_t est_fir_out;
+    if (fs_out >= fs_in)
+        est_fir_out = est_in_produced * (fs_out / fs_in);
+    else
+        est_fir_out = est_in_produced / (fs_in / fs_out);
+    size_t est_sdm_out = est_fir_out - (size_t)lat;
+    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm_out);
+    size_t dsd_in_count = generate_dsd_sine(fs_in, freq, 0.5, n_in, dsd_in);
+
+    if (dsd_in_count < 1024) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+
+    fir_chain_t fir;
+    if (fir_chain_init(&fir, fs_in, fs_out) != 0) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+    size_t fir_count = fir_chain_process(&fir, dsd_in, fir_buf, dsd_in_count);
+    fir_chain_free(&fir);
+
+    if (fir_count < 1024) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+
+    /* Apply FIR gain */
+    if (fir_gain != 1.0f) {
+        for (size_t i = 0; i < fir_count; i++)
+            fir_buf[i] *= fir_gain;
+    }
+
+    const ntf_filter_t *f_out = ntf_get_filter(filter_id, fs_out);
+    if (!f_out) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+    sdm_context_t sdm;
+    if (sdm_context_init(&sdm, f_out, depth, cands, lat) != 0) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+    if (state_limit > 0.0)
+        sdm.state_limit = state_limit;
+    size_t out_count = sdm_process_block(&sdm, fir_buf, dsd_out, fir_count);
+    sdm_context_free(&sdm);
+
+    if (out_count < 1024) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+
+    double sinad_db = measure_sinad(dsd_out, out_count, freq, (double)fs_out);
+    free(dsd_in); free(fir_buf); free(dsd_out);
+    return sinad_db;
+}
+
+static void test_weak_paths_sweep(void) {
+    typedef struct {
+        uint32_t fs_in, fs_out;
+        const char *name;
+    } path_t;
+
+    static const path_t paths[] = {
+        { DSD_RATE_64,  DSD_RATE_512, "DSD64->DSD512"   },
+        { DSD_RATE_128, DSD_RATE_512, "DSD128->DSD512"  },
+        { DSD_RATE_128, DSD_RATE_64,  "DSD128->DSD64"   },
+        { DSD_RATE_256, DSD_RATE_64,  "DSD256->DSD64"   },
+        { DSD_RATE_512, DSD_RATE_64,  "DSD512->DSD64"   },
+        { DSD_RATE_256, DSD_RATE_128, "DSD256->DSD128"  },
+    };
+    static const int n_paths = sizeof(paths) / sizeof(paths[0]);
+
+    static const ntf_filter_id_t filter_ids[] = {
+        NTF_CLANS_4, NTF_SDM_4,
+        NTF_CLANS_5, NTF_SDM_5,
+        NTF_CLANS_6, NTF_SDM_6,
+        NTF_CLANS_7, NTF_SDM_7,
+        NTF_CLANS_8, NTF_SDM_8,
+    };
+    static const char *filter_names[] = {
+        "clans-4", "sdm-4",
+        "clans-5", "sdm-5",
+        "clans-6", "sdm-6",
+        "clans-7", "sdm-7",
+        "clans-8", "sdm-8",
+    };
+    static const int n_filters = sizeof(filter_ids) / sizeof(filter_ids[0]);
+
+    static const double limits[] = { 0.0, 3.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0 };
+    static const int n_limits = sizeof(limits) / sizeof(limits[0]);
+
+    static const int cands_vals[] = { 2, 4, 8 };
+    static const int n_cands = sizeof(cands_vals) / sizeof(cands_vals[0]);
+
+    static const int depth_vals[] = { 4, 8 };
+    static const int n_depths = sizeof(depth_vals) / sizeof(depth_vals[0]);
+
+    const float gain = 0.708f;
+    const int lat = 512;
+
+    int combos_per_path = n_filters * n_limits * n_cands * n_depths;
+    int total = n_paths * combos_per_path;
+
+    printf("\n    ╔══════════════════════════════════════════════════════════════════╗\n");
+    printf("    ║  Weak Paths Sweep: gain=%.3f, lat=%d                           ║\n",
+           gain, lat);
+    printf("    ║  %d paths x %d filters x %d limits x %d cands x %d depths = %d  ║\n",
+           n_paths, n_filters, n_limits, n_cands, n_depths, total);
+    printf("    ║  Showing top 5 results per path (best SINAD)                   ║\n");
+    printf("    ╚══════════════════════════════════════════════════════════════════╝\n");
+
+    #define WEAK_TOP_N 5
+
+    for (int p = 0; p < n_paths; p++) {
+        /* Top-N tracking */
+        double top_sinad[WEAK_TOP_N];
+        int    top_filter[WEAK_TOP_N];
+        int    top_limit[WEAK_TOP_N];
+        int    top_cands[WEAK_TOP_N];
+        int    top_depth[WEAK_TOP_N];
+        for (int i = 0; i < WEAK_TOP_N; i++)
+            top_sinad[i] = -999.0;
+
+        int count = 0;
+        for (int fi = 0; fi < n_filters; fi++) {
+            for (int li = 0; li < n_limits; li++) {
+                for (int ci = 0; ci < n_cands; ci++) {
+                    for (int di = 0; di < n_depths; di++) {
+                        double sinad = measure_weak_path_sinad(
+                            paths[p].fs_in, paths[p].fs_out,
+                            filter_ids[fi], gain, limits[li],
+                            cands_vals[ci], depth_vals[di], lat);
+                        count++;
+
+                        /* Insert into top-N if better than worst */
+                        if (sinad > top_sinad[WEAK_TOP_N - 1]) {
+                            top_sinad[WEAK_TOP_N - 1]  = sinad;
+                            top_filter[WEAK_TOP_N - 1] = fi;
+                            top_limit[WEAK_TOP_N - 1]  = li;
+                            top_cands[WEAK_TOP_N - 1]  = ci;
+                            top_depth[WEAK_TOP_N - 1]  = di;
+                            /* Bubble up */
+                            for (int k = WEAK_TOP_N - 1; k > 0; k--) {
+                                if (top_sinad[k] > top_sinad[k - 1]) {
+                                    double ts = top_sinad[k];
+                                    int tf = top_filter[k], tl = top_limit[k];
+                                    int tc = top_cands[k], td = top_depth[k];
+                                    top_sinad[k]  = top_sinad[k - 1];
+                                    top_filter[k] = top_filter[k - 1];
+                                    top_limit[k]  = top_limit[k - 1];
+                                    top_cands[k]  = top_cands[k - 1];
+                                    top_depth[k]  = top_depth[k - 1];
+                                    top_sinad[k - 1]  = ts;
+                                    top_filter[k - 1] = tf;
+                                    top_limit[k - 1]  = tl;
+                                    top_cands[k - 1]  = tc;
+                                    top_depth[k - 1]  = td;
+                                } else break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        printf("\n    --- %s (top %d of %d combos) ---\n",
+               paths[p].name, WEAK_TOP_N, combos_per_path);
+        printf("    %-10s %-6s %-6s %-6s  SINAD\n",
+               "Filter", "Limit", "Cands", "Depth");
+        for (int i = 0; i < WEAK_TOP_N; i++) {
+            if (top_sinad[i] <= -999.0) break;
+            char lim_str[16];
+            if (limits[top_limit[i]] == 0.0)
+                sprintf_s(lim_str, sizeof(lim_str), "off");
+            else
+                sprintf_s(lim_str, sizeof(lim_str), "%.1f", limits[top_limit[i]]);
+
+            printf("    %-10s %-6s %-6d %-6d  %.1f dB\n",
+                   filter_names[top_filter[i]], lim_str,
+                   cands_vals[top_cands[i]], depth_vals[top_depth[i]],
+                   top_sinad[i]);
+        }
+        printf("    [%d/%d paths done]\n", p + 1, n_paths);
+    }
+
+    #undef WEAK_TOP_N
+
+    TEST_ASSERT_TRUE(1, "Weak paths sweep completed");
+}
+
 /* ─── Suites ─── */
 
 void test_rate_sinad_suite(void) {
@@ -1478,4 +1699,5 @@ void test_rate_sweep_suite(void) {
     TEST_RUN(test_comprehensive_ntf_limiter_sweep);
     TEST_RUN(test_cands_latency_sweep);
     TEST_RUN(test_gain_sweep);
+    TEST_RUN(test_weak_paths_sweep);
 }

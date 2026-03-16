@@ -1209,64 +1209,61 @@ public:
         if (out_rate == 0)
             return true;
 
-        /* Apply per-rate overrides (Auto = -1 falls back to global) */
-        m_config.ntf_filter = (int)m_config.rate_ntf[map_idx];
+        /* Apply per-rate overrides to a chunk-local copy of the config.
+         * This prevents stale values (cands, lat, depth) from leaking
+         * between chunks at different rates. */
+        dsd_config_t chunk_cfg = m_config;
+
+        chunk_cfg.ntf_filter = (int)m_config.rate_ntf[map_idx];
         if (m_config.rate_sdm[map_idx] >= 0)
-            m_config.sdm_mode = (int)m_config.rate_sdm[map_idx];
+            chunk_cfg.sdm_mode = (int)m_config.rate_sdm[map_idx];
         if (m_config.rate_ml[map_idx] >= 0)
-            m_config.ml_enabled = (m_config.rate_ml[map_idx] != 0);
+            chunk_cfg.ml_enabled = (m_config.rate_ml[map_idx] != 0);
 
         /* Per-rate state limiter: -1=Auto (engine uses path_config), 0=Off, >0=value */
         if (m_config.rate_limiter[map_idx] >= 0)
-            m_config.state_limit = (float)m_config.rate_limiter[map_idx];
+            chunk_cfg.state_limit = (float)m_config.rate_limiter[map_idx];
         else
-            m_config.state_limit = -1.0f;  /* Auto: let engine use path_config */
+            chunk_cfg.state_limit = -1.0f;
 
-        /* Resolve cands/lat/depth from path_config when Auto.
-         * This ensures persistent SDM, temp SDMs, overlap, and discard
-         * all use the same values — fixing the DSD256 segment mismatch. */
+        /* Resolve cands/lat/depth from path_config when Auto. */
         {
             uint32_t pi_in = is_dop ? dsd_rate : pcm_rate;
             engine_path_info_t pi;
             if (engine_get_path_info(pi_in, out_rate,
                     (int)m_config.rate_ntf[map_idx],
-                    m_config.sdm_mode, &m_config, &pi) == 0 && !pi.fir_only) {
-                /* Per-rate explicit overrides win; Auto resolves to path-optimal */
+                    chunk_cfg.sdm_mode, &chunk_cfg, &pi) == 0 && !pi.fir_only) {
                 if (m_config.rate_cands[map_idx] > 0)
-                    m_config.trellis_cands = (int)m_config.rate_cands[map_idx];
+                    chunk_cfg.trellis_cands = (int)m_config.rate_cands[map_idx];
                 else if (pi.cands > 0)
-                    m_config.trellis_cands = pi.cands;
+                    chunk_cfg.trellis_cands = pi.cands;
 
                 if (m_config.rate_depth[map_idx] > 0)
-                    m_config.trellis_depth = (int)m_config.rate_depth[map_idx];
+                    chunk_cfg.trellis_depth = (int)m_config.rate_depth[map_idx];
                 else if (pi.depth > 0)
-                    m_config.trellis_depth = pi.depth;
+                    chunk_cfg.trellis_depth = pi.depth;
 
-                /* Always use path-optimal lat for consistency */
                 if (pi.lat > 0)
-                    m_config.trellis_lat = pi.lat;
+                    chunk_cfg.trellis_lat = pi.lat;
             } else {
                 if (m_config.rate_cands[map_idx] > 0)
-                    m_config.trellis_cands = (int)m_config.rate_cands[map_idx];
+                    chunk_cfg.trellis_cands = (int)m_config.rate_cands[map_idx];
                 if (m_config.rate_depth[map_idx] > 0)
-                    m_config.trellis_depth = (int)m_config.rate_depth[map_idx];
+                    chunk_cfg.trellis_depth = (int)m_config.rate_depth[map_idx];
             }
         }
 
-        /* fir_gain_db is passed to engine_channel_init which applies it
-         * uniformly to all paths for volume consistency */
-
         /* Set output rate for this chunk */
-        m_config.fs_out = out_rate;
+        chunk_cfg.fs_out = out_rate;
         if (!m_logged_processing) {
             trellis_log("rate_map: lookup_rate=%u map_idx=%d out_idx=%u out_rate=%u is_dop=%d gain=%.3f fs_in=%u fs_out=%u",
-                        lookup_rate, map_idx, (unsigned)out_idx, out_rate, is_dop, m_config.gain, m_config.fs_in, m_config.fs_out);
+                        lookup_rate, map_idx, (unsigned)out_idx, out_rate, is_dop, chunk_cfg.gain, chunk_cfg.fs_in, chunk_cfg.fs_out);
             trellis_log("resolved: sdm=%s cands=%d depth=%d lat=%d fir_gain_db=%d",
-                        m_config.sdm_mode == SDM_MODE_TRELLIS ? "Trellis" : "PreCorr",
-                        m_config.trellis_cands, m_config.trellis_depth, m_config.trellis_lat,
-                        (int)m_config.fir_gain_db);
+                        chunk_cfg.sdm_mode == SDM_MODE_TRELLIS ? "Trellis" : "PreCorr",
+                        chunk_cfg.trellis_cands, chunk_cfg.trellis_depth, chunk_cfg.trellis_lat,
+                        (int)chunk_cfg.fir_gain_db);
         }
-        plugin_set_config(m_state, &m_config);
+        plugin_set_config(m_state, &chunk_cfg);
 
         m_channels = (int)channels;
         m_pcm_rate = pcm_rate;
