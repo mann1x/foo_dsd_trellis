@@ -550,8 +550,17 @@ size_t plugin_process(plugin_state_t *s,
     #define CPUSET_CHECK_INTERVAL   100  /* check every ~100 chunks */
     #define CPUSET_STABLE_THRESHOLD 5    /* 5 consecutive checks stable = rebuild */
     s->cpuset_changed = false;
+    /* CPUSET refresh: detect core changes but DON'T rebuild threadpool
+     * during playback. Rebuilding mid-playback causes heap corruption
+     * (worker threads destroyed while TLS buffers in use). Changes are
+     * applied on next engine reinit (rate/settings change). */
     s->cpuset_check_counter++;
     if (s->topology_detected && (s->cpuset_check_counter % CPUSET_CHECK_INTERVAL) == 0) {
+        bool mask_changed = false;
+        cpuset_refresh(&s->topology, &mask_changed);
+        /* Just log, don't rebuild */
+    }
+    if (false && s->topology_detected && (s->cpuset_check_counter % CPUSET_CHECK_INTERVAL) == 0) {
         bool mask_changed = false;
         uint64_t new_mask = cpuset_refresh(&s->topology, &mask_changed);
         if (mask_changed && s->pool) {
