@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 /* ─── Embedded PTX ─── */
 #include "kernels/fir_kernels_ptx.h"
@@ -238,8 +239,8 @@ bool gpu_cuda_probe(void) {
     RESOLVE_V2(cuMemcpyDtoH);
     RESOLVE_V2(cuMemcpyHtoDAsync);
     RESOLVE_V2(cuMemcpyDtoHAsync);
-    RESOLVE(cuMemAllocHost);
-    RESOLVE(cuMemFreeHost);
+    RESOLVE_V2(cuMemAllocHost);
+    RESOLVE_V2(cuMemFreeHost);
     RESOLVE(cuStreamCreate);
     RESOLVE_V2(cuStreamDestroy);
     RESOLVE(cuStreamSynchronize);
@@ -384,11 +385,12 @@ int gpu_cuda_fir_chain(cuda_context_t *c, const float *in, float *out,
                         size_t in_count, size_t *out_count) {
     if (!c || in_count < GPU_MIN_SAMPLES) return -1;
 
-    pfn_cuCtxSetCurrent(c->context);
+    CUresult cr = pfn_cuCtxSetCurrent(c->context);
+    if (cr != CUDA_SUCCESS) { OutputDebugStringA("CUDA: cuCtxSetCurrent failed\n"); return -1; }
 
     int s_idx = c->active;
     int stages = c->num_stages;
-    if (stages <= 0) return -1;
+    if (stages <= 0) { OutputDebugStringA("CUDA: stages <= 0\n"); return -1; }
 
     /* Calculate output size */
     size_t cur = in_count;
@@ -405,11 +407,11 @@ int gpu_cuda_fir_chain(cuda_context_t *c, const float *in, float *out,
     }
 
     /* Ensure buffers */
-    if (ensure_d_in(c, max_size) != 0) return -1;
-    if (ensure_d_out(c, max_size) != 0) return -1;
-    if (ensure_h_in(c, in_count) != 0) return -1;
-    if (ensure_h_out(c, final_out) != 0) return -1;
-    if (stages > 1 && ensure_d_inter(c, max_size) != 0) return -1;
+    if (ensure_d_in(c, max_size) != 0) { fprintf(stderr, "CUDA: ensure_d_in failed\n"); return -1; }
+    if (ensure_d_out(c, max_size) != 0) { fprintf(stderr, "CUDA: ensure_d_out failed\n"); return -1; }
+    if (ensure_h_in(c, in_count) != 0) { fprintf(stderr, "CUDA: ensure_h_in failed\n"); return -1; }
+    if (ensure_h_out(c, final_out) != 0) { fprintf(stderr, "CUDA: ensure_h_out failed\n"); return -1; }
+    if (stages > 1 && ensure_d_inter(c, max_size) != 0) { fprintf(stderr, "CUDA: ensure_d_inter failed\n"); return -1; }
 
     CUstream stream = c->streams[s_idx];
 

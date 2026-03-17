@@ -117,7 +117,10 @@ static void test_gpu_fir_up_2x(void) {
     cfg.fs_out = 5644800;
     fir_chain_init(&dummy_fir, cfg.fs_in, cfg.fs_out);
 
-    if (gpu_fir_setup(ctx, g_hb_taps, g_hb_ntaps, 1, true) != 0) {
+    printf("    g_hb_ntaps=%d, g_hb_taps[0]=%f\n", g_hb_ntaps, g_hb_taps[0]);
+    int setup_r = gpu_fir_setup(ctx, g_hb_taps, g_hb_ntaps, 1, true);
+    printf("    gpu_fir_setup returned %d\n", setup_r);
+    if (setup_r != 0) {
         printf("    (skipped: FIR setup failed)\n");
         fir_chain_free(&dummy_fir);
         gpu_destroy(ctx);
@@ -136,7 +139,9 @@ static void test_gpu_fir_up_2x(void) {
 
     /* GPU FIR */
     size_t gpu_n = 0;
+    printf("    setup ok, calling gpu_fir_chain_process(%zu samples)...\n", in_count);
     int r = gpu_fir_chain_process(ctx, in, gpu_out, in_count, &gpu_n, NULL, NULL);
+    printf("    gpu_fir_chain_process returned %d, gpu_n=%zu\n", r, gpu_n);
 
     if (r != 0) {
         printf("    (skipped: GPU FIR returned %d)\n", r);

@@ -20,14 +20,13 @@ __global__ void fir_upsample_2x(const float *in, float *out,
     int oi = blockIdx.x * blockDim.x + threadIdx.x;
     if (oi >= out_count) return;
 
+    /* Direct-form FIR on zero-stuffed input (matches IPP ippsFIRSR):
+     * out[n] = sum_{k=0}^{N-1} taps[k] * zs[n-k]
+     * where zs[2i] = in[i], zs[2i+1] = 0 */
     float acc = 0.0f;
-    int half = c_ntaps / 2;
-    int zs_len = in_count * 2;
-
     for (int k = 0; k < c_ntaps; k++) {
-        int zsi = oi - k + half;
-        if (zsi >= 0 && zsi < zs_len) {
-            /* Zero-stuffed: even indices = input, odd = 0 */
+        int zsi = oi - k;
+        if (zsi >= 0 && zsi < in_count * 2) {
             if ((zsi & 1) == 0)
                 acc += c_taps[k] * __ldg(&in[zsi >> 1]);
         }
@@ -44,12 +43,13 @@ __global__ void fir_downsample_2x(const float *in, float *out,
     int oi = blockIdx.x * blockDim.x + threadIdx.x;
     if (oi >= out_count) return;
 
-    int ii = oi * 2;  /* decimated position */
+    /* Direct-form FIR then decimate (matches IPP):
+     * fir[n] = sum_{k=0}^{N-1} taps[k] * in[n-k]
+     * out[i] = fir[2*i] */
+    int ii = oi * 2;
     float acc = 0.0f;
-    int half = c_ntaps / 2;
-
     for (int k = 0; k < c_ntaps; k++) {
-        int si = ii - k + half;
+        int si = ii - k;
         if (si >= 0 && si < in_count)
             acc += c_taps[k] * __ldg(&in[si]);
     }
@@ -96,12 +96,9 @@ __global__ void fir_upsample_2x_batch(const float *in, float *out,
     float *ch_out = out + ch * out_per_ch;
 
     float acc = 0.0f;
-    int half = c_ntaps / 2;
-    int zs_len = in_per_ch * 2;
-
     for (int k = 0; k < c_ntaps; k++) {
-        int zsi = oi - k + half;
-        if (zsi >= 0 && zsi < zs_len) {
+        int zsi = oi - k;
+        if (zsi >= 0 && zsi < in_per_ch * 2) {
             if ((zsi & 1) == 0)
                 acc += c_taps[k] * __ldg(&ch_in[zsi >> 1]);
         }
@@ -123,10 +120,8 @@ __global__ void fir_downsample_2x_batch(const float *in, float *out,
 
     int ii = oi * 2;
     float acc = 0.0f;
-    int half = c_ntaps / 2;
-
     for (int k = 0; k < c_ntaps; k++) {
-        int si = ii - k + half;
+        int si = ii - k;
         if (si >= 0 && si < in_per_ch)
             acc += c_taps[k] * __ldg(&ch_in[si]);
     }
