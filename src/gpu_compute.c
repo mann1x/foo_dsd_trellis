@@ -189,7 +189,7 @@ int gpu_trellis_process(gpu_context_t *ctx, const float *in, float *out,
                         size_t count, const void *sdm_state_in,
                         void *sdm_state_out, int num_cands, int order,
                         const double *ntf_a, const double *ntf_g) {
-    if (!ctx || num_cands < 16) return -1;
+    if (!ctx || num_cands < 2) return -1;
     (void)sdm_state_in; (void)sdm_state_out; /* state on device now */
     (void)num_cands; (void)order; (void)ntf_a; (void)ntf_g;
     switch (ctx_backend(ctx)) {

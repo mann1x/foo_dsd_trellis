@@ -762,7 +762,7 @@ int gpu_cuda_fir_batch(cuda_context_t *c, const float *in_batch,
  * Call gpu_cuda_trellis_setup once at engine init. */
 int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
                       size_t count) {
-    if (!c || !c->fn_trellis_chunk || c->trellis_cands < 16)
+    if (!c || !c->fn_trellis_chunk || c->trellis_cands < 2)
         return -1;
 
     pfn_cuCtxSetCurrent(c->context);

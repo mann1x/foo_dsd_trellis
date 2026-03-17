@@ -21,6 +21,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+/* log_ring_write from httpapi — declare here to avoid include order issues */
+extern void log_ring_write(const char *line);
+
 /* ─── Delay-loaded function pointers ─── */
 
 typedef HRESULT (WINAPI *PFN_D3D11CreateDevice)(
@@ -575,6 +578,14 @@ gpu_context_t *gpu_dx11_create(void) {
     c->cs_gain     = compile_cs(dev, g_hlsl_gain, "gain");
     c->cs_boxcar   = compile_cs(dev, g_hlsl_boxcar, "boxcar");
     c->cs_trellis  = compile_cs(dev, g_hlsl_trellis, "trellis");
+    {
+        char msg[256];
+        sprintf_s(msg, sizeof(msg),
+            "DX11 shaders: fir_up=%p fir_down=%p gain=%p boxcar=%p trellis=%p",
+            (void*)c->cs_fir_up, (void*)c->cs_fir_down,
+            (void*)c->cs_gain, (void*)c->cs_boxcar, (void*)c->cs_trellis);
+        log_ring_write(msg);
+    }
 
     if (!c->cs_fir_up || !c->cs_fir_down || !c->cs_gain || !c->cs_boxcar) {
         /* Trellis shader is optional — may fail on some GPUs */
@@ -876,6 +887,12 @@ typedef struct {
 int gpu_dx11_trellis_setup(dx11_context_t *c, int num_cands, int order,
                             int trellis_lat, const double *ntf_a,
                             const double *ntf_g, double state_limit) {
+    {
+        char msg[128];
+        sprintf_s(msg, sizeof(msg), "dx11_trellis_setup: ctx=%p cs=%p cands=%d order=%d",
+                  (void*)c, c ? (void*)c->cs_trellis : NULL, num_cands, order);
+        log_ring_write(msg);
+    }
     if (!c || !c->cs_trellis) return -1;
 
     c->trellis_cands = num_cands;

@@ -7,8 +7,13 @@
 
 #include "../include/engine.h"
 #include "../include/ntf.h"
+#include "../include/httpapi.h"
 #include <stdlib.h>
 #include <string.h>
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <stdio.h>
 
 /* ─── Path-adaptive SDM configuration table ───
  * Optimal NTF filter, limiter, candidates, and latency per rate conversion path.
@@ -292,12 +297,26 @@ size_t engine_process_block(engine_channel_t *eng,
             bool same_rate_gpu_ok = false;
 
             if (eng->gpu && eng->sdm_mode == SDM_MODE_TRELLIS &&
-                cfg->trellis_cands >= 16 && count >= GPU_MIN_SAMPLES) {
-                if (gpu_trellis_process(eng->gpu, eng->fir_buf, out, count,
-                                         NULL, NULL, cfg->trellis_cands,
+                eng->sdm.trellis_num >= 2 && count >= GPU_MIN_SAMPLES) {
+                LARGE_INTEGER t0, t1, freq;
+                QueryPerformanceFrequency(&freq);
+                QueryPerformanceCounter(&t0);
+                int gr = gpu_trellis_process(eng->gpu, eng->fir_buf, out, count,
+                                         NULL, NULL, (int)eng->sdm.trellis_num,
                                          eng->sdm.filter->order,
                                          eng->sdm.filter->a,
-                                         eng->sdm.filter->g) == 0) {
+                                         eng->sdm.filter->g);
+                QueryPerformanceCounter(&t1);
+                {
+                    double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+                    double audio_ms = (double)count / (double)cfg->fs_in * 1000.0;
+                    char msg[256];
+                    sprintf_s(msg, sizeof(msg),
+                        "[GPU SDM] trellis ch%d: %.1fms / %.1fms audio = %.2fx RT, %zu samples, rc=%d\n",
+                        eng->channel, ms, audio_ms, ms / audio_ms, count, gr);
+                    log_ring_write(msg);
+                }
+                if (gr == 0) {
                     sdm_out = count > (size_t)cfg->trellis_lat ?
                               count - (size_t)cfg->trellis_lat : 0;
                     same_rate_gpu_ok = true;
@@ -325,10 +344,24 @@ size_t engine_process_block(engine_channel_t *eng,
                 }
             }
             if (!same_rate_gpu_ok) {
+                LARGE_INTEGER t0, t1, freq;
+                QueryPerformanceFrequency(&freq);
+                QueryPerformanceCounter(&t0);
                 if (eng->sdm_mode == SDM_MODE_PRECORR)
                     sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
                 else
                     sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, count);
+                QueryPerformanceCounter(&t1);
+                {
+                    double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+                    double audio_ms = (double)count / (double)cfg->fs_in * 1000.0;
+                    char msg[256];
+                    sprintf_s(msg, sizeof(msg),
+                        "[CPU SDM] %s ch%d: %.1fms / %.1fms audio = %.2fx RT, %zu samples\n",
+                        eng->sdm_mode == SDM_MODE_PRECORR ? "precorr" : "trellis",
+                        eng->channel, ms, audio_ms, ms / audio_ms, count);
+                    log_ring_write(msg);
+                }
             }
             if (eng->ml_filter)
                 onnx_filter_process(eng->ml_filter, out, sdm_out);
@@ -385,7 +418,7 @@ size_t engine_process_block(engine_channel_t *eng,
     bool gpu_sdm_ok = false;
 
     if (eng->gpu && eng->sdm_mode == SDM_MODE_TRELLIS &&
-        cfg->trellis_cands >= 16 && fir_out >= GPU_MIN_SAMPLES) {
+        eng->sdm.trellis_num >= 16 && fir_out >= GPU_MIN_SAMPLES) {
         /* Persistent Trellis: state on device, only input/output transferred */
         if (gpu_trellis_process(eng->gpu, eng->fir_buf, out, fir_out,
                                  NULL, NULL, cfg->trellis_cands,

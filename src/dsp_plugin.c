@@ -422,8 +422,23 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     }
 
     /* Create GPU compute context if enabled */
+    {
+        extern void log_ring_write(const char *);
+        char msg[256];
+        sprintf_s(msg, sizeof(msg),
+            "GPU init check: enabled=%d gpu_ptr=%p backend=%d",
+            s->config.gpu_enabled, (void*)s->gpu, s->config.gpu_backend);
+        log_ring_write(msg);
+    }
     if (s->config.gpu_enabled && !s->gpu) {
-        if (gpu_available((gpu_backend_t)s->config.gpu_backend)) {
+        bool avail = gpu_available((gpu_backend_t)s->config.gpu_backend);
+        {
+            extern void log_ring_write(const char *);
+            char msg[128];
+            sprintf_s(msg, sizeof(msg), "GPU available(%d) = %d", s->config.gpu_backend, avail);
+            log_ring_write(msg);
+        }
+        if (avail) {
             s->gpu = gpu_create((gpu_backend_t)s->config.gpu_backend);
             if (s->gpu) {
                 /* Upload FIR coefficients — reuse the same taps the CPU path uses.
@@ -438,22 +453,30 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                                   num_stages, is_upsample);
                 }
                 /* Setup persistent SDM buffers on GPU */
-                uint32_t fs_out_gpu = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
                 if (s->config.sdm_mode == SDM_MODE_TRELLIS &&
-                    s->config.trellis_cands >= 16) {
+                    s->channels[0].sdm.filter) {
                     const ntf_filter_t *f = s->channels[0].sdm.filter;
-                    if (f) {
-                        /* Backend-neutral: try CUDA first, then DX11 */
-                        if (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)
-                            gpu_cuda_trellis_setup(s->gpu,
-                                s->config.trellis_cands, f->order,
-                                s->config.trellis_lat, f->a, f->g,
+                    int actual_cands = (int)s->channels[0].sdm.trellis_num;
+                    int actual_lat = (int)s->channels[0].sdm.trellis_lat;
+                    int rc;
+                    if (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)
+                        rc = gpu_cuda_trellis_setup(s->gpu,
+                                actual_cands, f->order,
+                                actual_lat, f->a, f->g,
                                 s->channels[0].sdm.state_limit);
-                        else
-                            gpu_dx11_trellis_setup(s->gpu,
-                                s->config.trellis_cands, f->order,
-                                s->config.trellis_lat, f->a, f->g,
+                    else
+                        rc = gpu_dx11_trellis_setup(s->gpu,
+                                actual_cands, f->order,
+                                actual_lat, f->a, f->g,
                                 s->channels[0].sdm.state_limit);
+                    {
+                        extern void log_ring_write(const char *);
+                        char msg[256];
+                        sprintf_s(msg, sizeof(msg),
+                            "GPU SDM setup: backend=%d trellis cands=%d order=%d lat=%d limit=%.1f rc=%d",
+                            s->config.gpu_backend, actual_cands, f->order,
+                            actual_lat, s->channels[0].sdm.state_limit, rc);
+                        log_ring_write(msg);
                     }
                 } else if (s->config.sdm_mode == SDM_MODE_PRECORR) {
                     const ntf_filter_t *f = s->channels[0].precorr.filter;
