@@ -78,8 +78,7 @@ int engine_channel_init(engine_channel_t *eng, int channel,
      * not at init time, so FIR+SDM are always available for gain control */
     eng->passthrough = false;
 
-    /* Rate-adaptive boxcar: more taps at higher DSD rates for smoother
-     * multi-bit output that Trellis SDM can track. */
+    /* Rate-adaptive boxcar (PreCorr fallback) */
     if (cfg->fs_in >= DSD_RATE_512)
         eng->boxcar.taps = 128;
     else if (cfg->fs_in >= DSD_RATE_256)
@@ -91,6 +90,10 @@ int engine_channel_init(engine_channel_t *eng, int channel,
 
     eng->sdm_mode = cfg->sdm_mode;
     eng->fir_gain = 1.0f;  /* default, may be overridden by path_table */
+
+    /* Init FIR lowpass for same-rate Trellis (replaces boxcar for smooth output) */
+    if (cfg->fs_in == fs_out && cfg->sdm_mode == SDM_MODE_TRELLIS && !cfg->mute)
+        fir_lowpass_init(&eng->lowpass, cfg->fs_in);
 
     /* DSD→PCM decimation: FIR only, no SDM */
     eng->fir_only = (fs_out < DSD_RATE_64 && cfg->fs_in >= DSD_RATE_64);
@@ -228,7 +231,9 @@ size_t engine_process_block(engine_channel_t *eng,
     {
         uint32_t fs_out = cfg->fs_out ? cfg->fs_out : cfg->fs_in;
         if (cfg->fs_in == fs_out) {
-            /* DSD-Wide: boxcar smooth ±1.0 → multi-bit, apply gain, re-encode via SDM */
+            /* DSD-Wide: smooth ±1.0 → multi-bit, apply gain, re-encode via SDM.
+             * Trellis: use FIR lowpass (smooth output for parallel stitching).
+             * PreCorr: use boxcar (fast, sufficient for greedy quantizer). */
             if (eng->fir_buf_sz < count * sizeof(float)) {
                 free(eng->fir_buf);
                 eng->fir_buf = (float *)malloc(count * sizeof(float));
@@ -236,15 +241,32 @@ size_t engine_process_block(engine_channel_t *eng,
             }
             if (!eng->fir_buf)
                 return 0;
-            boxcar_t *bc = &eng->boxcar;
-            const float inv_n = 1.0f / (float)bc->taps;
-            for (size_t i = 0; i < count; i++) {
-                float s = in[i] >= 0.0f ? 1.0f : -1.0f;
-                bc->sum -= bc->ring[bc->pos];
-                bc->ring[bc->pos] = s;
-                bc->sum += s;
-                bc->pos = (bc->pos + 1) % bc->taps;
-                eng->fir_buf[i] = bc->sum * inv_n * eng->fir_gain * cfg->gain;
+
+            if (eng->lowpass.initialized) {
+                /* FIR lowpass: quantize ±1.0 → temp, then filter */
+                float *qbuf = (float *)malloc(count * sizeof(float));
+                if (!qbuf) return 0;
+                for (size_t i = 0; i < count; i++)
+                    qbuf[i] = in[i] >= 0.0f ? 1.0f : -1.0f;
+                fir_lowpass_process(&eng->lowpass, qbuf, eng->fir_buf, count);
+                free(qbuf);
+                /* Apply gain */
+                float combined = eng->fir_gain * cfg->gain;
+                if (combined != 1.0f)
+                    for (size_t i = 0; i < count; i++)
+                        eng->fir_buf[i] *= combined;
+            } else {
+                /* Boxcar fallback (PreCorr or if lowpass init failed) */
+                boxcar_t *bc = &eng->boxcar;
+                const float inv_n = 1.0f / (float)bc->taps;
+                for (size_t i = 0; i < count; i++) {
+                    float s = in[i] >= 0.0f ? 1.0f : -1.0f;
+                    bc->sum -= bc->ring[bc->pos];
+                    bc->ring[bc->pos] = s;
+                    bc->sum += s;
+                    bc->pos = (bc->pos + 1) % bc->taps;
+                    eng->fir_buf[i] = bc->sum * inv_n * eng->fir_gain * cfg->gain;
+                }
             }
             /* Re-encode via SDM */
             size_t sdm_out;
@@ -326,11 +348,14 @@ void engine_channel_reset(engine_channel_t *eng) {
         else
             sdm_context_reset(&eng->sdm);
     }
+    if (eng->lowpass.initialized)
+        fir_lowpass_reset(&eng->lowpass);
     if (eng->ml_filter)
         onnx_filter_reset(eng->ml_filter);
 }
 
 void engine_channel_free(engine_channel_t *eng) {
+    fir_lowpass_free(&eng->lowpass);
     fir_chain_free(&eng->fir);
     if (!eng->fir_only) {
         if (eng->sdm_mode == SDM_MODE_PRECORR)
@@ -381,16 +406,29 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
     size_t fir_count;
     uint32_t fs_out_actual = cfg->fs_out ? cfg->fs_out : cfg->fs_in;
     if (cfg->fs_in == fs_out_actual) {
-        /* Same-rate: boxcar smooth ±1.0 → multi-bit (same as engine_process_block) */
-        boxcar_t *bc = &eng->boxcar;
-        const float inv_n = 1.0f / (float)bc->taps;
-        for (size_t i = 0; i < count; i++) {
-            float s = in[i] >= 0.0f ? 1.0f : -1.0f;
-            bc->sum -= bc->ring[bc->pos];
-            bc->ring[bc->pos] = s;
-            bc->sum += s;
-            bc->pos = (bc->pos + 1) % bc->taps;
-            eng->fir_buf[i] = bc->sum * inv_n;
+        /* Same-rate: smooth ±1.0 → multi-bit.
+         * Trellis: FIR lowpass (smooth output for parallel stitching).
+         * PreCorr: boxcar (fast, sufficient). */
+        if (eng->lowpass.initialized) {
+            /* FIR lowpass: quantize then filter */
+            float *qbuf = (float *)malloc(count * sizeof(float));
+            if (qbuf) {
+                for (size_t i = 0; i < count; i++)
+                    qbuf[i] = in[i] >= 0.0f ? 1.0f : -1.0f;
+                fir_lowpass_process(&eng->lowpass, qbuf, eng->fir_buf, count);
+                free(qbuf);
+            }
+        } else {
+            boxcar_t *bc = &eng->boxcar;
+            const float inv_n = 1.0f / (float)bc->taps;
+            for (size_t i = 0; i < count; i++) {
+                float s = in[i] >= 0.0f ? 1.0f : -1.0f;
+                bc->sum -= bc->ring[bc->pos];
+                bc->ring[bc->pos] = s;
+                bc->sum += s;
+                bc->pos = (bc->pos + 1) % bc->taps;
+                eng->fir_buf[i] = bc->sum * inv_n;
+            }
         }
         fir_count = count;
     } else {

@@ -488,11 +488,36 @@ static unsigned sdm_sort_cands(sdm_context_t *p, sdm_trellis_t *st)
             min = s;
     }
 
+    p->total_children += 2 * p->num_cands;
+
+    /* Determine the output bit from the majority of candidates, not just min.
+     * This is more robust than using only min->next, especially with many candidates. */
+    unsigned next_votes[2] = {0, 0};
+    for (i = 0; i < 2 * p->num_cands; i++)
+        next_votes[st->sdm[i].next & 1]++;
+    unsigned majority_next = (next_votes[1] > next_votes[0]) ? 1 : 0;
+    /* If min disagrees with majority AND has significantly higher cost
+     * than the best candidate with majority_next, use majority. */
+    if (min->next != majority_next) {
+        /* Find the best candidate with majority_next */
+        sdm_state_t *best_maj = NULL;
+        for (i = 0; i < 2 * p->num_cands; i++) {
+            s = &st->sdm[i];
+            if (s->next == majority_next && (!best_maj || sdm_cmplt(s, best_maj)))
+                best_maj = s;
+        }
+        /* Use majority if it's within 10% cost of min */
+        if (best_maj && best_maj->cost < min->cost * 1.1)
+            min = best_maj;
+    }
+
     for (i = 0, n = 0; i < 2 * p->num_cands; i++) {
         s = &st->sdm[i];
 
-        if (s->next != min->next)
+        if (s->next != min->next) {
+            p->next_filter_drops++;
             continue;
+        }
 
         if (n == p->trellis_num && sdm_cmple(st->act[n - 1], s))
             continue;
@@ -516,20 +541,50 @@ static unsigned sdm_sort_cands(sdm_context_t *p, sdm_trellis_t *st)
         if (sdm_cmple(t, s))
             continue;
 
-        for (j = 0; j < n; j++) {
-            r = st->act[j];
-            if (sdm_cmple(s, r))
+        /* Find where t is in act[] before replacing */
+        unsigned t_pos;
+        bool t_found = false;
+        for (t_pos = 0; t_pos < n; t_pos++) {
+            if (st->act[t_pos] == t) {
+                t_found = true;
                 break;
+            }
         }
 
-        st->act[j++] = s;
-
-        while (r != t && j < n) {
-            sdm_state_t *u = st->act[j];
-            st->act[j] = r;
-            r = u;
-            j++;
+        if (!t_found) {
+            /* t was evicted from act[] by a better entry earlier.
+             * Just insert s like a new non-duplicate entry. */
+            for (j = n; j > 0; j--) {
+                r = st->act[j - 1];
+                if (sdm_cmple(r, s))
+                    break;
+                if (j < p->trellis_num)
+                    st->act[j] = r;
+            }
+            if (j < p->trellis_num)
+                st->act[j] = s;
+            if (n < p->trellis_num)
+                n++;
+            continue;
         }
+
+        /* Remove t from act[] and insert s at correct position */
+        /* First remove t by shifting elements after t_pos left */
+        for (j = t_pos; j + 1 < n; j++)
+            st->act[j] = st->act[j + 1];
+        n--;
+
+        /* Now insert s in sorted position */
+        for (j = n; j > 0; j--) {
+            r = st->act[j - 1];
+            if (sdm_cmple(r, s))
+                break;
+            if (j < p->trellis_num)
+                st->act[j] = r;
+        }
+        if (j < p->trellis_num)
+            st->act[j] = s;
+        n++;
     }
 
     return n;
@@ -628,8 +683,10 @@ static double sdm_sample_trellis(sdm_context_t *p, double x)
             sdm_histbuf_put(p, s->hist);
     }
 
-    if (new_cands < p->num_cands)
+    if (new_cands < p->num_cands) {
         p->conv_fail++;
+        p->cands_collapse++;
+    }
 
     p->num_cands = new_cands;
     p->pos = next_pos;

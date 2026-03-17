@@ -48,6 +48,9 @@ typedef struct {
     const ntf_filter_t *filter;
     double         prev_y;
     uint64_t       conv_fail;
+    uint64_t       cands_collapse;  /* times num_cands dropped below trellis_num */
+    uint64_t       next_filter_drops; /* candidates discarded by next!=min->next */
+    uint64_t       total_children;    /* total children evaluated */
     double         state_limit;     /* Integrator state clamp (0 = disabled) */
     uint8_t        hist[2 * SDM_TRELLIS_MAX_NUM][SDM_TRELLIS_MAX_LAT / 8];
 } sdm_context_t;

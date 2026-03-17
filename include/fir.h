@@ -55,6 +55,22 @@ void fir_chain_reset(fir_chain_t *chain);
 /* Free scratch buffer and reset. */
 void fir_chain_free(fir_chain_t *chain);
 
+/* Same-rate lowpass FIR for DSD-Wide re-encoding.
+ * Replaces the boxcar with a proper IPP FIRSR lowpass.
+ * Produces smooth multi-bit output for Trellis SDM. */
+typedef struct {
+    void   *spec;       /* IppsFIRSpec_32f* */
+    void   *buf;        /* Ipp8u* work buffer */
+    float  *dly;        /* Delay line */
+    int     taps;       /* Filter length */
+    bool    initialized;
+} fir_lowpass_t;
+
+int fir_lowpass_init(fir_lowpass_t *lp, uint32_t dsd_rate);
+size_t fir_lowpass_process(fir_lowpass_t *lp, const float *in, float *out, size_t count);
+void fir_lowpass_reset(fir_lowpass_t *lp);
+void fir_lowpass_free(fir_lowpass_t *lp);
+
 /* IPP info */
 const char *fir_ipp_version(void);
 const char *fir_ipp_kernel_name(void);

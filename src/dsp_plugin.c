@@ -423,6 +423,10 @@ const dsd_config_t *plugin_get_config(const plugin_state_t *s) {
     return s ? &s->config : NULL;
 }
 
+const engine_channel_t *plugin_get_channels(const plugin_state_t *s) {
+    return (s && s->initialized) ? s->channels : NULL;
+}
+
 const cpu_topology_t *plugin_get_topology(const plugin_state_t *s) {
     return (s && s->topology_detected) ? &s->topology : NULL;
 }
@@ -906,6 +910,16 @@ size_t plugin_process(plugin_state_t *s,
         dsd_out_count = 0;
         for (int seg = 0; seg < segments_per_ch; seg++)
             dsd_out_count += blocks[seg].out_count;  /* channel 0 */
+
+        /* Accumulate temp SDM diagnostics into persistent SDM for logging */
+        if (temp_sdms && temp_sdm_count > 0) {
+            for (int i = 0; i < temp_sdm_count; i++) {
+                s->channels[0].sdm.conv_fail += temp_sdms[i].conv_fail;
+                s->channels[0].sdm.cands_collapse += temp_sdms[i].cands_collapse;
+                s->channels[0].sdm.next_filter_drops += temp_sdms[i].next_filter_drops;
+                s->channels[0].sdm.total_children += temp_sdms[i].total_children;
+            }
+        }
 
         /* Save FIR tail for next chunk's segment 0 warmup.
          * This enables all-temp SDM mode from chunk 2 onward,

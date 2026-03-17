@@ -37,6 +37,7 @@ plugin_state_t *plugin_create(void);
 void            plugin_destroy(plugin_state_t *s);
 void            plugin_set_config(plugin_state_t *s, const dsd_config_t *cfg);
 const dsd_config_t *plugin_get_config(const plugin_state_t *s);
+const engine_channel_t *plugin_get_channels(const plugin_state_t *s);
 size_t          plugin_process(plugin_state_t *s,
                                const float *in_pcm, float *out_pcm,
                                size_t pcm_frames, int num_channels,
@@ -1487,10 +1488,26 @@ public:
          * keep their previous values so playback resumes smoothly, just like
          * track-to-track transitions. */
 
-        if (m_chunk_count < 10)
+        if (m_chunk_count < 10) {
             trellis_log("chunk #%u output: %u frames, %u ch, %u Hz (out_rate=%u, is_pcm=%d, is_dop_in=%d)",
                         m_chunk_count, (unsigned)out_frames, channels, out_pcm_rate,
                         out_rate, (int)out_is_pcm, (int)is_dop);
+
+            /* Log SDM candidate diagnostics for Trellis mode */
+            if (chunk_cfg.sdm_mode == SDM_MODE_TRELLIS && m_state) {
+                const engine_channel_t *eng = plugin_get_channels(m_state);
+                if (eng) {
+                    const sdm_context_t *sdm = &eng[0].sdm;
+                    trellis_log("  SDM diag: conv_fail=%llu collapse=%llu next_drops=%llu/%llu (%.1f%%) num_cands=%d",
+                                (unsigned long long)sdm->conv_fail,
+                                (unsigned long long)sdm->cands_collapse,
+                                (unsigned long long)sdm->next_filter_drops,
+                                (unsigned long long)sdm->total_children,
+                                sdm->total_children > 0 ? 100.0 * sdm->next_filter_drops / sdm->total_children : 0.0,
+                                sdm->num_cands);
+                }
+            }
+        }
 
         chunk->set_data(out_as.get_ptr(), out_frames, channels, out_pcm_rate);
 

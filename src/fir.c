@@ -432,3 +432,90 @@ const char *fir_ipp_version(void) {
 const char *fir_ipp_kernel_name(void) {
     return "IPP FIRSR (63-tap Kaiser)";
 }
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Same-rate lowpass FIR for DSD-Wide re-encoding
+ * ═══════════════════════════════════════════════════════════════════════
+ * Replaces the boxcar with a proper windowed sinc lowpass.
+ * Produces smooth multi-bit output that Trellis SDM can track.
+ * Cutoff at ~50 kHz (audio band + margin) regardless of DSD rate.
+ */
+
+#define LP_NTAPS 63
+#define LP_KAISER_BETA 8.0   /* ~80 dB stopband, wider transition */
+
+int fir_lowpass_init(fir_lowpass_t *lp, uint32_t dsd_rate) {
+    memset(lp, 0, sizeof(*lp));
+
+    /* Design lowpass kernel: windowed sinc at cutoff = 50 kHz / (fs/2) */
+    double fc = 50000.0 / ((double)dsd_rate / 2.0);  /* normalized cutoff */
+    if (fc > 0.5) fc = 0.5;  /* can't exceed Nyquist/2 */
+
+    float taps[LP_NTAPS];
+    int M = LP_NTAPS - 1;
+    double I0_beta = bessel_I0(LP_KAISER_BETA);
+
+    for (int n = 0; n <= M; n++) {
+        double x = (double)n - (double)M / 2.0;
+        /* Sinc */
+        double sinc = (fabs(x) < 1e-10) ? 2.0 * fc : sin(2.0 * M_PI * fc * x) / (M_PI * x);
+        /* Kaiser window */
+        double arg = 1.0 - (2.0 * n / M - 1.0) * (2.0 * n / M - 1.0);
+        double w = bessel_I0(LP_KAISER_BETA * sqrt(fabs(arg))) / I0_beta;
+        taps[n] = (float)(sinc * w);
+    }
+
+    /* Normalize to unity gain at DC */
+    float sum = 0.0f;
+    for (int n = 0; n < LP_NTAPS; n++) sum += taps[n];
+    if (sum > 0.0f)
+        for (int n = 0; n < LP_NTAPS; n++) taps[n] /= sum;
+
+    /* Create IPP FIRSR spec */
+    int specSize = 0, bufSize = 0;
+    if (ippsFIRSRGetSize(LP_NTAPS, ipp32f, &specSize, &bufSize) != ippStsNoErr)
+        return -1;
+
+    lp->spec = ippsMalloc_8u(specSize);
+    lp->buf = ippsMalloc_8u(bufSize);
+    lp->dly = ippsMalloc_32f(LP_NTAPS - 1);
+    if (!lp->spec || !lp->buf || !lp->dly) {
+        fir_lowpass_free(lp);
+        return -1;
+    }
+
+    ippsZero_32f(lp->dly, LP_NTAPS - 1);
+
+    if (ippsFIRSRInit_32f(taps, LP_NTAPS, ippAlgAuto,
+                           (IppsFIRSpec_32f *)lp->spec) != ippStsNoErr) {
+        fir_lowpass_free(lp);
+        return -1;
+    }
+
+    lp->taps = LP_NTAPS;
+    lp->initialized = true;
+    return 0;
+}
+
+size_t fir_lowpass_process(fir_lowpass_t *lp, const float *in, float *out, size_t count) {
+    if (!lp->initialized || count == 0)
+        return 0;
+
+    ippsFIRSR_32f(in, out, (int)count,
+                   (IppsFIRSpec_32f *)lp->spec,
+                   lp->dly, lp->dly,
+                   (Ipp8u *)lp->buf);
+    return count;
+}
+
+void fir_lowpass_reset(fir_lowpass_t *lp) {
+    if (lp->initialized && lp->dly)
+        ippsZero_32f(lp->dly, lp->taps - 1);
+}
+
+void fir_lowpass_free(fir_lowpass_t *lp) {
+    if (lp->spec) { ippsFree(lp->spec); lp->spec = NULL; }
+    if (lp->buf)  { ippsFree(lp->buf);  lp->buf = NULL; }
+    if (lp->dly)  { ippsFree(lp->dly);  lp->dly = NULL; }
+    lp->initialized = false;
+}

@@ -27,7 +27,8 @@ typedef struct {
     sdm_context_t    sdm;        /* Trellis SDM context */
     precorr_context_t precorr;   /* PreCorr SDM context */
     fir_chain_t      fir;        /* FIR rate conversion chain */
-    boxcar_t         boxcar;     /* DSD-Wide smoothing for volume control */
+    boxcar_t         boxcar;     /* DSD-Wide smoothing (PreCorr fallback) */
+    fir_lowpass_t    lowpass;    /* DSD-Wide FIR lowpass (Trellis same-rate) */
     float           *fir_buf;    /* Post-FIR intermediate buffer */
     size_t           fir_buf_sz; /* Allocated size of fir_buf */
     int              channel;    /* Channel index (0=L, 1=R, ...) */
