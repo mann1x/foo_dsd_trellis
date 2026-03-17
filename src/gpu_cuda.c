@@ -149,6 +149,22 @@ typedef struct {
      * Prepended to input for continuity across chunk boundaries. */
     float         *delay_buf;       /* [ntaps-1] floats, host memory */
     bool           delay_valid;     /* true after first chunk */
+    /* ─── Persistent SDM state (pre-allocated, no per-chunk alloc) ─── */
+    CUdeviceptr    d_sdm_in;        /* SDM input buffer (device) */
+    CUdeviceptr    d_sdm_out;       /* SDM output buffer (device) */
+    size_t         sdm_buf_cap;     /* current capacity in floats */
+    /* Trellis persistent state on device */
+    CUdeviceptr    d_trellis_states; /* [num_cands * 8] doubles */
+    CUdeviceptr    d_trellis_costs;  /* [num_cands] doubles */
+    int            trellis_cands;    /* cached num_cands */
+    int            trellis_order;    /* cached NTF order */
+    int            trellis_lat;      /* cached latency */
+    bool           trellis_state_valid; /* false until first chunk or after reset */
+    /* PreCorr persistent state on device */
+    CUdeviceptr    d_precorr_init;   /* precorr_init_t on device */
+    CUdeviceptr    d_precorr_pred;   /* prediction table [256][8] on device */
+    bool           precorr_pred_uploaded; /* true after first upload */
+    bool           precorr_state_valid;
 } cuda_context_t;
 
 /* ─── Helpers ─── */
@@ -341,6 +357,13 @@ void gpu_cuda_destroy(void *ptr) {
     }
     if (c->d_inter) pfn_cuMemFree(c->d_inter);
     free(c->delay_buf);
+    /* Persistent SDM buffers */
+    if (c->d_sdm_in)  pfn_cuMemFree(c->d_sdm_in);
+    if (c->d_sdm_out) pfn_cuMemFree(c->d_sdm_out);
+    if (c->d_trellis_states) pfn_cuMemFree(c->d_trellis_states);
+    if (c->d_trellis_costs)  pfn_cuMemFree(c->d_trellis_costs);
+    if (c->d_precorr_init)   pfn_cuMemFree(c->d_precorr_init);
+    if (c->d_precorr_pred)   pfn_cuMemFree(c->d_precorr_pred);
     if (c->mod_sdm) pfn_cuModuleUnload(c->mod_sdm);
     if (c->module)  pfn_cuModuleUnload(c->module);
     if (c->context) pfn_cuCtxDestroy(c->context);
@@ -376,6 +399,88 @@ int gpu_cuda_fir_setup(cuda_context_t *c, const float *taps, int ntaps,
     c->delay_buf = (float *)calloc((size_t)(ntaps - 1), sizeof(float));
     c->delay_valid = false;
 
+    return 0;
+}
+
+/* ─── Persistent SDM setup ─── */
+
+static int ensure_sdm_bufs(cuda_context_t *c, size_t floats) {
+    if (c->sdm_buf_cap >= floats) return 0;
+    if (c->d_sdm_in)  pfn_cuMemFree(c->d_sdm_in);
+    if (c->d_sdm_out) pfn_cuMemFree(c->d_sdm_out);
+    if (pfn_cuMemAlloc(&c->d_sdm_in, floats * sizeof(float)) != CUDA_SUCCESS)
+        return -1;
+    if (pfn_cuMemAlloc(&c->d_sdm_out, floats * sizeof(float)) != CUDA_SUCCESS)
+        return -1;
+    c->sdm_buf_cap = floats;
+    return 0;
+}
+
+int gpu_cuda_trellis_setup(cuda_context_t *c, int num_cands, int order,
+                            int trellis_lat, const double *ntf_a,
+                            const double *ntf_g, double state_limit) {
+    pfn_cuCtxSetCurrent(c->context);
+
+    /* Upload NTF constants */
+    CUdeviceptr d_a, d_g, d_order, d_limit;
+    size_t sz;
+    pfn_cuModuleGetGlobal(&d_a, &sz, c->mod_sdm, "c_ntf_a");
+    pfn_cuMemcpyHtoD(d_a, ntf_a, (size_t)order * sizeof(double));
+    pfn_cuModuleGetGlobal(&d_g, &sz, c->mod_sdm, "c_ntf_g");
+    pfn_cuMemcpyHtoD(d_g, ntf_g, (size_t)order * sizeof(double));
+    pfn_cuModuleGetGlobal(&d_order, &sz, c->mod_sdm, "c_ntf_order");
+    pfn_cuMemcpyHtoD(d_order, &order, sizeof(int));
+    pfn_cuModuleGetGlobal(&d_limit, &sz, c->mod_sdm, "c_state_limit");
+    pfn_cuMemcpyHtoD(d_limit, &state_limit, sizeof(double));
+
+    /* Allocate persistent state buffers */
+    if (c->d_trellis_states) pfn_cuMemFree(c->d_trellis_states);
+    if (c->d_trellis_costs)  pfn_cuMemFree(c->d_trellis_costs);
+    pfn_cuMemAlloc(&c->d_trellis_states, (size_t)num_cands * 8 * sizeof(double));
+    pfn_cuMemAlloc(&c->d_trellis_costs, (size_t)num_cands * sizeof(double));
+
+    /* Zero-init state on device */
+    double *zeros = (double *)calloc((size_t)num_cands * 8, sizeof(double));
+    double *czeros = (double *)calloc((size_t)num_cands, sizeof(double));
+    if (zeros) pfn_cuMemcpyHtoD(c->d_trellis_states, zeros, (size_t)num_cands * 8 * sizeof(double));
+    if (czeros) pfn_cuMemcpyHtoD(c->d_trellis_costs, czeros, (size_t)num_cands * sizeof(double));
+    free(zeros); free(czeros);
+
+    c->trellis_cands = num_cands;
+    c->trellis_order = order;
+    c->trellis_lat = trellis_lat;
+    c->trellis_state_valid = false;
+    return 0;
+}
+
+int gpu_cuda_precorr_setup(cuda_context_t *c, int order,
+                            const float *ntf_a, const float *ntf_g,
+                            const float *pred_table, float state_limit) {
+    pfn_cuCtxSetCurrent(c->context);
+
+    /* Upload NTF constants */
+    CUdeviceptr d_a, d_g, d_order, d_limit;
+    size_t sz;
+    pfn_cuModuleGetGlobal(&d_a, &sz, c->mod_sdm, "c_precorr_a");
+    pfn_cuMemcpyHtoD(d_a, ntf_a, (size_t)order * sizeof(float));
+    pfn_cuModuleGetGlobal(&d_g, &sz, c->mod_sdm, "c_precorr_g");
+    pfn_cuMemcpyHtoD(d_g, ntf_g, (size_t)order * sizeof(float));
+    pfn_cuModuleGetGlobal(&d_order, &sz, c->mod_sdm, "c_precorr_order");
+    pfn_cuMemcpyHtoD(d_order, &order, sizeof(int));
+    pfn_cuModuleGetGlobal(&d_limit, &sz, c->mod_sdm, "c_precorr_limit");
+    pfn_cuMemcpyHtoD(d_limit, &state_limit, sizeof(float));
+
+    /* Upload prediction table (persistent) */
+    if (!c->d_precorr_pred)
+        pfn_cuMemAlloc(&c->d_precorr_pred, 256 * 8 * sizeof(float));
+    pfn_cuMemcpyHtoD(c->d_precorr_pred, pred_table, 256 * 8 * sizeof(float));
+
+    /* Allocate persistent init/final state */
+    if (!c->d_precorr_init)
+        pfn_cuMemAlloc(&c->d_precorr_init, sizeof(gpu_precorr_state_t));
+
+    c->precorr_pred_uploaded = true;
+    c->precorr_state_valid = false;
     return 0;
 }
 
@@ -649,144 +754,95 @@ int gpu_cuda_fir_batch(cuda_context_t *c, const float *in_batch,
 
 /* ─── Trellis SDM (cands >= 16) ─── */
 
+/* Persistent-buffer Trellis: no per-chunk alloc/free.
+ * State stays on GPU between chunks. Only input/output transferred.
+ * Call gpu_cuda_trellis_setup once at engine init. */
 int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
-                      size_t count, const void *sdm_state_in,
-                      void *sdm_state_out, int num_cands, int order,
-                      const double *ntf_a, const double *ntf_g,
-                      double state_limit, int trellis_lat) {
-    if (!c || !c->fn_trellis_chunk || num_cands < 16)
+                      size_t count) {
+    if (!c || !c->fn_trellis_chunk || c->trellis_cands < 16)
         return -1;
 
     pfn_cuCtxSetCurrent(c->context);
 
-    /* Upload NTF constants to SDM module */
-    CUdeviceptr d_a, d_g, d_order, d_limit;
-    size_t sz;
-    pfn_cuModuleGetGlobal(&d_a, &sz, c->mod_sdm, "c_ntf_a");
-    pfn_cuMemcpyHtoD(d_a, ntf_a, (size_t)order * sizeof(double));
-    pfn_cuModuleGetGlobal(&d_g, &sz, c->mod_sdm, "c_ntf_g");
-    pfn_cuMemcpyHtoD(d_g, ntf_g, (size_t)order * sizeof(double));
-    pfn_cuModuleGetGlobal(&d_order, &sz, c->mod_sdm, "c_ntf_order");
-    pfn_cuMemcpyHtoD(d_order, &order, sizeof(int));
-    pfn_cuModuleGetGlobal(&d_limit, &sz, c->mod_sdm, "c_state_limit");
-    pfn_cuMemcpyHtoD(d_limit, &state_limit, sizeof(double));
+    int nc = c->trellis_cands;
+    int lat = c->trellis_lat;
+    size_t out_count = count > (size_t)lat ? count - (size_t)lat : 0;
 
-    /* Allocate device memory */
-    CUdeviceptr d_in_buf, d_out_buf, d_init_states, d_init_costs;
-    CUdeviceptr d_final_states, d_final_costs;
-    size_t out_count = count > (size_t)trellis_lat ? count - (size_t)trellis_lat : 0;
+    /* Ensure persistent I/O buffers */
+    if (ensure_sdm_bufs(c, count > out_count ? count : out_count) != 0)
+        return -1;
 
-    pfn_cuMemAlloc(&d_in_buf, count * sizeof(float));
-    pfn_cuMemAlloc(&d_out_buf, (out_count > 0 ? out_count : 1) * sizeof(float));
-    pfn_cuMemAlloc(&d_init_states, (size_t)num_cands * 8 * sizeof(double));
-    pfn_cuMemAlloc(&d_init_costs, (size_t)num_cands * sizeof(double));
-    pfn_cuMemAlloc(&d_final_states, (size_t)num_cands * 8 * sizeof(double));
-    pfn_cuMemAlloc(&d_final_costs, (size_t)num_cands * sizeof(double));
+    /* Upload input only — state is already on device */
+    pfn_cuMemcpyHtoD(c->d_sdm_in, in, count * sizeof(float));
 
-    /* Upload input + initial state */
-    pfn_cuMemcpyHtoD(d_in_buf, in, count * sizeof(float));
-    pfn_cuMemcpyHtoD(d_init_states, sdm_state_in,
-                      (size_t)num_cands * 8 * sizeof(double));
-    const double *costs_in = (const double *)sdm_state_in + num_cands * 8;
-    pfn_cuMemcpyHtoD(d_init_costs, costs_in, (size_t)num_cands * sizeof(double));
-
-    /* Launch: block_size = max(64, 2*num_cands), 1 block */
-    int block_size = 2 * num_cands;
+    /* The kernel reads from d_trellis_states/costs and writes back to them.
+     * We pass them as both init and final — kernel updates in-place. */
+    int block_size = 2 * nc;
     if (block_size < 64) block_size = 64;
     int cnt = (int)count;
     void *args[] = {
-        &d_in_buf, &d_out_buf, &cnt,
-        &num_cands, &trellis_lat,
-        &d_init_states, &d_init_costs,
-        &d_final_states, &d_final_costs
+        &c->d_sdm_in, &c->d_sdm_out, &cnt,
+        &nc, &lat,
+        &c->d_trellis_states, &c->d_trellis_costs,
+        &c->d_trellis_states, &c->d_trellis_costs  /* write back to same buffers */
     };
     pfn_cuLaunchKernel(c->fn_trellis_chunk, 1, 1, 1,
                         (unsigned)block_size, 1, 1,
                         0, c->streams[0], args, NULL);
     pfn_cuStreamSynchronize(c->streams[0]);
 
-    /* Download output + final state */
+    /* Download output only — state stays on device for next chunk */
     if (out_count > 0)
-        pfn_cuMemcpyDtoH(out, d_out_buf, out_count * sizeof(float));
-    pfn_cuMemcpyDtoH(sdm_state_out, d_final_states,
-                      (size_t)num_cands * 8 * sizeof(double));
-    double *costs_out = (double *)sdm_state_out + num_cands * 8;
-    pfn_cuMemcpyDtoH(costs_out, d_final_costs, (size_t)num_cands * sizeof(double));
+        pfn_cuMemcpyDtoH(out, c->d_sdm_out, out_count * sizeof(float));
 
-    /* Cleanup */
-    pfn_cuMemFree(d_in_buf);
-    pfn_cuMemFree(d_out_buf);
-    pfn_cuMemFree(d_init_states);
-    pfn_cuMemFree(d_init_costs);
-    pfn_cuMemFree(d_final_states);
-    pfn_cuMemFree(d_final_costs);
-
+    c->trellis_state_valid = true;
     return 0;
 }
 
 /* ─── PreCorr batch ─── */
 
+/* Persistent-buffer PreCorr: no per-chunk alloc/free.
+ * Pred table and state stay on GPU. Only input/output transferred.
+ * Call gpu_cuda_precorr_setup once at engine init. */
 int gpu_cuda_precorr(cuda_context_t *c, const float *in, float *out,
-                      size_t count, const float *ntf_a, const float *ntf_g,
-                      int order, const float *pred_table,
+                      size_t count,
                       const gpu_precorr_state_t *init,
-                      gpu_precorr_state_t *final_state,
-                      int num_channels) {
-    if (!c || !c->fn_precorr_chunk)
+                      gpu_precorr_state_t *final_state) {
+    if (!c || !c->fn_precorr_chunk || !c->precorr_pred_uploaded)
         return -1;
 
     pfn_cuCtxSetCurrent(c->context);
 
-    /* Upload PreCorr NTF constants */
-    CUdeviceptr d_a, d_g, d_order, d_limit;
-    size_t sz;
-    pfn_cuModuleGetGlobal(&d_a, &sz, c->mod_sdm, "c_precorr_a");
-    pfn_cuMemcpyHtoD(d_a, ntf_a, (size_t)order * sizeof(float));
-    pfn_cuModuleGetGlobal(&d_g, &sz, c->mod_sdm, "c_precorr_g");
-    pfn_cuMemcpyHtoD(d_g, ntf_g, (size_t)order * sizeof(float));
-    pfn_cuModuleGetGlobal(&d_order, &sz, c->mod_sdm, "c_precorr_order");
-    pfn_cuMemcpyHtoD(d_order, &order, sizeof(int));
-    float zero_limit = 0.0f;
-    pfn_cuModuleGetGlobal(&d_limit, &sz, c->mod_sdm, "c_precorr_limit");
-    pfn_cuMemcpyHtoD(d_limit, &zero_limit, sizeof(float));
+    /* Ensure persistent I/O buffers */
+    if (ensure_sdm_bufs(c, count) != 0)
+        return -1;
 
-    size_t total = count * (size_t)num_channels;
-    size_t init_sz = (size_t)num_channels * sizeof(gpu_precorr_state_t);
+    /* Upload input + initial state (state is small: 48 bytes) */
+    pfn_cuMemcpyHtoD(c->d_sdm_in, in, count * sizeof(float));
+    pfn_cuMemcpyHtoD(c->d_precorr_init, init, sizeof(gpu_precorr_state_t));
 
-    /* Allocate device memory */
-    CUdeviceptr d_in_buf, d_out_buf, d_pred, d_init, d_final;
-    pfn_cuMemAlloc(&d_in_buf, total * sizeof(float));
-    pfn_cuMemAlloc(&d_out_buf, total * sizeof(float));
-    pfn_cuMemAlloc(&d_pred, 256 * 8 * sizeof(float));
-    pfn_cuMemAlloc(&d_init, init_sz);
-    pfn_cuMemAlloc(&d_final, init_sz);
+    /* Allocate a device-side final state buffer (reuse d_precorr_init area + offset) */
+    /* For simplicity, allocate a second init struct if needed */
+    static CUdeviceptr d_precorr_final = 0;
+    if (!d_precorr_final)
+        pfn_cuMemAlloc(&d_precorr_final, sizeof(gpu_precorr_state_t));
 
-    /* Upload */
-    pfn_cuMemcpyHtoD(d_in_buf, in, total * sizeof(float));
-    pfn_cuMemcpyHtoD(d_pred, pred_table, 256 * 8 * sizeof(float));
-    pfn_cuMemcpyHtoD(d_init, init, init_sz);
-
-    /* Launch: one thread per channel */
     int cnt = (int)count;
+    int num_ch = 1;
     void *args[] = {
-        &d_in_buf, &d_out_buf, &cnt,
-        &d_pred, &d_init, &d_final, &num_channels
+        &c->d_sdm_in, &c->d_sdm_out, &cnt,
+        &c->d_precorr_pred, &c->d_precorr_init,
+        &d_precorr_final, &num_ch
     };
     pfn_cuLaunchKernel(c->fn_precorr_chunk, 1, 1, 1,
-                        (unsigned)num_channels, 1, 1,
+                        1, 1, 1, /* 1 thread for 1 channel */
                         0, c->streams[0], args, NULL);
     pfn_cuStreamSynchronize(c->streams[0]);
 
-    /* Download */
-    pfn_cuMemcpyDtoH(out, d_out_buf, total * sizeof(float));
-    pfn_cuMemcpyDtoH(final_state, d_final, init_sz);
+    /* Download output + final state */
+    pfn_cuMemcpyDtoH(out, c->d_sdm_out, count * sizeof(float));
+    pfn_cuMemcpyDtoH(final_state, d_precorr_final, sizeof(gpu_precorr_state_t));
 
-    /* Cleanup */
-    pfn_cuMemFree(d_in_buf);
-    pfn_cuMemFree(d_out_buf);
-    pfn_cuMemFree(d_pred);
-    pfn_cuMemFree(d_init);
-    pfn_cuMemFree(d_final);
-
+    c->precorr_state_valid = true;
     return 0;
 }

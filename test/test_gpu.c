@@ -369,23 +369,21 @@ static void test_gpu_trellis_sinad(void) {
 
     /* Test with 16 candidates */
     int num_cands = 16;
-    int order = 5;
     size_t count = 8192;
+    int trellis_lat = 128;
+
+    const ntf_filter_t *f = ntf_auto_select(2822400);
+
+    /* Setup persistent Trellis state on GPU */
+    gpu_cuda_trellis_setup(ctx, num_cands, f->order, trellis_lat,
+                            f->a, f->g, 0.0);
 
     /* Generate test input: low-amplitude sine */
     float *in = (float *)malloc(count * sizeof(float));
     float *out = (float *)calloc(count, sizeof(float));
     gen_sine(in, count, 1000.0, 2822400.0, 0.3);
 
-    /* Prepare flat state: [num_cands * 8 doubles for states][num_cands doubles for costs] */
-    size_t state_size = (size_t)num_cands * 8 + (size_t)num_cands;
-    double *state_in = (double *)calloc(state_size, sizeof(double));
-    double *state_out = (double *)calloc(state_size, sizeof(double));
-
-    /* Get NTF coefficients */
-    const ntf_filter_t *f = ntf_auto_select(2822400);
-
-    int r = gpu_trellis_process(ctx, in, out, count, state_in, state_out,
+    int r = gpu_trellis_process(ctx, in, out, count, NULL, NULL,
                                  num_cands, f->order, f->a, f->g);
     if (r != 0) {
         printf("    (skipped: GPU Trellis returned %d)\n", r);
@@ -394,7 +392,7 @@ static void test_gpu_trellis_sinad(void) {
         /* Verify output is ±1.0 */
         int valid = 1;
         int non_zero = 0;
-        size_t lat = 128; /* skip trellis latency */
+        size_t lat = (size_t)trellis_lat;
         for (size_t i = lat; i < count - lat; i++) {
             if (out[i] != 1.0f && out[i] != -1.0f) { valid = 0; break; }
             if (out[i] != 0.0f) non_zero++;
@@ -405,7 +403,7 @@ static void test_gpu_trellis_sinad(void) {
         TEST_ASSERT_TRUE(non_zero > 0, "GPU Trellis produces non-trivial output");
     }
 
-    free(in); free(out); free(state_in); free(state_out);
+    free(in); free(out);
     gpu_destroy(ctx);
 }
 
@@ -445,6 +443,15 @@ static void test_gpu_precorr(void) {
     memset(&pc_cpu, 0, sizeof(pc_cpu));
     precorr_context_init(&pc_cpu, f);
 
+    /* Setup persistent PreCorr on GPU */
+    float ntf_a_f[8], ntf_g_f[8];
+    for (int k = 0; k < f->order; k++) {
+        ntf_a_f[k] = (float)f->a[k];
+        ntf_g_f[k] = (float)f->g[k];
+    }
+    gpu_cuda_precorr_setup(ctx, f->order, ntf_a_f, ntf_g_f,
+                            (const float *)pc.pred_table, 0.0f);
+
     /* Capture initial conditions after init (before any audio processing) */
     gpu_precorr_state_t gpu_init, gpu_final;
     memset(&gpu_init, 0, sizeof(gpu_init));
@@ -455,13 +462,6 @@ static void test_gpu_precorr(void) {
 
     /* Now run CPU reference */
     precorr_process_block(&pc_cpu, in, cpu_out, count);
-
-    /* GPU PreCorr — starts from same initial conditions as CPU */
-    float ntf_a_f[8], ntf_g_f[8];
-    for (int k = 0; k < f->order; k++) {
-        ntf_a_f[k] = (float)f->a[k];
-        ntf_g_f[k] = (float)f->g[k];
-    }
 
     int r = gpu_precorr_process(ctx, in, gpu_out, count,
                                  ntf_a_f, ntf_g_f, f->order,

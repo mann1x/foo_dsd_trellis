@@ -437,6 +437,31 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                     gpu_fir_setup(s->gpu, g_hb_taps, g_hb_ntaps,
                                   num_stages, is_upsample);
                 }
+                /* Setup persistent SDM buffers on GPU */
+                uint32_t fs_out_gpu = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
+                if (s->config.sdm_mode == SDM_MODE_TRELLIS &&
+                    s->config.trellis_cands >= 16) {
+                    const ntf_filter_t *f = s->channels[0].sdm.filter;
+                    if (f) {
+                        gpu_cuda_trellis_setup(s->gpu,
+                            s->config.trellis_cands, f->order,
+                            s->config.trellis_lat, f->a, f->g,
+                            s->channels[0].sdm.state_limit);
+                    }
+                } else if (s->config.sdm_mode == SDM_MODE_PRECORR) {
+                    const ntf_filter_t *f = s->channels[0].precorr.filter;
+                    if (f) {
+                        float a_f[8], g_f[8];
+                        for (int k = 0; k < f->order; k++) {
+                            a_f[k] = s->channels[0].precorr.a[k];
+                            g_f[k] = s->channels[0].precorr.g[k];
+                        }
+                        gpu_cuda_precorr_setup(s->gpu, f->order, a_f, g_f,
+                            (const float *)s->channels[0].precorr.pred_table,
+                            s->channels[0].precorr.state_limit);
+                    }
+                }
+
                 /* Assign GPU context to all engine channels */
                 for (int ch = 0; ch < s->num_channels; ch++)
                     s->channels[ch].gpu = s->gpu;

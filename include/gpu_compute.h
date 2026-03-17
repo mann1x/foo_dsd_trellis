@@ -148,17 +148,19 @@ int gpu_cuda_boxcar(void *ctx, const float *in, float *out,
 int gpu_cuda_fir_batch(void *ctx, const float *in_batch,
                         float *out_batch, size_t samples_per_ch,
                         int num_channels, size_t *out_count_per_ch);
-int gpu_cuda_trellis(void *ctx, const float *in, float *out,
-                      size_t count, const void *sdm_state_in,
-                      void *sdm_state_out, int num_cands, int order,
-                      const double *ntf_a, const double *ntf_g,
-                      double state_limit, int trellis_lat);
-int gpu_cuda_precorr(void *ctx, const float *in, float *out,
-                      size_t count, const float *ntf_a, const float *ntf_g,
-                      int order, const float *pred_table,
+/* Persistent SDM setup (call once at engine init) */
+int gpu_cuda_trellis_setup(void *ctx, int num_cands, int order,
+                            int trellis_lat, const double *ntf_a,
+                            const double *ntf_g, double state_limit);
+int gpu_cuda_precorr_setup(void *ctx, int order,
+                            const float *ntf_a, const float *ntf_g,
+                            const float *pred_table, float state_limit);
+
+/* Persistent-buffer SDM process (no per-chunk alloc) */
+int gpu_cuda_trellis(void *ctx, const float *in, float *out, size_t count);
+int gpu_cuda_precorr(void *ctx, const float *in, float *out, size_t count,
                       const gpu_precorr_state_t *init,
-                      gpu_precorr_state_t *final_state,
-                      int num_channels);
+                      gpu_precorr_state_t *final_state);
 
 #ifdef __cplusplus
 }

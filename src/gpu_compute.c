@@ -190,11 +190,11 @@ int gpu_trellis_process(gpu_context_t *ctx, const float *in, float *out,
                         void *sdm_state_out, int num_cands, int order,
                         const double *ntf_a, const double *ntf_g) {
     if (!ctx || num_cands < 16) return -1;
+    (void)sdm_state_in; (void)sdm_state_out; /* state on device now */
+    (void)num_cands; (void)order; (void)ntf_a; (void)ntf_g;
     switch (ctx_backend(ctx)) {
     case GPU_BACKEND_CUDA:
-        return gpu_cuda_trellis(ctx, in, out, count, sdm_state_in,
-                                 sdm_state_out, num_cands, order,
-                                 ntf_a, ntf_g, 0.0, 128);
+        return gpu_cuda_trellis(ctx, in, out, count);
     default: return -1;
     }
 }
@@ -205,11 +205,10 @@ int gpu_precorr_process(gpu_context_t *ctx, const float *in, float *out,
                         const gpu_precorr_state_t *init,
                         gpu_precorr_state_t *final_state) {
     if (!ctx) return -1;
+    (void)ntf_a; (void)ntf_g; (void)order; (void)pred_table; /* setup done earlier */
     switch (ctx_backend(ctx)) {
     case GPU_BACKEND_CUDA:
-        return gpu_cuda_precorr(ctx, in, out, count, ntf_a, ntf_g,
-                                 order, (const float *)pred_table,
-                                 init, final_state, 1);
+        return gpu_cuda_precorr(ctx, in, out, count, init, final_state);
     default: return -1;
     }
 }
