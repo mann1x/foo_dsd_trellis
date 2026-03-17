@@ -243,18 +243,24 @@ size_t engine_process_block(engine_channel_t *eng,
                 return 0;
 
             if (eng->lowpass.initialized) {
-                /* FIR lowpass: quantize ±1.0 → temp, then filter */
-                float *qbuf = (float *)malloc(count * sizeof(float));
-                if (!qbuf) return 0;
+                /* FIR lowpass: quantize ±1.0 into fir_buf, filter into a
+                 * second buffer, then swap. Avoids per-call malloc. */
                 for (size_t i = 0; i < count; i++)
-                    qbuf[i] = in[i] >= 0.0f ? 1.0f : -1.0f;
-                fir_lowpass_process(&eng->lowpass, qbuf, eng->fir_buf, count);
-                free(qbuf);
-                /* Apply gain */
+                    eng->fir_buf[i] = in[i] >= 0.0f ? 1.0f : -1.0f;
+                /* Allocate/grow a second buffer for FIR output */
+                static __declspec(thread) float *tls_lp_buf = NULL;
+                static __declspec(thread) size_t tls_lp_sz = 0;
+                if (tls_lp_sz < count) {
+                    free(tls_lp_buf);
+                    tls_lp_buf = (float *)malloc(count * sizeof(float));
+                    tls_lp_sz = tls_lp_buf ? count : 0;
+                }
+                if (!tls_lp_buf) return 0;
+                fir_lowpass_process(&eng->lowpass, eng->fir_buf, tls_lp_buf, count);
+                /* Apply gain and copy to fir_buf */
                 float combined = eng->fir_gain * cfg->gain;
-                if (combined != 1.0f)
-                    for (size_t i = 0; i < count; i++)
-                        eng->fir_buf[i] *= combined;
+                for (size_t i = 0; i < count; i++)
+                    eng->fir_buf[i] = tls_lp_buf[i] * combined;
             } else {
                 /* Boxcar fallback (PreCorr or if lowpass init failed) */
                 boxcar_t *bc = &eng->boxcar;
@@ -411,12 +417,19 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
          * PreCorr: boxcar (fast, sufficient). */
         if (eng->lowpass.initialized) {
             /* FIR lowpass: quantize then filter */
-            float *qbuf = (float *)malloc(count * sizeof(float));
-            if (qbuf) {
-                for (size_t i = 0; i < count; i++)
-                    qbuf[i] = in[i] >= 0.0f ? 1.0f : -1.0f;
-                fir_lowpass_process(&eng->lowpass, qbuf, eng->fir_buf, count);
-                free(qbuf);
+            /* Quantize into fir_buf, filter into TLS buffer, copy back */
+            for (size_t i = 0; i < count; i++)
+                eng->fir_buf[i] = in[i] >= 0.0f ? 1.0f : -1.0f;
+            static __declspec(thread) float *tls_lp_buf2 = NULL;
+            static __declspec(thread) size_t tls_lp_sz2 = 0;
+            if (tls_lp_sz2 < count) {
+                free(tls_lp_buf2);
+                tls_lp_buf2 = (float *)malloc(count * sizeof(float));
+                tls_lp_sz2 = tls_lp_buf2 ? count : 0;
+            }
+            if (tls_lp_buf2) {
+                fir_lowpass_process(&eng->lowpass, eng->fir_buf, tls_lp_buf2, count);
+                memcpy(eng->fir_buf, tls_lp_buf2, count * sizeof(float));
             }
         } else {
             boxcar_t *bc = &eng->boxcar;
