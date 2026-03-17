@@ -115,6 +115,8 @@ int engine_channel_init(engine_channel_t *eng, int channel,
         const path_config_t *pc = path_config_lookup(cfg->fs_in, fs_out);
         if (pc)
             eng->fir_gain = pc->fir_gain;
+        else if (is_rate_conv)
+            eng->fir_gain = fir_gain_db_to_linear(FIR_GAIN_DEFAULT); /* -3 dB for PCM→DSD */
 
         /* Apply user FIR gain override.
          * Auto: use path_config gain (0.708 = -3 dB for all paths).
@@ -338,88 +340,17 @@ size_t engine_process_block(engine_channel_t *eng,
             eng->fir_buf[i] *= combined_gain;
     }
 
-    /* SDM (PreCorr or Trellis) — try GPU for Trellis with cands >= 16 */
+    /* SDM always on CPU — GPU SDM (Trellis candidate expansion, PreCorr batch)
+     * is available via gpu_trellis_process/gpu_precorr_process for offline
+     * rendering (e.g. POST /api/render) but NOT used in the real-time engine.
+     * Reason: per-sample sequential GPU kernel + per-chunk cuMemAlloc/Free
+     * is much slower than CPU AVX2 for real-time playback.
+     * GPU offload of FIR + gain + boxcar (above) is the real-time win. */
     size_t sdm_out;
-    bool gpu_sdm_ok = false;
-
-    if (eng->gpu && eng->sdm_mode == SDM_MODE_TRELLIS &&
-        cfg->trellis_cands >= 16 && fir_out >= GPU_MIN_SAMPLES) {
-        /* Serialize SDM state → flat GPU arrays */
-        int nc = (int)eng->sdm.num_cands;
-        int order = eng->sdm.filter->order;
-        size_t state_sz = (size_t)nc * 8 + (size_t)nc; /* states + costs */
-        double *state_buf = (double *)calloc(state_sz, sizeof(double));
-        double *state_out_buf = (double *)calloc(state_sz, sizeof(double));
-        if (state_buf && state_out_buf) {
-            /* Extract candidate states and costs */
-            sdm_trellis_t *st = &eng->sdm.trellis[eng->sdm.idx];
-            for (int i = 0; i < nc; i++) {
-                for (int k = 0; k < order; k++)
-                    state_buf[i * 8 + k] = st->act[i]->state[k];
-                state_buf[nc * 8 + i] = st->act[i]->cost;
-            }
-
-            if (gpu_trellis_process(eng->gpu, eng->fir_buf, out, fir_out,
-                                     state_buf, state_out_buf, nc, order,
-                                     eng->sdm.filter->a,
-                                     eng->sdm.filter->g) == 0) {
-                /* Write back state to SDM context */
-                sdm_trellis_t *st_next = &eng->sdm.trellis[eng->sdm.idx ^ 1];
-                for (int i = 0; i < nc; i++) {
-                    for (int k = 0; k < order; k++)
-                        st_next->sdm[i].state[k] = state_out_buf[i * 8 + k];
-                    st_next->sdm[i].cost = state_out_buf[nc * 8 + i];
-                    st_next->act[i] = &st_next->sdm[i];
-                }
-                eng->sdm.idx ^= 1;
-                eng->sdm.num_cands = (unsigned)nc;
-                sdm_out = fir_out > (size_t)cfg->trellis_lat ?
-                          fir_out - (size_t)cfg->trellis_lat : 0;
-                gpu_sdm_ok = true;
-            }
-        }
-        free(state_buf);
-        free(state_out_buf);
-    }
-
-    /* GPU PreCorr dispatch */
-    if (!gpu_sdm_ok && eng->gpu && eng->sdm_mode == SDM_MODE_PRECORR &&
-        fir_out >= GPU_MIN_SAMPLES) {
-        int order = eng->precorr.filter->order;
-        float ntf_a_f[8], ntf_g_f[8];
-        for (int k = 0; k < order; k++) {
-            ntf_a_f[k] = eng->precorr.a[k];
-            ntf_g_f[k] = eng->precorr.g[k];
-        }
-        /* Pack CPU context state into GPU struct */
-        gpu_precorr_state_t gpu_init, gpu_final;
-        memcpy(gpu_init.state, eng->precorr.state, sizeof(gpu_init.state));
-        gpu_init.prev_y = eng->precorr.prev_y;
-        gpu_init.history = (int)eng->precorr.history;
-        gpu_init.phase = eng->precorr.phase;
-        gpu_init.pad = 0.0f;
-
-        if (gpu_precorr_process(eng->gpu, eng->fir_buf, out, fir_out,
-                                 ntf_a_f, ntf_g_f, order,
-                                 (const float (*)[8])eng->precorr.pred_table,
-                                 &gpu_init, &gpu_final) == 0) {
-            /* Unpack GPU final state back to CPU context */
-            memcpy(eng->precorr.state, gpu_final.state, sizeof(eng->precorr.state));
-            eng->precorr.prev_y = gpu_final.prev_y;
-            eng->precorr.history = (uint8_t)gpu_final.history;
-            eng->precorr.phase = gpu_final.phase;
-            sdm_out = fir_out;
-            gpu_sdm_ok = true;
-        }
-    }
-
-    if (!gpu_sdm_ok) {
-        /* CPU SDM fallback */
-        if (eng->sdm_mode == SDM_MODE_PRECORR)
-            sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, fir_out);
-        else
-            sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, fir_out);
-    }
+    if (eng->sdm_mode == SDM_MODE_PRECORR)
+        sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, fir_out);
+    else
+        sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, fir_out);
     if (eng->ml_filter)
         onnx_filter_process(eng->ml_filter, out, sdm_out);
     return sdm_out;
