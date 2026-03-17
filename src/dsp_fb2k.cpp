@@ -326,9 +326,13 @@ static void trellis_log(const char *fmt, ...) {
     if (g_log_enabled && g_log_file) {
         SYSTEMTIME st;
         GetLocalTime(&st);
-        fprintf(g_log_file, "[%02d:%02d:%02d.%03d] %s\n",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
+        char line[512];
+        snprintf(line, sizeof(line), "[%02d:%02d:%02d.%03d] %s",
+                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
+        fprintf(g_log_file, "%s\n", line);
         fflush(g_log_file);
+        /* Also write to ring buffer for API access */
+        log_ring_write(line);
     }
 
     LeaveCriticalSection(&g_log_cs);

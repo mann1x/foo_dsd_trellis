@@ -58,6 +58,27 @@ void httpapi_update_status(httpapi_t *api, const httpapi_status_t *status);
 /* Push current config from the audio thread (after reconfigure). */
 void httpapi_update_config(httpapi_t *api, const dsd_config_t *cfg);
 
+/* Log ring buffer: stores last N log lines in memory for fast API access.
+ * Thread-safe: writer (DSP thread) and reader (HTTP thread) use SRWLOCK. */
+#define LOG_RING_MAX_LINES  500
+#define LOG_RING_MAX_LINE   256
+
+typedef struct {
+    char    lines[LOG_RING_MAX_LINES][LOG_RING_MAX_LINE];
+    int     head;       /* next write position */
+    int     count;      /* total lines stored (max LOG_RING_MAX_LINES) */
+    SRWLOCK lock;
+} log_ring_t;
+
+/* Global log ring (shared between DSP writer and HTTP reader) */
+extern log_ring_t g_log_ring;
+
+/* Write a line to the ring buffer (called from trellis_log) */
+void log_ring_write(const char *line);
+
+/* Read last N lines from ring buffer into a buffer. Returns bytes written. */
+int log_ring_read(char *buf, int buf_size, int max_lines);
+
 /* Check if the HTTP thread received a config update via PUT.
  * Returns true and fills *cfg if a pending config exists (clears pending flag).
  * Audio thread calls this at the start of each on_chunk. */

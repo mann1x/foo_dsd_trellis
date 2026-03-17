@@ -31,6 +31,38 @@
 /* Forward declaration from config.c */
 void config_validate(dsd_config_t *cfg);
 
+/* ─── Log ring buffer ─── */
+log_ring_t g_log_ring = { .head = 0, .count = 0, .lock = SRWLOCK_INIT };
+
+void log_ring_write(const char *line) {
+    AcquireSRWLockExclusive(&g_log_ring.lock);
+    strncpy_s(g_log_ring.lines[g_log_ring.head], LOG_RING_MAX_LINE, line, _TRUNCATE);
+    g_log_ring.head = (g_log_ring.head + 1) % LOG_RING_MAX_LINES;
+    if (g_log_ring.count < LOG_RING_MAX_LINES)
+        g_log_ring.count++;
+    ReleaseSRWLockExclusive(&g_log_ring.lock);
+}
+
+int log_ring_read(char *buf, int buf_size, int max_lines) {
+    AcquireSRWLockShared(&g_log_ring.lock);
+    int n = g_log_ring.count;
+    if (max_lines < n) n = max_lines;
+    int pos = 0;
+    /* Start from oldest of the N lines we want */
+    int start = (g_log_ring.head - n + LOG_RING_MAX_LINES) % LOG_RING_MAX_LINES;
+    for (int i = 0; i < n && pos < buf_size - 2; i++) {
+        int idx = (start + i) % LOG_RING_MAX_LINES;
+        int len = (int)strlen(g_log_ring.lines[idx]);
+        if (pos + len + 1 >= buf_size) break;
+        memcpy(buf + pos, g_log_ring.lines[idx], len);
+        pos += len;
+        buf[pos++] = '\n';
+    }
+    buf[pos] = '\0';
+    ReleaseSRWLockShared(&g_log_ring.lock);
+    return pos;
+}
+
 #define HTTP_MAX_REQUEST  8192
 #define HTTP_MAX_RESPONSE 16384
 
@@ -727,9 +759,10 @@ static void handle_request(httpapi_t *api, SOCKET client) {
 
     } else if (strncmp(path, "/api/log", 8) == 0) {
         if (_stricmp(method, "GET") == 0) {
-            /* Read last N lines of the DSP log file.
-             * ?lines=N parameter (default 50, max 500). */
+            /* GET /api/log?lines=N          — read from ring buffer (fast, default)
+             * GET /api/log?lines=N&logfile=true — read from log file (full history) */
             int max_lines = 50;
+            bool from_file = false;
             const char *q = strchr(path, '?');
             if (q) {
                 const char *lp = strstr(q, "lines=");
@@ -738,91 +771,75 @@ static void handle_request(httpapi_t *api, SOCKET client) {
                     if (max_lines < 1) max_lines = 1;
                     if (max_lines > 500) max_lines = 500;
                 }
+                if (strstr(q, "logfile=true") || strstr(q, "logfile=1"))
+                    from_file = true;
             }
 
-            /* Build log path next to our DLL */
-            wchar_t dll_path[MAX_PATH];
-            /* Try multiple module name variants */
-            HMODULE hmod = GetModuleHandleW(L"foo_dsd_trellis.dll");
-            if (!hmod) hmod = GetModuleHandleW(L"foo_dsd_trellis");
-            if (!hmod) {
-                /* Fallback: use the API struct's own address to find our module */
-                MEMORY_BASIC_INFORMATION mbi;
-                if (VirtualQuery((void *)handle_request, &mbi, sizeof(mbi)))
-                    hmod = (HMODULE)mbi.AllocationBase;
-            }
-            if (!hmod) {
-                send_json(client, 500, "Internal Error",
-                          "{\"error\":\"dll not found\"}", 24);
-                return;
-            }
-            GetModuleFileNameW(hmod, dll_path, MAX_PATH);
-            wchar_t *sep = wcsrchr(dll_path, L'\\');
-            if (!sep) sep = wcsrchr(dll_path, L'/');
-            if (sep) *(sep + 1) = L'\0';
-            wcscat_s(dll_path, MAX_PATH, L"foo_dsd_trellis.log");
-
-            /* Open with shared read access (file may be open for writing) */
-            HANDLE hFile = CreateFileW(dll_path, GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hFile == INVALID_HANDLE_VALUE) {
-                /* Return the path we tried for debugging */
-                char err[512];
-                char narrow_path[MAX_PATH];
-                WideCharToMultiByte(CP_UTF8, 0, dll_path, -1, narrow_path, MAX_PATH, NULL, NULL);
-                int elen = snprintf(err, sizeof(err),
-                    "{\"error\":\"log file not found\",\"path\":\"%s\",\"err\":%lu}",
-                    narrow_path, GetLastError());
-                send_json(client, 404, "Not Found", err, elen);
-                return;
-            }
-
-            /* Read last portion of file (up to 64KB) */
-            LARGE_INTEGER file_size;
-            GetFileSizeEx(hFile, &file_size);
-            LONGLONG read_start = 0;
-            DWORD read_len = (DWORD)file_size.QuadPart;
-            if (read_len > 65536) {
-                read_start = file_size.QuadPart - 65536;
-                read_len = 65536;
-            }
-
-            char *buf = (char *)malloc(read_len + 1);
-            if (!buf) {
-                CloseHandle(hFile);
-                send_json(client, 500, "Internal Error",
-                          "{\"error\":\"malloc failed\"}", 24);
-                return;
-            }
-
-            LARGE_INTEGER li;
-            li.QuadPart = read_start;
-            SetFilePointerEx(hFile, li, NULL, FILE_BEGIN);
-            DWORD bytes_read = 0;
-            ReadFile(hFile, buf, read_len, &bytes_read, NULL);
-            CloseHandle(hFile);
-            buf[bytes_read] = '\0';
-
-            /* Find last N lines */
-            int line_count = 0;
-            char *line_start = buf + bytes_read;
-            for (char *p = buf + bytes_read - 1; p >= buf; p--) {
-                if (*p == '\n') {
-                    line_count++;
-                    if (line_count >= max_lines) {
-                        line_start = p + 1;
-                        break;
-                    }
+            if (!from_file) {
+                /* Ring buffer: instant, no file I/O */
+                char *buf = (char *)malloc(max_lines * LOG_RING_MAX_LINE);
+                if (!buf) {
+                    send_json(client, 500, "Internal Error",
+                              "{\"error\":\"malloc\"}", 18);
+                    return;
                 }
-            }
-            if (line_start == buf + bytes_read && bytes_read > 0)
-                line_start = buf;  /* no newlines found, return everything */
+                int len = log_ring_read(buf, max_lines * LOG_RING_MAX_LINE, max_lines);
+                send_response(client, 200, "OK", "text/plain", buf, len);
+                free(buf);
+            } else {
+                /* File: read last N lines from log file on disk */
+                wchar_t dll_path[MAX_PATH];
+                HMODULE hmod = GetModuleHandleW(L"foo_dsd_trellis.dll");
+                if (!hmod) {
+                    MEMORY_BASIC_INFORMATION mbi;
+                    if (VirtualQuery((void *)handle_request, &mbi, sizeof(mbi)))
+                        hmod = (HMODULE)mbi.AllocationBase;
+                }
+                if (!hmod) {
+                    send_json(client, 500, "Internal Error",
+                              "{\"error\":\"dll not found\"}", 24);
+                    return;
+                }
+                GetModuleFileNameW(hmod, dll_path, MAX_PATH);
+                wchar_t *sep = wcsrchr(dll_path, L'\\');
+                if (!sep) sep = wcsrchr(dll_path, L'/');
+                if (sep) *(sep + 1) = L'\0';
+                wcscat_s(dll_path, MAX_PATH, L"foo_dsd_trellis.log");
 
-            size_t result_len = (buf + bytes_read) - line_start;
-            send_response(client, 200, "OK", "text/plain",
-                          line_start, (int)result_len);
-            free(buf);
+                HANDLE hFile = CreateFileW(dll_path, GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (hFile == INVALID_HANDLE_VALUE) {
+                    char err[512];
+                    char np[MAX_PATH];
+                    WideCharToMultiByte(CP_UTF8, 0, dll_path, -1, np, MAX_PATH, NULL, NULL);
+                    int el = snprintf(err, sizeof(err),
+                        "{\"error\":\"log not found\",\"path\":\"%s\",\"err\":%lu}", np, GetLastError());
+                    send_json(client, 404, "Not Found", err, el);
+                    return;
+                }
+                LARGE_INTEGER fsz;
+                GetFileSizeEx(hFile, &fsz);
+                DWORD rlen = (DWORD)fsz.QuadPart;
+                LONGLONG rstart = 0;
+                if (rlen > 65536) { rstart = fsz.QuadPart - 65536; rlen = 65536; }
+                char *buf = (char *)malloc(rlen + 1);
+                if (!buf) { CloseHandle(hFile); return; }
+                LARGE_INTEGER li; li.QuadPart = rstart;
+                SetFilePointerEx(hFile, li, NULL, FILE_BEGIN);
+                DWORD br = 0;
+                ReadFile(hFile, buf, rlen, &br, NULL);
+                CloseHandle(hFile);
+                buf[br] = '\0';
+                int lc = 0;
+                char *ls = buf + br;
+                for (char *p = buf + br - 1; p >= buf; p--) {
+                    if (*p == '\n' && ++lc >= max_lines) { ls = p + 1; break; }
+                }
+                if (ls == buf + br && br > 0) ls = buf;
+                send_response(client, 200, "OK", "text/plain", ls, (int)((buf + br) - ls));
+                free(buf);
+            }
         } else {
             send_method_not_allowed(client);
         }
