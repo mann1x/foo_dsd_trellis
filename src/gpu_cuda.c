@@ -61,6 +61,7 @@ DECL_PFN(CUresult, cuMemFreeHost, void *);
 DECL_PFN(CUresult, cuStreamCreate, CUstream *, unsigned int);
 DECL_PFN(CUresult, cuStreamDestroy, CUstream);
 DECL_PFN(CUresult, cuStreamSynchronize, CUstream);
+DECL_PFN(CUresult, cuMemcpyDtoD, CUdeviceptr, CUdeviceptr, size_t);
 
 static HMODULE g_nvcuda = NULL;
 static bool    g_probed = false;
@@ -92,6 +93,7 @@ static PFN_cuMemFreeHost       pfn_cuMemFreeHost;
 static PFN_cuStreamCreate      pfn_cuStreamCreate;
 static PFN_cuStreamDestroy     pfn_cuStreamDestroy;
 static PFN_cuStreamSynchronize pfn_cuStreamSynchronize;
+static PFN_cuMemcpyDtoD        pfn_cuMemcpyDtoD;
 
 #define RESOLVE(name) do { \
     pfn_##name = (PFN_##name)GetProcAddress(g_nvcuda, #name); \
@@ -264,6 +266,7 @@ bool gpu_cuda_probe(void) {
     RESOLVE(cuStreamCreate);
     RESOLVE_V2(cuStreamDestroy);
     RESOLVE(cuStreamSynchronize);
+    RESOLVE_V2(cuMemcpyDtoD);
 
     if (!ok) { g_available = false; return false; }
 
@@ -775,8 +778,19 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     /* Upload input only — state is already on device */
     pfn_cuMemcpyHtoD(c->d_sdm_in, in, count * sizeof(float));
 
-    /* The kernel reads from d_trellis_states/costs and writes back to them.
-     * We pass them as both init and final — kernel updates in-place. */
+    /* Use separate init/final buffers — kernel reads init, writes final.
+     * After kernel completes, copy final→init for next chunk. */
+    /* Allocate a second set of state buffers for final output if needed */
+    static CUdeviceptr d_final_states = 0, d_final_costs = 0;
+    static int final_alloc_cands = 0;
+    if (final_alloc_cands < nc) {
+        if (d_final_states) pfn_cuMemFree(d_final_states);
+        if (d_final_costs)  pfn_cuMemFree(d_final_costs);
+        pfn_cuMemAlloc(&d_final_states, (size_t)nc * 8 * sizeof(double));
+        pfn_cuMemAlloc(&d_final_costs, (size_t)nc * sizeof(double));
+        final_alloc_cands = nc;
+    }
+
     int block_size = 2 * nc;
     if (block_size < 64) block_size = 64;
     int cnt = (int)count;
@@ -784,12 +798,18 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
         &c->d_sdm_in, &c->d_sdm_out, &cnt,
         &nc, &lat,
         &c->d_trellis_states, &c->d_trellis_costs,
-        &c->d_trellis_states, &c->d_trellis_costs  /* write back to same buffers */
+        &d_final_states, &d_final_costs
     };
     pfn_cuLaunchKernel(c->fn_trellis_chunk, 1, 1, 1,
                         (unsigned)block_size, 1, 1,
                         0, c->streams[0], args, NULL);
     pfn_cuStreamSynchronize(c->streams[0]);
+
+    /* Copy final → init for next chunk (device-to-device, ~1KB, fast) */
+    pfn_cuMemcpyDtoD(c->d_trellis_states, d_final_states,
+                      (size_t)nc * 8 * sizeof(double));
+    pfn_cuMemcpyDtoD(c->d_trellis_costs, d_final_costs,
+                      (size_t)nc * sizeof(double));
 
     /* Download output only — state stays on device for next chunk */
     if (out_count > 0)
