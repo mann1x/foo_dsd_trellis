@@ -642,15 +642,9 @@ size_t plugin_process(plugin_state_t *s,
     QueryPerformanceCounter(&t_end);
     s->time_unpack_ms = perf_ms(t_start, t_end);
 
-    /* Warm up boxcar+SDM with first chunk's real audio after flush.
-     * This primes the boxcar ring buffer and SDM integrators with
-     * actual audio content, preventing the play-start pop. */
-    if (s->needs_warmup) {
-        s->needs_warmup = false;
-        for (int ch = 0; ch < num_channels; ch++)
-            engine_channel_warmup(&s->channels[ch], s->ch_in[ch],
-                                   dsd_in_count, &s->config);
-    }
+    /* No warmup — boxcar+SDM state is preserved across flush for Trellis,
+     * and reset for PreCorr. Warmup corrupted the boxcar ring buffer by
+     * processing audio twice. The play-start pop is DAC/ASIO, not our code. */
 
     /* Determine if parallel SDM segmentation is beneficial.
      * Worth it only when rate-converting (SDM is the bottleneck)
@@ -672,9 +666,8 @@ size_t plugin_process(plugin_state_t *s,
     /* DSD64 same-rate: sequential (fast enough).
      * DSD128+ same-rate and rate conversion: parallel. */
     bool is_same_rate = (s->config.fs_in == fs_out);
-    /* DSD64/128 same-rate: sequential (fast enough with fir_gain fix).
-     * DSD256: parallel 2-seg. DSD512: parallel 4-seg. */
-    bool skip_parallel = (is_same_rate && fs_out <= DSD_RATE_128);
+    /* DSD64 same-rate: sequential. DSD128+: parallel. */
+    bool skip_parallel = (is_same_rate && fs_out <= DSD_RATE_64);
 
     if (need_rate_conv && !skip_parallel && num_threads > num_channels &&
         s->config.sdm_mode == SDM_MODE_TRELLIS) {

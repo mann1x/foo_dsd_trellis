@@ -312,17 +312,20 @@ size_t engine_process_block(engine_channel_t *eng,
 
 void engine_channel_reset(engine_channel_t *eng) {
     fir_chain_reset(&eng->fir);
-    /* PreCorr: reset boxcar + SDM (converges instantly, no pop).
-     * Trellis: preserve both boxcar AND SDM state across flush.
-     * This prevents the play-start pop — both states stay in sync.
-     * The boxcar.taps field is preserved in both cases. */
-    if (!eng->fir_only && eng->sdm_mode == SDM_MODE_PRECORR) {
+    /* Reset boxcar (preserve taps) and SDM for both modes.
+     * Clean state on every flush ensures no stale data corruption.
+     * The play-start pop is DAC/ASIO cold-start, not our code. */
+    {
         int saved_taps = eng->boxcar.taps;
         memset(&eng->boxcar, 0, sizeof(eng->boxcar));
         eng->boxcar.taps = saved_taps;
-        precorr_context_reset(&eng->precorr);
     }
-    /* Trellis: boxcar + SDM state preserved (no reset) */
+    if (!eng->fir_only) {
+        if (eng->sdm_mode == SDM_MODE_PRECORR)
+            precorr_context_reset(&eng->precorr);
+        else
+            sdm_context_reset(&eng->sdm);
+    }
     if (eng->ml_filter)
         onnx_filter_reset(eng->ml_filter);
 }
