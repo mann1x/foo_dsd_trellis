@@ -167,6 +167,51 @@ int engine_channel_init(engine_channel_t *eng, int channel,
     return 0;
 }
 
+/* Warm up boxcar+SDM with the first N samples of real audio input.
+ * Called once after reset, before the first engine_process_block.
+ * Feeds input through boxcar→SDM, discards output. This primes both
+ * the boxcar ring buffer and SDM integrators with real audio state,
+ * preventing the startup pop from zero-state mismatch. */
+void engine_channel_warmup(engine_channel_t *eng, const float *in,
+                            size_t count, const dsd_config_t *cfg) {
+    if (!in || count == 0 || cfg->mute)
+        return;
+
+    uint32_t fs_out = cfg->fs_out ? cfg->fs_out : cfg->fs_in;
+    if (cfg->fs_in != fs_out)
+        return;  /* warmup only for same-rate (boxcar path) */
+
+    /* Feed through boxcar */
+    size_t warmup = count;
+    if (warmup > (size_t)eng->boxcar.taps * 2)
+        warmup = (size_t)eng->boxcar.taps * 2;  /* only need 2x taps */
+
+    float *tmp = (float *)malloc(warmup * sizeof(float));
+    if (!tmp) return;
+
+    boxcar_t *bc = &eng->boxcar;
+    const float inv_n = 1.0f / (float)bc->taps;
+    for (size_t i = 0; i < warmup; i++) {
+        float s = in[i] >= 0.0f ? 1.0f : -1.0f;
+        bc->sum -= bc->ring[bc->pos];
+        bc->ring[bc->pos] = s;
+        bc->sum += s;
+        bc->pos = (bc->pos + 1) % bc->taps;
+        tmp[i] = bc->sum * inv_n * eng->fir_gain * cfg->gain;
+    }
+
+    /* Feed through SDM (discard output) */
+    float *trash = (float *)malloc(warmup * sizeof(float));
+    if (trash) {
+        if (eng->sdm_mode == SDM_MODE_PRECORR)
+            precorr_process_block(&eng->precorr, tmp, trash, warmup);
+        else
+            sdm_process_block(&eng->sdm, tmp, trash, warmup);
+        free(trash);
+    }
+    free(tmp);
+}
+
 size_t engine_process_block(engine_channel_t *eng,
                             const float *in, float *out,
                             size_t count, const dsd_config_t *cfg) {
@@ -199,7 +244,7 @@ size_t engine_process_block(engine_channel_t *eng,
                 bc->ring[bc->pos] = s;
                 bc->sum += s;
                 bc->pos = (bc->pos + 1) % bc->taps;
-                eng->fir_buf[i] = bc->sum * inv_n * cfg->gain;
+                eng->fir_buf[i] = bc->sum * inv_n * eng->fir_gain * cfg->gain;
             }
             /* Re-encode via SDM */
             size_t sdm_out;
@@ -267,15 +312,17 @@ size_t engine_process_block(engine_channel_t *eng,
 
 void engine_channel_reset(engine_channel_t *eng) {
     fir_chain_reset(&eng->fir);
-    /* PreCorr: reset boxcar + SDM (PreCorr is stateless, crashes with stale state).
-     * Trellis: preserve both boxcar and SDM state to prevent startup pop.
-     * Both must be consistent — boxcar state feeds SDM state. */
+    /* PreCorr: reset boxcar + SDM (converges instantly, no pop).
+     * Trellis: preserve both boxcar AND SDM state across flush.
+     * This prevents the play-start pop — both states stay in sync.
+     * The boxcar.taps field is preserved in both cases. */
     if (!eng->fir_only && eng->sdm_mode == SDM_MODE_PRECORR) {
         int saved_taps = eng->boxcar.taps;
         memset(&eng->boxcar, 0, sizeof(eng->boxcar));
         eng->boxcar.taps = saved_taps;
         precorr_context_reset(&eng->precorr);
     }
+    /* Trellis: boxcar + SDM state preserved (no reset) */
     if (eng->ml_filter)
         onnx_filter_reset(eng->ml_filter);
 }

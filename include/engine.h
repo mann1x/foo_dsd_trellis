@@ -77,6 +77,11 @@ size_t engine_process_block(engine_channel_t *eng,
 /* Reset engine state (seek / discontinuity). */
 void engine_channel_reset(engine_channel_t *eng);
 
+/* Warm up boxcar+SDM with real audio input after reset.
+ * Prevents startup pop by priming state with actual audio. */
+void engine_channel_warmup(engine_channel_t *eng, const float *in,
+                            size_t count, const dsd_config_t *cfg);
+
 /* Free engine resources. */
 void engine_channel_free(engine_channel_t *eng);
 
