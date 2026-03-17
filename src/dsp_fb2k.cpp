@@ -13,6 +13,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include "../include/gpu_compute.h"
 #include <commctrl.h>
 
 /* DoP: 16 DSD bits packed per PCM frame */
@@ -423,6 +424,8 @@ public:
         COMMAND_HANDLER_EX(IDC_COMBO_FIR_GAIN, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_CHECK_ML_ENABLED, BN_CLICKED, OnMlChange)
         COMMAND_HANDLER_EX(IDC_COMBO_ML_EP, CBN_SELCHANGE, OnChange)
+        COMMAND_HANDLER_EX(IDC_CHECK_GPU_ENABLED, BN_CLICKED, OnGpuChange)
+        COMMAND_HANDLER_EX(IDC_COMBO_GPU_BACKEND, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_EDIT_THREADS, EN_CHANGE, OnEditChange)
         COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_EDIT, CBN_SELCHANGE, OnRateMapEditChange)
         COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_EDIT, CBN_KILLFOCUS, OnComboKillFocus)
@@ -586,6 +589,25 @@ private:
         }
         UpdateMlStatus();
 
+        /* GPU Compute */
+        CheckDlgButton(IDC_CHECK_GPU_ENABLED, m_cfg.gpu_enabled ? BST_CHECKED : BST_UNCHECKED);
+        {
+            CComboBox gpub(GetDlgItem(IDC_COMBO_GPU_BACKEND));
+            gpub.AddString(L"Auto");
+            gpub.AddString(L"DirectCompute");
+            gpub.AddString(L"CUDA");
+            /* Map gpu_backend: None=0→Auto, DX=1, CUDA=2, Auto=3→0 */
+            int sel = 0;
+            switch (m_cfg.gpu_backend) {
+            case 1: sel = 1; break;  /* DirectX */
+            case 2: sel = 2; break;  /* CUDA */
+            default: sel = 0; break; /* Auto or None */
+            }
+            gpub.SetCurSel(sel);
+            gpub.EnableWindow(m_cfg.gpu_enabled);
+        }
+        UpdateGpuStatus();
+
         /* Show initial engine info */
         const cpu_features_t *cpu = cpu_detect();
         pfc::string_formatter info;
@@ -643,6 +665,32 @@ private:
             }
         }
         ::uSetDlgItemText(*this, IDC_STATIC_ML_STATUS, status);
+    }
+
+    void OnGpuChange(UINT, int, CWindow) {
+        if (m_updating) return;
+        bool enabled = IsDlgButtonChecked(IDC_CHECK_GPU_ENABLED) == BST_CHECKED;
+        CComboBox(GetDlgItem(IDC_COMBO_GPU_BACKEND)).EnableWindow(enabled);
+        UpdateGpuStatus();
+    }
+
+    void UpdateGpuStatus() {
+        bool enabled = IsDlgButtonChecked(IDC_CHECK_GPU_ENABLED) == BST_CHECKED;
+        if (!enabled) {
+            ::uSetDlgItemText(*this, IDC_STATIC_GPU_INFO, "");
+            return;
+        }
+
+        gpu_info_t info;
+        gpu_get_info(&info);
+        if (info.available) {
+            char buf[256];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%s (%zu MB)",
+                         info.device_name, info.vram_mb);
+            ::uSetDlgItemText(*this, IDC_STATIC_GPU_INFO, buf);
+        } else {
+            ::uSetDlgItemText(*this, IDC_STATIC_GPU_INFO, "No GPU detected");
+        }
     }
 
     /* ─── Rate map in-place editing ─── */
@@ -1040,6 +1088,18 @@ private:
         /* ML filter */
         m_cfg.ml_enabled = IsDlgButtonChecked(IDC_CHECK_ML_ENABLED) == BST_CHECKED;
         m_cfg.ml_ep = combo_to_ml_ep(CComboBox(GetDlgItem(IDC_COMBO_ML_EP)).GetCurSel());
+
+        /* GPU compute */
+        m_cfg.gpu_enabled = IsDlgButtonChecked(IDC_CHECK_GPU_ENABLED) == BST_CHECKED;
+        {
+            int sel = CComboBox(GetDlgItem(IDC_COMBO_GPU_BACKEND)).GetCurSel();
+            /* Combo: 0=Auto, 1=DirectCompute, 2=CUDA → backend enum: 3,1,2 */
+            switch (sel) {
+            case 1: m_cfg.gpu_backend = 1; break;  /* GPU_BACKEND_DIRECTX */
+            case 2: m_cfg.gpu_backend = 2; break;  /* GPU_BACKEND_CUDA */
+            default: m_cfg.gpu_backend = 3; break;  /* GPU_BACKEND_AUTO */
+            }
+        }
 
         /* rate_map and rate_ntf are maintained via OnRateMapEditChange/OnNtfEditChange */
 

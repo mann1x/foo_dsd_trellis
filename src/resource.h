@@ -19,6 +19,9 @@
 #define IDC_CHECK_ANTIPOP           1027
 #define IDC_COMBO_FIR_GAIN          1028
 #define IDC_STATIC_FIR_GAIN         1029
+#define IDC_CHECK_GPU_ENABLED       1030
+#define IDC_COMBO_GPU_BACKEND       1031
+#define IDC_STATIC_GPU_INFO         1032
 
 // Next default values for new objects
 //
