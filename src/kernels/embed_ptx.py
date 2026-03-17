@@ -9,7 +9,10 @@ with open(ptx_file, "r") as f:
 
 with open(out_file, "w") as out:
     out.write("/* Auto-generated from {} — do not edit */\n".format(ptx_file))
-    out.write("static const char g_ptx_fir_kernels[] =\n")
+    import os
+    base = os.path.splitext(os.path.basename(ptx_file))[0]
+    var_name = "g_ptx_" + base
+    out.write("static const char {}[] =\n".format(var_name))
     for line in lines:
         clean = line.rstrip("\n").replace("\\", "\\\\").replace('"', '\\"')
         out.write('    "{}\\n"\n'.format(clean))

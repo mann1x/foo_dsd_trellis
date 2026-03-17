@@ -127,7 +127,7 @@ int gpu_fir_chain_process(gpu_context_t *ctx, const float *in, float *out,
                           size_t in_count, size_t *out_count,
                           const float *delay_in, float *delay_out) {
     if (!ctx) return -1;
-    (void)delay_in; (void)delay_out; /* TODO: delay-line round-trip */
+    (void)delay_in; (void)delay_out; /* Delay handled internally by backend */
     switch (ctx_backend(ctx)) {
     case GPU_BACKEND_DIRECTX:
         return gpu_dx11_fir_chain(ctx, in, out, in_count, out_count);
@@ -202,13 +202,14 @@ int gpu_trellis_process(gpu_context_t *ctx, const float *in, float *out,
 int gpu_precorr_process(gpu_context_t *ctx, const float *in, float *out,
                         size_t count, const float *ntf_a, const float *ntf_g,
                         int order, const float pred_table[256][8],
-                        const float *state_in, float *state_out) {
+                        const gpu_precorr_state_t *init,
+                        gpu_precorr_state_t *final_state) {
     if (!ctx) return -1;
     switch (ctx_backend(ctx)) {
     case GPU_BACKEND_CUDA:
         return gpu_cuda_precorr(ctx, in, out, count, ntf_a, ntf_g,
                                  order, (const float *)pred_table,
-                                 state_in, state_out, 1);
+                                 init, final_state, 1);
     default: return -1;
     }
 }

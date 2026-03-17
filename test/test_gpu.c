@@ -440,25 +440,33 @@ static void test_gpu_precorr(void) {
     float *cpu_out = (float *)calloc(count, sizeof(float));
     gen_sine(in, count, 1000.0, 2822400.0, 0.3);
 
-    /* CPU reference */
+    /* CPU reference — capture initial state BEFORE processing */
     precorr_context_t pc_cpu;
     memset(&pc_cpu, 0, sizeof(pc_cpu));
     precorr_context_init(&pc_cpu, f);
+
+    /* Capture initial conditions after init (before any audio processing) */
+    gpu_precorr_state_t gpu_init, gpu_final;
+    memset(&gpu_init, 0, sizeof(gpu_init));
+    memcpy(gpu_init.state, pc_cpu.state, sizeof(gpu_init.state));
+    gpu_init.prev_y = pc_cpu.prev_y;
+    gpu_init.history = (int)pc_cpu.history;
+    gpu_init.phase = pc_cpu.phase;
+
+    /* Now run CPU reference */
     precorr_process_block(&pc_cpu, in, cpu_out, count);
 
-    /* GPU PreCorr */
+    /* GPU PreCorr — starts from same initial conditions as CPU */
     float ntf_a_f[8], ntf_g_f[8];
     for (int k = 0; k < f->order; k++) {
         ntf_a_f[k] = (float)f->a[k];
         ntf_g_f[k] = (float)f->g[k];
     }
-    float state_in[8] = {0};
-    float state_out[8] = {0};
 
     int r = gpu_precorr_process(ctx, in, gpu_out, count,
                                  ntf_a_f, ntf_g_f, f->order,
                                  (const float (*)[8])pc.pred_table,
-                                 state_in, state_out);
+                                 &gpu_init, &gpu_final);
     if (r != 0) {
         printf("    (skipped: GPU PreCorr returned %d)\n", r);
         g_tests_run++; g_tests_passed++;

@@ -199,11 +199,20 @@ __constant__ float c_precorr_g[8];
 __constant__ int   c_precorr_order;
 __constant__ float c_precorr_limit;
 
+/* Per-channel initial conditions (uploaded alongside state) */
+struct precorr_init_t {
+    float state[8];
+    float prev_y;
+    int   history;
+    int   phase;
+    float pad;  /* alignment */
+};
+
 __global__ void precorr_chunk(
     const float *in, float *out, int count,
-    const float *pred_table,    /* [256][8] = 2048 floats */
-    const float *init_state,    /* [8] per channel */
-    float *final_state,         /* [8] per channel */
+    const float *pred_table,           /* [256][8] = 2048 floats */
+    const struct precorr_init_t *init, /* [num_channels] */
+    struct precorr_init_t *final_out,  /* [num_channels] */
     int num_channels)
 {
     int ch = blockIdx.x * blockDim.x + threadIdx.x;
@@ -214,13 +223,13 @@ __global__ void precorr_chunk(
     float state[8];
     float d[8];
 
-    /* Load initial state */
+    /* Load initial conditions from CPU-trained context */
     for (int k = 0; k < order; k++)
-        state[k] = init_state[ch * 8 + k];
+        state[k] = init[ch].state[k];
 
-    unsigned history = 0x69;
-    int phase = 0;
-    float prev_y = 0.0f;
+    unsigned history = (unsigned)init[ch].history;
+    int phase = init[ch].phase;
+    float prev_y = init[ch].prev_y;
 
     const float *ch_in  = in  + ch * count;
     float       *ch_out = out + ch * count;
@@ -263,9 +272,12 @@ __global__ void precorr_chunk(
         ch_out[s] = out_y;
     }
 
-    /* Save final state */
+    /* Save final state + conditions for next chunk */
     for (int k = 0; k < order; k++)
-        final_state[ch * 8 + k] = state[k];
+        final_out[ch].state[k] = state[k];
+    final_out[ch].prev_y = prev_y;
+    final_out[ch].history = (int)history;
+    final_out[ch].phase = phase;
 }
 
 } /* extern "C" */

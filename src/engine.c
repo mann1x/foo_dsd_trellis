@@ -262,16 +262,27 @@ size_t engine_process_block(engine_channel_t *eng,
                 for (size_t i = 0; i < count; i++)
                     eng->fir_buf[i] = tls_lp_buf[i] * combined;
             } else {
-                /* Boxcar fallback (PreCorr or if lowpass init failed) */
-                boxcar_t *bc = &eng->boxcar;
-                const float inv_n = 1.0f / (float)bc->taps;
-                for (size_t i = 0; i < count; i++) {
-                    float s = in[i] >= 0.0f ? 1.0f : -1.0f;
-                    bc->sum -= bc->ring[bc->pos];
-                    bc->ring[bc->pos] = s;
-                    bc->sum += s;
-                    bc->pos = (bc->pos + 1) % bc->taps;
-                    eng->fir_buf[i] = bc->sum * inv_n * eng->fir_gain * cfg->gain;
+                /* Boxcar: try GPU, fall back to CPU */
+                float combined = eng->fir_gain * cfg->gain;
+                bool boxcar_gpu_ok = false;
+                if (eng->gpu && count >= GPU_MIN_SAMPLES) {
+                    if (gpu_boxcar_smooth(eng->gpu, in, eng->fir_buf,
+                                           count, eng->boxcar.taps,
+                                           combined) == 0)
+                        boxcar_gpu_ok = true;
+                }
+                if (!boxcar_gpu_ok) {
+                    /* CPU boxcar fallback */
+                    boxcar_t *bc = &eng->boxcar;
+                    const float inv_n = 1.0f / (float)bc->taps;
+                    for (size_t i = 0; i < count; i++) {
+                        float s = in[i] >= 0.0f ? 1.0f : -1.0f;
+                        bc->sum -= bc->ring[bc->pos];
+                        bc->ring[bc->pos] = s;
+                        bc->sum += s;
+                        bc->pos = (bc->pos + 1) % bc->taps;
+                        eng->fir_buf[i] = bc->sum * inv_n * eng->fir_gain * cfg->gain;
+                    }
                 }
             }
             /* Re-encode via SDM */
@@ -380,12 +391,23 @@ size_t engine_process_block(engine_channel_t *eng,
             ntf_a_f[k] = eng->precorr.a[k];
             ntf_g_f[k] = eng->precorr.g[k];
         }
-        float state_out[8];
+        /* Pack CPU context state into GPU struct */
+        gpu_precorr_state_t gpu_init, gpu_final;
+        memcpy(gpu_init.state, eng->precorr.state, sizeof(gpu_init.state));
+        gpu_init.prev_y = eng->precorr.prev_y;
+        gpu_init.history = (int)eng->precorr.history;
+        gpu_init.phase = eng->precorr.phase;
+        gpu_init.pad = 0.0f;
+
         if (gpu_precorr_process(eng->gpu, eng->fir_buf, out, fir_out,
                                  ntf_a_f, ntf_g_f, order,
                                  (const float (*)[8])eng->precorr.pred_table,
-                                 eng->precorr.state, state_out) == 0) {
-            memcpy(eng->precorr.state, state_out, sizeof(state_out));
+                                 &gpu_init, &gpu_final) == 0) {
+            /* Unpack GPU final state back to CPU context */
+            memcpy(eng->precorr.state, gpu_final.state, sizeof(eng->precorr.state));
+            eng->precorr.prev_y = gpu_final.prev_y;
+            eng->precorr.history = (uint8_t)gpu_final.history;
+            eng->precorr.phase = gpu_final.phase;
             sdm_out = fir_out;
             gpu_sdm_ok = true;
         }

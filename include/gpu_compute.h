@@ -98,12 +98,22 @@ int gpu_trellis_process(gpu_context_t *ctx, const float *in, float *out,
 
 /* ─── PreCorr SDM ─── */
 
+/* Per-channel PreCorr initial/final conditions (matches GPU struct layout) */
+typedef struct {
+    float state[8];
+    float prev_y;
+    int   history;
+    int   phase;
+    float pad;
+} gpu_precorr_state_t;
+
 /* Process entire chunk through PreCorr SDM on GPU.
  * Sequential loop, one thread per channel for multi-channel batch. */
 int gpu_precorr_process(gpu_context_t *ctx, const float *in, float *out,
                         size_t count, const float *ntf_a, const float *ntf_g,
                         int order, const float pred_table[256][8],
-                        const float *state_in, float *state_out);
+                        const gpu_precorr_state_t *init,
+                        gpu_precorr_state_t *final_state);
 
 /* ─── Backend probe functions (implemented in gpu_dx11.c / gpu_cuda.c) ─── */
 
@@ -146,7 +156,8 @@ int gpu_cuda_trellis(void *ctx, const float *in, float *out,
 int gpu_cuda_precorr(void *ctx, const float *in, float *out,
                       size_t count, const float *ntf_a, const float *ntf_g,
                       int order, const float *pred_table,
-                      const float *state_in, float *state_out,
+                      const gpu_precorr_state_t *init,
+                      gpu_precorr_state_t *final_state,
                       int num_channels);
 
 #ifdef __cplusplus

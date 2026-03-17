@@ -145,6 +145,10 @@ typedef struct {
     /* Intermediate device buffer for multi-stage */
     CUdeviceptr    d_inter;
     size_t         cap_inter;
+    /* FIR delay line: last (ntaps-1) input samples from previous chunk.
+     * Prepended to input for continuity across chunk boundaries. */
+    float         *delay_buf;       /* [ntaps-1] floats, host memory */
+    bool           delay_valid;     /* true after first chunk */
 } cuda_context_t;
 
 /* ─── Helpers ─── */
@@ -336,6 +340,7 @@ void gpu_cuda_destroy(void *ptr) {
         if (c->h_out[i])   pfn_cuMemFreeHost(c->h_out[i]);
     }
     if (c->d_inter) pfn_cuMemFree(c->d_inter);
+    free(c->delay_buf);
     if (c->mod_sdm) pfn_cuModuleUnload(c->mod_sdm);
     if (c->module)  pfn_cuModuleUnload(c->module);
     if (c->context) pfn_cuCtxDestroy(c->context);
@@ -366,6 +371,11 @@ int gpu_cuda_fir_setup(cuda_context_t *c, const float *taps, int ntaps,
     if (pfn_cuMemcpyHtoD(d_ntaps, &ntaps, sizeof(int)) != CUDA_SUCCESS)
         return -1;
 
+    /* Allocate delay buffer for continuity across chunks */
+    free(c->delay_buf);
+    c->delay_buf = (float *)calloc((size_t)(ntaps - 1), sizeof(float));
+    c->delay_valid = false;
+
     return 0;
 }
 
@@ -392,54 +402,66 @@ int gpu_cuda_fir_chain(cuda_context_t *c, const float *in, float *out,
     int stages = c->num_stages;
     if (stages <= 0) { OutputDebugStringA("CUDA: stages <= 0\n"); return -1; }
 
-    /* Calculate output size */
+    /* FIR delay line: prepend previous chunk's tail for continuity.
+     * Extended input = [delay_buf (ntaps-1)] [in (in_count)]
+     * The FIR output for the extended input includes the transient,
+     * but we only keep output starting from the original input position. */
+    int dly_len = c->ntaps - 1;  /* 62 for 63-tap filter */
+    size_t ext_in = in_count + (size_t)dly_len;
+
+    /* Calculate output size (based on original in_count, not extended) */
     size_t cur = in_count;
     for (int s = 0; s < stages; s++)
         cur = c->upsample ? cur * 2 : cur / 2;
     size_t final_out = cur;
 
+    /* Extended output includes the delay prefix */
+    size_t ext_out = ext_in;
+    for (int s = 0; s < stages; s++)
+        ext_out = c->upsample ? ext_out * 2 : ext_out / 2;
+
     /* Calculate max intermediate */
-    size_t max_size = in_count;
-    cur = in_count;
+    size_t max_size = ext_in;
+    cur = ext_in;
     for (int s = 0; s < stages; s++) {
         cur = c->upsample ? cur * 2 : cur / 2;
         if (cur > max_size) max_size = cur;
     }
 
     /* Ensure buffers */
-    if (ensure_d_in(c, max_size) != 0) { fprintf(stderr, "CUDA: ensure_d_in failed\n"); return -1; }
-    if (ensure_d_out(c, max_size) != 0) { fprintf(stderr, "CUDA: ensure_d_out failed\n"); return -1; }
-    if (ensure_h_in(c, in_count) != 0) { fprintf(stderr, "CUDA: ensure_h_in failed\n"); return -1; }
-    if (ensure_h_out(c, final_out) != 0) { fprintf(stderr, "CUDA: ensure_h_out failed\n"); return -1; }
-    if (stages > 1 && ensure_d_inter(c, max_size) != 0) { fprintf(stderr, "CUDA: ensure_d_inter failed\n"); return -1; }
+    if (ensure_d_in(c, max_size) != 0) return -1;
+    if (ensure_d_out(c, max_size) != 0) return -1;
+    if (ensure_h_in(c, ext_in) != 0) return -1;
+    if (ensure_h_out(c, ext_out) != 0) return -1;
+    if (stages > 1 && ensure_d_inter(c, max_size) != 0) return -1;
 
     CUstream stream = c->streams[s_idx];
 
-    /* Upload input via pinned memory (async) */
-    memcpy(c->h_in[s_idx], in, in_count * sizeof(float));
+    /* Build extended input: [delay | in] */
+    if (c->delay_valid && c->delay_buf)
+        memcpy(c->h_in[s_idx], c->delay_buf, (size_t)dly_len * sizeof(float));
+    else
+        memset(c->h_in[s_idx], 0, (size_t)dly_len * sizeof(float));
+    memcpy(c->h_in[s_idx] + dly_len, in, in_count * sizeof(float));
+
+    /* Save current input's tail as delay for next chunk */
+    if (c->delay_buf) {
+        if (in_count >= (size_t)dly_len)
+            memcpy(c->delay_buf, in + in_count - dly_len,
+                   (size_t)dly_len * sizeof(float));
+        c->delay_valid = true;
+    }
+
     if (pfn_cuMemcpyHtoDAsync(c->d_in[s_idx], c->h_in[s_idx],
-                               in_count * sizeof(float), stream) != CUDA_SUCCESS)
+                               ext_in * sizeof(float), stream) != CUDA_SUCCESS)
         return -1;
 
-    /* Multi-stage FIR dispatch */
-    cur = in_count;
+    /* Multi-stage FIR dispatch on extended input */
+    cur = ext_in;
     for (int s = 0; s < stages; s++) {
         size_t next = c->upsample ? cur * 2 : cur / 2;
 
         CUdeviceptr src, dst;
-        if (s == 0) {
-            src = c->d_in[s_idx];
-        } else {
-            /* Ping-pong: even stages from d_inter, odd from d_out */
-            src = (s & 1) ? c->d_inter : c->d_out[s_idx];
-        }
-        if (s == stages - 1) {
-            dst = c->d_out[s_idx];
-        } else {
-            dst = (s & 1) ? c->d_out[s_idx] : c->d_inter;
-        }
-
-        /* For stage > 0, source is previous output — use proper ping-pong */
         if (stages == 1) {
             src = c->d_in[s_idx];
             dst = c->d_out[s_idx];
@@ -450,7 +472,6 @@ int gpu_cuda_fir_chain(cuda_context_t *c, const float *in, float *out,
             src = (stages % 2 == 0) ? c->d_inter : c->d_out[s_idx];
             dst = c->d_out[s_idx];
         } else {
-            /* Middle stages: alternate */
             if (s & 1) { src = c->d_inter; dst = c->d_out[s_idx]; }
             else       { src = c->d_out[s_idx]; dst = c->d_inter; }
         }
@@ -458,17 +479,19 @@ int gpu_cuda_fir_chain(cuda_context_t *c, const float *in, float *out,
         cuda_fir_stage(c, c->upsample, src, dst, (int)cur, (int)next);
         cur = next;
     }
+    /* cur now = ext_out (extended output including delay prefix) */
 
-    /* Download result (async) */
+    /* Download full extended result */
     if (pfn_cuMemcpyDtoHAsync(c->h_out[s_idx], c->d_out[s_idx],
-                               final_out * sizeof(float), stream) != CUDA_SUCCESS)
+                               ext_out * sizeof(float), stream) != CUDA_SUCCESS)
         return -1;
 
-    /* Synchronize this stream */
     pfn_cuStreamSynchronize(stream);
 
-    /* Copy from pinned to caller's buffer */
-    memcpy(out, c->h_out[s_idx], final_out * sizeof(float));
+    /* Strip delay prefix from output: skip first (ext_out - final_out) samples.
+     * The delay prefix in the input gets scaled by the FIR chain ratio. */
+    size_t out_skip = ext_out - final_out;
+    memcpy(out, c->h_out[s_idx] + out_skip, final_out * sizeof(float));
 
     /* Rotate stream for next call (triple-buffering) */
     c->active = (s_idx + 1) % NUM_STREAMS;
@@ -706,7 +729,8 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
 int gpu_cuda_precorr(cuda_context_t *c, const float *in, float *out,
                       size_t count, const float *ntf_a, const float *ntf_g,
                       int order, const float *pred_table,
-                      const float *state_in, float *state_out,
+                      const gpu_precorr_state_t *init,
+                      gpu_precorr_state_t *final_state,
                       int num_channels) {
     if (!c || !c->fn_precorr_chunk)
         return -1;
@@ -727,25 +751,26 @@ int gpu_cuda_precorr(cuda_context_t *c, const float *in, float *out,
     pfn_cuMemcpyHtoD(d_limit, &zero_limit, sizeof(float));
 
     size_t total = count * (size_t)num_channels;
+    size_t init_sz = (size_t)num_channels * sizeof(gpu_precorr_state_t);
 
     /* Allocate device memory */
-    CUdeviceptr d_in_buf, d_out_buf, d_pred, d_state_in, d_state_out;
+    CUdeviceptr d_in_buf, d_out_buf, d_pred, d_init, d_final;
     pfn_cuMemAlloc(&d_in_buf, total * sizeof(float));
     pfn_cuMemAlloc(&d_out_buf, total * sizeof(float));
     pfn_cuMemAlloc(&d_pred, 256 * 8 * sizeof(float));
-    pfn_cuMemAlloc(&d_state_in, (size_t)num_channels * 8 * sizeof(float));
-    pfn_cuMemAlloc(&d_state_out, (size_t)num_channels * 8 * sizeof(float));
+    pfn_cuMemAlloc(&d_init, init_sz);
+    pfn_cuMemAlloc(&d_final, init_sz);
 
     /* Upload */
     pfn_cuMemcpyHtoD(d_in_buf, in, total * sizeof(float));
     pfn_cuMemcpyHtoD(d_pred, pred_table, 256 * 8 * sizeof(float));
-    pfn_cuMemcpyHtoD(d_state_in, state_in, (size_t)num_channels * 8 * sizeof(float));
+    pfn_cuMemcpyHtoD(d_init, init, init_sz);
 
     /* Launch: one thread per channel */
     int cnt = (int)count;
     void *args[] = {
         &d_in_buf, &d_out_buf, &cnt,
-        &d_pred, &d_state_in, &d_state_out, &num_channels
+        &d_pred, &d_init, &d_final, &num_channels
     };
     pfn_cuLaunchKernel(c->fn_precorr_chunk, 1, 1, 1,
                         (unsigned)num_channels, 1, 1,
@@ -754,15 +779,14 @@ int gpu_cuda_precorr(cuda_context_t *c, const float *in, float *out,
 
     /* Download */
     pfn_cuMemcpyDtoH(out, d_out_buf, total * sizeof(float));
-    pfn_cuMemcpyDtoH(state_out, d_state_out,
-                      (size_t)num_channels * 8 * sizeof(float));
+    pfn_cuMemcpyDtoH(final_state, d_final, init_sz);
 
     /* Cleanup */
     pfn_cuMemFree(d_in_buf);
     pfn_cuMemFree(d_out_buf);
     pfn_cuMemFree(d_pred);
-    pfn_cuMemFree(d_state_in);
-    pfn_cuMemFree(d_state_out);
+    pfn_cuMemFree(d_init);
+    pfn_cuMemFree(d_final);
 
     return 0;
 }
