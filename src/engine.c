@@ -34,13 +34,14 @@ typedef struct {
 static const path_config_t path_table[] = {
     /*                                            lim  cands lat  depth gain  */
     /* All paths use 0.708 (-3 dB) gain for uniform volume across rates */
-    /* Same-rate re-encode (boxcar → SDM, sequential single-thread).
-     * Lower cands/depth for real-time at high DSD rates.
-     * CLANS_5: only stable NTF with crude boxcar input. */
-    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  2,  256, 4, 0.708f },
-    { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_5, 0.0,  2,  256, 4, 0.708f },
+    /* Same-rate re-encode (boxcar → SDM).
+     * Rate-adaptive boxcar (32/64/128 taps) + rate-adaptive cands.
+     * DSD64: needs cands=4 for path diversity with 32-tap boxcar.
+     * DSD256+: needs cands=2 for real-time budget. */
+    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  4,  256, 4, 0.708f },
+    { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_5, 0.0,  4,  256, 4, 0.708f },
     { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_5, 0.0,  2,  512, 4, 0.708f },
-    { DSD_RATE_512, DSD_RATE_512, NTF_CLANS_5, 6.0,  2,  768, 4, 0.708f },
+    { DSD_RATE_512, DSD_RATE_512, NTF_CLANS_5, 0.0,  2,  512, 4, 0.708f },
     /* Upsample paths */
     { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_4,   0.0,  2,  512, 4, 0.708f },
     { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  512, 4, 0.708f },
@@ -77,6 +78,17 @@ int engine_channel_init(engine_channel_t *eng, int channel,
      * not at init time, so FIR+SDM are always available for gain control */
     eng->passthrough = false;
 
+    /* Rate-adaptive boxcar: more taps at higher DSD rates for smoother
+     * multi-bit output that Trellis SDM can track. */
+    if (cfg->fs_in >= DSD_RATE_512)
+        eng->boxcar.taps = 128;
+    else if (cfg->fs_in >= DSD_RATE_256)
+        eng->boxcar.taps = 64;
+    else if (cfg->fs_in >= DSD_RATE_128)
+        eng->boxcar.taps = 64;
+    else
+        eng->boxcar.taps = 32;
+
     eng->sdm_mode = cfg->sdm_mode;
     eng->fir_gain = 1.0f;  /* default, may be overridden by path_table */
 
@@ -94,14 +106,12 @@ int engine_channel_init(engine_channel_t *eng, int channel,
         if (fir_chain_init(&eng->fir, cfg->fs_in, fs_out) != 0)
             return -1;
 
-        /* Path-adaptive lookup for rate conversion with NTF_AUTO */
+        /* Path-adaptive lookup — always look up for gain/limiter.
+         * NTF from path_config only used when ntf_filter == NTF_AUTO. */
         bool is_rate_conv = (cfg->fs_in != fs_out);
-        const path_config_t *pc = NULL;
-        if (cfg->ntf_filter == NTF_AUTO) {
-            pc = path_config_lookup(cfg->fs_in, fs_out);
-            if (pc)
-                eng->fir_gain = pc->fir_gain;
-        }
+        const path_config_t *pc = path_config_lookup(cfg->fs_in, fs_out);
+        if (pc)
+            eng->fir_gain = pc->fir_gain;
 
         /* Apply user FIR gain override.
          * Auto: use path_config gain (0.708 = -3 dB for all paths).
@@ -182,13 +192,13 @@ size_t engine_process_block(engine_channel_t *eng,
             if (!eng->fir_buf)
                 return 0;
             boxcar_t *bc = &eng->boxcar;
-            const float inv_n = 1.0f / BOXCAR_TAPS;
+            const float inv_n = 1.0f / (float)bc->taps;
             for (size_t i = 0; i < count; i++) {
                 float s = in[i] >= 0.0f ? 1.0f : -1.0f;
                 bc->sum -= bc->ring[bc->pos];
                 bc->ring[bc->pos] = s;
                 bc->sum += s;
-                bc->pos = (bc->pos + 1) % BOXCAR_TAPS;
+                bc->pos = (bc->pos + 1) % bc->taps;
                 eng->fir_buf[i] = bc->sum * inv_n * cfg->gain;
             }
             /* Re-encode via SDM */
@@ -257,12 +267,15 @@ size_t engine_process_block(engine_channel_t *eng,
 
 void engine_channel_reset(engine_channel_t *eng) {
     fir_chain_reset(&eng->fir);
-    memset(&eng->boxcar, 0, sizeof(eng->boxcar));
-    /* PreCorr must be reset (crashes with stale state).
-     * Trellis SDM state is preserved to prevent startup pop —
-     * integrators keep their values so playback resumes smoothly. */
-    if (!eng->fir_only && eng->sdm_mode == SDM_MODE_PRECORR)
+    /* PreCorr: reset boxcar + SDM (PreCorr is stateless, crashes with stale state).
+     * Trellis: preserve both boxcar and SDM state to prevent startup pop.
+     * Both must be consistent — boxcar state feeds SDM state. */
+    if (!eng->fir_only && eng->sdm_mode == SDM_MODE_PRECORR) {
+        int saved_taps = eng->boxcar.taps;
+        memset(&eng->boxcar, 0, sizeof(eng->boxcar));
+        eng->boxcar.taps = saved_taps;
         precorr_context_reset(&eng->precorr);
+    }
     if (eng->ml_filter)
         onnx_filter_reset(eng->ml_filter);
 }
@@ -320,13 +333,13 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
     if (cfg->fs_in == fs_out_actual) {
         /* Same-rate: boxcar smooth ±1.0 → multi-bit (same as engine_process_block) */
         boxcar_t *bc = &eng->boxcar;
-        const float inv_n = 1.0f / BOXCAR_TAPS;
+        const float inv_n = 1.0f / (float)bc->taps;
         for (size_t i = 0; i < count; i++) {
             float s = in[i] >= 0.0f ? 1.0f : -1.0f;
             bc->sum -= bc->ring[bc->pos];
             bc->ring[bc->pos] = s;
             bc->sum += s;
-            bc->pos = (bc->pos + 1) % BOXCAR_TAPS;
+            bc->pos = (bc->pos + 1) % bc->taps;
             eng->fir_buf[i] = bc->sum * inv_n;
         }
         fir_count = count;
@@ -422,9 +435,10 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
 
     info->fir_only = false;
 
-    /* Path-adaptive lookup (includes same-rate re-encode entries) */
+    /* Path-adaptive lookup — always look up for cands/depth/lat/gain.
+     * NTF from path_config is only used when ntf_override == NTF_AUTO. */
     const path_config_t *pc = NULL;
-    if (ntf_override == NTF_AUTO && sdm_mode == SDM_MODE_TRELLIS) {
+    if (sdm_mode == SDM_MODE_TRELLIS) {
         pc = path_config_lookup(fs_in, fs_out);
     }
 

@@ -12,12 +12,14 @@
 #include "onnx_filter.h"
 
 /* DSD-Wide boxcar filter: smooths 1-bit DSD to multi-bit at same rate.
- * Enables gain control without decimating to PCM domain. */
-#define BOXCAR_TAPS 8
+ * Tap count is rate-adaptive: more taps at higher DSD rates for smoother
+ * output that Trellis SDM can track. */
+#define BOXCAR_MAX_TAPS 128
 typedef struct {
-    float ring[BOXCAR_TAPS];
+    float ring[BOXCAR_MAX_TAPS];
     float sum;
     int   pos;
+    int   taps;   /* runtime tap count (set at init) */
 } boxcar_t;
 
 /* Per-channel processing state */

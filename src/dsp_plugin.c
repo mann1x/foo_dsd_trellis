@@ -51,6 +51,8 @@ typedef struct plugin_state {
     float              active_gain;       /* Gain engine was initialized with */
     bool               active_mute;       /* Mute state engine was initialized with */
     int                active_sdm_mode;   /* SDM mode engine was initialized with */
+    int                active_cands;      /* Trellis cands engine was initialized with */
+    int                active_depth;      /* Trellis depth engine was initialized with */
 
     /* Per-channel buffers for unpack/repack */
     float            **ch_in;        /* [ch][dsd_samples] unpacked DSD input */
@@ -334,6 +336,8 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     s->active_gain = s->config.gain;
     s->active_mute = s->config.mute;
     s->active_sdm_mode = s->config.sdm_mode;
+    s->active_cands = s->config.trellis_cands;
+    s->active_depth = s->config.trellis_depth;
 
     s->channels = (engine_channel_t *)calloc(
         (size_t)num_channels, sizeof(engine_channel_t));
@@ -508,11 +512,14 @@ size_t plugin_process(plugin_state_t *s,
     /* Always keep fs_in in sync (plugin_set_config may have overwritten it) */
     s->config.fs_in = dsd_rate;
 
-    /* Initialize engine on first use, channel/rate change, or output rate change */
+    /* Initialize engine on first use, channel/rate change, output rate,
+     * SDM mode, or cands/depth change (path_config may change these) */
     if (!s->initialized || s->num_channels != num_channels ||
         s->detected_dsd_rate != dsd_rate ||
         s->active_fs_out != s->config.fs_out ||
-        s->active_sdm_mode != s->config.sdm_mode) {
+        s->active_sdm_mode != s->config.sdm_mode ||
+        s->active_cands != s->config.trellis_cands ||
+        s->active_depth != s->config.trellis_depth) {
         /* Tear down old state */
         if (s->initialized) {
             if (s->pool) {
@@ -645,7 +652,15 @@ size_t plugin_process(plugin_state_t *s,
      * Same-rate re-encode stays sequential (boxcar→SDM is fast at cands=2).
      * Rate conversion uses parallel segments (FIR+SDM is the bottleneck). */
     uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
-    bool skip_parallel = false;  /* parallel for all Trellis paths */
+    /* Parallel SDM segmentation tuning per path type:
+     * - DSD64 same-rate: sequential (fast enough at cands=2, no stitching pops)
+     * - DSD128/256 same-rate: 2 segments (fewer stitch points)
+     * - DSD512 same-rate: 4 segments (needed for real-time)
+     * - Rate conversion: 4 segments (FIR output is smooth, SDM converges well) */
+    /* DSD64 same-rate: sequential (fast enough).
+     * DSD128+ same-rate and rate conversion: parallel. */
+    bool is_same_rate = (s->config.fs_in == fs_out);
+    bool skip_parallel = (is_same_rate && fs_out <= DSD_RATE_64);
 
     if (need_rate_conv && !skip_parallel && num_threads > num_channels &&
         s->config.sdm_mode == SDM_MODE_TRELLIS) {
@@ -653,10 +668,18 @@ size_t plugin_process(plugin_state_t *s,
         if (fs_out > s->config.fs_in)
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);
 
-        overlap = 2 * (size_t)s->config.trellis_lat;
+        /* Boxcar needs 4x overlap for SDM convergence; FIR needs 2x */
+        overlap = (is_same_rate ? 4 : 2) * (size_t)s->config.trellis_lat;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
-        if (segments_per_ch > 4) segments_per_ch = 4;
+        int max_seg;
+        if (!is_same_rate)
+            max_seg = 4;                   /* rate conversion: 4 segments */
+        else if (fs_out >= DSD_RATE_512)
+            max_seg = 4;                   /* DSD512 same-rate: 4 for RT budget */
+        else
+            max_seg = 2;                   /* DSD128/256 same-rate: 2 segments */
+        if (segments_per_ch > max_seg) segments_per_ch = max_seg;
 
         /* Ensure minimum segment size (at least 4x overlap) */
         size_t min_seg = overlap * 4;
@@ -767,7 +790,8 @@ size_t plugin_process(plugin_state_t *s,
             return 0;
         memset(blocks, 0, (size_t)total_blocks * sizeof(channel_block_t));
 
-        size_t discard = (size_t)s->config.trellis_lat;
+        /* discard = overlap - trellis_lat, so output_count = this_seg exactly */
+        size_t discard = overlap - (size_t)s->config.trellis_lat;
 
         /* Allocate FIR tail and seg0 buffers if needed */
         if (!s->fir_tail && num_channels > 0) {
@@ -996,7 +1020,9 @@ size_t plugin_process_pcm(plugin_state_t *s,
     if (!s->initialized || s->num_channels != num_channels ||
         s->detected_dsd_rate != dsd_rate ||
         s->active_fs_out != s->config.fs_out ||
-        s->active_sdm_mode != s->config.sdm_mode) {
+        s->active_sdm_mode != s->config.sdm_mode ||
+        s->active_cands != s->config.trellis_cands ||
+        s->active_depth != s->config.trellis_depth) {
         /* Tear down old state */
         if (s->initialized) {
             if (s->pool) {

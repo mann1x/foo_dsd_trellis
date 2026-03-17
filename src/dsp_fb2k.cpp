@@ -1226,9 +1226,14 @@ public:
         {
             uint32_t pi_in = is_dop ? dsd_rate : pcm_rate;
             engine_path_info_t pi;
-            if (engine_get_path_info(pi_in, out_rate,
+            int pi_rc = engine_get_path_info(pi_in, out_rate,
                     (int)m_config.rate_ntf[map_idx],
-                    chunk_cfg.sdm_mode, &chunk_cfg, &pi) == 0 && !pi.fir_only) {
+                    chunk_cfg.sdm_mode, &chunk_cfg, &pi);
+            if (m_chunk_count < 3)
+                trellis_log("path_info: rc=%d fir_only=%d pi.cands=%d pi.depth=%d pi.lat=%d pi_in=%u out=%u ntf=%d sdm=%d",
+                            pi_rc, (int)pi.fir_only, pi.cands, pi.depth, pi.lat,
+                            pi_in, out_rate, (int)m_config.rate_ntf[map_idx], chunk_cfg.sdm_mode);
+            if (pi_rc == 0 && !pi.fir_only) {
                 if (m_config.rate_cands[map_idx] > 0)
                     chunk_cfg.trellis_cands = (int)m_config.rate_cands[map_idx];
                 else if (pi.cands > 0)
@@ -1260,6 +1265,15 @@ public:
                         (int)chunk_cfg.fir_gain_db, chunk_cfg.fs_in, chunk_cfg.fs_out);
         }
         plugin_set_config(m_state, &chunk_cfg);
+
+        /* Log actual engine config on first few chunks to diagnose cands/depth issues */
+        if (m_chunk_count < 3) {
+            const dsd_config_t *ecfg = plugin_get_config(m_state);
+            if (ecfg)
+                trellis_log("engine cfg: sdm=%d cands=%d depth=%d lat=%d fir_gain_db=%d",
+                            ecfg->sdm_mode, ecfg->trellis_cands, ecfg->trellis_depth,
+                            ecfg->trellis_lat, (int)ecfg->fir_gain_db);
+        }
 
         m_channels = (int)channels;
         m_pcm_rate = pcm_rate;
