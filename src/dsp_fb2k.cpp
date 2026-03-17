@@ -168,6 +168,11 @@ static initquit_factory_t<volume_init> g_volume_init;
 /* Forward declaration for logger (defined below) */
 static void trellis_log(const char *fmt, ...);
 
+/* C-callable log function for engine/GPU code */
+extern "C" void trellis_log_c(const char *msg) {
+    trellis_log("%s", msg);
+}
+
 /* ─── Output device detection ─── */
 /* Caches the current output module type (ASIO, WASAPI, DS, etc.)
  * and device name. Updated on init and via output_config_change_callback. */

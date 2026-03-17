@@ -21,8 +21,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-/* log_ring_write from httpapi — declare here to avoid include order issues */
-extern void log_ring_write(const char *line);
+/* C-callable log function (writes to file + ring + console) */
+extern void trellis_log_c(const char *msg);
 
 /* ─── Delay-loaded function pointers ─── */
 
@@ -149,14 +149,18 @@ static const char g_hlsl_trellis[] =
 "    int num_cands;\n"
 "    int trellis_lat;\n"
 "    int ntf_order;\n"
-"    float4 ntf_a[2];\n"   /* 8 floats packed as 2 float4 */
-"    float4 ntf_g[2];\n"
+"    float ntf_a0, ntf_a1, ntf_a2, ntf_a3;\n"
+"    float ntf_a4, ntf_a5, ntf_a6, ntf_a7;\n"
+"    float ntf_g0, ntf_g1, ntf_g2, ntf_g3;\n"
+"    float ntf_g4, ntf_g5, ntf_g6, ntf_g7;\n"
 "    float state_limit;\n"
-"    float pad[3];\n"
+"    float pad0, pad1, pad2;\n"
 "};\n"
 "\n"
-"float get_a(int k) { return k < 4 ? ntf_a[0][k] : ntf_a[1][k-4]; }\n"
-"float get_g(int k) { return k < 4 ? ntf_g[0][k] : ntf_g[1][k-4]; }\n"
+"groupshared float s_a[8];\n"
+"groupshared float s_g[8];\n"
+"float get_a(int k) { return s_a[k]; }\n"
+"float get_g(int k) { return s_g[k]; }\n"
 "\n"
 "groupshared float s_state[64][8];\n"
 "groupshared float s_cost[64];\n"
@@ -170,9 +174,18 @@ static const char g_hlsl_trellis[] =
 "    int nc = num_cands;\n"
 "    int order = ntf_order;\n"
 "\n"
+"    /* Init NTF coeffs in groupshared (thread 0 copies from cbuffer) */\n"
+"    if (t == 0) {\n"
+"        s_a[0]=ntf_a0; s_a[1]=ntf_a1; s_a[2]=ntf_a2; s_a[3]=ntf_a3;\n"
+"        s_a[4]=ntf_a4; s_a[5]=ntf_a5; s_a[6]=ntf_a6; s_a[7]=ntf_a7;\n"
+"        s_g[0]=ntf_g0; s_g[1]=ntf_g1; s_g[2]=ntf_g2; s_g[3]=ntf_g3;\n"
+"        s_g[4]=ntf_g4; s_g[5]=ntf_g5; s_g[6]=ntf_g6; s_g[7]=ntf_g7;\n"
+"    }\n"
+"    GroupMemoryBarrierWithGroupSync();\n"
+"\n"
 "    if (t < nc) {\n"
-"        for (int k = 0; k < order; k++)\n"
-"            s_state[t][k] = g_states[t * 8 + k];\n"
+"        for (int ki = 0; ki < order; ki++)\n"
+"            s_state[t][ki] = g_states[t * 8 + ki];\n"
 "        s_cost[t] = g_costs[t];\n"
 "        s_path[t] = 0;\n"
 "    }\n"
@@ -184,23 +197,23 @@ static const char g_hlsl_trellis[] =
 "        int ac = s_active;\n"
 "\n"
 "        if (t < 2 * ac) {\n"
-"            int pi = t / 2;\n"
+"            int pi = (int)((uint)t >> 1);\n"
 "            float y_b = (t & 1) ? -1.0f : 1.0f;\n"
 "            float d[8];\n"
 "            d[0] = s_state[pi][0] - get_g(0) * s_state[pi][1] + x;\n"
-"            for (int k = 1; k < order - 1; k++)\n"
-"                d[k] = s_state[pi][k] + s_state[pi][k-1] - get_g(k) * s_state[pi][k+1];\n"
+"            { for (int ka = 1; ka < order - 1; ka++)\n"
+"                d[ka] = s_state[pi][ka] + s_state[pi][ka-1] - get_g(ka) * s_state[pi][ka+1]; }\n"
 "            d[order-1] = s_state[pi][order-1] + s_state[pi][order-2];\n"
 "            float v = x;\n"
-"            for (int k = 0; k < order; k++) v += get_a(k) * d[k];\n"
+"            { for (int kb = 0; kb < order; kb++) v += get_a(kb) * d[kb]; }\n"
 "            d[0] += y_b;\n"
 "            if (state_limit > 0.0f) {\n"
-"                for (int k = 0; k < order; k++) {\n"
-"                    d[k] = clamp(d[k], -state_limit, state_limit);\n"
+"                for (int kc = 0; kc < order; kc++) {\n"
+"                    d[kc] = clamp(d[kc], -state_limit, state_limit);\n"
 "                }\n"
 "            }\n"
 "            int ci = nc + t;\n"
-"            for (int k = 0; k < order; k++) s_state[ci][k] = d[k];\n"
+"            { for (int kd = 0; kd < order; kd++) s_state[ci][kd] = d[kd]; }\n"
 "            s_cost[ci] = s_cost[pi] + (v + get_a(0)*y_b)*(v + get_a(0)*y_b);\n"
 "            s_path[ci] = (s_path[pi] << 1 | (uint)(t & 1)) & 0xFF;\n"
 "        }\n"
@@ -208,25 +221,25 @@ static const char g_hlsl_trellis[] =
 "\n"
 "        if (t == 0) {\n"
 "            int total = 2 * ac;\n"
-"            for (int i = 0; i < ac; i++) {\n"
-"                int best = nc + i;\n"
-"                for (int j = nc + i + 1; j < nc + total; j++) {\n"
-"                    if (s_cost[j] < s_cost[best]) best = j;\n"
+"            for (int si = 0; si < ac; si++) {\n"
+"                int best = nc + si;\n"
+"                for (int sj = nc + si + 1; sj < nc + total; sj++) {\n"
+"                    if (s_cost[sj] < s_cost[best]) best = sj;\n"
 "                }\n"
-"                if (best != nc + i) {\n"
-"                    float tc = s_cost[nc+i]; s_cost[nc+i] = s_cost[best]; s_cost[best] = tc;\n"
-"                    uint tp = s_path[nc+i]; s_path[nc+i] = s_path[best]; s_path[best] = tp;\n"
-"                    for (int k = 0; k < order; k++) {\n"
-"                        float ts = s_state[nc+i][k]; s_state[nc+i][k] = s_state[best][k]; s_state[best][k] = ts;\n"
+"                if (best != nc + si) {\n"
+"                    float tc = s_cost[nc+si]; s_cost[nc+si] = s_cost[best]; s_cost[best] = tc;\n"
+"                    uint tp = s_path[nc+si]; s_path[nc+si] = s_path[best]; s_path[best] = tp;\n"
+"                    for (int se = 0; se < order; se++) {\n"
+"                        float ts = s_state[nc+si][se]; s_state[nc+si][se] = s_state[best][se]; s_state[best][se] = ts;\n"
 "                    }\n"
 "                }\n"
 "            }\n"
 "            s_output = s_path[nc] & 1;\n"
 "            float min_c = s_cost[nc];\n"
-"            for (int i = 0; i < ac; i++) {\n"
-"                s_cost[i] = s_cost[nc+i] - min_c;\n"
-"                s_path[i] = s_path[nc+i];\n"
-"                for (int k = 0; k < order; k++) s_state[i][k] = s_state[nc+i][k];\n"
+"            for (int ri = 0; ri < ac; ri++) {\n"
+"                s_cost[ri] = s_cost[nc+ri] - min_c;\n"
+"                s_path[ri] = s_path[nc+ri];\n"
+"                for (int rf = 0; rf < order; rf++) s_state[ri][rf] = s_state[nc+ri][rf];\n"
 "            }\n"
 "        }\n"
 "        GroupMemoryBarrierWithGroupSync();\n"
@@ -236,8 +249,8 @@ static const char g_hlsl_trellis[] =
 "    }\n"
 "\n"
 "    if (t < nc) {\n"
-"        for (int k = 0; k < order; k++)\n"
-"            g_states[t * 8 + k] = s_state[t][k];\n"
+"        for (int kg = 0; kg < order; kg++)\n"
+"            g_states[t * 8 + kg] = s_state[t][kg];\n"
 "        g_costs[t] = s_cost[t];\n"
 "    }\n"
 "}\n";
@@ -301,15 +314,24 @@ static ID3D11ComputeShader *compile_cs(ID3D11Device *dev,
 
     ID3DBlob *blob = NULL, *err = NULL;
     HRESULT hr = g_pfn_compile(src, strlen(src), name, NULL, NULL,
-                                "main", "cs_5_0", 0, 0, &blob, &err);
-    if (FAILED(hr)) {
-        if (err) {
-            OutputDebugStringA((const char *)ID3D10Blob_GetBufferPointer(err));
-            ID3D10Blob_Release(err);
-        }
+                                "main", "cs_5_0",
+                                0, 0, &blob, &err);
+    if (err) {
+        const char *errmsg = (const char *)ID3D10Blob_GetBufferPointer(err);
+        SIZE_T errlen = ID3D10Blob_GetBufferSize(err);
+        /* Log full error/warning output in chunks */
+        char logbuf[1024];
+        sprintf_s(logbuf, sizeof(logbuf), "HLSL [%s] hr=0x%08x len=%zu: %.900s",
+                  name, (unsigned)hr, (size_t)errlen, errmsg ? errmsg : "(null)");
+        trellis_log_c(logbuf);
+        ID3D10Blob_Release(err);
+    }
+    if (FAILED(hr) || !blob) {
+        char hrbuf[128];
+        sprintf_s(hrbuf, sizeof(hrbuf), "HLSL [%s] FAILED: hr=0x%08x blob=%p", name, (unsigned)hr, (void*)blob);
+        trellis_log_c(hrbuf);
         return NULL;
     }
-    if (err) ID3D10Blob_Release(err);
 
     ID3D11ComputeShader *cs = NULL;
     hr = ID3D11Device_CreateComputeShader(dev,
@@ -584,7 +606,7 @@ gpu_context_t *gpu_dx11_create(void) {
             "DX11 shaders: fir_up=%p fir_down=%p gain=%p boxcar=%p trellis=%p",
             (void*)c->cs_fir_up, (void*)c->cs_fir_down,
             (void*)c->cs_gain, (void*)c->cs_boxcar, (void*)c->cs_trellis);
-        log_ring_write(msg);
+        trellis_log_c(msg);
     }
 
     if (!c->cs_fir_up || !c->cs_fir_down || !c->cs_gain || !c->cs_boxcar) {
@@ -878,11 +900,12 @@ typedef struct {
     int   num_cands;
     int   trellis_lat;
     int   ntf_order;
-    float ntf_a[8];      /* packed as float4 ntf_a[2] in HLSL */
+    float ntf_a[8];
     float ntf_g[8];
     float state_limit;
     float pad[3];
 } dx11_trellis_params_t;
+/* C struct matches HLSL cbuffer: 4 ints (16 bytes) + 8 floats (32) + 8 floats (32) + 4 floats (16) = 96 bytes */
 
 int gpu_dx11_trellis_setup(dx11_context_t *c, int num_cands, int order,
                             int trellis_lat, const double *ntf_a,
@@ -891,7 +914,7 @@ int gpu_dx11_trellis_setup(dx11_context_t *c, int num_cands, int order,
         char msg[128];
         sprintf_s(msg, sizeof(msg), "dx11_trellis_setup: ctx=%p cs=%p cands=%d order=%d",
                   (void*)c, c ? (void*)c->cs_trellis : NULL, num_cands, order);
-        log_ring_write(msg);
+        trellis_log_c(msg);
     }
     if (!c || !c->cs_trellis) return -1;
 

@@ -7,7 +7,6 @@
 
 #include "../include/engine.h"
 #include "../include/ntf.h"
-#include "../include/httpapi.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -314,7 +313,7 @@ size_t engine_process_block(engine_channel_t *eng,
                     sprintf_s(msg, sizeof(msg),
                         "[GPU SDM] trellis ch%d: %.1fms / %.1fms audio = %.2fx RT, %zu samples, rc=%d\n",
                         eng->channel, ms, audio_ms, ms / audio_ms, count, gr);
-                    log_ring_write(msg);
+                    { extern void trellis_log_c(const char *); trellis_log_c(msg); }
                 }
                 if (gr == 0) {
                     sdm_out = count > (size_t)cfg->trellis_lat ?
@@ -360,7 +359,7 @@ size_t engine_process_block(engine_channel_t *eng,
                         "[CPU SDM] %s ch%d: %.1fms / %.1fms audio = %.2fx RT, %zu samples\n",
                         eng->sdm_mode == SDM_MODE_PRECORR ? "precorr" : "trellis",
                         eng->channel, ms, audio_ms, ms / audio_ms, count);
-                    log_ring_write(msg);
+                    { extern void trellis_log_c(const char *); trellis_log_c(msg); }
                 }
             }
             if (eng->ml_filter)

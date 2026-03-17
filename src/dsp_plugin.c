@@ -423,12 +423,12 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
 
     /* Create GPU compute context if enabled */
     {
-        extern void log_ring_write(const char *);
+        extern void trellis_log_c(const char *);
         char msg[256];
         sprintf_s(msg, sizeof(msg),
             "GPU init check: enabled=%d gpu_ptr=%p backend=%d",
             s->config.gpu_enabled, (void*)s->gpu, s->config.gpu_backend);
-        log_ring_write(msg);
+        trellis_log_c(msg);
     }
     if (s->config.gpu_enabled && !s->gpu) {
         bool avail = gpu_available((gpu_backend_t)s->config.gpu_backend);
@@ -436,7 +436,7 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
             extern void log_ring_write(const char *);
             char msg[128];
             sprintf_s(msg, sizeof(msg), "GPU available(%d) = %d", s->config.gpu_backend, avail);
-            log_ring_write(msg);
+            trellis_log_c(msg);
         }
         if (avail) {
             s->gpu = gpu_create((gpu_backend_t)s->config.gpu_backend);
@@ -476,7 +476,7 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                             "GPU SDM setup: backend=%d trellis cands=%d order=%d lat=%d limit=%.1f rc=%d",
                             s->config.gpu_backend, actual_cands, f->order,
                             actual_lat, s->channels[0].sdm.state_limit, rc);
-                        log_ring_write(msg);
+                        trellis_log_c(msg);
                     }
                 } else if (s->config.sdm_mode == SDM_MODE_PRECORR) {
                     const ntf_filter_t *f = s->channels[0].precorr.filter;
