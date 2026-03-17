@@ -443,10 +443,17 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                     s->config.trellis_cands >= 16) {
                     const ntf_filter_t *f = s->channels[0].sdm.filter;
                     if (f) {
-                        gpu_cuda_trellis_setup(s->gpu,
-                            s->config.trellis_cands, f->order,
-                            s->config.trellis_lat, f->a, f->g,
-                            s->channels[0].sdm.state_limit);
+                        /* Backend-neutral: try CUDA first, then DX11 */
+                        if (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)
+                            gpu_cuda_trellis_setup(s->gpu,
+                                s->config.trellis_cands, f->order,
+                                s->config.trellis_lat, f->a, f->g,
+                                s->channels[0].sdm.state_limit);
+                        else
+                            gpu_dx11_trellis_setup(s->gpu,
+                                s->config.trellis_cands, f->order,
+                                s->config.trellis_lat, f->a, f->g,
+                                s->channels[0].sdm.state_limit);
                     }
                 } else if (s->config.sdm_mode == SDM_MODE_PRECORR) {
                     const ntf_filter_t *f = s->channels[0].precorr.filter;

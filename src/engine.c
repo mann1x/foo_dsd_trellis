@@ -287,12 +287,49 @@ size_t engine_process_block(engine_channel_t *eng,
                     }
                 }
             }
-            /* Re-encode via SDM */
+            /* Re-encode via SDM — try GPU first */
             size_t sdm_out;
-            if (eng->sdm_mode == SDM_MODE_PRECORR)
-                sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
-            else
-                sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, count);
+            bool same_rate_gpu_ok = false;
+
+            if (eng->gpu && eng->sdm_mode == SDM_MODE_TRELLIS &&
+                cfg->trellis_cands >= 16 && count >= GPU_MIN_SAMPLES) {
+                if (gpu_trellis_process(eng->gpu, eng->fir_buf, out, count,
+                                         NULL, NULL, cfg->trellis_cands,
+                                         eng->sdm.filter->order,
+                                         eng->sdm.filter->a,
+                                         eng->sdm.filter->g) == 0) {
+                    sdm_out = count > (size_t)cfg->trellis_lat ?
+                              count - (size_t)cfg->trellis_lat : 0;
+                    same_rate_gpu_ok = true;
+                }
+            }
+            if (!same_rate_gpu_ok && eng->gpu && eng->sdm_mode == SDM_MODE_PRECORR &&
+                count >= GPU_MIN_SAMPLES) {
+                gpu_precorr_state_t gi, gf;
+                memcpy(gi.state, eng->precorr.state, sizeof(gi.state));
+                gi.prev_y = eng->precorr.prev_y;
+                gi.history = (int)eng->precorr.history;
+                gi.phase = eng->precorr.phase;
+                gi.pad = 0.0f;
+                if (gpu_precorr_process(eng->gpu, eng->fir_buf, out, count,
+                                         eng->precorr.a, eng->precorr.g,
+                                         eng->precorr.filter->order,
+                                         (const float (*)[8])eng->precorr.pred_table,
+                                         &gi, &gf) == 0) {
+                    memcpy(eng->precorr.state, gf.state, sizeof(eng->precorr.state));
+                    eng->precorr.prev_y = gf.prev_y;
+                    eng->precorr.history = (uint8_t)gf.history;
+                    eng->precorr.phase = gf.phase;
+                    sdm_out = count;
+                    same_rate_gpu_ok = true;
+                }
+            }
+            if (!same_rate_gpu_ok) {
+                if (eng->sdm_mode == SDM_MODE_PRECORR)
+                    sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
+                else
+                    sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, count);
+            }
             if (eng->ml_filter)
                 onnx_filter_process(eng->ml_filter, out, sdm_out);
             return sdm_out;

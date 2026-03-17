@@ -115,6 +115,15 @@ static int config_to_json(const dsd_config_t *cfg, char *buf, int max) {
     p = json_append(buf, p, max, "  \"sdm_mode\": %d,\n", cfg->sdm_mode);
     p = json_append(buf, p, max, "  \"sdm_mode_name\": \"%s\",\n",
                     cfg->sdm_mode == 1 ? "trellis" : "precorr");
+    p = json_append(buf, p, max, "  \"antipop\": %s,\n", cfg->antipop ? "true" : "false");
+    p = json_append(buf, p, max, "  \"ml_enabled\": %s,\n", cfg->ml_enabled ? "true" : "false");
+    p = json_append(buf, p, max, "  \"fir_gain_db\": %d,\n", (int)cfg->fir_gain_db);
+    p = json_append(buf, p, max, "  \"gpu_enabled\": %s,\n", cfg->gpu_enabled ? "true" : "false");
+    p = json_append(buf, p, max, "  \"gpu_backend\": %d,\n", cfg->gpu_backend);
+    p = json_append(buf, p, max, "  \"gpu_backend_name\": \"%s\",\n",
+                    cfg->gpu_backend == 1 ? "DirectCompute" :
+                    cfg->gpu_backend == 2 ? "CUDA" :
+                    cfg->gpu_backend == 3 ? "Auto" : "None");
     p = json_append(buf, p, max, "  \"fir_engine\": \"%s\"\n", fir_ipp_kernel_name());
     p = json_append(buf, p, max, "}");
     return p;

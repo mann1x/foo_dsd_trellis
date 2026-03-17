@@ -149,6 +149,11 @@ int gpu_cuda_fir_batch(void *ctx, const float *in_batch,
                         float *out_batch, size_t samples_per_ch,
                         int num_channels, size_t *out_count_per_ch);
 /* Persistent SDM setup (call once at engine init) */
+int gpu_dx11_trellis(void *ctx, const float *in, float *out, size_t count);
+int gpu_dx11_trellis_setup(void *ctx, int num_cands, int order,
+                            int trellis_lat, const double *ntf_a,
+                            const double *ntf_g, double state_limit);
+
 int gpu_cuda_trellis_setup(void *ctx, int num_cands, int order,
                             int trellis_lat, const double *ntf_a,
                             const double *ntf_g, double state_limit);

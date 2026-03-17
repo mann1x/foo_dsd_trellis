@@ -133,6 +133,119 @@ static const char g_hlsl_boxcar[] =
 "    g_out[i] = sum / (float)bt * gain_val;\n"
 "}\n";
 
+/* Trellis SDM chunk shader — sequential per-sample, parallel candidate expansion.
+ * Thread 0..2*num_cands-1: NTF evaluation. Thread 0: sort+output.
+ * Resources: t0=input, u0=output, u1=cand_states(double as uint2), u2=cand_costs */
+static const char g_hlsl_trellis[] =
+"StructuredBuffer<float>    g_in    : register(t0);\n"
+"RWStructuredBuffer<float>  g_out   : register(u0);\n"
+"RWStructuredBuffer<uint2>  g_states : register(u1);\n" /* double as uint2 */
+"RWStructuredBuffer<uint2>  g_costs  : register(u2);\n"
+"cbuffer TrellisParams : register(b0) {\n"
+"    int count;\n"
+"    int num_cands;\n"
+"    int trellis_lat;\n"
+"    int ntf_order;\n"
+"    double ntf_a[8];\n"  /* 128 bytes */
+"    double ntf_g[8];\n"  /* 128 bytes */
+"    double state_limit;\n"
+"};\n"
+"\n"
+"/* Double pack/unpack via uint2 (HLSL has no native double UAV) */\n"
+"double load_d(uint2 v) { return asdouble(v.x, v.y); }\n"
+"uint2 store_d(double v) { uint lo, hi; asuint(v, lo, hi); return uint2(lo, hi); }\n"
+"\n"
+"groupshared double s_state[64][8];\n"  /* max 32 cands × 2 children */
+"groupshared double s_cost[64];\n"
+"groupshared uint   s_path[64];\n"
+"groupshared uint   s_output;\n"
+"groupshared int    s_active;\n"
+"\n"
+"[numthreads(64, 1, 1)]\n"
+"void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {\n"
+"    int t = tid.x;\n"
+"    int nc = num_cands;\n"
+"    int order = ntf_order;\n"
+"\n"
+"    /* Load initial state from UAV */\n"
+"    if (t < nc) {\n"
+"        for (int k = 0; k < order; k++)\n"
+"            s_state[t][k] = load_d(g_states[t * 8 + k]);\n"
+"        s_cost[t] = load_d(g_costs[t]);\n"
+"        s_path[t] = 0;\n"
+"    }\n"
+"    if (t == 0) s_active = nc;\n"
+"    GroupMemoryBarrierWithGroupSync();\n"
+"\n"
+"    for (int s = 0; s < count; s++) {\n"
+"        double x = (double)g_in[s];\n"
+"        int ac = s_active;\n"
+"\n"
+"        /* Parallel NTF eval: tid < 2*ac */\n"
+"        if (t < 2 * ac) {\n"
+"            int pi = t / 2;\n"
+"            double y_b = (t & 1) ? -1.0 : 1.0;\n"
+"            double d[8];\n"
+"            d[0] = s_state[pi][0] - ntf_g[0] * s_state[pi][1] + x;\n"
+"            for (int k = 1; k < order - 1; k++)\n"
+"                d[k] = s_state[pi][k] + s_state[pi][k-1] - ntf_g[k] * s_state[pi][k+1];\n"
+"            d[order-1] = s_state[pi][order-1] + s_state[pi][order-2];\n"
+"            double v = x;\n"
+"            for (int k = 0; k < order; k++) v += ntf_a[k] * d[k];\n"
+"            d[0] += y_b;\n"
+"            if (state_limit > 0.0) {\n"
+"                for (int k = 0; k < order; k++) {\n"
+"                    if (d[k] > state_limit) d[k] = state_limit;\n"
+"                    else if (d[k] < -state_limit) d[k] = -state_limit;\n"
+"                }\n"
+"            }\n"
+"            int ci = nc + t;\n" /* children go after parents in shared mem */
+"            for (int k = 0; k < order; k++) s_state[ci][k] = d[k];\n"
+"            s_cost[ci] = s_cost[pi] + (v + ntf_a[0]*y_b)*(v + ntf_a[0]*y_b);\n"
+"            s_path[ci] = (s_path[pi] << 1 | (uint)(t & 1)) & 0xFF;\n"
+"        }\n"
+"        GroupMemoryBarrierWithGroupSync();\n"
+"\n"
+"        /* Thread 0: selection sort top nc by cost */\n"
+"        if (t == 0) {\n"
+"            int total = 2 * ac;\n"
+"            /* Simple sort in children range [nc..nc+total) */\n"
+"            for (int i = 0; i < ac; i++) {\n"
+"                int best = nc + i;\n"
+"                for (int j = nc + i + 1; j < nc + total; j++) {\n"
+"                    if (s_cost[j] < s_cost[best]) best = j;\n"
+"                }\n"
+"                if (best != nc + i) {\n"
+"                    /* Swap */\n"
+"                    double tc = s_cost[nc+i]; s_cost[nc+i] = s_cost[best]; s_cost[best] = tc;\n"
+"                    uint tp = s_path[nc+i]; s_path[nc+i] = s_path[best]; s_path[best] = tp;\n"
+"                    for (int k = 0; k < order; k++) {\n"
+"                        double ts = s_state[nc+i][k]; s_state[nc+i][k] = s_state[best][k]; s_state[best][k] = ts;\n"
+"                    }\n"
+"                }\n"
+"            }\n"
+"            s_output = s_path[nc] & 1;\n"
+"            double min_c = s_cost[nc];\n"
+"            for (int i = 0; i < ac; i++) {\n"
+"                s_cost[i] = s_cost[nc+i] - min_c;\n"
+"                s_path[i] = s_path[nc+i];\n"
+"                for (int k = 0; k < order; k++) s_state[i][k] = s_state[nc+i][k];\n"
+"            }\n"
+"        }\n"
+"        GroupMemoryBarrierWithGroupSync();\n"
+"\n"
+"        if (t == 0 && s >= trellis_lat)\n"
+"            g_out[s - trellis_lat] = s_output ? 1.0f : -1.0f;\n"
+"    }\n"
+"\n"
+"    /* Save final state */\n"
+"    if (t < nc) {\n"
+"        for (int k = 0; k < order; k++)\n"
+"            g_states[t * 8 + k] = store_d(s_state[t][k]);\n"
+"        g_costs[t] = store_d(s_cost[t]);\n"
+"    }\n"
+"}\n";
+
 /* ─── DX11 context structure ─── */
 
 typedef struct {
@@ -144,6 +257,7 @@ typedef struct {
     ID3D11ComputeShader   *cs_fir_down;
     ID3D11ComputeShader   *cs_gain;
     ID3D11ComputeShader   *cs_boxcar;
+    ID3D11ComputeShader   *cs_trellis;
     /* GPU buffers */
     ID3D11Buffer          *buf_in;
     ID3D11ShaderResourceView *srv_in;
@@ -454,8 +568,10 @@ gpu_context_t *gpu_dx11_create(void) {
     c->cs_fir_down = compile_cs(dev, g_hlsl_fir_downsample, "fir_down");
     c->cs_gain     = compile_cs(dev, g_hlsl_gain, "gain");
     c->cs_boxcar   = compile_cs(dev, g_hlsl_boxcar, "boxcar");
+    c->cs_trellis  = compile_cs(dev, g_hlsl_trellis, "trellis");
 
     if (!c->cs_fir_up || !c->cs_fir_down || !c->cs_gain || !c->cs_boxcar) {
+        /* Trellis shader is optional — may fail on some GPUs */
         gpu_dx11_destroy(c);
         return NULL;
     }
@@ -484,6 +600,7 @@ void gpu_dx11_destroy(void *ptr) {
     if (c->buf_out)   ID3D11Buffer_Release(c->buf_out);
     if (c->srv_in)    ID3D11ShaderResourceView_Release(c->srv_in);
     if (c->buf_in)    ID3D11Buffer_Release(c->buf_in);
+    if (c->cs_trellis) ID3D11ComputeShader_Release(c->cs_trellis);
     if (c->cs_boxcar) ID3D11ComputeShader_Release(c->cs_boxcar);
     if (c->cs_gain)   ID3D11ComputeShader_Release(c->cs_gain);
     if (c->cs_fir_down) ID3D11ComputeShader_Release(c->cs_fir_down);
@@ -727,4 +844,26 @@ int gpu_dx11_boxcar(dx11_context_t *c, const float *in, float *out,
     ID3D11DeviceContext_CSSetUnorderedAccessViews(c->ctx, 0, 1, &null_uav, NULL);
 
     return download_buf(c->ctx, c->buf_out, c->buf_staging, out, count);
+}
+
+/* ─── DX11 Trellis SDM ─── */
+
+int gpu_dx11_trellis_setup(dx11_context_t *c, int num_cands, int order,
+                            int trellis_lat, const double *ntf_a,
+                            const double *ntf_g, double state_limit) {
+    /* DX11 Trellis uses the cs_trellis shader with constant buffer
+     * for NTF params. State stored in UAV structured buffers. */
+    if (!c || !c->cs_trellis) return -1;
+    (void)num_cands; (void)order; (void)trellis_lat;
+    (void)ntf_a; (void)ntf_g; (void)state_limit;
+    /* TODO: create UAV buffers for state, upload NTF to constant buffer */
+    return -1; /* Not yet fully implemented — falls back to CPU */
+}
+
+int gpu_dx11_trellis(dx11_context_t *c, const float *in, float *out,
+                      size_t count) {
+    if (!c || !c->cs_trellis) return -1;
+    (void)in; (void)out; (void)count;
+    /* TODO: dispatch cs_trellis with persistent state buffers */
+    return -1; /* Not yet fully implemented — falls back to CPU */
 }

@@ -195,6 +195,9 @@ int gpu_trellis_process(gpu_context_t *ctx, const float *in, float *out,
     switch (ctx_backend(ctx)) {
     case GPU_BACKEND_CUDA:
         return gpu_cuda_trellis(ctx, in, out, count);
+    case GPU_BACKEND_DIRECTX:
+        /* DX11 Trellis uses same API — setup must be called first */
+        return gpu_dx11_trellis(ctx, in, out, count);
     default: return -1;
     }
 }
