@@ -135,6 +135,16 @@ int gpu_cuda_fir_chain(void *ctx, const float *in, float *out,
 int gpu_cuda_gain(void *ctx, float *buf, size_t count, float gain);
 int gpu_cuda_boxcar(void *ctx, const float *in, float *out,
                      size_t count, int taps, float gain);
+int gpu_cuda_trellis(void *ctx, const float *in, float *out,
+                      size_t count, const void *sdm_state_in,
+                      void *sdm_state_out, int num_cands, int order,
+                      const double *ntf_a, const double *ntf_g,
+                      double state_limit, int trellis_lat);
+int gpu_cuda_precorr(void *ctx, const float *in, float *out,
+                      size_t count, const float *ntf_a, const float *ntf_g,
+                      int order, const float *pred_table,
+                      const float *state_in, float *state_out,
+                      int num_channels);
 
 #ifdef __cplusplus
 }

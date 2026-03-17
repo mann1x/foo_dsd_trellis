@@ -5,7 +5,7 @@
  * PTX kernels embedded as C string (compiled offline with nvcc).
  * Triple-buffered async pipeline: 3 streams + pinned host memory.
  *
- * Implements: FIR upsample/downsample, gain, boxcar smoothing.
+ * Implements: FIR upsample/downsample, gain, boxcar, Trellis SDM, PreCorr.
  */
 
 #include "../include/gpu_compute.h"
@@ -17,6 +17,7 @@
 
 /* ─── Embedded PTX ─── */
 #include "kernels/fir_kernels_ptx.h"
+#include "kernels/sdm_kernels_ptx.h"
 
 /* ─── CUDA Driver API types (no CUDA headers needed) ─── */
 
@@ -115,6 +116,10 @@ typedef struct {
     CUfunction     fn_fir_down;
     CUfunction     fn_gain;
     CUfunction     fn_boxcar;
+    /* SDM kernels (from sdm_kernels.ptx) */
+    CUmodule       mod_sdm;
+    CUfunction     fn_trellis_chunk;
+    CUfunction     fn_precorr_chunk;
     /* Triple-buffered device memory */
     CUdeviceptr    d_in[NUM_STREAMS];
     CUdeviceptr    d_out[NUM_STREAMS];
@@ -286,6 +291,14 @@ gpu_context_t *gpu_cuda_create(void) {
     if (pfn_cuModuleGetFunction(&c->fn_boxcar, c->module, "boxcar_smooth") != CUDA_SUCCESS)
         goto fail;
 
+    /* Load SDM PTX module */
+    if (pfn_cuModuleLoadData(&c->mod_sdm, g_ptx_sdm_kernels) != CUDA_SUCCESS)
+        goto fail;
+    if (pfn_cuModuleGetFunction(&c->fn_trellis_chunk, c->mod_sdm, "trellis_chunk") != CUDA_SUCCESS)
+        goto fail;
+    if (pfn_cuModuleGetFunction(&c->fn_precorr_chunk, c->mod_sdm, "precorr_chunk") != CUDA_SUCCESS)
+        goto fail;
+
     /* Create streams */
     for (int i = 0; i < NUM_STREAMS; i++) {
         if (pfn_cuStreamCreate(&c->streams[i], 0) != CUDA_SUCCESS)
@@ -311,6 +324,7 @@ void gpu_cuda_destroy(void *ptr) {
         if (c->h_out[i])   pfn_cuMemFreeHost(c->h_out[i]);
     }
     if (c->d_inter) pfn_cuMemFree(c->d_inter);
+    if (c->mod_sdm) pfn_cuModuleUnload(c->mod_sdm);
     if (c->module)  pfn_cuModuleUnload(c->module);
     if (c->context) pfn_cuCtxDestroy(c->context);
     free(c);
@@ -511,5 +525,148 @@ int gpu_cuda_boxcar(cuda_context_t *c, const float *in, float *out,
     memcpy(out, c->h_out[s_idx], count * sizeof(float));
 
     c->active = (s_idx + 1) % NUM_STREAMS;
+    return 0;
+}
+
+/* ─── Trellis SDM (cands >= 16) ─── */
+
+int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
+                      size_t count, const void *sdm_state_in,
+                      void *sdm_state_out, int num_cands, int order,
+                      const double *ntf_a, const double *ntf_g,
+                      double state_limit, int trellis_lat) {
+    if (!c || !c->fn_trellis_chunk || num_cands < 16)
+        return -1;
+
+    pfn_cuCtxSetCurrent(c->context);
+
+    /* Upload NTF constants to SDM module */
+    CUdeviceptr d_a, d_g, d_order, d_limit;
+    size_t sz;
+    pfn_cuModuleGetGlobal(&d_a, &sz, c->mod_sdm, "c_ntf_a");
+    pfn_cuMemcpyHtoD(d_a, ntf_a, (size_t)order * sizeof(double));
+    pfn_cuModuleGetGlobal(&d_g, &sz, c->mod_sdm, "c_ntf_g");
+    pfn_cuMemcpyHtoD(d_g, ntf_g, (size_t)order * sizeof(double));
+    pfn_cuModuleGetGlobal(&d_order, &sz, c->mod_sdm, "c_ntf_order");
+    pfn_cuMemcpyHtoD(d_order, &order, sizeof(int));
+    pfn_cuModuleGetGlobal(&d_limit, &sz, c->mod_sdm, "c_state_limit");
+    pfn_cuMemcpyHtoD(d_limit, &state_limit, sizeof(double));
+
+    /* Allocate device memory */
+    CUdeviceptr d_in_buf, d_out_buf, d_init_states, d_init_costs;
+    CUdeviceptr d_final_states, d_final_costs;
+    size_t out_count = count > (size_t)trellis_lat ? count - (size_t)trellis_lat : 0;
+
+    pfn_cuMemAlloc(&d_in_buf, count * sizeof(float));
+    pfn_cuMemAlloc(&d_out_buf, (out_count > 0 ? out_count : 1) * sizeof(float));
+    pfn_cuMemAlloc(&d_init_states, (size_t)num_cands * 8 * sizeof(double));
+    pfn_cuMemAlloc(&d_init_costs, (size_t)num_cands * sizeof(double));
+    pfn_cuMemAlloc(&d_final_states, (size_t)num_cands * 8 * sizeof(double));
+    pfn_cuMemAlloc(&d_final_costs, (size_t)num_cands * sizeof(double));
+
+    /* Upload input + initial state */
+    pfn_cuMemcpyHtoD(d_in_buf, in, count * sizeof(float));
+    pfn_cuMemcpyHtoD(d_init_states, sdm_state_in,
+                      (size_t)num_cands * 8 * sizeof(double));
+    const double *costs_in = (const double *)sdm_state_in + num_cands * 8;
+    pfn_cuMemcpyHtoD(d_init_costs, costs_in, (size_t)num_cands * sizeof(double));
+
+    /* Launch: block_size = max(64, 2*num_cands), 1 block */
+    int block_size = 2 * num_cands;
+    if (block_size < 64) block_size = 64;
+    int cnt = (int)count;
+    void *args[] = {
+        &d_in_buf, &d_out_buf, &cnt,
+        &num_cands, &trellis_lat,
+        &d_init_states, &d_init_costs,
+        &d_final_states, &d_final_costs
+    };
+    pfn_cuLaunchKernel(c->fn_trellis_chunk, 1, 1, 1,
+                        (unsigned)block_size, 1, 1,
+                        0, c->streams[0], args, NULL);
+    pfn_cuStreamSynchronize(c->streams[0]);
+
+    /* Download output + final state */
+    if (out_count > 0)
+        pfn_cuMemcpyDtoH(out, d_out_buf, out_count * sizeof(float));
+    pfn_cuMemcpyDtoH(sdm_state_out, d_final_states,
+                      (size_t)num_cands * 8 * sizeof(double));
+    double *costs_out = (double *)sdm_state_out + num_cands * 8;
+    pfn_cuMemcpyDtoH(costs_out, d_final_costs, (size_t)num_cands * sizeof(double));
+
+    /* Cleanup */
+    pfn_cuMemFree(d_in_buf);
+    pfn_cuMemFree(d_out_buf);
+    pfn_cuMemFree(d_init_states);
+    pfn_cuMemFree(d_init_costs);
+    pfn_cuMemFree(d_final_states);
+    pfn_cuMemFree(d_final_costs);
+
+    return 0;
+}
+
+/* ─── PreCorr batch ─── */
+
+int gpu_cuda_precorr(cuda_context_t *c, const float *in, float *out,
+                      size_t count, const float *ntf_a, const float *ntf_g,
+                      int order, const float *pred_table,
+                      const float *state_in, float *state_out,
+                      int num_channels) {
+    if (!c || !c->fn_precorr_chunk)
+        return -1;
+
+    pfn_cuCtxSetCurrent(c->context);
+
+    /* Upload PreCorr NTF constants */
+    CUdeviceptr d_a, d_g, d_order, d_limit;
+    size_t sz;
+    pfn_cuModuleGetGlobal(&d_a, &sz, c->mod_sdm, "c_precorr_a");
+    pfn_cuMemcpyHtoD(d_a, ntf_a, (size_t)order * sizeof(float));
+    pfn_cuModuleGetGlobal(&d_g, &sz, c->mod_sdm, "c_precorr_g");
+    pfn_cuMemcpyHtoD(d_g, ntf_g, (size_t)order * sizeof(float));
+    pfn_cuModuleGetGlobal(&d_order, &sz, c->mod_sdm, "c_precorr_order");
+    pfn_cuMemcpyHtoD(d_order, &order, sizeof(int));
+    float zero_limit = 0.0f;
+    pfn_cuModuleGetGlobal(&d_limit, &sz, c->mod_sdm, "c_precorr_limit");
+    pfn_cuMemcpyHtoD(d_limit, &zero_limit, sizeof(float));
+
+    size_t total = count * (size_t)num_channels;
+
+    /* Allocate device memory */
+    CUdeviceptr d_in_buf, d_out_buf, d_pred, d_state_in, d_state_out;
+    pfn_cuMemAlloc(&d_in_buf, total * sizeof(float));
+    pfn_cuMemAlloc(&d_out_buf, total * sizeof(float));
+    pfn_cuMemAlloc(&d_pred, 256 * 8 * sizeof(float));
+    pfn_cuMemAlloc(&d_state_in, (size_t)num_channels * 8 * sizeof(float));
+    pfn_cuMemAlloc(&d_state_out, (size_t)num_channels * 8 * sizeof(float));
+
+    /* Upload */
+    pfn_cuMemcpyHtoD(d_in_buf, in, total * sizeof(float));
+    pfn_cuMemcpyHtoD(d_pred, pred_table, 256 * 8 * sizeof(float));
+    pfn_cuMemcpyHtoD(d_state_in, state_in, (size_t)num_channels * 8 * sizeof(float));
+
+    /* Launch: one thread per channel */
+    int cnt = (int)count;
+    void *args[] = {
+        &d_in_buf, &d_out_buf, &cnt,
+        &d_pred, &d_state_in, &d_state_out, &num_channels
+    };
+    pfn_cuLaunchKernel(c->fn_precorr_chunk, 1, 1, 1,
+                        (unsigned)num_channels, 1, 1,
+                        0, c->streams[0], args, NULL);
+    pfn_cuStreamSynchronize(c->streams[0]);
+
+    /* Download */
+    pfn_cuMemcpyDtoH(out, d_out_buf, total * sizeof(float));
+    pfn_cuMemcpyDtoH(state_out, d_state_out,
+                      (size_t)num_channels * 8 * sizeof(float));
+
+    /* Cleanup */
+    pfn_cuMemFree(d_in_buf);
+    pfn_cuMemFree(d_out_buf);
+    pfn_cuMemFree(d_pred);
+    pfn_cuMemFree(d_state_in);
+    pfn_cuMemFree(d_state_out);
+
     return 0;
 }
