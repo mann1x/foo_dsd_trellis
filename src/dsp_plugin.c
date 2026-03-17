@@ -437,7 +437,9 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                     gpu_fir_setup(s->gpu, g_hb_taps, g_hb_ntaps,
                                   num_stages, is_upsample);
                 }
-                /* GPU context created — logged by dsp_fb2k.cpp */
+                /* Assign GPU context to all engine channels */
+                for (int ch = 0; ch < s->num_channels; ch++)
+                    s->channels[ch].gpu = s->gpu;
             }
         }
     }

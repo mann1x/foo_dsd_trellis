@@ -38,6 +38,7 @@ typedef struct {
     bool             passthrough;/* true if no processing needed */
     bool             fir_only;   /* true for DSD→PCM decimation (no SDM) */
     onnx_filter_t   *ml_filter;  /* ONNX ML post-filter (NULL if disabled) */
+    gpu_context_t   *gpu;        /* GPU compute context (shared, NULL if disabled) */
 } engine_channel_t;
 
 /* Block processing mode */
