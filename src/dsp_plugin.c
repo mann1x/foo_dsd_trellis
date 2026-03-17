@@ -643,13 +643,26 @@ size_t plugin_process(plugin_state_t *s,
     if (!pcm_temp)
         return 0;
 
-    for (int ch = 0; ch < num_channels; ch++) {
-        /* Extract strided PCM for this channel */
-        for (size_t f = 0; f < pcm_frames; f++)
-            pcm_temp[f] = in_pcm[f * (size_t)num_channels + (size_t)ch];
-
-        /* Unpack DoP to DSD floats */
-        dop_unpack(pcm_temp, s->ch_in[ch], pcm_frames);
+    /* Parallel DoP unpack: one threadpool task per channel */
+    if (s->pool && num_channels > 0) {
+        channel_block_t unpack_blocks[32];
+        memset(unpack_blocks, 0, (size_t)num_channels * sizeof(channel_block_t));
+        for (int ch = 0; ch < num_channels; ch++) {
+            unpack_blocks[ch].mode = BLOCK_MODE_UNPACK;
+            unpack_blocks[ch].channel = ch;
+            unpack_blocks[ch].pcm_interleaved = (float *)in_pcm;
+            unpack_blocks[ch].dsd_channel = s->ch_in[ch];
+            unpack_blocks[ch].pcm_frames = pcm_frames;
+            unpack_blocks[ch].num_channels = num_channels;
+            threadpool_submit(s->pool, &unpack_blocks[ch]);
+        }
+        threadpool_wait(s->pool);
+    } else {
+        for (int ch = 0; ch < num_channels; ch++) {
+            for (size_t f = 0; f < pcm_frames; f++)
+                pcm_temp[f] = in_pcm[f * (size_t)num_channels + (size_t)ch];
+            dop_unpack(pcm_temp, s->ch_in[ch], pcm_frames);
+        }
     }
 
     QueryPerformanceCounter(&t_end);
@@ -989,19 +1002,51 @@ size_t plugin_process(plugin_state_t *s,
     if (out_pcm_frames == 0)
         return 0;
 
-    if (s->cached_pcm_temp_sz < out_pcm_frames) {
-        free(s->cached_pcm_temp);
-        s->cached_pcm_temp = (float *)malloc(out_pcm_frames * sizeof(float));
-        s->cached_pcm_temp_sz = s->cached_pcm_temp ? out_pcm_frames : 0;
-    }
-    float *pcm_temp2 = s->cached_pcm_temp;
-    if (!pcm_temp2)
-        return 0;
+    /* Parallel DoP pack: one threadpool task per channel.
+     * Each channel needs its own pcm_temp buffer. */
+    if (s->pool && num_channels > 0 && !fir_only) {
+        /* Allocate per-channel pack temp buffers */
+        float **pack_temps = (float **)calloc((size_t)num_channels, sizeof(float *));
+        if (!pack_temps) return 0;
+        for (int ch = 0; ch < num_channels; ch++) {
+            pack_temps[ch] = (float *)malloc(out_pcm_frames * sizeof(float));
+            if (!pack_temps[ch]) {
+                for (int j = 0; j < ch; j++) free(pack_temps[j]);
+                free(pack_temps);
+                return 0;
+            }
+        }
 
-    for (int ch = 0; ch < num_channels; ch++) {
-        dop_pack(s->ch_out[ch], pcm_temp2, dsd_out_count);
-        for (size_t f = 0; f < out_pcm_frames; f++)
-            out_pcm[f * (size_t)num_channels + (size_t)ch] = pcm_temp2[f];
+        channel_block_t pack_blocks[32];
+        memset(pack_blocks, 0, (size_t)num_channels * sizeof(channel_block_t));
+        for (int ch = 0; ch < num_channels; ch++) {
+            pack_blocks[ch].mode = BLOCK_MODE_PACK;
+            pack_blocks[ch].channel = ch;
+            pack_blocks[ch].dsd_channel = s->ch_out[ch];
+            pack_blocks[ch].pcm_interleaved = out_pcm;
+            pack_blocks[ch].pcm_temp = pack_temps[ch];
+            pack_blocks[ch].count = dsd_out_count;
+            pack_blocks[ch].num_channels = num_channels;
+            threadpool_submit(s->pool, &pack_blocks[ch]);
+        }
+        threadpool_wait(s->pool);
+
+        for (int ch = 0; ch < num_channels; ch++) free(pack_temps[ch]);
+        free(pack_temps);
+    } else {
+        /* Fallback: sequential pack */
+        if (s->cached_pcm_temp_sz < out_pcm_frames) {
+            free(s->cached_pcm_temp);
+            s->cached_pcm_temp = (float *)malloc(out_pcm_frames * sizeof(float));
+            s->cached_pcm_temp_sz = s->cached_pcm_temp ? out_pcm_frames : 0;
+        }
+        float *pcm_temp2 = s->cached_pcm_temp;
+        if (!pcm_temp2) return 0;
+        for (int ch = 0; ch < num_channels; ch++) {
+            dop_pack(s->ch_out[ch], pcm_temp2, dsd_out_count);
+            for (size_t f = 0; f < out_pcm_frames; f++)
+                out_pcm[f * (size_t)num_channels + (size_t)ch] = pcm_temp2[f];
+        }
     }
 
     QueryPerformanceCounter(&t_pack_end);

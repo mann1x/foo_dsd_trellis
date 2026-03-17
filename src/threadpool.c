@@ -11,6 +11,11 @@
  */
 
 #include "../include/threadpool.h"
+#include "../include/dop.h"
+
+#ifndef DOP_BITS_PER_FRAME
+#define DOP_BITS_PER_FRAME 16
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -143,6 +148,34 @@ static DWORD WINAPI worker_func(LPVOID param) {
             block->out_count = engine_process_fir_gain(block->eng,
                                                         block->in, block->count,
                                                         block->cfg, &block->fir_out);
+        } else if (block->mode == BLOCK_MODE_UNPACK) {
+            /* DoP unpack: extract this channel from interleaved PCM */
+            int ch = block->channel;
+            int nch = block->num_channels;
+            size_t frames = block->pcm_frames;
+            const float *pcm = block->pcm_interleaved;
+            float *dsd = block->dsd_channel;
+            /* Extract strided PCM for this channel */
+            float *pcm_temp = (float *)malloc(frames * sizeof(float));
+            if (pcm_temp) {
+                for (size_t f = 0; f < frames; f++)
+                    pcm_temp[f] = pcm[f * (size_t)nch + (size_t)ch];
+                dop_unpack(pcm_temp, dsd, frames);
+                free(pcm_temp);
+            }
+            block->out_count = frames * DOP_BITS_PER_FRAME;
+        } else if (block->mode == BLOCK_MODE_PACK) {
+            /* DoP pack: pack this channel's DSD into interleaved PCM */
+            int ch = block->channel;
+            int nch = block->num_channels;
+            size_t dsd_count = block->count;
+            size_t pcm_frames = dsd_count / DOP_BITS_PER_FRAME;
+            float *pcm_temp = block->pcm_temp;
+            dop_pack(block->dsd_channel, pcm_temp, dsd_count);
+            float *out = block->pcm_interleaved;
+            for (size_t f = 0; f < pcm_frames; f++)
+                out[f * (size_t)nch + (size_t)ch] = pcm_temp[f];
+            block->out_count = pcm_frames;
         } else {
             block->out_count = engine_process_block(block->eng, block->in,
                                                      block->out, block->count,

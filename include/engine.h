@@ -40,9 +40,11 @@ typedef struct {
 } engine_channel_t;
 
 /* Block processing mode */
-#define BLOCK_MODE_FULL  0   /* FIR + gain + SDM (original path) */
-#define BLOCK_MODE_SDM   1   /* SDM segment only (parallel path) */
-#define BLOCK_MODE_FIR   2   /* FIR + gain only (parallel path) */
+#define BLOCK_MODE_FULL    0   /* FIR + gain + SDM (original path) */
+#define BLOCK_MODE_SDM     1   /* SDM segment only (parallel path) */
+#define BLOCK_MODE_FIR     2   /* FIR + gain only (parallel path) */
+#define BLOCK_MODE_UNPACK  3   /* DoP unpack only (parallel unpack) */
+#define BLOCK_MODE_PACK    4   /* DoP pack only (parallel pack) */
 
 /* Work item dispatched to thread pool */
 typedef struct {
@@ -58,6 +60,12 @@ typedef struct {
     sdm_context_t      *sdm_ctx;   /* SDM context for segment processing */
     size_t              discard;    /* Output samples to discard (warmup) */
     float              *fir_out;   /* [FIR mode] pointer to FIR output buffer */
+    /* Unpack/pack mode fields */
+    float              *pcm_interleaved; /* [UNPACK/PACK] interleaved PCM buffer */
+    float              *dsd_channel;     /* [UNPACK/PACK] per-channel DSD buffer */
+    float              *pcm_temp;        /* [PACK] temp buffer for dop_pack */
+    size_t              pcm_frames;      /* [UNPACK/PACK] PCM frame count */
+    int                 num_channels;    /* [UNPACK/PACK] total channel count */
     /* RT headroom monitoring (set by worker, read by engine) */
     double              rt_ratio;    /* processing_time / audio_duration (0=instant, 1=realtime limit) */
     bool                stressed;    /* true if rt_ratio > threshold */
