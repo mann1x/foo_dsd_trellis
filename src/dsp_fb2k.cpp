@@ -1303,8 +1303,42 @@ public:
                 else
                     trellis_log("DSD%u -> DSD%u, %uch", dsd_mult, out_rate / 44100, channels);
             }
-            out_frames = plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
-                                        pcm_frames, (int)channels, pcm_rate);
+
+            /* Sub-chunk processing: split large chunks into smaller pieces
+             * (~200ms max) to prevent ASIO buffer underrun. Each sub-chunk
+             * is output via insert_chunk, keeping the ASIO buffer fed. */
+            size_t sub_chunk_pcm = pcm_rate / 5;  /* ~200ms worth of PCM frames */
+            if (sub_chunk_pcm < pcm_frames && pcm_frames > sub_chunk_pcm * 2) {
+                /* Process in sub-chunks, insert_chunk for all but last */
+                size_t processed = 0;
+                while (processed + sub_chunk_pcm < pcm_frames) {
+                    size_t sub_out = plugin_process(m_state,
+                        in_f32.get_ptr() + processed * channels,
+                        out_buf.get_ptr(), sub_chunk_pcm, (int)channels, pcm_rate);
+
+                    if (sub_out > 0) {
+                        uint32_t sub_pcm_rate = out_is_pcm ? out_rate : (out_rate / 16);
+                        audio_chunk_impl sub_chunk;
+                        size_t sub_total = sub_out * channels;
+                        pfc::array_staticsize_t<audio_sample> sub_as;
+                        sub_as.set_size_discard(sub_total);
+                        for (size_t i = 0; i < sub_total; i++)
+                            sub_as[i] = (audio_sample)out_buf[i];
+                        sub_chunk.set_data(sub_as.get_ptr(), sub_out, channels, sub_pcm_rate);
+                        insert_chunk(sub_chunk);
+                    }
+                    processed += sub_chunk_pcm;
+                }
+                /* Process remaining (last sub-chunk) → goes into main output */
+                size_t remaining = pcm_frames - processed;
+                out_frames = plugin_process(m_state,
+                    in_f32.get_ptr() + processed * channels,
+                    out_buf.get_ptr(), remaining, (int)channels, pcm_rate);
+            } else {
+                /* Small chunk — process in one go */
+                out_frames = plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
+                                            pcm_frames, (int)channels, pcm_rate);
+            }
         } else {
             /* PCM input — convert to DSD */
             if (!m_logged_processing) {
