@@ -149,19 +149,24 @@ static DWORD WINAPI worker_func(LPVOID param) {
                                                         block->in, block->count,
                                                         block->cfg, &block->fir_out);
         } else if (block->mode == BLOCK_MODE_UNPACK) {
-            /* DoP unpack: extract this channel from interleaved PCM */
+            /* DoP unpack: extract this channel from interleaved PCM.
+             * Uses TLS buffer to avoid per-call malloc/free. */
             int ch = block->channel;
             int nch = block->num_channels;
             size_t frames = block->pcm_frames;
             const float *pcm = block->pcm_interleaved;
             float *dsd = block->dsd_channel;
-            /* Extract strided PCM for this channel */
-            float *pcm_temp = (float *)malloc(frames * sizeof(float));
-            if (pcm_temp) {
+            static __declspec(thread) float *tls_unpack = NULL;
+            static __declspec(thread) size_t tls_unpack_sz = 0;
+            if (tls_unpack_sz < frames) {
+                free(tls_unpack);
+                tls_unpack = (float *)malloc(frames * sizeof(float));
+                tls_unpack_sz = tls_unpack ? frames : 0;
+            }
+            if (tls_unpack) {
                 for (size_t f = 0; f < frames; f++)
-                    pcm_temp[f] = pcm[f * (size_t)nch + (size_t)ch];
-                dop_unpack(pcm_temp, dsd, frames);
-                free(pcm_temp);
+                    tls_unpack[f] = pcm[f * (size_t)nch + (size_t)ch];
+                dop_unpack(tls_unpack, dsd, frames);
             }
             block->out_count = frames * DOP_BITS_PER_FRAME;
         } else if (block->mode == BLOCK_MODE_PACK) {

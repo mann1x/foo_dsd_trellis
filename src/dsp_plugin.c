@@ -96,6 +96,11 @@ typedef struct plugin_state {
     float             *cached_pcm_temp;
     size_t             cached_pcm_temp_sz;
 
+    /* Cached per-channel pack temp buffers (avoid per-chunk malloc/free) */
+    float            **cached_pack_temps;
+    size_t             cached_pack_temps_sz;  /* floats per channel */
+    int                cached_pack_temps_n;   /* number of channels */
+
     /* Previous chunk FIR tail for parallel SDM segment 0 warmup.
      * Fixes chunk-boundary state discontinuity: after first chunk,
      * segment 0 also uses a temp SDM with warmup from this tail. */
@@ -265,6 +270,13 @@ void plugin_destroy(plugin_state_t *s) {
     }
     free(s->cached_blocks);
     free(s->cached_pcm_temp);
+
+    /* Free cached pack temp buffers */
+    if (s->cached_pack_temps) {
+        for (int i = 0; i < s->cached_pack_temps_n; i++)
+            free(s->cached_pack_temps[i]);
+        free(s->cached_pack_temps);
+    }
 
     /* Free FIR tail and seg0 buffers */
     if (s->fir_tail) {
@@ -966,10 +978,8 @@ size_t plugin_process(plugin_state_t *s,
         }
     } else {
         /* === Sequential path: dispatch full blocks per channel === */
-        channel_block_t *blocks = (channel_block_t *)calloc(
-            (size_t)num_channels, sizeof(channel_block_t));
-        if (!blocks)
-            return 0;
+        channel_block_t blocks[32];  /* stack-allocated, no per-chunk malloc */
+        memset(blocks, 0, (size_t)num_channels * sizeof(channel_block_t));
 
         for (int ch = 0; ch < num_channels; ch++) {
             blocks[ch].in       = s->ch_in[ch];
@@ -985,7 +995,7 @@ size_t plugin_process(plugin_state_t *s,
         threadpool_wait(s->pool);
 
         dsd_out_count = blocks[0].out_count;
-        free(blocks);
+        /* blocks is stack-allocated, no free needed */
     }
 
     if (dsd_out_count == 0)
@@ -1015,20 +1025,27 @@ size_t plugin_process(plugin_state_t *s,
         return 0;
 
     /* Parallel DoP pack on dedicated IO pool (separate from SDM workers).
-     * Each channel needs its own pcm_temp buffer. */
+     * Uses cached per-channel temp buffers to avoid per-chunk malloc/free. */
     threadpool_t *io_pack = s->io_pool ? s->io_pool : s->pool;
     if (io_pack && num_channels > 0 && !fir_only) {
-        /* Allocate per-channel pack temp buffers */
-        float **pack_temps = (float **)calloc((size_t)num_channels, sizeof(float *));
-        if (!pack_temps) return 0;
-        for (int ch = 0; ch < num_channels; ch++) {
-            pack_temps[ch] = (float *)malloc(out_pcm_frames * sizeof(float));
-            if (!pack_temps[ch]) {
-                for (int j = 0; j < ch; j++) free(pack_temps[j]);
-                free(pack_temps);
-                return 0;
+        /* Grow cached pack temp buffers if needed */
+        if (s->cached_pack_temps_sz < out_pcm_frames ||
+            s->cached_pack_temps_n < num_channels) {
+            /* Free old */
+            if (s->cached_pack_temps) {
+                for (int j = 0; j < s->cached_pack_temps_n; j++)
+                    free(s->cached_pack_temps[j]);
+                free(s->cached_pack_temps);
+            }
+            s->cached_pack_temps = (float **)calloc((size_t)num_channels, sizeof(float *));
+            if (s->cached_pack_temps) {
+                for (int ch = 0; ch < num_channels; ch++)
+                    s->cached_pack_temps[ch] = (float *)malloc(out_pcm_frames * sizeof(float));
+                s->cached_pack_temps_sz = out_pcm_frames;
+                s->cached_pack_temps_n = num_channels;
             }
         }
+        if (!s->cached_pack_temps) return 0;
 
         channel_block_t pack_blocks[32];
         memset(pack_blocks, 0, (size_t)num_channels * sizeof(channel_block_t));
@@ -1037,15 +1054,12 @@ size_t plugin_process(plugin_state_t *s,
             pack_blocks[ch].channel = ch;
             pack_blocks[ch].dsd_channel = s->ch_out[ch];
             pack_blocks[ch].pcm_interleaved = out_pcm;
-            pack_blocks[ch].pcm_temp = pack_temps[ch];
+            pack_blocks[ch].pcm_temp = s->cached_pack_temps[ch];
             pack_blocks[ch].count = dsd_out_count;
             pack_blocks[ch].num_channels = num_channels;
             threadpool_submit(io_pack, &pack_blocks[ch]);
         }
         threadpool_wait(io_pack);
-
-        for (int ch = 0; ch < num_channels; ch++) free(pack_temps[ch]);
-        free(pack_temps);
     } else {
         /* Fallback: sequential pack */
         if (s->cached_pcm_temp_sz < out_pcm_frames) {
