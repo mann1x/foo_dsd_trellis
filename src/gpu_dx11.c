@@ -420,7 +420,7 @@ void gpu_dx11_get_info(gpu_info_t *info) {
     memset(info, 0, sizeof(*info));
     info->backend = GPU_BACKEND_DIRECTX;
     info->available = g_available;
-    strncpy(info->device_name, g_device_name, sizeof(info->device_name) - 1);
+    strncpy_s(info->device_name, sizeof(info->device_name), g_device_name, _TRUNCATE);
     info->vram_mb = g_vram_bytes / (1024 * 1024);
 }
 

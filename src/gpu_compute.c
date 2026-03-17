@@ -141,17 +141,25 @@ int gpu_fir_batch_process(gpu_context_t *ctx, const float *in_batch,
                           float *out_batch, size_t samples_per_ch,
                           int num_channels, size_t *out_count_per_ch) {
     if (!ctx) return -1;
-    /* Batch = sequential per-channel calls for now */
-    for (int ch = 0; ch < num_channels; ch++) {
-        size_t out_n = 0;
-        int r = gpu_fir_chain_process(ctx,
-            in_batch + ch * samples_per_ch,
-            out_batch + ch * (*out_count_per_ch), /* caller pre-estimates */
-            samples_per_ch, &out_n, NULL, NULL);
-        if (r != 0) return -1;
-        if (ch == 0) *out_count_per_ch = out_n;
+    /* True batched dispatch for CUDA, sequential fallback for DX11 */
+    switch (ctx_backend(ctx)) {
+    case GPU_BACKEND_CUDA:
+        return gpu_cuda_fir_batch(ctx, in_batch, out_batch,
+                                   samples_per_ch, num_channels, out_count_per_ch);
+    default: {
+        /* Sequential per-channel fallback */
+        for (int ch = 0; ch < num_channels; ch++) {
+            size_t out_n = 0;
+            int r = gpu_fir_chain_process(ctx,
+                in_batch + ch * samples_per_ch,
+                out_batch + ch * (*out_count_per_ch),
+                samples_per_ch, &out_n, NULL, NULL);
+            if (r != 0) return -1;
+            if (ch == 0) *out_count_per_ch = out_n;
+        }
+        return 0;
     }
-    return 0;
+    }
 }
 
 int gpu_gain_apply(gpu_context_t *ctx, float *buf, size_t count, float gain) {

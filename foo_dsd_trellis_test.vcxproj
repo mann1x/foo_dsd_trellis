@@ -140,6 +140,7 @@
     <ClCompile Include="test\test_precorr.c" />
     <ClCompile Include="test\test_sinad_diag.c" />
     <ClCompile Include="test\test_onnx_filter.c" />
+    <ClCompile Include="test\test_gpu.c" />
     <!-- Library sources (linked directly, no DLL dependency) -->
     <ClCompile Include="src\config.c" />
     <ClCompile Include="src\dop.c" />
@@ -154,6 +155,9 @@
     <ClCompile Include="src\precorr.c" />
     <ClCompile Include="src\wav_io.c" />
     <ClCompile Include="src\onnx_filter.c" />
+    <ClCompile Include="src\gpu_compute.c" />
+    <ClCompile Include="src\gpu_dx11.c" />
+    <ClCompile Include="src\gpu_cuda.c" />
     <!-- Tools -->
     <ClCompile Include="tools\dsd_encode.c" />
   </ItemGroup>

@@ -80,4 +80,64 @@ __global__ void boxcar_smooth(const float *in, float *out,
     out[i] = sum / (float)taps * gain;
 }
 
+/* ─── Batched FIR 2x Upsample (multi-channel) ───
+ * Grid: (ceil(out_per_ch/256), num_channels, 1)
+ * blockIdx.y = channel index
+ * in/out: contiguous [ch0_data | ch1_data | ...] */
+__global__ void fir_upsample_2x_batch(const float *in, float *out,
+                                       int in_per_ch, int out_per_ch,
+                                       int num_channels) {
+    int ch = blockIdx.y;
+    if (ch >= num_channels) return;
+    int oi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (oi >= out_per_ch) return;
+
+    const float *ch_in = in + ch * in_per_ch;
+    float *ch_out = out + ch * out_per_ch;
+
+    float acc = 0.0f;
+    int half = c_ntaps / 2;
+    int zs_len = in_per_ch * 2;
+
+    for (int k = 0; k < c_ntaps; k++) {
+        int zsi = oi - k + half;
+        if (zsi >= 0 && zsi < zs_len) {
+            if ((zsi & 1) == 0)
+                acc += c_taps[k] * __ldg(&ch_in[zsi >> 1]);
+        }
+    }
+    ch_out[oi] = acc * 2.0f;
+}
+
+/* ─── Batched FIR 2x Downsample (multi-channel) ─── */
+__global__ void fir_downsample_2x_batch(const float *in, float *out,
+                                         int in_per_ch, int out_per_ch,
+                                         int num_channels) {
+    int ch = blockIdx.y;
+    if (ch >= num_channels) return;
+    int oi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (oi >= out_per_ch) return;
+
+    const float *ch_in = in + ch * in_per_ch;
+    float *ch_out = out + ch * out_per_ch;
+
+    int ii = oi * 2;
+    float acc = 0.0f;
+    int half = c_ntaps / 2;
+
+    for (int k = 0; k < c_ntaps; k++) {
+        int si = ii - k + half;
+        if (si >= 0 && si < in_per_ch)
+            acc += c_taps[k] * __ldg(&ch_in[si]);
+    }
+    ch_out[oi] = acc;
+}
+
+/* ─── Batched gain (multi-channel contiguous) ─── */
+__global__ void gain_apply_batch(float *buf, int total_count, float gain) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total_count)
+        buf[i] *= gain;
+}
+
 } /* extern "C" */
