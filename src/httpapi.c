@@ -742,7 +742,15 @@ static void handle_request(httpapi_t *api, SOCKET client) {
 
             /* Build log path next to our DLL */
             wchar_t dll_path[MAX_PATH];
+            /* Try multiple module name variants */
             HMODULE hmod = GetModuleHandleW(L"foo_dsd_trellis.dll");
+            if (!hmod) hmod = GetModuleHandleW(L"foo_dsd_trellis");
+            if (!hmod) {
+                /* Fallback: use the API struct's own address to find our module */
+                MEMORY_BASIC_INFORMATION mbi;
+                if (VirtualQuery((void *)handle_request, &mbi, sizeof(mbi)))
+                    hmod = (HMODULE)mbi.AllocationBase;
+            }
             if (!hmod) {
                 send_json(client, 500, "Internal Error",
                           "{\"error\":\"dll not found\"}", 24);
@@ -756,11 +764,17 @@ static void handle_request(httpapi_t *api, SOCKET client) {
 
             /* Open with shared read access (file may be open for writing) */
             HANDLE hFile = CreateFileW(dll_path, GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hFile == INVALID_HANDLE_VALUE) {
-                send_json(client, 404, "Not Found",
-                          "{\"error\":\"log file not found\"}", 30);
+                /* Return the path we tried for debugging */
+                char err[512];
+                char narrow_path[MAX_PATH];
+                WideCharToMultiByte(CP_UTF8, 0, dll_path, -1, narrow_path, MAX_PATH, NULL, NULL);
+                int elen = snprintf(err, sizeof(err),
+                    "{\"error\":\"log file not found\",\"path\":\"%s\",\"err\":%lu}",
+                    narrow_path, GetLastError());
+                send_json(client, 404, "Not Found", err, elen);
                 return;
             }
 
