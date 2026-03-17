@@ -658,20 +658,12 @@ size_t plugin_process(plugin_state_t *s,
     int segments_per_ch = 1;
     size_t overlap = 0;
 
-    /* Parallel SDM segmentation for Trellis mode.
-     * Same-rate re-encode stays sequential (boxcar→SDM is fast at cands=2).
-     * Rate conversion uses parallel segments (FIR+SDM is the bottleneck). */
+    /* Same-rate: always sequential (sub-chunk processing handles latency,
+     * parallel stitching causes pops with boxcar/FIR-lowpass input).
+     * Rate conversion: parallel (FIR output is smooth, SDM converges). */
     uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
-    /* Parallel SDM segmentation tuning per path type:
-     * - DSD64 same-rate: sequential (fast enough at cands=2, no stitching pops)
-     * - DSD128/256 same-rate: 2 segments (fewer stitch points)
-     * - DSD512 same-rate: 4 segments (needed for real-time)
-     * - Rate conversion: 4 segments (FIR output is smooth, SDM converges well) */
-    /* DSD64 same-rate: sequential (fast enough).
-     * DSD128+ same-rate and rate conversion: parallel. */
     bool is_same_rate = (s->config.fs_in == fs_out);
-    /* DSD64 same-rate: sequential. DSD128+: parallel. */
-    bool skip_parallel = (is_same_rate && fs_out <= DSD_RATE_64);
+    bool skip_parallel = is_same_rate;
 
     if (need_rate_conv && !skip_parallel && num_threads > num_channels &&
         s->config.sdm_mode == SDM_MODE_TRELLIS) {
