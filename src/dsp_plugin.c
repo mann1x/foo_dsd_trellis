@@ -44,7 +44,8 @@ typedef struct plugin_state {
     dsd_config_t       config;
     engine_channel_t  *channels;
     int                num_channels;
-    threadpool_t      *pool;
+    threadpool_t      *pool;         /* SDM/FIR worker pool (pinned to selected cores) */
+    threadpool_t      *io_pool;      /* Dedicated unpack/pack pool (2 threads) */
     bool               initialized;
     uint32_t           detected_dsd_rate;
     uint32_t           active_fs_out;     /* Output rate engine was initialized with */
@@ -236,6 +237,10 @@ void plugin_destroy(plugin_state_t *s) {
         threadpool_destroy(s->pool);
         s->pool = NULL;
     }
+    if (s->io_pool) {
+        threadpool_destroy(s->io_pool);
+        s->io_pool = NULL;
+    }
 
     if (s->channels) {
         for (int i = 0; i < s->num_channels; i++)
@@ -394,6 +399,12 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         s->channels = NULL;
         return -1;
     }
+
+    /* Create dedicated IO pool for DoP unpack/pack (2 threads).
+     * Separate from SDM pool so unpack/pack don't compete with
+     * audio processing for cores. Uses OS scheduling (no pinning). */
+    if (!s->io_pool)
+        s->io_pool = threadpool_create(num_channels, 0);
 
     /* Create ML post-filters if enabled and ONNX Runtime is available */
     if (s->config.ml_enabled && onnx_runtime_available()) {
@@ -643,8 +654,9 @@ size_t plugin_process(plugin_state_t *s,
     if (!pcm_temp)
         return 0;
 
-    /* Parallel DoP unpack: one threadpool task per channel */
-    if (s->pool && num_channels > 0) {
+    /* Parallel DoP unpack on dedicated IO pool (separate from SDM workers) */
+    threadpool_t *io = s->io_pool ? s->io_pool : s->pool;
+    if (io && num_channels > 0) {
         channel_block_t unpack_blocks[32];
         memset(unpack_blocks, 0, (size_t)num_channels * sizeof(channel_block_t));
         for (int ch = 0; ch < num_channels; ch++) {
@@ -654,9 +666,9 @@ size_t plugin_process(plugin_state_t *s,
             unpack_blocks[ch].dsd_channel = s->ch_in[ch];
             unpack_blocks[ch].pcm_frames = pcm_frames;
             unpack_blocks[ch].num_channels = num_channels;
-            threadpool_submit(s->pool, &unpack_blocks[ch]);
+            threadpool_submit(io, &unpack_blocks[ch]);
         }
-        threadpool_wait(s->pool);
+        threadpool_wait(io);
     } else {
         for (int ch = 0; ch < num_channels; ch++) {
             for (size_t f = 0; f < pcm_frames; f++)
@@ -1002,9 +1014,10 @@ size_t plugin_process(plugin_state_t *s,
     if (out_pcm_frames == 0)
         return 0;
 
-    /* Parallel DoP pack: one threadpool task per channel.
+    /* Parallel DoP pack on dedicated IO pool (separate from SDM workers).
      * Each channel needs its own pcm_temp buffer. */
-    if (s->pool && num_channels > 0 && !fir_only) {
+    threadpool_t *io_pack = s->io_pool ? s->io_pool : s->pool;
+    if (io_pack && num_channels > 0 && !fir_only) {
         /* Allocate per-channel pack temp buffers */
         float **pack_temps = (float **)calloc((size_t)num_channels, sizeof(float *));
         if (!pack_temps) return 0;
@@ -1027,9 +1040,9 @@ size_t plugin_process(plugin_state_t *s,
             pack_blocks[ch].pcm_temp = pack_temps[ch];
             pack_blocks[ch].count = dsd_out_count;
             pack_blocks[ch].num_channels = num_channels;
-            threadpool_submit(s->pool, &pack_blocks[ch]);
+            threadpool_submit(io_pack, &pack_blocks[ch]);
         }
-        threadpool_wait(s->pool);
+        threadpool_wait(io_pack);
 
         for (int ch = 0; ch < num_channels; ch++) free(pack_temps[ch]);
         free(pack_temps);
