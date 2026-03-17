@@ -501,7 +501,9 @@ uint64_t cpuset_refresh(cpu_topology_t *topo, bool *changed) {
         ptr += info->Size;
     }
 
-    free(buf);
+    /* Don't free buf — it's the cached g_refresh_buf, reused across calls.
+     * The free(buf) here was a use-after-free bug: g_refresh_buf became a
+     * dangling pointer, causing gradual heap corruption on subsequent calls. */
 
     if (new_mask != topo->last_cpuset_mask) {
         topo->last_cpuset_mask = new_mask;

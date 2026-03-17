@@ -1547,8 +1547,9 @@ public:
             insert_chunk(chunk_out);
         }
 
-        /* ─── Anti-pop trailing silence (DSD→DSD only) ─── */
-        if (m_config.antipop && m_last_is_dop_input) {
+        /* Trailing silence disabled — investigating if insert_chunk
+         * during endofplayback causes heap corruption */
+        if (false && m_config.antipop && m_last_is_dop_input) {
             insert_antipop_trail();
         }
     }
