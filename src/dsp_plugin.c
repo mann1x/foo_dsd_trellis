@@ -667,12 +667,11 @@ size_t plugin_process(plugin_state_t *s,
     int segments_per_ch = 1;
     size_t overlap = 0;
 
-    /* DSD64/128 same-rate: sequential (fast enough, no stitching pops).
-     * DSD256/512 same-rate: parallel with FIR lowpass (needed for RT).
-     * Rate conversion: parallel (FIR output is smooth). */
+    /* DSD64 same-rate: sequential (fast enough even at cands=4).
+     * DSD128+: parallel with FIR lowpass (needed for RT at cands=4). */
     uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
     bool is_same_rate = (s->config.fs_in == fs_out);
-    bool skip_parallel = (is_same_rate && fs_out <= DSD_RATE_128);
+    bool skip_parallel = (is_same_rate && fs_out <= DSD_RATE_64);
 
     if (need_rate_conv && !skip_parallel && num_threads > num_channels &&
         s->config.sdm_mode == SDM_MODE_TRELLIS) {
