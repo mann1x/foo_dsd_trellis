@@ -48,6 +48,8 @@ size_t          plugin_process_pcm(plugin_state_t *s,
                                     uint32_t pcm_rate);
 size_t          plugin_drain(plugin_state_t *s, float *out_pcm,
                              int num_channels);
+size_t          plugin_generate_tail(plugin_state_t *s, float *out_pcm,
+                                      int num_channels, int ms);
 double          plugin_get_latency(const plugin_state_t *s);
 void            plugin_flush(plugin_state_t *s);
 int             plugin_reconfigure(plugin_state_t *s, const dsd_config_t *cfg);
@@ -603,11 +605,11 @@ private:
     }
 
     void OnChange(UINT, int, CWindow) {
-        if (!m_updating) UpdatePreset();
+        /* Settings only apply on OK — no live reconfigure during playback */
     }
 
     void OnEditChange(UINT, int, CWindow) {
-        if (!m_updating) UpdatePreset();
+        /* Settings only apply on OK */
     }
 
     void OnMlChange(UINT, int, CWindow) {
@@ -615,7 +617,6 @@ private:
         bool enabled = IsDlgButtonChecked(IDC_CHECK_ML_ENABLED) == BST_CHECKED;
         CComboBox(GetDlgItem(IDC_COMBO_ML_EP)).EnableWindow(enabled);
         UpdateMlStatus();
-        UpdatePreset();
     }
 
     void UpdateMlStatus() {
@@ -804,7 +805,6 @@ private:
             m_listRate.SetItemText(m_editRow, 1, g_output_names[out_idx]);
             RefreshAutoText(m_editRow);
             UpdatePathInfo(m_editRow);
-            if (!m_updating) UpdatePreset();
         }
     }
 
@@ -867,7 +867,6 @@ private:
 
         RefreshAutoText(m_editRow);
         UpdatePathInfo(m_editRow);
-        if (!m_updating) UpdatePreset();
     }
 
     void OnComboKillFocus(UINT, int, CWindow) {
@@ -1485,15 +1484,36 @@ public:
             }
         }
 
-        /* ─── Anti-pop lead-in (configurable) ───
-         * On rate change, output PCM zeros at the new rate to let the
-         * output device reconfigure silently. Buffer the real audio
-         * and prepend it to the next chunk. Never use insert_chunk
-         * during rate transitions — it confuses fb2k's output pipeline. */
-        /* Anti-pop lead-in is NOT needed — preserving SDM state across
-         * flush/stop eliminates the startup transient pop. The SDM integrators
-         * keep their previous values so playback resumes smoothly, just like
-         * track-to-track transitions. */
+        /* ─── Anti-pop lead-in: rate-switch trick ───
+         * On first chunk after stop→play, insert DoP silence at an alternate
+         * rate then at the target rate. The rate change triggers the DAC's
+         * hardware mute circuit, so by the time real audio arrives the DAC
+         * is already in DSD mode at the correct rate with mute released.
+         * Uses proper 0x69 DSD silence with DoP markers throughout.
+         * Skip if trailing silence was just inserted (stop→play < few seconds)
+         * — the trail already muted the DAC, and rapid rate changes crash. */
+        if (m_config.antipop && m_antipop_pending && out_frames > 0
+            && is_dop && out_pcm_rate > 0) {
+            m_antipop_pending = false;
+
+            if (m_trail_inserted) {
+                /* Trail already primed the DAC — just insert target-rate
+                 * silence to re-establish DSD mode at correct rate. */
+                int post_trail_ms = ANTIPOP_LEADIN_MS + 5; /* slightly longer */
+                trellis_log("anti-pop lead-in: %dms at %u Hz (trail active, skip rate switch)",
+                            post_trail_ms, out_pcm_rate);
+                insert_silence_chunk(channels, out_pcm_rate, true, post_trail_ms);
+            } else {
+                /* Cold start — full rate-switch trick */
+                int half_ms = ANTIPOP_LEADIN_MS / 2;
+                uint32_t alt_rate = (out_pcm_rate == 176400) ? 352800 : 176400;
+                trellis_log("anti-pop lead-in: %dms at %u Hz + %dms at %u Hz",
+                            half_ms, alt_rate, half_ms, out_pcm_rate);
+                insert_silence_chunk(channels, alt_rate, true, half_ms);
+                insert_silence_chunk(channels, out_pcm_rate, true, half_ms);
+            }
+            m_trail_inserted = false;
+        }
 
         if (m_chunk_count < 10) {
             trellis_log("chunk #%u output: %u frames, %u ch, %u Hz (out_rate=%u, is_pcm=%d, is_dop_in=%d)",
@@ -1525,38 +1545,42 @@ public:
         if (!m_state || m_channels == 0)
             return;
 
-        size_t max_drain_frames = 2048 / 16;
-        pfc::array_staticsize_t<float> drain_buf;
-        drain_buf.set_size_discard(max_drain_frames * (unsigned)m_channels);
+        /* Drain SDM latency — but NOT when antipop preserves SDM state,
+         * because sdm_drain feeds zeros and sets draining=1, corrupting
+         * the preserved state for the next play (crash on rapid stop→play). */
+        if (!m_config.antipop) {
+            size_t max_drain_frames = 2048 / 16;
+            pfc::array_staticsize_t<float> drain_buf;
+            drain_buf.set_size_discard(max_drain_frames * (unsigned)m_channels);
 
-        size_t drain_frames = plugin_drain(m_state, drain_buf.get_ptr(),
-                                           m_channels);
+            size_t drain_frames = plugin_drain(m_state, drain_buf.get_ptr(),
+                                               m_channels);
 
-        if (drain_frames > 0 && m_pcm_rate > 0 && m_last_is_dop_input) {
-            /* Only drain for DSD→DSD path. For PCM→DSD, the SDM latency
-             * samples are negligible and insert_chunk at DoP rate leaves
-             * fb2k's output configured at 176400, causing a glitch on
-             * the next PCM playback. */
-            uint32_t out_pcm_rate = m_config.fs_out / 16;
-            if (out_pcm_rate == 0)
-                out_pcm_rate = m_pcm_rate;
+            if (drain_frames > 0 && m_pcm_rate > 0 && m_last_is_dop_input) {
+                uint32_t out_pcm_rate = m_config.fs_out / 16;
+                if (out_pcm_rate == 0)
+                    out_pcm_rate = m_pcm_rate;
 
-            size_t total = drain_frames * (unsigned)m_channels;
-            pfc::array_staticsize_t<audio_sample> drain_as;
-            drain_as.set_size_discard(total);
-            for (size_t i = 0; i < total; i++)
-                drain_as[i] = (audio_sample)drain_buf[i];
+                size_t total = drain_frames * (unsigned)m_channels;
+                pfc::array_staticsize_t<audio_sample> drain_as;
+                drain_as.set_size_discard(total);
+                for (size_t i = 0; i < total; i++)
+                    drain_as[i] = (audio_sample)drain_buf[i];
 
-            audio_chunk_impl chunk_out;
-            chunk_out.set_data(drain_as.get_ptr(), drain_frames,
-                               (unsigned)m_channels, out_pcm_rate);
-            insert_chunk(chunk_out);
+                audio_chunk_impl chunk_out;
+                chunk_out.set_data(drain_as.get_ptr(), drain_frames,
+                                   (unsigned)m_channels, out_pcm_rate);
+                insert_chunk(chunk_out);
+            }
         }
 
-        /* Trailing silence disabled — investigating if insert_chunk
-         * during endofplayback causes heap corruption */
-        if (false && m_config.antipop && m_last_is_dop_input) {
+        /* Anti-pop: insert DSD silence (0x69 idle pattern with DoP markers)
+         * to let the DAC's analog output settle to zero before the stream
+         * stops. Without this, the DAC reverts from DSD→PCM mode on stream
+         * stop and the mode switch produces an audible pop. */
+        if (m_config.antipop && m_last_is_dop_input) {
             insert_antipop_trail();
+            m_trail_inserted = true;
         }
     }
 
@@ -1659,7 +1683,8 @@ public:
     }
 
 private:
-    static const int ANTIPOP_MS = 50;  /* ms of silence for anti-pop */
+    static const int ANTIPOP_MS = 150;       /* ms of DSD silence for trail */
+    static const int ANTIPOP_LEADIN_MS = 70; /* ms of DSD silence for lead-in */
 
     /* Insert a silence chunk directly (no engine needed).
      * For DoP: generates DSD idle pattern via dop_pack.
@@ -1678,12 +1703,19 @@ private:
         sil_as.set_size_discard(sil_total);
 
         if (is_dop_output) {
-            /* DoP silence: DSD idle pattern (alternating ±1.0) → dop_pack */
+            /* DoP silence: DSD idle pattern 0x69 (01101001) → dop_pack.
+             * 0x69 is the standard DSD silence byte — a toggling pattern
+             * with zero DC content. Using this instead of 0xAA ensures the
+             * DAC sees a proper DSD idle signal while DoP markers keep it
+             * in DSD mode, preventing the PCM mode-revert pop. */
+            static const float dsd_0x69[8] = {
+                -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f
+            };
             size_t dsd_per_frame = sil_frames * DOP_BITS_PER_FRAME;
             pfc::array_staticsize_t<float> dsd_idle;
             dsd_idle.set_size_discard(dsd_per_frame);
             for (size_t i = 0; i < dsd_per_frame; i++)
-                dsd_idle[i] = (i & 1) ? 1.0f : -1.0f;
+                dsd_idle[i] = dsd_0x69[i & 7];
 
             pfc::array_staticsize_t<float> dop_pcm;
             dop_pcm.set_size_discard(sil_frames);
@@ -1702,13 +1734,26 @@ private:
         insert_chunk(chunk_out);
     }
 
-    /* Insert trailing silence to flush ASIO buffer before stop */
+    /* Insert trailing silence to flush ASIO buffer before stop.
+     * Two phases: (1) DSD silence at current rate to settle analog output,
+     * (2) DSD silence at a different rate to trigger DAC hardware mute
+     * via rate-change detection — DAC mutes before stream actually stops. */
     void insert_antipop_trail() {
         if (m_last_out_pcm_rate == 0 || m_last_channels == 0)
             return;
-        trellis_log("anti-pop: %dms trailing silence", ANTIPOP_MS);
+
+        int half_ms = ANTIPOP_MS / 2;
+
+        /* Phase 1: silence at current DSD rate */
+        trellis_log("anti-pop trail: %dms at %u Hz + rate switch", half_ms, m_last_out_pcm_rate);
         insert_silence_chunk(m_last_channels, m_last_out_pcm_rate,
-                              m_last_out_is_dop, ANTIPOP_MS);
+                              m_last_out_is_dop, half_ms);
+
+        /* Phase 2: silence at a different DoP rate to trigger DAC mute. */
+        if (m_last_out_is_dop) {
+            uint32_t alt_rate = (m_last_out_pcm_rate == 176400) ? 352800 : 176400;
+            insert_silence_chunk(m_last_channels, alt_rate, true, half_ms);
+        }
     }
 
     dsd_config_t     m_config;
@@ -1722,7 +1767,8 @@ private:
     unsigned         m_chunk_count = 0;
 
     /* Anti-pop / deferred output state */
-    bool             m_antipop_pending = true;         /* legacy — kept for trailing silence */
+    bool             m_antipop_pending = true;         /* insert lead-in on first chunk */
+    bool             m_trail_inserted = false;         /* trailing silence was just inserted */
     uint32_t         m_last_out_pcm_rate = 0;          /* last output PCM rate */
     uint32_t         m_last_pcm_rate = 0;              /* last input PCM rate */
     int              m_last_channels = 0;              /* last channel count */

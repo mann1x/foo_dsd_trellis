@@ -1257,6 +1257,57 @@ size_t plugin_drain(plugin_state_t *s, float *out_pcm, int num_channels) {
     return out_frames;
 }
 
+/*
+ * Generate trailing DSD silence by feeding zeros through the SDM engine.
+ * The SDM winds down naturally from the last music state → silence,
+ * avoiding the hard discontinuity of raw idle pattern insertion.
+ * Returns number of output DoP PCM frames per channel.
+ */
+size_t plugin_generate_tail(plugin_state_t *s, float *out_pcm,
+                            int num_channels, int ms) {
+    if (!s || !s->initialized || !s->channels || num_channels <= 0 || ms <= 0)
+        return 0;
+
+    uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
+    if (fs_out == 0)
+        return 0;
+
+    /* DSD samples for the requested duration */
+    size_t dsd_count = (size_t)((uint64_t)fs_out * (uint64_t)ms / 1000);
+    if (dsd_count == 0)
+        return 0;
+
+    /* Zero input = silence fed through the SDM */
+    float *sil_in  = (float *)calloc(dsd_count, sizeof(float));
+    float *dsd_out = (float *)malloc(dsd_count * sizeof(float));
+    size_t pcm_frames = dsd_count / DOP_BITS_PER_FRAME;
+    float *pcm_temp = (float *)malloc((pcm_frames + 1) * sizeof(float));
+    if (!sil_in || !dsd_out || !pcm_temp) {
+        free(sil_in); free(dsd_out); free(pcm_temp);
+        return 0;
+    }
+
+    int ch_count = num_channels < s->num_channels ? num_channels : s->num_channels;
+    for (int ch = 0; ch < ch_count; ch++) {
+        size_t n = engine_process_block(&s->channels[ch], sil_in, dsd_out,
+                                         dsd_count, &s->config);
+        if (n == 0) continue;
+
+        size_t frames = n / DOP_BITS_PER_FRAME;
+        if (frames > pcm_frames) frames = pcm_frames;
+        dop_pack(dsd_out, pcm_temp, frames * DOP_BITS_PER_FRAME);
+
+        for (size_t f = 0; f < frames; f++)
+            out_pcm[f * (size_t)num_channels + (size_t)ch] = pcm_temp[f];
+    }
+
+    free(sil_in);
+    free(dsd_out);
+    free(pcm_temp);
+
+    return pcm_frames;
+}
+
 /* Get processing latency in seconds */
 double plugin_get_latency(const plugin_state_t *s) {
     if (!s || !s->initialized || s->detected_dsd_rate == 0)
@@ -1279,8 +1330,9 @@ double plugin_get_latency(const plugin_state_t *s) {
 void plugin_flush(plugin_state_t *s) {
     if (!s || !s->initialized)
         return;
+    bool preserve = s->config.antipop;
     for (int i = 0; i < s->num_channels; i++)
-        engine_channel_reset(&s->channels[i]);
+        engine_channel_reset(&s->channels[i], preserve);
     s->fir_tail_valid = false;
     s->needs_warmup = true;  /* prime SDM with real audio on next chunk */
 }

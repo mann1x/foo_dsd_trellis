@@ -12,7 +12,7 @@ A native foobar2000 DSP plugin that converts PCM and DSD audio to DSD using sigm
 | Per-Rate Config | SDM mode, candidates, depth, NTF, state limiter, and ML filter configurable per input rate |
 | FIR Gain | Global FIR gain limiter (Auto = -3 dB) for uniform volume across all rate conversion paths |
 | Volume Control | DSD-Wide: boxcar smoothing + gain + SDM re-encode (no PCM decimation) |
-| Anti-Pop | SDM state preservation across stop/play eliminates startup transients without lead-in silence |
+| Anti-Pop | Three-layer anti-pop: SDM state preservation + DoP 0x69 silence trail + rate-switch DAC mute trick |
 | Parallel SDM | Chunk segmentation with FIR tail warmup for real-time DSD256/DSD512 Trellis processing |
 | Mute | Silence pattern substitution (0x69/0x96) |
 | DoP Detection | Auto-detect DoP markers (0x05/0xFA) in 24-bit PCM frames |
@@ -54,15 +54,39 @@ For Trellis mode at high DSD rates (DSD256/DSD512), single-core SDM processing e
 
 This eliminates the persistent SDM state dependency between chunks that previously caused periodic audio glitches.
 
-### Anti-Pop (SDM State Preservation)
+### Anti-Pop System
 
-Traditional anti-pop approaches (PCM silence lead-in, DoP silence, rate-change tricks) caused more problems than they solved — DAC rate transitions, output pipeline confusion, and timing-dependent pops.
+DSD playback over DoP is prone to pops at start and stop because the DAC switches between PCM and DSD modes when the DoP stream starts or stops. The anti-pop system uses three complementary layers:
 
-The solution: **preserve SDM integrator state across flush/stop**. When `engine_channel_reset` is called (stop, seek, track change), the Trellis SDM internal state (integrator values, candidate paths) is NOT zeroed. Only the FIR chain and boxcar filter are reset. This means:
+#### Layer 1: SDM State Preservation (Play Start)
 
-- **Stop → Play**: SDM continues from its previous integrator state, producing smooth output from the first sample — identical to track-to-track transitions
-- **First play after launch**: Pipeline warmup at engine init feeds 8192 DSD silence samples through the full FIR + SDM chain to settle integrators before real audio arrives
-- **PreCorr**: Always reset on flush (PreCorr's greedy quantizer is stateless and doesn't benefit from preserved state; stale state can cause instability)
+When `engine_channel_reset` is called (stop, seek, track change) with `antipop` enabled, the Trellis SDM internal state (integrator values, candidate paths, history buffers) is **preserved** — only the FIR chain and boxcar filter are reset. This eliminates the DC step that occurs when SDM integrators restart from zero.
+
+- **Stop → Play**: SDM continues from its previous integrator state, producing smooth output from the first sample
+- **PreCorr**: Always fully reset (greedy quantizer doesn't benefit from preserved state)
+- **sdm_drain skipped**: When antipop is enabled, `on_endofplayback` does not call `sdm_drain` — draining feeds zeros and sets `draining=1`, which would corrupt preserved state on rapid stop→play
+
+#### Layer 2: DoP 0x69 Silence Trail (Stop)
+
+At `on_endofplayback`, inserts 150ms of properly DoP-framed DSD silence before the stream stops:
+
+1. **75ms at current DSD rate**: DSD idle pattern `0x69` (`01101001` — a toggling pattern with zero DC content) packed with DoP markers (0x05/0xFA). The DAC stays in DSD mode while its analog output settles to zero.
+2. **75ms at an alternate DSD rate** (DSD64↔DSD128): Forces a sample rate change, triggering the DAC's hardware mute circuit. The DAC mutes its output before the stream actually stops, preventing the PCM mode-revert pop.
+
+**Why 0x69?** The standard DSD silence byte. PCM silence (0x00) represents negative full-scale in DSD — a massive DC transient. The alternating bit pattern 0xAA was also wrong (different DC characteristics). 0x69 is recognized by DAC firmware as proper DSD idle.
+
+#### Layer 3: DoP Silence Lead-In (Play Start)
+
+On the first chunk after stop→play, inserts DoP 0x69 silence before real audio:
+
+- **Cold start** (no prior trailing silence): 35ms at alternate rate + 35ms at target rate — the rate switch triggers the DAC's hardware mute, then the target-rate silence lets the DAC settle at the correct rate before audio begins.
+- **After trailing silence** (recent stop→play): 75ms at target rate only — the trail already muted the DAC, so no rate switch is needed. Avoids rapid rate-change conflicts.
+
+#### Design Constraints
+
+- **No `sdm_drain` with antipop**: Draining corrupts preserved SDM state (`draining=1`, zero-fed integrators) — causes crashes on rapid stop→play.
+- **No rate switch in trailing silence AND lead-in**: Rapid stop→play can queue 4+ rate changes in the output pipeline, crashing fb2k's ASIO output. The `m_trail_inserted` flag prevents lead-in rate switching when the trail already handled it.
+- **Settings apply on OK only**: The property page does not push `on_preset_changed` on every control toggle — fb2k would destroy and recreate the DSP instance mid-playback, causing volume spikes (gain reset to 1.0) and stuttering.
 
 ## DSD Rates
 
@@ -214,7 +238,7 @@ Viterbi look-ahead sigma-delta modulator, ported from mansr/sox sdm.c (LGPL v2.1
 
 **Latency**: configurable via `trellis_lat` (16-2048 DSD samples). First `trellis_lat` input samples fill the latency buffer with no output; `sdm_drain` flushes remaining samples at end of stream.
 
-**State preservation**: Trellis integrator state is preserved across flush/stop to prevent startup transient pops.
+**State preservation**: Trellis integrator state is preserved across flush/stop when `antipop` is enabled (see Anti-Pop System).
 
 ### PreCorr SDM (`precorr.c`)
 
@@ -389,7 +413,7 @@ foo_dsd_trellis/
 
 ## Test Results
 
-725 tests across 13 suites, all passing:
+723 tests across 13 suites, all passing:
 
 | Suite | Tag | Tests | Coverage |
 |-------|-----|-------|----------|

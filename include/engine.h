@@ -83,8 +83,10 @@ size_t engine_process_block(engine_channel_t *eng,
                             const float *in, float *out,
                             size_t count, const dsd_config_t *cfg);
 
-/* Reset engine state (seek / discontinuity). */
-void engine_channel_reset(engine_channel_t *eng);
+/* Reset engine state (seek / discontinuity).
+ * If preserve_sdm is true, Trellis SDM integrators are kept warm
+ * (anti-pop: avoids DC step on play-from-stop). */
+void engine_channel_reset(engine_channel_t *eng, bool preserve_sdm);
 
 /* Warm up boxcar+SDM with real audio input after reset.
  * Prevents startup pop by priming state with actual audio. */

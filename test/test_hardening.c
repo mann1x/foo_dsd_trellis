@@ -297,7 +297,7 @@ static void test_reset_clears_state(void) {
     TEST_ASSERT_TRUE(n1 > 0, "pre-reset output");
 
     /* Reset */
-    engine_channel_reset(&eng);
+    engine_channel_reset(&eng, false);
 
     /* After reset, SDM latency starts over — first block should have
      * the same count as the very first call */
@@ -324,7 +324,7 @@ static void test_reset_then_different_signal(void) {
     }
 
     engine_process_block(&eng, in1, out, 256, &cfg);
-    engine_channel_reset(&eng);
+    engine_channel_reset(&eng, false);
 
     /* After reset, processing a different signal should not crash
      * or produce invalid output */
@@ -421,7 +421,7 @@ static void test_drain_after_reset(void) {
     engine_process_block(&eng, in, out, 256, &cfg);
 
     /* Reset then drain — should not crash */
-    engine_channel_reset(&eng);
+    engine_channel_reset(&eng, false);
     float drain_out[128];
     size_t drained = sdm_drain(&eng.sdm, drain_out, 128);
     TEST_ASSERT_TRUE(drained <= (size_t)cfg.trellis_lat,

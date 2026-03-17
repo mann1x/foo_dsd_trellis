@@ -338,21 +338,24 @@ size_t engine_process_block(engine_channel_t *eng,
     return sdm_out;
 }
 
-void engine_channel_reset(engine_channel_t *eng) {
+void engine_channel_reset(engine_channel_t *eng, bool preserve_sdm) {
     fir_chain_reset(&eng->fir);
-    /* Reset boxcar (preserve taps) and SDM for both modes.
-     * Clean state on every flush ensures no stale data corruption.
-     * The play-start pop is DAC/ASIO cold-start, not our code. */
+    /* Reset boxcar (preserve taps). */
     {
         int saved_taps = eng->boxcar.taps;
         memset(&eng->boxcar, 0, sizeof(eng->boxcar));
         eng->boxcar.taps = saved_taps;
     }
     if (!eng->fir_only) {
-        if (eng->sdm_mode == SDM_MODE_PRECORR)
+        if (preserve_sdm && eng->sdm_mode == SDM_MODE_TRELLIS) {
+            /* Anti-pop: keep Trellis SDM integrators warm across flush.
+             * The candidate state and history buffers survive so the first
+             * chunk after stop→play resumes without a DC step pop. */
+        } else if (eng->sdm_mode == SDM_MODE_PRECORR) {
             precorr_context_reset(&eng->precorr);
-        else
+        } else {
             sdm_context_reset(&eng->sdm);
+        }
     }
     if (eng->lowpass.initialized)
         fir_lowpass_reset(&eng->lowpass);
