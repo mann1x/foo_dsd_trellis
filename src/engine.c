@@ -91,7 +91,7 @@ int engine_channel_init(engine_channel_t *eng, int channel,
     eng->sdm_mode = cfg->sdm_mode;
     eng->fir_gain = 1.0f;  /* default, may be overridden by path_table */
 
-    /* Init FIR lowpass for same-rate Trellis (replaces boxcar for smooth output) */
+    /* Init FIR lowpass for same-rate Trellis */
     if (cfg->fs_in == fs_out && cfg->sdm_mode == SDM_MODE_TRELLIS && !cfg->mute)
         fir_lowpass_init(&eng->lowpass, cfg->fs_in);
 

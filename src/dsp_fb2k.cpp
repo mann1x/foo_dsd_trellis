@@ -1304,30 +1304,39 @@ public:
                     trellis_log("DSD%u -> DSD%u, %uch", dsd_mult, out_rate / 44100, channels);
             }
 
-            /* Sub-chunk processing: split large chunks into ~100ms pieces.
-             * Process sequentially, accumulate outputs into out_buf.
-             * This keeps each processing call short enough to prevent
-             * ASIO buffer underrun. */
-            size_t sub_chunk_pcm = pcm_rate / 10;  /* ~100ms worth of PCM frames */
-            if (sub_chunk_pcm < pcm_frames && pcm_frames > sub_chunk_pcm * 2) {
+            /* Sub-chunk processing: split into ~100ms pieces for lower latency.
+             * Each sub-chunk is processed independently, output accumulated. */
+            size_t sub_chunk_pcm = pcm_rate / 10;  /* ~100ms */
+            if (sub_chunk_pcm >= 16 && pcm_frames > sub_chunk_pcm * 2) {
+                /* Allocate a temporary buffer for sub-chunk output */
+                size_t max_sub_out = sub_chunk_pcm * 8;  /* worst case ratio */
+                pfc::array_staticsize_t<float> sub_out_buf;
+                sub_out_buf.set_size_discard(max_sub_out * channels);
+
                 size_t processed = 0;
                 size_t out_offset = 0;
                 while (processed < pcm_frames) {
                     size_t this_sub = pcm_frames - processed;
                     if (this_sub > sub_chunk_pcm) this_sub = sub_chunk_pcm;
 
-                    /* Process sub-chunk into temp area of out_buf */
+                    /* Process sub-chunk into separate temp buffer */
                     size_t sub_out = plugin_process(m_state,
                         in_f32.get_ptr() + processed * channels,
-                        out_buf.get_ptr() + out_offset * channels,
+                        sub_out_buf.get_ptr(),
                         this_sub, (int)channels, pcm_rate);
 
-                    out_offset += sub_out;
+                    /* Copy sub-chunk output to correct offset in main out_buf */
+                    if (sub_out > 0) {
+                        size_t copy_sz = sub_out * channels;
+                        memcpy(out_buf.get_ptr() + out_offset * channels,
+                               sub_out_buf.get_ptr(),
+                               copy_sz * sizeof(float));
+                        out_offset += sub_out;
+                    }
                     processed += this_sub;
                 }
                 out_frames = out_offset;
             } else {
-                /* Small chunk — process in one go */
                 out_frames = plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
                                             pcm_frames, (int)channels, pcm_rate);
             }
