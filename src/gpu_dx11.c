@@ -258,6 +258,19 @@ typedef struct {
     ID3D11ComputeShader   *cs_gain;
     ID3D11ComputeShader   *cs_boxcar;
     ID3D11ComputeShader   *cs_trellis;
+    /* Persistent Trellis SDM buffers */
+    ID3D11Buffer          *buf_trellis_states;  /* UAV: [cands*8] uint2 (doubles) */
+    ID3D11UnorderedAccessView *uav_trellis_states;
+    ID3D11Buffer          *buf_trellis_costs;   /* UAV: [cands] uint2 (doubles) */
+    ID3D11UnorderedAccessView *uav_trellis_costs;
+    ID3D11Buffer          *buf_trellis_params;  /* cbuffer: NTF coeffs + config */
+    int                    trellis_cands;
+    int                    trellis_order;
+    int                    trellis_lat;
+    double                 trellis_ntf_a[8];
+    double                 trellis_ntf_g[8];
+    double                 trellis_state_limit;
+    bool                   trellis_ready;
     /* GPU buffers */
     ID3D11Buffer          *buf_in;
     ID3D11ShaderResourceView *srv_in;
@@ -600,6 +613,11 @@ void gpu_dx11_destroy(void *ptr) {
     if (c->buf_out)   ID3D11Buffer_Release(c->buf_out);
     if (c->srv_in)    ID3D11ShaderResourceView_Release(c->srv_in);
     if (c->buf_in)    ID3D11Buffer_Release(c->buf_in);
+    if (c->uav_trellis_costs)  ID3D11UnorderedAccessView_Release(c->uav_trellis_costs);
+    if (c->buf_trellis_costs)  ID3D11Buffer_Release(c->buf_trellis_costs);
+    if (c->uav_trellis_states) ID3D11UnorderedAccessView_Release(c->uav_trellis_states);
+    if (c->buf_trellis_states) ID3D11Buffer_Release(c->buf_trellis_states);
+    if (c->buf_trellis_params) ID3D11Buffer_Release(c->buf_trellis_params);
     if (c->cs_trellis) ID3D11ComputeShader_Release(c->cs_trellis);
     if (c->cs_boxcar) ID3D11ComputeShader_Release(c->cs_boxcar);
     if (c->cs_gain)   ID3D11ComputeShader_Release(c->cs_gain);
@@ -848,22 +866,186 @@ int gpu_dx11_boxcar(dx11_context_t *c, const float *in, float *out,
 
 /* ─── DX11 Trellis SDM ─── */
 
+/* Trellis constant buffer layout (must match HLSL cbuffer TrellisParams).
+ * HLSL cbuffer requires 16-byte alignment per element. */
+#pragma pack(push, 16)
+typedef struct {
+    int count;
+    int num_cands;
+    int trellis_lat;
+    int ntf_order;
+    double ntf_a[8];    /* 64 bytes */
+    double ntf_g[8];    /* 64 bytes */
+    double state_limit;
+    double pad[3];      /* align to 16 bytes */
+} dx11_trellis_params_t;
+#pragma pack(pop)
+
+/* Create a structured buffer with uint2 stride (for packing doubles). */
+static HRESULT create_uint2_buf(ID3D11Device *dev, UINT count,
+                                 UINT bind_flags, ID3D11Buffer **buf) {
+    D3D11_BUFFER_DESC desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.ByteWidth           = count * 8;  /* uint2 = 8 bytes */
+    desc.Usage               = D3D11_USAGE_DEFAULT;
+    desc.BindFlags           = bind_flags;
+    desc.MiscFlags           = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    desc.StructureByteStride = 8;  /* uint2 */
+    return ID3D11Device_CreateBuffer(dev, &desc, NULL, buf);
+}
+
+static HRESULT create_uint2_uav(ID3D11Device *dev, ID3D11Buffer *buf,
+                                  UINT count, ID3D11UnorderedAccessView **uav) {
+    D3D11_UNORDERED_ACCESS_VIEW_DESC desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.Format              = DXGI_FORMAT_UNKNOWN;
+    desc.ViewDimension       = D3D11_UAV_DIMENSION_BUFFER;
+    desc.Buffer.FirstElement = 0;
+    desc.Buffer.NumElements  = count;
+    return ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)buf,
+                                                   &desc, uav);
+}
+
 int gpu_dx11_trellis_setup(dx11_context_t *c, int num_cands, int order,
                             int trellis_lat, const double *ntf_a,
                             const double *ntf_g, double state_limit) {
-    /* DX11 Trellis uses the cs_trellis shader with constant buffer
-     * for NTF params. State stored in UAV structured buffers. */
     if (!c || !c->cs_trellis) return -1;
-    (void)num_cands; (void)order; (void)trellis_lat;
-    (void)ntf_a; (void)ntf_g; (void)state_limit;
-    /* TODO: create UAV buffers for state, upload NTF to constant buffer */
-    return -1; /* Not yet fully implemented — falls back to CPU */
+
+    c->trellis_cands = num_cands;
+    c->trellis_order = order;
+    c->trellis_lat   = trellis_lat;
+    c->trellis_state_limit = state_limit;
+    memset(c->trellis_ntf_a, 0, sizeof(c->trellis_ntf_a));
+    memset(c->trellis_ntf_g, 0, sizeof(c->trellis_ntf_g));
+    for (int k = 0; k < order && k < 8; k++) {
+        c->trellis_ntf_a[k] = ntf_a[k];
+        c->trellis_ntf_g[k] = ntf_g[k];
+    }
+
+    /* Create state UAV buffers (uint2 = packed double) */
+    UINT state_count = (UINT)(num_cands * 8);  /* doubles */
+    UINT cost_count  = (UINT)num_cands;
+
+    if (c->uav_trellis_states) ID3D11UnorderedAccessView_Release(c->uav_trellis_states);
+    if (c->buf_trellis_states) ID3D11Buffer_Release(c->buf_trellis_states);
+    if (c->uav_trellis_costs)  ID3D11UnorderedAccessView_Release(c->uav_trellis_costs);
+    if (c->buf_trellis_costs)  ID3D11Buffer_Release(c->buf_trellis_costs);
+    c->uav_trellis_states = NULL; c->buf_trellis_states = NULL;
+    c->uav_trellis_costs = NULL;  c->buf_trellis_costs = NULL;
+
+    if (FAILED(create_uint2_buf(c->device, state_count,
+            D3D11_BIND_UNORDERED_ACCESS, &c->buf_trellis_states)))
+        return -1;
+    if (FAILED(create_uint2_uav(c->device, c->buf_trellis_states,
+            state_count, &c->uav_trellis_states)))
+        return -1;
+    if (FAILED(create_uint2_buf(c->device, cost_count,
+            D3D11_BIND_UNORDERED_ACCESS, &c->buf_trellis_costs)))
+        return -1;
+    if (FAILED(create_uint2_uav(c->device, c->buf_trellis_costs,
+            cost_count, &c->uav_trellis_costs)))
+        return -1;
+
+    /* Zero-init state on device */
+    {
+        uint8_t *zeros = (uint8_t *)calloc(state_count, 8);
+        if (zeros) {
+            D3D11_BOX box = {0, 0, 0, state_count * 8, 1, 1};
+            ID3D11DeviceContext_UpdateSubresource(c->ctx,
+                (ID3D11Resource *)c->buf_trellis_states, 0, &box, zeros, 0, 0);
+            free(zeros);
+        }
+        zeros = (uint8_t *)calloc(cost_count, 8);
+        if (zeros) {
+            D3D11_BOX box = {0, 0, 0, cost_count * 8, 1, 1};
+            ID3D11DeviceContext_UpdateSubresource(c->ctx,
+                (ID3D11Resource *)c->buf_trellis_costs, 0, &box, zeros, 0, 0);
+            free(zeros);
+        }
+    }
+
+    /* Create constant buffer for NTF params */
+    if (c->buf_trellis_params) ID3D11Buffer_Release(c->buf_trellis_params);
+    c->buf_trellis_params = NULL;
+    if (FAILED(create_cb(c->device, sizeof(dx11_trellis_params_t),
+            &c->buf_trellis_params)))
+        return -1;
+
+    /* Upload NTF constants */
+    dx11_trellis_params_t params;
+    memset(&params, 0, sizeof(params));
+    params.num_cands   = num_cands;
+    params.ntf_order   = order;
+    params.trellis_lat = trellis_lat;
+    params.state_limit = state_limit;
+    for (int k = 0; k < order && k < 8; k++) {
+        params.ntf_a[k] = ntf_a[k];
+        params.ntf_g[k] = ntf_g[k];
+    }
+    ID3D11DeviceContext_UpdateSubresource(c->ctx,
+        (ID3D11Resource *)c->buf_trellis_params, 0, NULL, &params, 0, 0);
+
+    c->trellis_ready = true;
+    return 0;
 }
 
 int gpu_dx11_trellis(dx11_context_t *c, const float *in, float *out,
                       size_t count) {
-    if (!c || !c->cs_trellis) return -1;
-    (void)in; (void)out; (void)count;
-    /* TODO: dispatch cs_trellis with persistent state buffers */
-    return -1; /* Not yet fully implemented — falls back to CPU */
+    if (!c || !c->cs_trellis || !c->trellis_ready) return -1;
+
+    int lat = c->trellis_lat;
+    size_t out_count = count > (size_t)lat ? count - (size_t)lat : 0;
+
+    /* Ensure I/O buffers */
+    if (ensure_buf_in(c, count) != 0) return -1;
+    if (ensure_buf_out(c, out_count > 0 ? out_count : 1) != 0) return -1;
+    if (ensure_staging(c, out_count > 0 ? out_count : 1) != 0) return -1;
+
+    /* Upload input */
+    upload_buf(c->ctx, c->buf_in, in, count);
+
+    /* Upload params with cached NTF coefficients */
+    dx11_trellis_params_t params;
+    memset(&params, 0, sizeof(params));
+    params.count       = (int)count;
+    params.num_cands   = c->trellis_cands;
+    params.trellis_lat = c->trellis_lat;
+    params.ntf_order   = c->trellis_order;
+    params.state_limit = c->trellis_state_limit;
+    memcpy(params.ntf_a, c->trellis_ntf_a, sizeof(params.ntf_a));
+    memcpy(params.ntf_g, c->trellis_ntf_g, sizeof(params.ntf_g));
+    ID3D11DeviceContext_UpdateSubresource(c->ctx,
+        (ID3D11Resource *)c->buf_trellis_params, 0, NULL, &params, 0, 0);
+
+    /* Bind resources:
+     * t0 = input SRV
+     * u0 = output UAV
+     * u1 = trellis states UAV
+     * u2 = trellis costs UAV
+     * b0 = params cbuffer */
+    ID3D11DeviceContext_CSSetShader(c->ctx, c->cs_trellis, NULL, 0);
+    ID3D11ShaderResourceView *srvs[1] = { c->srv_in };
+    ID3D11DeviceContext_CSSetShaderResources(c->ctx, 0, 1, srvs);
+    ID3D11UnorderedAccessView *uavs[3] = {
+        c->uav_out, c->uav_trellis_states, c->uav_trellis_costs
+    };
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(c->ctx, 0, 3, uavs, NULL);
+    ID3D11DeviceContext_CSSetConstantBuffers(c->ctx, 0, 1, &c->buf_trellis_params);
+
+    /* Dispatch: 1 group of 64 threads (entire chunk sequential) */
+    ID3D11DeviceContext_Dispatch(c->ctx, 1, 1, 1);
+
+    /* Unbind */
+    ID3D11ShaderResourceView *null_srvs[1] = { NULL };
+    ID3D11UnorderedAccessView *null_uavs[3] = { NULL, NULL, NULL };
+    ID3D11DeviceContext_CSSetShaderResources(c->ctx, 0, 1, null_srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(c->ctx, 0, 3, null_uavs, NULL);
+
+    /* Download output */
+    if (out_count > 0) {
+        if (download_buf(c->ctx, c->buf_out, c->buf_staging, out, out_count) != 0)
+            return -1;
+    }
+
+    return 0;
 }
