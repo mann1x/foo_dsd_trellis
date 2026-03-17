@@ -10,6 +10,7 @@
 #include "precorr.h"
 #include "fir.h"
 #include "onnx_filter.h"
+#include "gpu_compute.h"
 
 /* DSD-Wide boxcar filter: smooths 1-bit DSD to multi-bit at same rate.
  * Tap count is rate-adaptive: more taps at higher DSD rates for smoother

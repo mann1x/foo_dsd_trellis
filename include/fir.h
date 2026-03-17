@@ -16,6 +16,10 @@
 /* IPP FIRSR half-band filter length */
 #define IPP_HB_NTAPS 63
 
+/* Global half-band taps (computed once, shared with GPU backend) */
+extern float g_hb_taps[IPP_HB_NTAPS];
+extern int   g_hb_ntaps;
+
 typedef struct {
     int         num_stages;     /* 0 = passthrough */
     float      *scratch;        /* Intermediate buffer between stages */

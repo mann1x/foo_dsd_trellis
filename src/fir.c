@@ -21,6 +21,11 @@
 
 #define IPP_HB_KAISER_BETA 12.0   /* ~120 dB stopband */
 
+/* Global half-band taps for GPU sharing */
+float g_hb_taps[IPP_HB_NTAPS] = {0};
+int   g_hb_ntaps = IPP_HB_NTAPS;
+static bool g_hb_taps_initialized = false;
+
 /* ═══════════════════════════════════════════════════════════════════════
  * Half-band filter design
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -71,6 +76,12 @@ static int ipp_firsr_stage_init(fir_chain_t *chain, int stage_idx) {
     Ipp32f taps[IPP_HB_NTAPS];
     for (int i = 0; i < IPP_HB_NTAPS; i++)
         taps[i] = (Ipp32f)hd[i];
+
+    /* Cache taps globally for GPU backend */
+    if (!g_hb_taps_initialized) {
+        memcpy(g_hb_taps, taps, sizeof(g_hb_taps));
+        g_hb_taps_initialized = true;
+    }
 
     int specSize = 0, bufSize = 0;
     IppStatus st = ippsFIRSRGetSize(IPP_HB_NTAPS, ipp32f, &specSize, &bufSize);

@@ -128,10 +128,12 @@ static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
 #define CONFIG_V11_SIZE (CONFIG_V10_SIZE + 1 + 4 * RATE_MAP_COUNT)
 /* v12: rate_limiter(12) + fir_gain_db(1) */
 #define CONFIG_V12_SIZE (CONFIG_V11_SIZE + RATE_MAP_COUNT + 1)
+/* v13: gpu_enabled(1) + gpu_backend(1) + rate_gpu(12) */
+#define CONFIG_V13_SIZE (CONFIG_V12_SIZE + 1 + 1 + RATE_MAP_COUNT)
 
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
-    if (buf_size < CONFIG_V12_SIZE)
+    if (buf_size < CONFIG_V13_SIZE)
         return 0;
 
     size_t pos = 0;
@@ -179,6 +181,11 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     memcpy(buf + pos, cfg->rate_limiter, RATE_MAP_COUNT);
     pos += RATE_MAP_COUNT;
     pos = write_u8(buf, pos, (uint8_t)(int8_t)cfg->fir_gain_db);
+    /* v13: GPU compute settings */
+    pos = write_u8(buf, pos, cfg->gpu_enabled ? 1 : 0);
+    pos = write_u8(buf, pos, (uint8_t)cfg->gpu_backend);
+    memcpy(buf + pos, cfg->rate_gpu, RATE_MAP_COUNT);
+    pos += RATE_MAP_COUNT;
 
     return pos;
 }
@@ -291,6 +298,14 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
                 pos = read_u8(buf, pos, &u8);
                 cfg->fir_gain_db = (int8_t)u8;
             }
+            /* Version 13 adds GPU compute settings */
+            if (version >= 13 && buf_size >= CONFIG_V13_SIZE) {
+                uint8_t u8;
+                pos = read_u8(buf, pos, &u8); cfg->gpu_enabled = (u8 != 0);
+                pos = read_u8(buf, pos, &u8); cfg->gpu_backend = (int)u8;
+                memcpy(cfg->rate_gpu, buf + pos, RATE_MAP_COUNT);
+                pos += RATE_MAP_COUNT;
+            }
         } else {
             /* Migrate from v1-v7: use fs_out + proc_mode to populate rate_map */
             uint8_t out_idx = dsd_to_rate_out(fs_out_raw);
@@ -397,4 +412,8 @@ void config_validate(dsd_config_t *cfg) {
         if (cfg->fir_gain_db > 0) cfg->fir_gain_db = 0;
         if (cfg->fir_gain_db < -12) cfg->fir_gain_db = -12;
     }
+
+    /* Validate GPU settings */
+    if (cfg->gpu_backend < 0 || cfg->gpu_backend > 3)
+        cfg->gpu_backend = 3;  /* GPU_BACKEND_AUTO */
 }

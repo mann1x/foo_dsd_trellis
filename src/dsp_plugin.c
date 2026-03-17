@@ -101,6 +101,9 @@ typedef struct plugin_state {
     size_t             cached_pack_temps_sz;  /* floats per channel */
     int                cached_pack_temps_n;   /* number of channels */
 
+    /* GPU compute context (shared across all channels, NULL if disabled) */
+    gpu_context_t     *gpu;
+
     /* Previous chunk FIR tail for parallel SDM segment 0 warmup.
      * Fixes chunk-boundary state discontinuity: after first chunk,
      * segment 0 also uses a temp SDM with warmup from this tail. */
@@ -290,6 +293,12 @@ void plugin_destroy(plugin_state_t *s) {
         free(s->seg0_buf);
     }
 
+    /* Destroy GPU compute context */
+    if (s->gpu) {
+        gpu_destroy(s->gpu);
+        s->gpu = NULL;
+    }
+
     free(s);
 }
 
@@ -410,6 +419,27 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         free(s->channels);
         s->channels = NULL;
         return -1;
+    }
+
+    /* Create GPU compute context if enabled */
+    if (s->config.gpu_enabled && !s->gpu) {
+        if (gpu_available((gpu_backend_t)s->config.gpu_backend)) {
+            s->gpu = gpu_create((gpu_backend_t)s->config.gpu_backend);
+            if (s->gpu) {
+                /* Upload FIR coefficients — reuse the same taps the CPU path uses.
+                 * The FIR chain is initialized per-channel, but all channels share
+                 * the same half-band Kaiser taps. Get them from channel 0. */
+                int num_stages = s->channels[0].fir.num_stages;
+                bool is_upsample = s->channels[0].fir.upsample;
+                if (num_stages > 0) {
+                    extern float g_hb_taps[];
+                    extern int   g_hb_ntaps;
+                    gpu_fir_setup(s->gpu, g_hb_taps, g_hb_ntaps,
+                                  num_stages, is_upsample);
+                }
+                /* GPU context created — logged by dsp_fb2k.cpp */
+            }
+        }
     }
 
     /* Create dedicated IO pool for DoP unpack/pack (2 threads).
@@ -756,23 +786,70 @@ size_t plugin_process(plugin_state_t *s,
         float *fir_data[32];  /* max 32 channels */
         size_t fir_counts[32];
 
-        /* Submit FIR blocks to threadpool for parallel processing */
-        channel_block_t fir_blocks[32];
-        memset(fir_blocks, 0, (size_t)num_channels * sizeof(channel_block_t));
-        for (int ch = 0; ch < num_channels; ch++) {
-            fir_blocks[ch].mode    = BLOCK_MODE_FIR;
-            fir_blocks[ch].eng     = &s->channels[ch];
-            fir_blocks[ch].in      = s->ch_in[ch];
-            fir_blocks[ch].count   = dsd_in_count;
-            fir_blocks[ch].cfg     = &s->config;
-            fir_blocks[ch].channel = ch;
-            threadpool_submit(s->pool, &fir_blocks[ch]);
-        }
-        threadpool_wait(s->pool);
+        /* GPU FIR: single batched dispatch for all channels when available.
+         * Falls back to threadpool FIR on GPU failure or small buffers. */
+        bool gpu_fir_ok = false;
+        if (s->gpu && dsd_in_count >= GPU_MIN_SAMPLES &&
+            s->channels[0].fir.num_stages > 0) {
+            /* Estimate output count for buffer sizing */
+            size_t est_out = dsd_in_count;
+            for (int st = 0; st < s->channels[0].fir.num_stages; st++)
+                est_out = s->channels[0].fir.upsample ? est_out * 2 : est_out / 2;
 
-        for (int ch = 0; ch < num_channels; ch++) {
-            fir_counts[ch] = fir_blocks[ch].out_count;
-            fir_data[ch] = fir_blocks[ch].fir_out;
+            for (int ch = 0; ch < num_channels; ch++) {
+                size_t gpu_out = 0;
+                if (gpu_fir_chain_process(s->gpu, s->ch_in[ch],
+                        s->channels[ch].fir_buf, dsd_in_count,
+                        &gpu_out, NULL, NULL) == 0) {
+                    fir_counts[ch] = gpu_out;
+                    fir_data[ch] = s->channels[ch].fir_buf;
+                    /* Ensure fir_buf is large enough */
+                    if (s->channels[ch].fir_buf_sz < gpu_out * sizeof(float)) {
+                        free(s->channels[ch].fir_buf);
+                        s->channels[ch].fir_buf = (float *)malloc(gpu_out * sizeof(float));
+                        s->channels[ch].fir_buf_sz = gpu_out * sizeof(float);
+                        /* Re-run on new buffer */
+                        gpu_fir_chain_process(s->gpu, s->ch_in[ch],
+                            s->channels[ch].fir_buf, dsd_in_count,
+                            &gpu_out, NULL, NULL);
+                        fir_data[ch] = s->channels[ch].fir_buf;
+                    }
+                    gpu_fir_ok = true;
+                } else {
+                    gpu_fir_ok = false;
+                    break;
+                }
+            }
+            /* Apply gain on GPU */
+            if (gpu_fir_ok) {
+                float combined = s->channels[0].fir_gain * s->config.gain;
+                if (combined != 1.0f) {
+                    for (int ch = 0; ch < num_channels; ch++)
+                        gpu_gain_apply(s->gpu, fir_data[ch],
+                                       fir_counts[ch], combined);
+                }
+            }
+        }
+
+        if (!gpu_fir_ok) {
+            /* Threadpool FIR fallback */
+            channel_block_t fir_blocks[32];
+            memset(fir_blocks, 0, (size_t)num_channels * sizeof(channel_block_t));
+            for (int ch = 0; ch < num_channels; ch++) {
+                fir_blocks[ch].mode    = BLOCK_MODE_FIR;
+                fir_blocks[ch].eng     = &s->channels[ch];
+                fir_blocks[ch].in      = s->ch_in[ch];
+                fir_blocks[ch].count   = dsd_in_count;
+                fir_blocks[ch].cfg     = &s->config;
+                fir_blocks[ch].channel = ch;
+                threadpool_submit(s->pool, &fir_blocks[ch]);
+            }
+            threadpool_wait(s->pool);
+
+            for (int ch = 0; ch < num_channels; ch++) {
+                fir_counts[ch] = fir_blocks[ch].out_count;
+                fir_data[ch] = fir_blocks[ch].fir_out;
+            }
         }
 
         QueryPerformanceCounter(&t_fir_end);

@@ -1,0 +1,143 @@
+/*
+ * foo_dsd_trellis — GPU Compute Offload API
+ *
+ * Abstract GPU compute interface for FIR convolution, gain, boxcar, and SDM.
+ * Two backends: DirectCompute (D3D11 cs_5_0) and CUDA (driver API).
+ * Both delay-loaded — plugin works without any GPU driver installed.
+ *
+ * All functions return 0 on success, -1 on failure (caller falls back to CPU).
+ */
+
+#ifndef GPU_COMPUTE_H
+#define GPU_COMPUTE_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct gpu_context gpu_context_t;
+
+typedef enum {
+    GPU_BACKEND_NONE     = 0,   /* GPU disabled */
+    GPU_BACKEND_DIRECTX  = 1,   /* D3D11 Compute Shader cs_5_0 */
+    GPU_BACKEND_CUDA     = 2,   /* CUDA Driver API (nvcuda.dll) */
+    GPU_BACKEND_AUTO     = 3,   /* Try CUDA first, then DirectX */
+} gpu_backend_t;
+
+typedef struct {
+    gpu_backend_t backend;          /* Active backend */
+    char          device_name[128]; /* GPU device name */
+    size_t        vram_mb;          /* Available VRAM in MB */
+    bool          available;        /* true if GPU is usable */
+} gpu_info_t;
+
+/* Minimum sample count for GPU to be faster than CPU.
+ * Below this, kernel launch + transfer overhead exceeds CPU FIR time. */
+#define GPU_MIN_SAMPLES 8192
+
+/* ─── Probe & Info ─── */
+
+/* Probe GPU availability. Thread-safe, caches result. */
+bool gpu_available(gpu_backend_t preferred);
+
+/* Get info about the active GPU (call after gpu_available). */
+void gpu_get_info(gpu_info_t *info);
+
+/* ─── Lifecycle ─── */
+
+/* Create a GPU compute context. Returns NULL on failure. */
+gpu_context_t *gpu_create(gpu_backend_t backend);
+
+/* Destroy GPU context. Safe to call with NULL. */
+void gpu_destroy(gpu_context_t *ctx);
+
+/* ─── FIR Convolution ─── */
+
+/* Upload FIR coefficients (call once per rate configuration).
+ * taps: filter coefficients, ntaps: tap count (63),
+ * num_stages: number of 2x up/downsample stages,
+ * upsample: true for upsample chain, false for downsample. */
+int gpu_fir_setup(gpu_context_t *ctx, const float *taps, int ntaps,
+                  int num_stages, bool upsample);
+
+/* Process FIR chain for one channel.
+ * delay_in/delay_out: FIR delay line state (62 floats per stage). */
+int gpu_fir_chain_process(gpu_context_t *ctx, const float *in, float *out,
+                          size_t in_count, size_t *out_count,
+                          const float *delay_in, float *delay_out);
+
+/* Batched FIR: process all channels in one kernel launch.
+ * in_batch/out_batch: contiguous buffers [ch0_data | ch1_data | ...]. */
+int gpu_fir_batch_process(gpu_context_t *ctx, const float *in_batch,
+                          float *out_batch, size_t samples_per_ch,
+                          int num_channels, size_t *out_count_per_ch);
+
+/* ─── Gain & Boxcar ─── */
+
+/* Apply gain multiply in-place. */
+int gpu_gain_apply(gpu_context_t *ctx, float *buf, size_t count, float gain);
+
+/* Boxcar smoothing + gain in one pass.
+ * Converts ±1.0 DSD → multi-bit via running average, applies gain. */
+int gpu_boxcar_smooth(gpu_context_t *ctx, const float *in, float *out,
+                      size_t count, int taps, float gain);
+
+/* ─── Trellis SDM (cands ≥ 16 only) ─── */
+
+/* Process entire chunk through Trellis SDM on GPU.
+ * Sequential per-sample loop with parallel candidate expansion.
+ * Only viable when num_cands >= 16. */
+int gpu_trellis_process(gpu_context_t *ctx, const float *in, float *out,
+                        size_t count, const void *sdm_state_in,
+                        void *sdm_state_out, int num_cands, int order,
+                        const double *ntf_a, const double *ntf_g);
+
+/* ─── PreCorr SDM ─── */
+
+/* Process entire chunk through PreCorr SDM on GPU.
+ * Sequential loop, one thread per channel for multi-channel batch. */
+int gpu_precorr_process(gpu_context_t *ctx, const float *in, float *out,
+                        size_t count, const float *ntf_a, const float *ntf_g,
+                        int order, const float pred_table[256][8],
+                        const float *state_in, float *state_out);
+
+/* ─── Backend probe functions (implemented in gpu_dx11.c / gpu_cuda.c) ─── */
+
+bool gpu_dx11_probe(void);
+bool gpu_cuda_probe(void);
+
+void gpu_dx11_get_info(gpu_info_t *info);
+void gpu_cuda_get_info(gpu_info_t *info);
+
+gpu_context_t *gpu_dx11_create(void);
+gpu_context_t *gpu_cuda_create(void);
+
+void gpu_dx11_destroy(void *ctx);
+void gpu_cuda_destroy(void *ctx);
+
+/* Backend-specific operations (called by gpu_compute.c dispatcher) */
+int gpu_dx11_fir_setup(void *ctx, const float *taps, int ntaps,
+                        int num_stages, bool upsample);
+int gpu_dx11_fir_chain(void *ctx, const float *in, float *out,
+                        size_t in_count, size_t *out_count);
+int gpu_dx11_gain(void *ctx, float *buf, size_t count, float gain);
+int gpu_dx11_boxcar(void *ctx, const float *in, float *out,
+                     size_t count, int taps, float gain);
+
+int gpu_cuda_fir_setup(void *ctx, const float *taps, int ntaps,
+                        int num_stages, bool upsample);
+int gpu_cuda_fir_chain(void *ctx, const float *in, float *out,
+                        size_t in_count, size_t *out_count);
+int gpu_cuda_gain(void *ctx, float *buf, size_t count, float gain);
+int gpu_cuda_boxcar(void *ctx, const float *in, float *out,
+                     size_t count, int taps, float gain);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* GPU_COMPUTE_H */

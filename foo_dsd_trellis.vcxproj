@@ -94,6 +94,10 @@
       <SubSystem>Windows</SubSystem>
       <AdditionalDependencies>$(ProjectDir)foobar2000-sdk\foobar2000\shared\shared-$(Platform).lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <PreLinkEvent>
+      <Command>taskkill /F /IM mspdbsrv.exe 2&gt;nul || exit /b 0</Command>
+      <Message>Killing stale PDB server to prevent IPP link corruption</Message>
+    </PreLinkEvent>
   </ItemDefinitionGroup>
   <!-- Debug-specific -->
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
@@ -210,6 +214,15 @@
     <ClCompile Include="src\tusbaudio.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\gpu_compute.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\gpu_dx11.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\gpu_cuda.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\foo_dsd_trellis.rc" />
@@ -231,6 +244,7 @@
     <ClInclude Include="include\cpuset.h" />
     <ClInclude Include="include\precorr.h" />
     <ClInclude Include="include\onnx_filter.h" />
+    <ClInclude Include="include\gpu_compute.h" />
   </ItemGroup>
   <!-- SDK project references -->
   <ItemGroup>
