@@ -195,8 +195,13 @@ static DWORD WINAPI worker_func(LPVOID param) {
             uint32_t fs_out = (block->cfg)
                 ? (block->cfg->fs_out ? block->cfg->fs_out : block->cfg->fs_in)
                 : 0;
-            double audio_sec = (fs_out > 0 && block->out_count > 0)
-                ? (double)block->out_count / (double)fs_out
+            /* For PACK mode, out_count is DoP PCM frames (rate = fs_out/16).
+             * For UNPACK mode, out_count is DSD samples (rate = fs_out). */
+            double rate = (double)fs_out;
+            if (block->mode == BLOCK_MODE_PACK && fs_out > 0)
+                rate = (double)(fs_out / DOP_BITS_PER_FRAME);
+            double audio_sec = (rate > 0.0 && block->out_count > 0)
+                ? (double)block->out_count / rate
                 : 0.0;
             double proc_sec = (double)(t_end.QuadPart - t_start.QuadPart) / (double)freq.QuadPart;
             block->rt_ratio = (audio_sec > 0.0) ? proc_sec / audio_sec : 0.0;

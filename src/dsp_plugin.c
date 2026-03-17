@@ -674,6 +674,7 @@ size_t plugin_process(plugin_state_t *s,
         for (int ch = 0; ch < num_channels; ch++) {
             unpack_blocks[ch].mode = BLOCK_MODE_UNPACK;
             unpack_blocks[ch].channel = ch;
+            unpack_blocks[ch].cfg = &s->config;
             unpack_blocks[ch].pcm_interleaved = (float *)in_pcm;
             unpack_blocks[ch].dsd_channel = s->ch_in[ch];
             unpack_blocks[ch].pcm_frames = pcm_frames;
@@ -1052,6 +1053,7 @@ size_t plugin_process(plugin_state_t *s,
         for (int ch = 0; ch < num_channels; ch++) {
             pack_blocks[ch].mode = BLOCK_MODE_PACK;
             pack_blocks[ch].channel = ch;
+            pack_blocks[ch].cfg = &s->config;
             pack_blocks[ch].dsd_channel = s->ch_out[ch];
             pack_blocks[ch].pcm_interleaved = out_pcm;
             pack_blocks[ch].pcm_temp = s->cached_pack_temps[ch];
