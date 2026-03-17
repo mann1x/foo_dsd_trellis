@@ -286,7 +286,9 @@ static pfc::string8 get_log_path() {
 static void log_open() {
     if (g_log_file) return;
     pfc::string8 path = get_log_path();
-    fopen_s(&g_log_file, path.c_str(), "a");
+    /* Open with shared read access so the REST API can read the log
+     * while we're writing to it. _fsopen with _SH_DENYNO allows concurrent reads. */
+    g_log_file = _fsopen(path.c_str(), "a", _SH_DENYNO);
     if (g_log_file) {
         SYSTEMTIME st;
         GetLocalTime(&st);
