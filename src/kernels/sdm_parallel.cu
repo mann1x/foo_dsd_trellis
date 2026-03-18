@@ -46,7 +46,12 @@ __global__ void trellis_parallel_segments(
     const int *seg_out_starts,/* [num_segments] start offset in output */
     int seg_total_size,       /* samples per segment including warmup */
     int warmup,               /* warmup samples to discard */
-    int num_cands)
+    int num_cands,
+    /* Persistent state for segment 0 (continuity across chunks) */
+    const double *seg0_init_states,  /* [num_cands * 8] or NULL */
+    const double *seg0_init_costs,   /* [num_cands] or NULL */
+    double *seg0_final_states,       /* [num_cands * 8] */
+    double *seg0_final_costs)        /* [num_cands] */
 {
     int seg = blockIdx.x;
     int tid = threadIdx.x;
@@ -67,11 +72,18 @@ __global__ void trellis_parallel_segments(
     __shared__ int s_active;
     __shared__ unsigned s_output;
 
-    /* Initialize: all candidates start from zero state */
+    /* Segment 0: load persistent state for continuity across chunks.
+     * Segments 1+: start from zero with warmup overlap for convergence. */
     if (tid < nc) {
-        for (int k = 0; k < order; k++)
-            s_state[tid][k] = 0.0;
-        s_cost[tid] = 0.0;
+        if (seg == 0 && seg0_init_states) {
+            for (int k = 0; k < order; k++)
+                s_state[tid][k] = seg0_init_states[tid * 8 + k];
+            s_cost[tid] = seg0_init_costs[tid];
+        } else {
+            for (int k = 0; k < order; k++)
+                s_state[tid][k] = 0.0;
+            s_cost[tid] = 0.0;
+        }
         s_path[tid] = 0;
         s_next[tid] = 0;
     }
@@ -134,10 +146,19 @@ __global__ void trellis_parallel_segments(
         }
         __syncthreads();
 
-        /* Write output only after warmup */
-        if (tid == 0 && s >= warmup) {
+        /* Write output only after warmup.
+         * Segment 0 has no warmup (persistent state = already converged). */
+        int eff_warmup = (seg == 0 && seg0_init_states) ? 0 : warmup;
+        if (tid == 0 && s >= eff_warmup) {
             seg_out[out_idx++] = s_output ? 1.0f : -1.0f;
         }
+    }
+
+    /* Segment 0: save final state for next chunk */
+    if (seg == 0 && seg0_final_states && tid < nc) {
+        for (int k = 0; k < order; k++)
+            seg0_final_states[tid * 8 + k] = s_state[tid][k];
+        seg0_final_costs[tid] = s_cost[tid];
     }
 }
 

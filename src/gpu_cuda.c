@@ -864,11 +864,15 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
 
     for (int i = 0; i < num_segs; i++) {
         size_t seg_start = (size_t)i * base_seg;
-        /* Segment input starts `warmup` before the actual segment data.
-         * Segment 0 has no prior data — starts from 0 with less warmup. */
-        int in_start = (int)seg_start - warmup;
-        if (in_start < 0) in_start = 0;
-        h_seg_starts[i] = in_start;
+        if (i == 0) {
+            /* Segment 0: persistent state, no warmup prefix needed */
+            h_seg_starts[i] = 0;
+        } else {
+            /* Segments 1+: start warmup samples before segment boundary */
+            int in_start = (int)seg_start - warmup;
+            if (in_start < 0) in_start = 0;
+            h_seg_starts[i] = in_start;
+        }
         h_seg_out_starts[i] = (int)((size_t)i * out_per_seg);
     }
 
@@ -893,6 +897,23 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     QueryPerformanceFrequency(&t_freq);
     QueryPerformanceCounter(&t_start_qpc);
 
+    /* Segment 0 persistent state: use trellis_states/costs from setup.
+     * These persist across chunks for continuity (no cold-start pop).
+     * Allocate final state buffers for segment 0's output. */
+    static CUdeviceptr d_seg0_final_s = 0, d_seg0_final_c = 0;
+    static int seg0_alloc = 0;
+    if (seg0_alloc < nc) {
+        if (d_seg0_final_s) pfn_cuMemFree(d_seg0_final_s);
+        if (d_seg0_final_c) pfn_cuMemFree(d_seg0_final_c);
+        pfn_cuMemAlloc(&d_seg0_final_s, (size_t)nc * 8 * sizeof(double));
+        pfn_cuMemAlloc(&d_seg0_final_c, (size_t)nc * sizeof(double));
+        seg0_alloc = nc;
+    }
+
+    /* Pass persistent state for segment 0 (NULL if first ever chunk) */
+    CUdeviceptr seg0_init_s = c->trellis_state_valid ? c->d_trellis_states : (CUdeviceptr)0;
+    CUdeviceptr seg0_init_c = c->trellis_state_valid ? c->d_trellis_costs : (CUdeviceptr)0;
+
     /* Launch: num_segs blocks, each with 2*nc threads */
     int block_size = 2 * nc;
     if (block_size < 32) block_size = 32;
@@ -900,13 +921,21 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     void *args[] = {
         &c->d_sdm_in, &c->d_sdm_out,
         &d_seg_starts, &d_seg_out_starts,
-        &seg_total_i, &warmup, &nc
+        &seg_total_i, &warmup, &nc,
+        &seg0_init_s, &seg0_init_c,
+        &d_seg0_final_s, &d_seg0_final_c
     };
     pfn_cuLaunchKernel(c->fn_trellis_parallel,
                         (unsigned)num_segs, 1, 1,
                         (unsigned)block_size, 1, 1,
                         0, stream, args, NULL);
     pfn_cuStreamSynchronize(stream);
+
+    /* Copy segment 0's final state to persistent buffer for next chunk */
+    pfn_cuMemcpyDtoD(c->d_trellis_states, d_seg0_final_s,
+                      (size_t)nc * 8 * sizeof(double));
+    pfn_cuMemcpyDtoD(c->d_trellis_costs, d_seg0_final_c,
+                      (size_t)nc * sizeof(double));
     QueryPerformanceCounter(&t_kernel);
 
     /* Download output */
