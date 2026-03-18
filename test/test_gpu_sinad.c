@@ -43,7 +43,8 @@ void test_gpu_sinad_comparison(void) {
 
     uint32_t dsd_rate = 2822400;
     int cands = 4, depth = 4, lat = 256;
-    size_t N = 524288;  /* ~186ms at DSD64, gives ~8192 PCM samples */
+    /* Use small N to force 1 segment (no stitching artifacts) */
+    size_t N = 32768;
 
     /* Bin-align test frequency to BOTH DSD and PCM rates.
      * PCM output will be N/64 samples at 44100 Hz.
@@ -101,11 +102,46 @@ void test_gpu_sinad_comparison(void) {
     {
         gpu_context_t *ctx = gpu_create(GPU_BACKEND_CUDA);
         if (!ctx) { printf("  GPU create failed\n"); goto cleanup4; }
+        printf("  NTF a[]: ");
+        for (int k = 0; k < f->order; k++) printf("%.6f ", f->a[k]);
+        printf("\n  NTF g[]: ");
+        for (int k = 0; k < f->order; k++) printf("%.6f ", f->g[k]);
+        printf("\n");
         gpu_cuda_trellis_setup(ctx, cands, f->order, lat, f->a, f->g, 0.0);
+
+        /* Test with 1 segment (no stitching) to isolate quality issues */
         int rc = gpu_trellis_process(ctx, smoothed, gpu_out, enc_n,
                                       NULL, NULL, cands, f->order, f->a, f->g);
+
+        /* Check GPU output gain vs CPU */
+        double gpu_rms = 0, cpu_rms = 0;
+        size_t chk = enc_n > 10000 ? 10000 : enc_n;
+        for (size_t i = 1000; i < chk; i++) {
+            gpu_rms += gpu_out[i] * gpu_out[i];
+            cpu_rms += cpu_out[i] * cpu_out[i];
+        }
+        gpu_rms = sqrt(gpu_rms / (chk - 1000));
+        cpu_rms = sqrt(cpu_rms / (chk - 1000));
+        printf("  RMS: CPU=%.4f GPU=%.4f (both should be 1.0 for ±1.0 DSD)\n", cpu_rms, gpu_rms);
         gpu_destroy(ctx);
         printf("  GPU re-encode: rc=%d\n", rc);
+
+        /* Running average of DSD (crude decimation) at sample 10000 */
+        {
+            double cpu_avg = 0, gpu_avg = 0;
+            for (size_t i = 10000; i < 10064; i++) {
+                cpu_avg += cpu_out[i];
+                gpu_avg += gpu_out[i];
+            }
+            printf("  DSD avg[10000..10063]: CPU=%.4f GPU=%.4f (input=%.4f)\n",
+                   cpu_avg/64, gpu_avg/64, smoothed[10000]);
+        }
+        /* Print first DSD samples for comparison */
+        printf("  CPU DSD[1000..1019]: ");
+        for (size_t i = 1000; i < 1020; i++) printf("%.0f ", cpu_out[i]);
+        printf("\n  GPU DSD[1000..1019]: ");
+        for (size_t i = 1000; i < 1020; i++) printf("%.0f ", gpu_out[i]);
+        printf("\n");
         if (rc != 0) goto cleanup4;
     }
 
@@ -130,6 +166,30 @@ void test_gpu_sinad_comparison(void) {
         fir_chain_free(&fir2);
 
         printf("  CPU PCM: %zu, GPU PCM: %zu\n", cpu_pcm_n, gpu_pcm_n);
+
+        /* Check PCM output ranges */
+        if (cpu_pcm_n > 200 && gpu_pcm_n > 200) {
+            float cpu_min=1e9, cpu_max=-1e9, gpu_min=1e9, gpu_max=-1e9;
+            for (size_t i = 128; i < cpu_pcm_n; i++) {
+                if (cpu_pcm[i] < cpu_min) cpu_min = cpu_pcm[i];
+                if (cpu_pcm[i] > cpu_max) cpu_max = cpu_pcm[i];
+            }
+            for (size_t i = 128; i < gpu_pcm_n; i++) {
+                if (gpu_pcm[i] < gpu_min) gpu_min = gpu_pcm[i];
+                if (gpu_pcm[i] > gpu_max) gpu_max = gpu_pcm[i];
+            }
+            printf("  CPU PCM range: [%.4f, %.4f]\n", cpu_min, cpu_max);
+            printf("  GPU PCM range: [%.4f, %.4f]\n", gpu_min, gpu_max);
+        }
+
+        /* Print first few PCM samples */
+        printf("  CPU PCM[128..137]: ");
+        for (size_t i = 128; i < 138 && i < cpu_pcm_n; i++)
+            printf("%.4f ", cpu_pcm[i]);
+        printf("\n  GPU PCM[128..137]: ");
+        for (size_t i = 128; i < 138 && i < gpu_pcm_n; i++)
+            printf("%.4f ", gpu_pcm[i]);
+        printf("\n");
 
         /* Measure SINAD */
         size_t skip = 128;

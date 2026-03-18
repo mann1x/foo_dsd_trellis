@@ -285,7 +285,7 @@ __global__ void trellis_parallel_segments(
         int eff_M = (seg == 0 && seg0_init_states) ? 0 : M_convergence;
         bool hist_ready = (s_pending >= lat) || (seg == 0 && seg0_init_states);
         if (tid == 0 && hist_ready && s >= eff_M && out_idx < D_output) {
-            seg_out[out_idx++] = s_output_bit ? 1.0f : -1.0f;
+            seg_out[out_idx++] = s_output_bit ? -1.0f : 1.0f; /* inverted vs intuition */
         }
     }
 
