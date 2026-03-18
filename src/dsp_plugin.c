@@ -1111,9 +1111,18 @@ size_t plugin_process(plugin_state_t *s,
             s->fir_tail_len = overlap;
             s->fir_tail_valid = true;
         }
+    } else if (s->gpu && s->config.gpu_enabled) {
+        /* === Sequential path WITH GPU: run on calling thread ===
+         * D3D11 contexts are single-threaded — must run GPU dispatch
+         * from the same thread that created the device, not from
+         * threadpool workers. */
+        for (int ch = 0; ch < num_channels; ch++) {
+            dsd_out_count = engine_process_block(&s->channels[ch],
+                s->ch_in[ch], s->ch_out[ch], dsd_in_count, &s->config);
+        }
     } else {
         /* === Sequential path: dispatch full blocks per channel === */
-        channel_block_t blocks[32];  /* stack-allocated, no per-chunk malloc */
+        channel_block_t blocks[32];
         memset(blocks, 0, (size_t)num_channels * sizeof(channel_block_t));
 
         for (int ch = 0; ch < num_channels; ch++) {

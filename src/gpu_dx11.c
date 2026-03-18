@@ -1000,12 +1000,28 @@ int gpu_dx11_trellis(dx11_context_t *c, const float *in, float *out,
     int lat = c->trellis_lat;
     size_t out_count = count > (size_t)lat ? count - (size_t)lat : 0;
 
+    /* Unbind all resources before resizing buffers — prevents releasing
+     * bound resources which crashes the NVIDIA D3D11 driver. */
+    {
+        ID3D11ShaderResourceView *null_srvs[2] = { NULL, NULL };
+        ID3D11UnorderedAccessView *null_uavs[3] = { NULL, NULL, NULL };
+        ID3D11DeviceContext_CSSetShaderResources(c->ctx, 0, 2, null_srvs);
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(c->ctx, 0, 3, null_uavs, NULL);
+        ID3D11DeviceContext_CSSetShader(c->ctx, NULL, NULL, 0);
+    }
+
     /* Ensure I/O buffers */
     if (ensure_buf_in(c, count) != 0) return -1;
     if (ensure_buf_out(c, out_count > 0 ? out_count : 1) != 0) return -1;
     if (ensure_staging(c, out_count > 0 ? out_count : 1) != 0) return -1;
 
     /* Upload input */
+    {
+        char ubuf[128];
+        sprintf_s(ubuf, sizeof(ubuf), "DX11 trellis: uploading %zu floats, buf_in=%p cap=%zu",
+                  count, (void*)c->buf_in, c->cap_in);
+        trellis_log_c(ubuf);
+    }
     upload_buf(c->ctx, c->buf_in, in, count);
 
     /* Upload params with cached NTF coefficients */
@@ -1021,12 +1037,24 @@ int gpu_dx11_trellis(dx11_context_t *c, const float *in, float *out,
     ID3D11DeviceContext_UpdateSubresource(c->ctx,
         (ID3D11Resource *)c->buf_trellis_params, 0, NULL, &params, 0, 0);
 
-    /* Bind resources:
-     * t0 = input SRV
-     * u0 = output UAV
-     * u1 = trellis states UAV
-     * u2 = trellis costs UAV
-     * b0 = params cbuffer */
+    /* Validate resources before dispatch */
+    {
+        char vbuf[256];
+        sprintf_s(vbuf, sizeof(vbuf),
+            "DX11 trellis dispatch: srv_in=%p uav_out=%p uav_states=%p uav_costs=%p cb=%p cs=%p count=%zu out=%zu",
+            (void*)c->srv_in, (void*)c->uav_out,
+            (void*)c->uav_trellis_states, (void*)c->uav_trellis_costs,
+            (void*)c->buf_trellis_params, (void*)c->cs_trellis,
+            count, out_count);
+        trellis_log_c(vbuf);
+    }
+    if (!c->srv_in || !c->uav_out || !c->uav_trellis_states ||
+        !c->uav_trellis_costs || !c->buf_trellis_params) {
+        trellis_log_c("DX11 trellis: NULL resource, aborting");
+        return -1;
+    }
+
+    /* Bind resources */
     ID3D11DeviceContext_CSSetShader(c->ctx, c->cs_trellis, NULL, 0);
     ID3D11ShaderResourceView *srvs[1] = { c->srv_in };
     ID3D11DeviceContext_CSSetShaderResources(c->ctx, 0, 1, srvs);
@@ -1037,7 +1065,11 @@ int gpu_dx11_trellis(dx11_context_t *c, const float *in, float *out,
     ID3D11DeviceContext_CSSetConstantBuffers(c->ctx, 0, 1, &c->buf_trellis_params);
 
     /* Dispatch: 1 group of 64 threads (entire chunk sequential) */
+    trellis_log_c("DX11 trellis: dispatching 1 group of 64 threads...");
     ID3D11DeviceContext_Dispatch(c->ctx, 1, 1, 1);
+    /* Force GPU flush to detect errors immediately */
+    ID3D11DeviceContext_Flush(c->ctx);
+    trellis_log_c("DX11 trellis: dispatch+flush completed");
 
     /* Unbind */
     ID3D11ShaderResourceView *null_srvs[1] = { NULL };
