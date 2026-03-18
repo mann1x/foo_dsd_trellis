@@ -63,6 +63,31 @@ int log_ring_read(char *buf, int buf_size, int max_lines) {
     return pos;
 }
 
+/* ─── On-demand audio capture ─── */
+
+audio_capture_t g_audio_capture = { .state = CAPTURE_IDLE };
+
+void capture_write(const float *samples, size_t count, int channels, uint32_t rate) {
+    if (g_audio_capture.state != CAPTURE_RECORDING)
+        return;
+
+    g_audio_capture.rate = rate;
+    g_audio_capture.channels = channels;
+
+    size_t total = count * (size_t)channels;
+    size_t avail = g_audio_capture.target - g_audio_capture.written;
+    if (total > avail) total = avail;
+
+    if (total > 0 && g_audio_capture.buf) {
+        memcpy(g_audio_capture.buf + g_audio_capture.written, samples,
+               total * sizeof(float));
+        g_audio_capture.written += total;
+    }
+
+    if (g_audio_capture.written >= g_audio_capture.target)
+        InterlockedExchange(&g_audio_capture.state, CAPTURE_DONE);
+}
+
 #define HTTP_MAX_REQUEST  8192
 #define HTTP_MAX_RESPONSE 16384
 
@@ -848,6 +873,105 @@ static void handle_request(httpapi_t *api, SOCKET client) {
                 if (ls == buf + br && br > 0) ls = buf;
                 send_response(client, 200, "OK", "text/plain", ls, (int)((buf + br) - ls));
                 free(buf);
+            }
+        } else {
+            send_method_not_allowed(client);
+        }
+
+    } else if (strncmp(path, "/api/capture", 12) == 0) {
+        if (_stricmp(method, "POST") == 0) {
+            /* POST /api/capture?duration=1&rate=2822400
+             * Arms capture for N seconds at given DSD rate.
+             * Audio thread will record output on next chunks. */
+            int duration = 1;
+            uint32_t rate = 2822400;  /* DSD64 default */
+            int channels = 2;
+            const char *q = strchr(path, '?');
+            if (q) {
+                const char *dp = strstr(q, "duration=");
+                if (dp) duration = atoi(dp + 9);
+                const char *rp = strstr(q, "rate=");
+                if (rp) rate = (uint32_t)atoi(rp + 5);
+                const char *cp = strstr(q, "channels=");
+                if (cp) channels = atoi(cp + 9);
+            }
+            if (duration < 1) duration = 1;
+            if (duration > 10) duration = 10;
+            if (channels < 1) channels = 1;
+            if (channels > 8) channels = 8;
+
+            size_t target = (size_t)rate * (size_t)channels * (size_t)duration;
+            if (target > CAPTURE_MAX_SAMPLES) target = CAPTURE_MAX_SAMPLES;
+
+            /* Free old buffer and allocate new */
+            free(g_audio_capture.buf);
+            g_audio_capture.buf = (float *)malloc(target * sizeof(float));
+            g_audio_capture.buf_size = g_audio_capture.buf ? target : 0;
+            g_audio_capture.written = 0;
+            g_audio_capture.target = target;
+            g_audio_capture.rate = rate;
+            g_audio_capture.channels = channels;
+
+            if (g_audio_capture.buf) {
+                InterlockedExchange(&g_audio_capture.state, CAPTURE_ARMED);
+                char json[256];
+                int len = sprintf_s(json, sizeof(json),
+                    "{\"status\":\"armed\",\"duration\":%d,\"rate\":%u,\"channels\":%d,\"samples\":%zu}",
+                    duration, rate, channels, target);
+                send_json(client, 200, "OK", json, len);
+            } else {
+                send_json(client, 500, "Internal Error",
+                          "{\"error\":\"malloc failed\"}", 24);
+            }
+
+        } else if (_stricmp(method, "GET") == 0) {
+            /* GET /api/capture — returns WAV if done, status otherwise */
+            LONG state = InterlockedCompareExchange(&g_audio_capture.state, 0, 0);
+            if (state == CAPTURE_DONE && g_audio_capture.buf) {
+                /* Build WAV header + data */
+                size_t data_bytes = g_audio_capture.written * sizeof(float);
+                size_t wav_size = 44 + data_bytes;
+                char *wav = (char *)malloc(wav_size);
+                if (wav) {
+                    /* WAV header: 32-bit float PCM */
+                    uint32_t sr = g_audio_capture.rate;
+                    uint16_t ch = (uint16_t)g_audio_capture.channels;
+                    uint16_t bps = 32;
+                    uint32_t byte_rate = sr * ch * (bps / 8);
+                    uint16_t block = ch * (bps / 8);
+                    memcpy(wav, "RIFF", 4);
+                    *(uint32_t *)(wav + 4) = (uint32_t)(wav_size - 8);
+                    memcpy(wav + 8, "WAVE", 4);
+                    memcpy(wav + 12, "fmt ", 4);
+                    *(uint32_t *)(wav + 16) = 16;
+                    *(uint16_t *)(wav + 20) = 3;  /* IEEE float */
+                    *(uint16_t *)(wav + 22) = ch;
+                    *(uint32_t *)(wav + 24) = sr;
+                    *(uint32_t *)(wav + 28) = byte_rate;
+                    *(uint16_t *)(wav + 32) = block;
+                    *(uint16_t *)(wav + 34) = bps;
+                    memcpy(wav + 36, "data", 4);
+                    *(uint32_t *)(wav + 40) = (uint32_t)data_bytes;
+                    memcpy(wav + 44, g_audio_capture.buf, data_bytes);
+
+                    send_response(client, 200, "OK", "audio/wav", wav, (int)wav_size);
+                    free(wav);
+
+                    /* Reset capture state */
+                    InterlockedExchange(&g_audio_capture.state, CAPTURE_IDLE);
+                } else {
+                    send_json(client, 500, "Internal Error",
+                              "{\"error\":\"wav malloc\"}", 22);
+                }
+            } else {
+                char json[128];
+                const char *st = state == CAPTURE_IDLE ? "idle" :
+                                 state == CAPTURE_ARMED ? "armed" :
+                                 state == CAPTURE_RECORDING ? "recording" : "unknown";
+                int len = sprintf_s(json, sizeof(json),
+                    "{\"status\":\"%s\",\"written\":%zu,\"target\":%zu}",
+                    st, g_audio_capture.written, g_audio_capture.target);
+                send_json(client, 200, "OK", json, len);
             }
         } else {
             send_method_not_allowed(client);

@@ -1603,6 +1603,13 @@ public:
 
         chunk->set_data(out_as.get_ptr(), out_frames, channels, out_pcm_rate);
 
+        /* On-demand audio capture: write to capture buffer if recording */
+        if (g_audio_capture.state == CAPTURE_RECORDING ||
+            capture_check_armed()) {
+            capture_write((const float *)out_as.get_ptr(),
+                          out_frames, channels, out_pcm_rate);
+        }
+
         return true;
     }
 

@@ -84,6 +84,39 @@ int log_ring_read(char *buf, int buf_size, int max_lines);
  * Audio thread calls this at the start of each on_chunk. */
 bool httpapi_get_pending_config(httpapi_t *api, dsd_config_t *cfg);
 
+/* ─── On-demand audio capture ─── */
+
+/* Capture state: HTTP thread sets ARMED, audio thread writes samples
+ * and sets DONE when buffer is full. HTTP thread reads and serves. */
+#define CAPTURE_IDLE     0
+#define CAPTURE_ARMED    1
+#define CAPTURE_RECORDING 2
+#define CAPTURE_DONE     3
+
+#define CAPTURE_MAX_SAMPLES (2822400 * 2 * 5)  /* 5 seconds stereo DSD64 */
+
+typedef struct {
+    volatile LONG state;        /* CAPTURE_IDLE/ARMED/RECORDING/DONE */
+    float        *buf;          /* sample buffer (allocated on arm) */
+    size_t        buf_size;     /* allocated samples */
+    size_t        written;      /* samples written so far */
+    size_t        target;       /* target sample count */
+    uint32_t      rate;         /* DSD or PCM sample rate */
+    int           channels;     /* channel count */
+} audio_capture_t;
+
+extern audio_capture_t g_audio_capture;
+
+/* Called by audio thread: write samples to capture buffer if recording */
+void capture_write(const float *samples, size_t count, int channels, uint32_t rate);
+
+/* Called by audio thread: check if capture is armed and start recording */
+static inline bool capture_check_armed(void) {
+    return InterlockedCompareExchange(&g_audio_capture.state,
+                                      CAPTURE_RECORDING, CAPTURE_ARMED)
+           == CAPTURE_ARMED;
+}
+
 #ifdef __cplusplus
 }
 #endif
