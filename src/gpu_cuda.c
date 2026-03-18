@@ -19,6 +19,7 @@
 /* ─── Embedded PTX ─── */
 #include "kernels/fir_kernels_ptx.h"
 #include "kernels/sdm_kernels_ptx.h"
+#include "kernels/sdm_parallel_ptx.h"
 
 /* ─── CUDA Driver API types (no CUDA headers needed) ─── */
 
@@ -59,6 +60,9 @@ DECL_PFN(CUresult, cuMemcpyDtoHAsync, void *, CUdeviceptr, size_t, CUstream);
 DECL_PFN(CUresult, cuMemAllocHost, void **, size_t);
 DECL_PFN(CUresult, cuMemFreeHost, void *);
 DECL_PFN(CUresult, cuStreamCreate, CUstream *, unsigned int);
+DECL_PFN(CUresult, cuDeviceGetAttribute, int *, int, CUdevice);
+DECL_PFN(CUresult, cuStreamCreateWithPriority, CUstream *, unsigned int, int);
+DECL_PFN(CUresult, cuCtxGetStreamPriorityRange, int *, int *);
 DECL_PFN(CUresult, cuStreamDestroy, CUstream);
 DECL_PFN(CUresult, cuStreamSynchronize, CUstream);
 DECL_PFN(CUresult, cuMemcpyDtoD, CUdeviceptr, CUdeviceptr, size_t);
@@ -68,6 +72,7 @@ static bool    g_probed = false;
 static bool    g_available = false;
 static char    g_device_name[128] = "";
 static size_t  g_vram_bytes = 0;
+static int     g_sm_count = 0;  /* Streaming Multiprocessors */
 
 /* Resolved function pointers */
 static PFN_cuInit              pfn_cuInit;
@@ -91,6 +96,9 @@ static PFN_cuMemcpyDtoHAsync   pfn_cuMemcpyDtoHAsync;
 static PFN_cuMemAllocHost      pfn_cuMemAllocHost;
 static PFN_cuMemFreeHost       pfn_cuMemFreeHost;
 static PFN_cuStreamCreate      pfn_cuStreamCreate;
+static PFN_cuDeviceGetAttribute pfn_cuDeviceGetAttribute;
+static PFN_cuStreamCreateWithPriority pfn_cuStreamCreateWithPriority;
+static PFN_cuCtxGetStreamPriorityRange pfn_cuCtxGetStreamPriorityRange;
 static PFN_cuStreamDestroy     pfn_cuStreamDestroy;
 static PFN_cuStreamSynchronize pfn_cuStreamSynchronize;
 static PFN_cuMemcpyDtoD        pfn_cuMemcpyDtoD;
@@ -127,6 +135,10 @@ typedef struct {
     CUmodule       mod_sdm;
     CUfunction     fn_trellis_chunk;
     CUfunction     fn_precorr_chunk;
+    /* Parallel-segment SDM (from sdm_parallel.ptx) */
+    CUmodule       mod_sdm_parallel;
+    CUfunction     fn_trellis_parallel;
+    int            num_sms;  /* GPU SM count for optimal parallelism */
     /* Triple-buffered device memory */
     CUdeviceptr    d_in[NUM_STREAMS];
     CUdeviceptr    d_out[NUM_STREAMS];
@@ -147,6 +159,8 @@ typedef struct {
     /* Intermediate device buffer for multi-stage */
     CUdeviceptr    d_inter;
     size_t         cap_inter;
+    /* Low-priority stream for SDM (won't block display) */
+    CUstream       sdm_stream;
     /* FIR delay line: last (ntaps-1) input samples from previous chunk.
      * Prepended to input for continuity across chunk boundaries. */
     float         *delay_buf;       /* [ntaps-1] floats, host memory */
@@ -161,6 +175,8 @@ typedef struct {
     int            trellis_cands;    /* cached num_cands */
     int            trellis_order;    /* cached NTF order */
     int            trellis_lat;      /* cached latency */
+    double         trellis_ntf_a[8]; /* cached NTF coefficients */
+    double         trellis_ntf_g[8];
     bool           trellis_state_valid; /* false until first chunk or after reset */
     /* PreCorr persistent state on device */
     CUdeviceptr    d_precorr_init;   /* precorr_init_t on device */
@@ -264,6 +280,12 @@ bool gpu_cuda_probe(void) {
     RESOLVE_V2(cuMemAllocHost);
     RESOLVE_V2(cuMemFreeHost);
     RESOLVE(cuStreamCreate);
+    RESOLVE(cuDeviceGetAttribute);
+    /* Optional — may not exist on older drivers */
+    pfn_cuStreamCreateWithPriority = (PFN_cuStreamCreateWithPriority)
+        GetProcAddress(g_nvcuda, "cuStreamCreateWithPriority");
+    pfn_cuCtxGetStreamPriorityRange = (PFN_cuCtxGetStreamPriorityRange)
+        GetProcAddress(g_nvcuda, "cuCtxGetStreamPriorityRange");
     RESOLVE_V2(cuStreamDestroy);
     RESOLVE(cuStreamSynchronize);
     RESOLVE_V2(cuMemcpyDtoD);
@@ -277,6 +299,10 @@ bool gpu_cuda_probe(void) {
 
     pfn_cuDeviceGetName(g_device_name, sizeof(g_device_name), dev);
     pfn_cuDeviceTotalMem(&g_vram_bytes, dev);
+
+    /* Query SM count for optimal segment parallelism */
+    if (pfn_cuDeviceGetAttribute)
+        pfn_cuDeviceGetAttribute(&g_sm_count, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, dev);
 
     g_available = true;
     return true;
@@ -338,10 +364,29 @@ gpu_context_t *gpu_cuda_create(void) {
     if (pfn_cuModuleGetFunction(&c->fn_precorr_chunk, c->mod_sdm, "precorr_chunk") != CUDA_SUCCESS)
         goto fail;
 
+    /* Load parallel-segment SDM module */
+    if (pfn_cuModuleLoadData(&c->mod_sdm_parallel, g_ptx_sdm_parallel) != CUDA_SUCCESS)
+        goto fail;
+    if (pfn_cuModuleGetFunction(&c->fn_trellis_parallel, c->mod_sdm_parallel,
+                                  "trellis_parallel_segments") != CUDA_SUCCESS)
+        goto fail;
+    c->num_sms = g_sm_count > 0 ? g_sm_count : 64;
+
     /* Create streams */
     for (int i = 0; i < NUM_STREAMS; i++) {
         if (pfn_cuStreamCreate(&c->streams[i], 0) != CUDA_SUCCESS)
             goto fail;
+    }
+    /* Create low-priority stream for SDM (avoids blocking display).
+     * Falls back to default stream if priority not supported. */
+    if (pfn_cuStreamCreateWithPriority && pfn_cuCtxGetStreamPriorityRange) {
+        int lo_pri = 0, hi_pri = 0;
+        pfn_cuCtxGetStreamPriorityRange(&lo_pri, &hi_pri);
+        /* lo_pri = lowest priority (highest number), hi_pri = highest */
+        if (pfn_cuStreamCreateWithPriority(&c->sdm_stream, 0, lo_pri) != CUDA_SUCCESS)
+            c->sdm_stream = c->streams[0];
+    } else {
+        c->sdm_stream = c->streams[0];
     }
 
     return (gpu_context_t *)c;
@@ -371,6 +416,9 @@ void gpu_cuda_destroy(void *ptr) {
     if (c->d_trellis_costs)  pfn_cuMemFree(c->d_trellis_costs);
     if (c->d_precorr_init)   pfn_cuMemFree(c->d_precorr_init);
     if (c->d_precorr_pred)   pfn_cuMemFree(c->d_precorr_pred);
+    if (c->mod_sdm_parallel) pfn_cuModuleUnload(c->mod_sdm_parallel);
+    if (c->sdm_stream && c->sdm_stream != c->streams[0])
+        pfn_cuStreamDestroy(c->sdm_stream);
     if (c->mod_sdm) pfn_cuModuleUnload(c->mod_sdm);
     if (c->module)  pfn_cuModuleUnload(c->module);
     if (c->context) pfn_cuCtxDestroy(c->context);
@@ -456,6 +504,8 @@ int gpu_cuda_trellis_setup(cuda_context_t *c, int num_cands, int order,
     c->trellis_cands = num_cands;
     c->trellis_order = order;
     c->trellis_lat = trellis_lat;
+    memcpy(c->trellis_ntf_a, ntf_a, (size_t)order * sizeof(double));
+    memcpy(c->trellis_ntf_g, ntf_g, (size_t)order * sizeof(double));
     c->trellis_state_valid = false;
     return 0;
 }
@@ -764,101 +814,124 @@ int gpu_cuda_fir_batch(cuda_context_t *c, const float *in_batch,
 /* Persistent-buffer Trellis: no per-chunk alloc/free.
  * State stays on GPU between chunks. Only input/output transferred.
  * Call gpu_cuda_trellis_setup once at engine init. */
-/* Chunked GPU Trellis: subdivide into GPU_SDM_SUB_CHUNK-sized dispatches
- * to prevent GPU lockup. Each sub-dispatch processes a small batch,
- * yielding the GPU between dispatches so the display stays responsive.
- * State persists on device between sub-chunks via DtoD copy. */
+/* Parallel-segment GPU Trellis: launches num_sms independent segments,
+ * each with overlap warmup. Massive parallelism across segments.
+ * Same approach as CPU threadpool segmentation but with 84+ segments. */
 int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
                       size_t count) {
-    if (!c || !c->fn_trellis_chunk || c->trellis_cands < 2)
+    if (!c || !c->fn_trellis_parallel || c->trellis_cands < 2)
         return -1;
 
     pfn_cuCtxSetCurrent(c->context);
 
     int nc = c->trellis_cands;
     int lat = c->trellis_lat;
+    int num_segs = c->num_sms;  /* one segment per SM */
 
-    /* Ensure persistent I/O buffers for sub-chunk size */
-    size_t sub = GPU_SDM_SUB_CHUNK;
-    if (ensure_sdm_bufs(c, sub) != 0)
-        return -1;
+    /* Minimum segment size: 4× warmup to be worthwhile */
+    int warmup = 2 * lat;  /* overlap for SDM convergence */
+    size_t min_seg = (size_t)(warmup * 4);
+    if (count < min_seg * 2) num_segs = 1;
+    if (num_segs > (int)(count / min_seg)) num_segs = (int)(count / min_seg);
+    if (num_segs < 1) num_segs = 1;
 
-    /* Allocate final state + path buffers if needed */
-    static CUdeviceptr d_final_states = 0, d_final_costs = 0;
-    static CUdeviceptr d_init_paths = 0, d_final_paths = 0;
-    static int final_alloc_cands = 0;
-    if (final_alloc_cands < nc) {
-        if (d_final_states) pfn_cuMemFree(d_final_states);
-        if (d_final_costs)  pfn_cuMemFree(d_final_costs);
-        if (d_init_paths)   pfn_cuMemFree(d_init_paths);
-        if (d_final_paths)  pfn_cuMemFree(d_final_paths);
-        pfn_cuMemAlloc(&d_final_states, (size_t)nc * 8 * sizeof(double));
-        pfn_cuMemAlloc(&d_final_costs, (size_t)nc * sizeof(double));
-        pfn_cuMemAlloc(&d_init_paths, (size_t)nc * sizeof(int));
-        pfn_cuMemAlloc(&d_final_paths, (size_t)nc * sizeof(int));
-        /* Zero-init paths for first invocation */
-        int *zeros = (int *)calloc((size_t)nc, sizeof(int));
-        if (zeros) {
-            pfn_cuMemcpyHtoD(d_init_paths, zeros, (size_t)nc * sizeof(int));
-            free(zeros);
-        }
-        final_alloc_cands = nc;
+    size_t base_seg = count / (size_t)num_segs;
+    size_t out_per_seg = base_seg;
+    size_t seg_total = base_seg + (size_t)warmup; /* each seg processes base+warmup */
+
+    /* Upload NTF constants to parallel module */
+    {
+        CUdeviceptr d_a, d_g, d_order, d_limit;
+        size_t sz;
+        pfn_cuModuleGetGlobal(&d_a, &sz, c->mod_sdm_parallel, "c_ntf_a");
+        pfn_cuMemcpyHtoD(d_a, c->trellis_ntf_a, (size_t)c->trellis_order * sizeof(double));
+        pfn_cuModuleGetGlobal(&d_g, &sz, c->mod_sdm_parallel, "c_ntf_g");
+        pfn_cuMemcpyHtoD(d_g, c->trellis_ntf_g, (size_t)c->trellis_order * sizeof(double));
+        pfn_cuModuleGetGlobal(&d_order, &sz, c->mod_sdm_parallel, "c_ntf_order");
+        pfn_cuMemcpyHtoD(d_order, &c->trellis_order, sizeof(int));
+        pfn_cuModuleGetGlobal(&d_limit, &sz, c->mod_sdm_parallel, "c_state_limit");
+        double sl = 0.0;
+        pfn_cuMemcpyHtoD(d_limit, &sl, sizeof(double));
     }
 
+    /* Allocate segment descriptor arrays */
+    int *h_seg_starts = (int *)malloc((size_t)num_segs * sizeof(int));
+    int *h_seg_out_starts = (int *)malloc((size_t)num_segs * sizeof(int));
+    if (!h_seg_starts || !h_seg_out_starts) {
+        free(h_seg_starts); free(h_seg_out_starts);
+        return -1;
+    }
+
+    for (int i = 0; i < num_segs; i++) {
+        size_t seg_start = (size_t)i * base_seg;
+        /* Segment input starts `warmup` before the actual segment data.
+         * Segment 0 has no prior data — starts from 0 with less warmup. */
+        int in_start = (int)seg_start - warmup;
+        if (in_start < 0) in_start = 0;
+        h_seg_starts[i] = in_start;
+        h_seg_out_starts[i] = (int)((size_t)i * out_per_seg);
+    }
+
+    CUstream stream = c->sdm_stream;
+    size_t total_out = out_per_seg * (size_t)num_segs;
+
+    /* Ensure device buffers */
+    if (ensure_sdm_bufs(c, count > total_out ? count : total_out) != 0) {
+        free(h_seg_starts); free(h_seg_out_starts);
+        return -1;
+    }
+
+    /* Upload input + segment descriptors */
+    CUdeviceptr d_seg_starts, d_seg_out_starts;
+    pfn_cuMemAlloc(&d_seg_starts, (size_t)num_segs * sizeof(int));
+    pfn_cuMemAlloc(&d_seg_out_starts, (size_t)num_segs * sizeof(int));
+    pfn_cuMemcpyHtoDAsync(c->d_sdm_in, in, count * sizeof(float), stream);
+    pfn_cuMemcpyHtoDAsync(d_seg_starts, h_seg_starts, (size_t)num_segs * sizeof(int), stream);
+    pfn_cuMemcpyHtoDAsync(d_seg_out_starts, h_seg_out_starts, (size_t)num_segs * sizeof(int), stream);
+
+    LARGE_INTEGER t_start_qpc, t_kernel, t_end, t_freq;
+    QueryPerformanceFrequency(&t_freq);
+    QueryPerformanceCounter(&t_start_qpc);
+
+    /* Launch: num_segs blocks, each with 2*nc threads */
     int block_size = 2 * nc;
-    if (block_size < 64) block_size = 64;
+    if (block_size < 32) block_size = 32;
+    int seg_total_i = (int)seg_total;
+    void *args[] = {
+        &c->d_sdm_in, &c->d_sdm_out,
+        &d_seg_starts, &d_seg_out_starts,
+        &seg_total_i, &warmup, &nc
+    };
+    pfn_cuLaunchKernel(c->fn_trellis_parallel,
+                        (unsigned)num_segs, 1, 1,
+                        (unsigned)block_size, 1, 1,
+                        0, stream, args, NULL);
+    pfn_cuStreamSynchronize(stream);
+    QueryPerformanceCounter(&t_kernel);
 
-    /* Process in sub-chunks. First sub-chunk uses trellis_lat for
-     * initial latency fill. Subsequent sub-chunks use lat=0 (state
-     * is warm, all samples produce output). */
-    size_t samples_processed = 0;
-    size_t out_written = 0;
-    bool first_sub = !c->trellis_state_valid;  /* need latency fill? */
+    /* Download output */
+    if (total_out > 0)
+        pfn_cuMemcpyDtoHAsync(out, c->d_sdm_out, total_out * sizeof(float), stream);
+    pfn_cuStreamSynchronize(stream);
+    QueryPerformanceCounter(&t_end);
 
-    while (samples_processed < count) {
-        size_t chunk = count - samples_processed;
-        if (chunk > sub) chunk = sub;
+    /* Cleanup segment descriptors */
+    pfn_cuMemFree(d_seg_starts);
+    pfn_cuMemFree(d_seg_out_starts);
+    free(h_seg_starts);
+    free(h_seg_out_starts);
 
-        /* Upload sub-chunk input */
-        pfn_cuMemcpyHtoD(c->d_sdm_in, in + samples_processed,
-                          chunk * sizeof(float));
-
-        /* Use lat for first sub-chunk only (or if state not yet valid) */
-        int sub_lat = first_sub ? lat : 0;
-        int cnt = (int)chunk;
-        /* Pass path buffers — NULL (0) on first invocation with fresh state */
-        CUdeviceptr paths_in = (first_sub && !c->trellis_state_valid) ?
-                               (CUdeviceptr)0 : d_init_paths;
-        void *args[] = {
-            &c->d_sdm_in, &c->d_sdm_out, &cnt,
-            &nc, &sub_lat,
-            &c->d_trellis_states, &c->d_trellis_costs,
-            &d_final_states, &d_final_costs,
-            &paths_in, &d_final_paths
-        };
-        pfn_cuLaunchKernel(c->fn_trellis_chunk, 1, 1, 1,
-                            (unsigned)block_size, 1, 1,
-                            0, c->streams[0], args, NULL);
-        pfn_cuStreamSynchronize(c->streams[0]);
-
-        /* Rotate state + paths: final → init */
-        pfn_cuMemcpyDtoD(c->d_trellis_states, d_final_states,
-                          (size_t)nc * 8 * sizeof(double));
-        pfn_cuMemcpyDtoD(c->d_trellis_costs, d_final_costs,
-                          (size_t)nc * sizeof(double));
-        pfn_cuMemcpyDtoD(d_init_paths, d_final_paths,
-                          (size_t)nc * sizeof(int));
-
-        /* Download output */
-        size_t sub_out = chunk > (size_t)sub_lat ? chunk - (size_t)sub_lat : 0;
-        if (sub_out > 0) {
-            pfn_cuMemcpyDtoH(out + out_written,
-                              c->d_sdm_out,
-                              sub_out * sizeof(float));
-        }
-        out_written += sub_out;
-        samples_processed += chunk;
-        first_sub = false;
+    /* Log timing */
+    {
+        extern void trellis_log_c(const char *);
+        double kernel_ms = (double)(t_kernel.QuadPart - t_start_qpc.QuadPart) * 1000.0 / (double)t_freq.QuadPart;
+        double total_ms = (double)(t_end.QuadPart - t_start_qpc.QuadPart) * 1000.0 / (double)t_freq.QuadPart;
+        double audio_ms = (double)count / 2822400.0 * 1000.0; /* approximate */
+        char msg[256];
+        sprintf_s(msg, sizeof(msg),
+            "[GPU CUDA SDM parallel] %zu samples, %d segs, %d cands, warmup=%d: kernel=%.1fms total=%.1fms (%.2fx RT)",
+            count, num_segs, nc, warmup, kernel_ms, total_ms, total_ms / audio_ms);
+        trellis_log_c(msg);
     }
 
     c->trellis_state_valid = true;
