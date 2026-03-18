@@ -42,7 +42,9 @@ __global__ void trellis_parallel_segments(
     const double *seg0_init_states,
     const double *seg0_init_costs,
     double *seg0_final_states,
-    double *seg0_final_costs)
+    double *seg0_final_costs,
+    double *all_final_states,
+    double *all_final_costs)
 {
     int seg = blockIdx.x;
     int tid = threadIdx.x;
@@ -300,7 +302,13 @@ __global__ void trellis_parallel_segments(
         }
     }
 
-    /* Segment 0: save final state */
+    /* Save all segments' final states for boundary re-encoding */
+    if (all_final_states && tid < nc) {
+        for (int k = 0; k < order; k++)
+            all_final_states[seg * nc * 8 + tid * 8 + k] = p_state[tid][k];
+        all_final_costs[seg * nc + tid] = p_cost[tid];
+    }
+    /* Segment 0: also save to persistent state buffers */
     if (seg == 0 && seg0_final_states && tid < nc) {
         for (int k = 0; k < order; k++)
             seg0_final_states[tid * 8 + k] = p_state[tid][k];

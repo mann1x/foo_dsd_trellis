@@ -66,15 +66,27 @@ __global__ void gain_apply(float *buf, int count, float gain) {
 /* ─── Boxcar smoothing + gain ───
  * Converts ±1.0 DSD → multi-bit via running average, applies gain.
  * Causal boxcar: output[i] = mean(sign(in[i-taps+1..i])) * gain */
+/* Boxcar smooth with history prefix for chunk continuity.
+ * `in` points to the start of current chunk data.
+ * `hist` points to the last `taps` samples from the previous chunk
+ * (NULL on first chunk — uses 0.0 for missing samples).
+ * Each thread reads up to `taps` preceding samples. */
 __global__ void boxcar_smooth(const float *in, float *out,
-                               int count, int taps, float gain) {
+                               int count, int taps, float gain,
+                               const float *hist) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
 
     float sum = 0.0f;
     for (int k = 0; k < taps; k++) {
         int si = i - k;
-        float v = (si >= 0) ? in[si] : 0.0f;
+        float v;
+        if (si >= 0)
+            v = in[si];
+        else if (hist)
+            v = hist[taps + si];  /* hist[taps-1] = last sample of prev chunk */
+        else
+            v = 0.0f;
         sum += (v >= 0.0f) ? 1.0f : -1.0f;
     }
     out[i] = sum / (float)taps * gain;

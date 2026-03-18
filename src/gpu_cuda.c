@@ -9,6 +9,8 @@
  */
 
 #include "../include/gpu_compute.h"
+#include "../include/trellis.h"
+#include "../include/ntf.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -183,6 +185,17 @@ typedef struct {
     CUdeviceptr    d_precorr_pred;   /* prediction table [256][8] on device */
     bool           precorr_pred_uploaded; /* true after first upload */
     bool           precorr_state_valid;
+    /* Boundary re-encoding: all segments' final NTF states */
+    CUdeviceptr    d_all_final_states;
+    CUdeviceptr    d_all_final_costs;
+    double        *h_all_final_states;
+    double        *h_all_final_costs;
+    int            boundary_alloc;  /* allocated num_segs * nc */
+    /* Boxcar history for chunk continuity */
+    CUdeviceptr    d_boxcar_hist;    /* last taps samples from previous chunk */
+    float         *h_boxcar_hist;    /* host-side copy */
+    int            boxcar_hist_taps; /* allocated size (0 = none) */
+    bool           boxcar_hist_valid;
 } cuda_context_t;
 
 /* ─── Helpers ─── */
@@ -417,6 +430,10 @@ void gpu_cuda_destroy(void *ptr) {
     if (c->d_trellis_costs)  pfn_cuMemFree(c->d_trellis_costs);
     if (c->d_precorr_init)   pfn_cuMemFree(c->d_precorr_init);
     if (c->d_precorr_pred)   pfn_cuMemFree(c->d_precorr_pred);
+    if (c->d_all_final_states) pfn_cuMemFree(c->d_all_final_states);
+    if (c->d_all_final_costs)  pfn_cuMemFree(c->d_all_final_costs);
+    free(c->h_all_final_states);
+    free(c->h_all_final_costs);
     if (c->mod_sdm_parallel) pfn_cuModuleUnload(c->mod_sdm_parallel);
     if (c->sdm_stream && c->sdm_stream != c->streams[0])
         pfn_cuStreamDestroy(c->sdm_stream);
@@ -708,20 +725,45 @@ int gpu_cuda_boxcar(cuda_context_t *c, const float *in, float *out,
     if (ensure_h_in(c, count) != 0) return -1;
     if (ensure_h_out(c, count) != 0) return -1;
 
+    /* Ensure boxcar history buffer exists */
+    if (c->boxcar_hist_taps < taps) {
+        if (c->d_boxcar_hist) pfn_cuMemFree(c->d_boxcar_hist);
+        free(c->h_boxcar_hist);
+        pfn_cuMemAlloc(&c->d_boxcar_hist, (size_t)taps * sizeof(float));
+        c->h_boxcar_hist = (float *)calloc((size_t)taps, sizeof(float));
+        c->boxcar_hist_taps = taps;
+        c->boxcar_hist_valid = false;
+    }
+
     CUstream stream = c->streams[s_idx];
 
     memcpy(c->h_in[s_idx], in, count * sizeof(float));
     pfn_cuMemcpyHtoDAsync(c->d_in[s_idx], c->h_in[s_idx],
                            count * sizeof(float), stream);
 
+    /* Upload history (previous chunk's tail) if available */
+    CUdeviceptr hist_ptr = (CUdeviceptr)0;
+    if (c->boxcar_hist_valid) {
+        pfn_cuMemcpyHtoDAsync(c->d_boxcar_hist, c->h_boxcar_hist,
+                               (size_t)taps * sizeof(float), stream);
+        hist_ptr = c->d_boxcar_hist;
+    }
+
     int cnt = (int)count;
-    void *args[] = { &c->d_in[s_idx], &c->d_out[s_idx], &cnt, &taps, &gain };
+    void *args[] = { &c->d_in[s_idx], &c->d_out[s_idx], &cnt, &taps, &gain, &hist_ptr };
     launch_kernel(c, c->fn_boxcar, args, (int)count);
 
     pfn_cuMemcpyDtoHAsync(c->h_out[s_idx], c->d_out[s_idx],
                            count * sizeof(float), stream);
     pfn_cuStreamSynchronize(stream);
     memcpy(out, c->h_out[s_idx], count * sizeof(float));
+
+    /* Save last `taps` samples as history for next chunk */
+    if (count >= (size_t)taps) {
+        memcpy(c->h_boxcar_hist, in + count - (size_t)taps,
+               (size_t)taps * sizeof(float));
+        c->boxcar_hist_valid = true;
+    }
 
     c->active = (s_idx + 1) % NUM_STREAMS;
     return 0;
@@ -934,19 +976,33 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     CUdeviceptr seg0_init_s = c->trellis_state_valid ? c->d_trellis_states : (CUdeviceptr)0;
     CUdeviceptr seg0_init_c = c->trellis_state_valid ? c->d_trellis_costs : (CUdeviceptr)0;
 
+    /* Allocate all-segment final state buffers for boundary re-encoding */
+    int needed = num_segs * nc;
+    if (c->boundary_alloc < needed) {
+        if (c->d_all_final_states) pfn_cuMemFree(c->d_all_final_states);
+        if (c->d_all_final_costs)  pfn_cuMemFree(c->d_all_final_costs);
+        free(c->h_all_final_states); free(c->h_all_final_costs);
+        pfn_cuMemAlloc(&c->d_all_final_states, (size_t)needed * 8 * sizeof(double));
+        pfn_cuMemAlloc(&c->d_all_final_costs, (size_t)needed * sizeof(double));
+        c->h_all_final_states = (double *)malloc((size_t)needed * 8 * sizeof(double));
+        c->h_all_final_costs = (double *)malloc((size_t)needed * sizeof(double));
+        c->boundary_alloc = needed;
+    }
+
     /* Launch kernel */
     int block_size = 2 * nc;
     if (block_size < 32) block_size = 32;
     int seg_total_i = seg_total;
     int M_param = M;
     int D_param = D;
-    int overlap_param = 0;  /* no crossfade — DSD is 1-bit, can't blend */
+    int overlap_param = 0;
     void *args[] = {
         &c->d_sdm_in, &c->d_sdm_out,
         &d_seg_starts, &d_seg_out_starts,
         &seg_total_i, &M_param, &D_param, &nc, &lat, &overlap_param,
         &seg0_init_s, &seg0_init_c,
-        &d_seg0_final_s, &d_seg0_final_c
+        &d_seg0_final_s, &d_seg0_final_c,
+        &c->d_all_final_states, &c->d_all_final_costs
     };
     pfn_cuLaunchKernel(c->fn_trellis_parallel,
                         (unsigned)num_segs, 1, 1,
@@ -961,10 +1017,89 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
                       (size_t)nc * sizeof(double));
     QueryPerformanceCounter(&t_kernel);
 
-    /* Download output */
+    /* Download output + all-segment final states */
     if (total_out > 0)
         pfn_cuMemcpyDtoHAsync(out, c->d_sdm_out, total_out * sizeof(float), stream);
+    pfn_cuMemcpyDtoHAsync(c->h_all_final_states, c->d_all_final_states,
+                           (size_t)needed * 8 * sizeof(double), stream);
+    pfn_cuMemcpyDtoHAsync(c->h_all_final_costs, c->d_all_final_costs,
+                           (size_t)needed * sizeof(double), stream);
     pfn_cuStreamSynchronize(stream);
+
+    /* ─── Boundary re-encoding on CPU ───
+     * For each boundary between segments i and i+1:
+     * 1. Init a temp sdm_context from segment i's best-candidate final state
+     * 2. Warmup: feed (half + lat) samples before boundary → discard
+     * 3. Replace: feed half samples after boundary → overwrite GPU output */
+    if (0 && num_segs > 1) {  /* TODO: boundary re-encoding disabled — needs D >> M to work */
+        int half = 256;
+        ntf_filter_t tmp_flt;
+        memset(&tmp_flt, 0, sizeof(tmp_flt));
+        tmp_flt.order = c->trellis_order;
+        for (int k = 0; k < c->trellis_order; k++) {
+            tmp_flt.a[k] = c->trellis_ntf_a[k];
+            tmp_flt.g[k] = c->trellis_ntf_g[k];
+        }
+        /* Use the auto-selected filter name for init */
+        const ntf_filter_t *real_flt = ntf_auto_select(0);
+        if (real_flt) tmp_flt.name = real_flt->name;
+
+        float *discard_buf = (float *)malloc(((size_t)half + (size_t)lat + (size_t)M) * sizeof(float));
+
+        for (int i = 0; i < num_segs - 1 && discard_buf; i++) {
+            int bnd_out = (i + 1) * D;  /* boundary in output */
+            int bnd_in = (i + 1) * D;   /* boundary in input (same-rate) */
+
+            /* Warmup: feed half+lat samples before boundary */
+            int warmup = half + lat;
+            int in_start = bnd_in - warmup;
+            if (in_start < 0) in_start = 0;
+            int actual_warmup = bnd_in - in_start;
+
+            /* Replace: half samples after boundary */
+            int replace_end = bnd_in + half;
+            if (replace_end > (int)count) replace_end = (int)count;
+            int replace_count = replace_end - bnd_in;
+            if (replace_count <= 0 || bnd_out + replace_count > (int)total_out)
+                continue;
+
+            /* Init temp SDM from segment i's best candidate (idx 0) */
+            sdm_context_t tmp;
+            sdm_context_init(&tmp, &tmp_flt, 8, nc, lat);
+
+            /* Inject segment i's best candidate (idx 0) final state
+             * into the single initial candidate (SDM starts with num_cands=1) */
+            int state_off = i * nc * 8;  /* best candidate = index 0 */
+            {
+                sdm_state_t *s = tmp.trellis[0].act[0];
+                for (int k = 0; k < c->trellis_order; k++)
+                    s->state[k] = c->h_all_final_states[state_off + k];
+                s->cost = 0.0;
+            }
+
+            /* Feed warmup (output discarded) */
+            size_t warmup_out = sdm_process_block(&tmp, in + in_start, discard_buf, (size_t)actual_warmup);
+
+            /* Feed replacement region → overwrite GPU output at boundary */
+            size_t replace_out = sdm_process_block(&tmp, in + bnd_in, out + bnd_out, (size_t)replace_count);
+
+            if (i == 0) {
+                extern void trellis_log_c(const char *);
+                char dbg[256];
+                sprintf_s(dbg, sizeof(dbg),
+                    "boundary[0]: bnd_out=%d warmup_in=%d warmup_out=%zu replace_in=%d replace_out=%zu "
+                    "state[0]=%.4f in[bnd]=%.4f gpu_out[bnd]=%.1f cpu_out[bnd]=%.1f",
+                    bnd_out, actual_warmup, warmup_out, replace_count, replace_out,
+                    c->h_all_final_states[state_off],
+                    in[bnd_in], out[bnd_out], out[bnd_out]);
+                trellis_log_c(dbg);
+            }
+
+            sdm_context_free(&tmp);
+        }
+        free(discard_buf);
+    }
+
     QueryPerformanceCounter(&t_end);
 
     pfn_cuMemFree(d_seg_starts);
