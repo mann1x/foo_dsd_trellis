@@ -826,23 +826,26 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
 
     int nc = c->trellis_cands;
     int lat = c->trellis_lat;
-    /* Balance parallelism vs quality: fewer segments = fewer boundary
-     * artifacts but slower. 8 segments = 7 boundaries, still well
-     * under real-time on modern GPUs. Cap at num_sms. */
-    int max_segs = 8;
-    if (max_segs > c->num_sms) max_segs = c->num_sms;
-    int num_segs = max_segs;
 
-    /* Large warmup for convergence from zero state */
-    int warmup = 16 * lat;
-    size_t min_seg = (size_t)(warmup * 4);
-    if (count < min_seg * 2) num_segs = 1;
-    if (num_segs > (int)(count / min_seg)) num_segs = (int)(count / min_seg);
+    /* SBVD parameters:
+     * M = convergence region (trellis paths converge regardless of init state)
+     * D = output region (valid samples kept)
+     * L = traceback lookahead (ensures correct decisions at end of D)
+     * Total processed per segment: M + D + L
+     * Only D samples are output per segment. */
+    int M = 8 * lat;   /* convergence depth: 8× trellis latency */
+    int L = lat;        /* traceback lookahead: 1× trellis latency */
+
+    /* Segment count: use available SMs but ensure segments are large enough */
+    int num_segs = c->num_sms;
+    size_t min_D = (size_t)(M + L) * 2;  /* D must be > M+L for efficiency */
+    if (count < min_D * 2) num_segs = 1;
+    if (num_segs > (int)(count / min_D)) num_segs = (int)(count / min_D);
     if (num_segs < 1) num_segs = 1;
 
-    size_t base_seg = count / (size_t)num_segs;
-    size_t out_per_seg = base_seg;
-    size_t seg_total = base_seg + (size_t)warmup; /* each seg processes base+warmup */
+    int D = (int)(count / (size_t)num_segs);  /* output samples per segment */
+    int seg_total = M + D + L;                /* total processed per segment */
+    size_t out_per_seg = (size_t)D;
 
     /* Upload NTF constants to parallel module */
     {
@@ -868,13 +871,15 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     }
 
     for (int i = 0; i < num_segs; i++) {
-        size_t seg_start = (size_t)i * base_seg;
+        int seg_boundary = i * D;  /* where this segment's output starts in the input */
         if (i == 0) {
-            /* Segment 0: persistent state, no warmup prefix needed */
+            /* Segment 0: persistent state → no M convergence needed.
+             * Starts at input 0, processes D+L samples. */
             h_seg_starts[i] = 0;
         } else {
-            /* Segments 1+: start warmup samples before segment boundary */
-            int in_start = (int)seg_start - warmup;
+            /* Segments 1+: start M samples before boundary for convergence,
+             * process M+D+L samples, output only D middle samples. */
+            int in_start = seg_boundary - M;
             if (in_start < 0) in_start = 0;
             h_seg_starts[i] = in_start;
         }
@@ -922,11 +927,13 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     /* Launch: num_segs blocks, each with 2*nc threads */
     int block_size = 2 * nc;
     if (block_size < 32) block_size = 32;
-    int seg_total_i = (int)seg_total;
+    int seg_total_i = seg_total;
+    int M_param = M;
+    int D_param = D;
     void *args[] = {
         &c->d_sdm_in, &c->d_sdm_out,
         &d_seg_starts, &d_seg_out_starts,
-        &seg_total_i, &warmup, &nc,
+        &seg_total_i, &M_param, &D_param, &nc,
         &seg0_init_s, &seg0_init_c,
         &d_seg0_final_s, &d_seg0_final_c
     };
@@ -963,8 +970,8 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
         double audio_ms = (double)count / 2822400.0 * 1000.0; /* approximate */
         char msg[256];
         sprintf_s(msg, sizeof(msg),
-            "[GPU CUDA SDM parallel] %zu samples, %d segs, %d cands, warmup=%d: kernel=%.1fms total=%.1fms (%.2fx RT)",
-            count, num_segs, nc, warmup, kernel_ms, total_ms, total_ms / audio_ms);
+            "[GPU CUDA SBVD] %zu samples, %d segs, %d cands, M=%d D=%d L=%d: kernel=%.1fms total=%.1fms (%.2fx RT)",
+            count, num_segs, nc, M, D, L, kernel_ms, total_ms, total_ms / audio_ms);
         trellis_log_c(msg);
     }
 

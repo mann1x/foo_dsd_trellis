@@ -30,22 +30,24 @@ __device__ double ntf_calc(const double *s, double *d,
 
 #define MAX_CANDS 32
 
-/* Per-segment trellis SDM.
- * Each block = one segment. tid = candidate thread.
+/* SBVD (Sliding Block Viterbi Decoder) parallel trellis SDM.
  *
- * in:          full FIR output (all segments contiguous)
- * out:         output buffer (only actual segment data, no warmup)
- * seg_starts:  [num_segments] — start index of each segment in `in`
- * seg_sizes:   [num_segments] — total size including warmup
- * warmup:      number of warmup samples to discard per segment
- * num_cands:   candidates for trellis
+ * Each segment has three regions:
+ *   M (convergence) — trellis paths converge regardless of initial state
+ *   D (output)      — valid output samples kept
+ *   L (lookahead)   — provides traceback context for end of D region
+ *
+ * Total processed per segment: M + D + L
+ * Only D samples are output. M and L are discarded.
+ * Segment 0 uses persistent state (M=0, no convergence needed).
  */
 __global__ void trellis_parallel_segments(
     const float *in, float *out,
     const int *seg_starts,    /* [num_segments] start offset in input */
     const int *seg_out_starts,/* [num_segments] start offset in output */
-    int seg_total_size,       /* samples per segment including warmup */
-    int warmup,               /* warmup samples to discard */
+    int seg_total_size,       /* M + D + L total samples to process */
+    int M_convergence,        /* convergence warmup (discard from start) */
+    int D_output,             /* valid output samples to keep */
     int num_cands,
     /* Persistent state for segment 0 (continuity across chunks) */
     const double *seg0_init_states,  /* [num_cands * 8] or NULL */
@@ -146,10 +148,11 @@ __global__ void trellis_parallel_segments(
         }
         __syncthreads();
 
-        /* Write output only after warmup.
-         * Segment 0 has no warmup (persistent state = already converged). */
-        int eff_warmup = (seg == 0 && seg0_init_states) ? 0 : warmup;
-        if (tid == 0 && s >= eff_warmup) {
+        /* SBVD output: only samples in [M, M+D) are kept.
+         * Segment 0 with persistent state: M=0, output from sample 0.
+         * Samples after M+D are lookahead (discarded). */
+        int eff_M = (seg == 0 && seg0_init_states) ? 0 : M_convergence;
+        if (tid == 0 && s >= eff_M && out_idx < D_output) {
             seg_out[out_idx++] = s_output ? 1.0f : -1.0f;
         }
     }
