@@ -151,12 +151,17 @@ __global__ void trellis_parallel_segments(
                     c_hist[i][byte_pos] &= ~(1u << bit_pos);
             }
 
-            /* Output: read traceback from best candidate's history */
+            /* Output: traceback from best candidate's history, or
+             * immediate best bit if history not yet filled. */
             if (s_pending >= lat) {
                 int read_pos = (s_hist_pos + 1) % lat;
                 int r_byte = read_pos / 8;
                 int r_bit = read_pos % 8;
                 s_output_bit = (c_hist[0][r_byte] >> r_bit) & 1;
+            } else {
+                /* History not filled — use best candidate's immediate bit.
+                 * Only used for segment 0 with persistent state. */
+                s_output_bit = c_bit[0];
             }
 
             s_hist_pos = (s_hist_pos + 1) % lat;
@@ -174,9 +179,13 @@ __global__ void trellis_parallel_segments(
         }
         __syncthreads();
 
-        /* SBVD output */
-        int eff_M = (seg == 0 && seg0_init_states) ? trellis_lat : M_convergence;
-        if (tid == 0 && s_pending >= lat && s >= eff_M && out_idx < D_output) {
+        /* SBVD output.
+         * Segment 0 with persistent state: output from sample 0 using
+         * immediate best-candidate bit (no traceback wait). Avoids gap.
+         * Segments 1+: wait for both M convergence and lat history fill. */
+        int eff_M = (seg == 0 && seg0_init_states) ? 0 : M_convergence;
+        bool hist_ready = (s_pending >= lat) || (seg == 0 && seg0_init_states);
+        if (tid == 0 && hist_ready && s >= eff_M && out_idx < D_output) {
             seg_out[out_idx++] = s_output_bit ? 1.0f : -1.0f;
         }
     }
