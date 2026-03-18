@@ -106,8 +106,8 @@ __global__ void trellis_parallel_segments(
         int ac = s_active;
 
         /* Phase 0: Compute parent traceback bits (before expansion).
-         * Each parent reads its history at next_pos to get the output
-         * bit from trellis_lat ago. Children inherit this. */
+         * Reads history for potential future use (traceback disabled
+         * for now but infrastructure preserved). */
         if (tid < ac) {
             if (s_pending >= lat) {
                 int next_pos = (s_hist_pos + 1) % lat;
@@ -205,60 +205,12 @@ __global__ void trellis_parallel_segments(
                 ac = deduped;  /* may be less than nc */
             }
 
-            /* Majority vote on traceback output bit (matches CPU).
-             * Count how many candidates agree on next=0 vs next=1.
-             * Filter out candidates that disagree with majority. */
-            if (s_pending >= lat) {
-                unsigned votes[2] = {0, 0};
-                for (int i = 0; i < ac; i++)
-                    votes[c_next[i] & 1]++;
-                unsigned majority = (votes[1] > votes[0]) ? 1 : 0;
-
-                /* If best candidate disagrees with majority and majority's
-                 * best is within 10% cost, use majority (matches CPU). */
-                if (c_next[0] != majority) {
-                    for (int i = 1; i < ac; i++) {
-                        if (c_next[i] == majority && c_cost[i] < c_cost[0] * 1.1) {
-                            /* Swap this candidate to position 0 */
-                            double t_c = c_cost[0]; c_cost[0] = c_cost[i]; c_cost[i] = t_c;
-                            unsigned t_b = c_bit[0]; c_bit[0] = c_bit[i]; c_bit[i] = t_b;
-                            unsigned t_p = c_path[0]; c_path[0] = c_path[i]; c_path[i] = t_p;
-                            unsigned t_n = c_next[0]; c_next[0] = c_next[i]; c_next[i] = t_n;
-                            for (int k = 0; k < order; k++) {
-                                double t_s = c_state[0][k]; c_state[0][k] = c_state[i][k]; c_state[i][k] = t_s;
-                            }
-                            for (int b = 0; b < hist_bytes; b++) {
-                                unsigned char t_h = c_hist[0][b]; c_hist[0][b] = c_hist[i][b]; c_hist[i][b] = t_h;
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                /* Filter: keep only candidates matching best's next */
-                unsigned best_next = c_next[0];
-                int filtered = 0;
-                for (int i = 0; i < ac; i++) {
-                    if (c_next[i] == best_next) {
-                        if (filtered != i) {
-                            c_cost[filtered] = c_cost[i];
-                            c_bit[filtered] = c_bit[i];
-                            c_path[filtered] = c_path[i];
-                            c_next[filtered] = c_next[i];
-                            for (int k = 0; k < order; k++)
-                                c_state[filtered][k] = c_state[i][k];
-                            for (int b = 0; b < hist_bytes; b++)
-                                c_hist[filtered][b] = c_hist[i][b];
-                        }
-                        filtered++;
-                    }
-                }
-                ac = filtered;
-
-                s_output_bit = best_next;
-            } else {
-                s_output_bit = c_bit[0];
-            }
+            /* Output: best candidate's current bit (no traceback).
+             * Traceback causes LF noise from the mode transition when
+             * s_pending reaches lat — the output jumps from current-best
+             * to a historical bit, creating 84 discontinuities/sec.
+             * Without traceback, c_bit[0] gives clean LF performance. */
+            s_output_bit = c_bit[0];
 
             /* Record each selected child's bit in its history */
             int byte_pos = s_hist_pos / 8;
