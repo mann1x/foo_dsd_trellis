@@ -592,8 +592,19 @@ static void test_gpu_vs_cpu_trellis(void) {
             if (gpu_out[i] == cpu_out[i]) match++;
         }
         double pct = (cmp > skip) ? 100.0 * match / (double)(cmp - skip) : 0;
-        printf("    GPU output: %s, bit match vs CPU: %.1f%%\n",
-               valid ? "valid" : "INVALID", pct);
+        /* Measure SINAD: signal power vs noise in audio band */
+        double gpu_sig = 0, gpu_nse = 0, cpu_sig = 0, cpu_nse = 0;
+        for (size_t i = skip; i < cmp; i++) {
+            double s2 = (double)in[i];
+            double gd = (double)gpu_out[i] - s2;
+            double cd = (double)cpu_out[i] - s2;
+            gpu_sig += s2*s2; gpu_nse += gd*gd;
+            cpu_sig += s2*s2; cpu_nse += cd*cd;
+        }
+        double gpu_sinad = gpu_nse > 0 ? 10.0*log10(gpu_sig/gpu_nse) : 300.0;
+        double cpu_sinad = cpu_nse > 0 ? 10.0*log10(cpu_sig/cpu_nse) : 300.0;
+        printf("    GPU output: %s, bit match: %.1f%%, GPU SINAD: %.1f dB, CPU SINAD: %.1f dB\n",
+               valid ? "valid" : "INVALID", pct, gpu_sinad, cpu_sinad);
         TEST_ASSERT_TRUE(valid, "GPU output is ±1.0");
     }
     free(in); free(gpu_out); free(cpu_out);
