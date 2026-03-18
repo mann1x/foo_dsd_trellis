@@ -1371,6 +1371,13 @@ public:
                 if (m_config.rate_depth[map_idx] > 0)
                     chunk_cfg.trellis_depth = (int)m_config.rate_depth[map_idx];
             }
+
+            /* Auto-compute optimal trellis latency from candidate count.
+             * Sweep shows optimal lat = nc * 8:
+             *   nc=2 → lat=16, nc=4 → lat=32, nc=8 → lat=64
+             * Higher DSD rates don't benefit from more lat (NTF headroom). */
+            chunk_cfg.trellis_lat = chunk_cfg.trellis_cands * 8;
+            if (chunk_cfg.trellis_lat < 16) chunk_cfg.trellis_lat = 16;
         }
 
         /* Set output rate for this chunk */

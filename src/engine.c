@@ -37,29 +37,28 @@ typedef struct {
  * to keep the signal within the SDM's linear operating range. */
 static const path_config_t path_table[] = {
     /*                                            lim  cands lat  depth gain  */
-    /* All paths use 0.708 (-3 dB) gain for uniform volume across rates */
-    /* Same-rate re-encode (boxcar → SDM).
-     * Rate-adaptive boxcar (32/64/128 taps) + rate-adaptive cands.
-     * DSD64: needs cands=4 for path diversity with 32-tap boxcar.
-     * DSD256+: needs cands=2 for real-time budget. */
-    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  4,  256, 4, 0.708f },
-    { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_5, 0.0,  4,  256, 4, 0.708f },
-    { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_5, 0.0,  2,  512, 4, 0.708f },
-    { DSD_RATE_512, DSD_RATE_512, NTF_CLANS_5, 0.0,  2,  512, 4, 0.708f },
+    /* All paths use 0.708 (-3 dB) gain for uniform volume across rates.
+     * lat = 0 means "auto" (computed as cands * 8 at runtime).
+     * Optimal lat from nc×lat sweep: nc=2→16, nc=4→32, nc=8→64. */
+    /* Same-rate re-encode (boxcar → SDM) */
+    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  4,  0, 4, 0.708f },
+    { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_5, 0.0,  4,  0, 4, 0.708f },
+    { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_5, 0.0,  2,  0, 4, 0.708f },
+    { DSD_RATE_512, DSD_RATE_512, NTF_CLANS_5, 0.0,  2,  0, 4, 0.708f },
     /* Upsample paths */
-    { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_4,   0.0,  2,  512, 4, 0.708f },
-    { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  512, 4, 0.708f },
-    { DSD_RATE_64,  DSD_RATE_512, NTF_CLANS_6, 10.0, 2,  512, 4, 0.708f },
-    { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  512, 4, 0.708f },
-    { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_8, 12.0, 2,  512, 4, 0.708f },
-    { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  2,  512, 4, 0.708f },
+    { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },
+    { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 0.708f },
+    { DSD_RATE_64,  DSD_RATE_512, NTF_CLANS_6, 10.0, 2,  0, 4, 0.708f },
+    { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 0.708f },
+    { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_8, 12.0, 2,  0, 4, 0.708f },
+    { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 0.708f },
     /* Downsample paths */
-    { DSD_RATE_128, DSD_RATE_64,  NTF_CLANS_4, 0.0,  32, 512, 0, 0.708f },
-    { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  512, 0, 0.708f },
-    { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_4, 0.0,  8,  512, 0, 0.708f },
-    { DSD_RATE_512, DSD_RATE_64,  NTF_SDM_6,   0.0,  8,  512, 0, 0.708f },
-    { DSD_RATE_512, DSD_RATE_128, NTF_SDM_4,  16.0, 16,  512, 0, 0.708f },
-    { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,  16.0,  8,  512, 0, 0.708f },
+    { DSD_RATE_128, DSD_RATE_64,  NTF_CLANS_4, 0.0,  32, 0, 0, 0.708f },
+    { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  0, 0, 0.708f },
+    { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_4, 0.0,  8,  0, 0, 0.708f },
+    { DSD_RATE_512, DSD_RATE_64,  NTF_SDM_6,   0.0,  8,  0, 0, 0.708f },
+    { DSD_RATE_512, DSD_RATE_128, NTF_SDM_4,  16.0, 16,  0, 0, 0.708f },
+    { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 0.708f },
 };
 
 #define PATH_TABLE_COUNT (sizeof(path_table) / sizeof(path_table[0]))
@@ -608,6 +607,15 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
         info->cands = cfg->trellis_cands;
         info->lat = cfg->trellis_lat;
         info->fir_gain = 1.0f;
+    }
+
+    /* Auto-compute optimal lat from candidate count when lat=0 (auto).
+     * Sweep shows optimal lat = cands * 8:
+     *   nc=2 → lat=16, nc=4 → lat=32, nc=8 → lat=64
+     * Minimum 16 for path convergence. */
+    if (info->lat <= 0) {
+        info->lat = info->cands * 8;
+        if (info->lat < 16) info->lat = 16;
     }
 
     return 0;

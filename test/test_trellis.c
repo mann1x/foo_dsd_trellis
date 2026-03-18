@@ -365,20 +365,28 @@ void test_trellis_suite(void) {
     TEST_RUN(test_sdm_sinad_dsd512);
 }
 
-/* Temporary: lat sweep for Hawksford investigation */
+/* NC × LAT sweep across all DSD rates */
 void test_lat_sweep(void) {
-    printf("\n=== LAT SWEEP (DSD64, nc=4, depth=8) ===\n");
-    int lats[] = {16, 32, 64, 128, 256};
-    for (int i = 0; i < 5; i++) {
-        printf("  lat=%d: ", lats[i]);
-        double sinad = measure_sinad_1khz(64, 8, 4, lats[i]);
-        printf("  => %.1f dB\n", sinad);
-    }
-    printf("\n=== LAT SWEEP (DSD64, nc=8, depth=8) ===\n");
-    for (int i = 0; i < 5; i++) {
-        printf("  lat=%d: ", lats[i]);
-        double sinad = measure_sinad_1khz(64, 8, 8, lats[i]);
-        printf("  => %.1f dB\n", sinad);
+    int ncs[] = {2, 4, 8, 16, 32};
+    int lats[] = {16, 32, 64, 128};
+    int n_nc = 5, n_lat = 4;
+    int rates[] = {64, 128, 256, 512};
+    int n_rates = 4;
+
+    for (int r = 0; r < n_rates; r++) {
+        printf("\n=== DSD%d NC x LAT sweep (depth=8) ===\n", rates[r]);
+        printf("%8s", "nc\\lat");
+        for (int j = 0; j < n_lat; j++) printf("  lat=%-4d", lats[j]);
+        printf("\n");
+
+        for (int i = 0; i < n_nc; i++) {
+            printf("  nc=%-3d", ncs[i]);
+            for (int j = 0; j < n_lat; j++) {
+                double sinad = measure_sinad_1khz(rates[r], 8, ncs[i], lats[j]);
+                printf("  %5.1f dB", sinad);
+            }
+            printf("\n");
+        }
     }
     g_tests_run++; g_tests_passed++;
 }
