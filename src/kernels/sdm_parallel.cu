@@ -113,7 +113,9 @@ __global__ void trellis_parallel_segments(
             for (int k = 0; k < order; k++)
                 c_state[tid][k] = d[k];
             c_cost[tid] = p_cost[pi] + (v + c_ntf_a[0]*y_b)*(v + c_ntf_a[0]*y_b);
-            c_bit[tid] = (tid & 1);  /* 0 = +1.0, 1 = -1.0 */
+            /* Bit convention: 1 = y=+1.0, 0 = y=-1.0 (matches CPU).
+             * tid&1=0 → y_b=+1.0 → bit=1. tid&1=1 → y_b=-1.0 → bit=0. */
+            c_bit[tid] = (tid & 1) ? 0u : 1u;
             /* Copy parent history to child */
             for (int b = 0; b < hist_bytes; b++)
                 c_hist[tid][b] = p_hist[pi][b];
