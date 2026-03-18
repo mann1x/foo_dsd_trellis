@@ -600,7 +600,10 @@ int gpu_dx12_trellis_full(dx12_t *c, const float *in, float *out,
     if (!c || !c->tr_ready || !c->pso[PSO_TRELLIS]) return -1;
 
     int nc = c->tr_cands;
-    int warmup = 4 * c->tr_lat;  /* 4× overlap for SDM convergence (matches CPU) */
+    /* Balance parallelism vs quality: fewer segments = fewer stitching
+     * artifacts. 8 segments gives good parallelism with minimal noise. */
+    if (num_segs > 8) num_segs = 8;
+    int warmup = 16 * c->tr_lat;
     size_t base_seg = count / (size_t)num_segs;
     size_t seg_total = base_seg + (size_t)warmup;
     size_t total_out = base_seg * (size_t)num_segs;

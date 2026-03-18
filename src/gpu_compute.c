@@ -226,7 +226,7 @@ int gpu_trellis_process(gpu_context_t *ctx, const float *in, float *out,
         return gpu_cuda_trellis(ctx, in, out, count);
     case GPU_BACKEND_DIRECTX: {
         /* Try DX12 parallel-segment trellis first */
-        int r = gpu_dx12_trellis_full(ctx, in, out, count, 64 /* segments */);
+        int r = gpu_dx12_trellis_full(ctx, in, out, count, 8 /* segments */);
         if (r == 0) return 0;
         return gpu_dx11_trellis(ctx, in, out, count);
     }
