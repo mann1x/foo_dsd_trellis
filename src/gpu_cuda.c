@@ -842,13 +842,18 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
      * Target: each segment processes ~50K samples (empirically ~50ms
      * on modern GPUs). This adapts to GPU speed automatically —
      * faster GPUs with more SMs get more segments. */
-    int target_D = 100000; /* target ~100ms per segment — fewer boundaries, easier stitching */
-    int num_segs = (int)(count / (size_t)target_D);
-    if (num_segs > c->num_sms) num_segs = c->num_sms;
+    /* Use all SMs for maximum parallelism. The history copy overhead
+     * per sample is fixed regardless of segment count — the total
+     * work is the same whether split into 28 or 84 segments. More
+     * segments just means more SMs working simultaneously. */
+    int num_segs = c->num_sms;
+    /* Ensure minimum D (output per segment) > M + L for SBVD to work */
+    size_t min_D_sbvd = (size_t)(M + L + 1024);
+    if (num_segs > (int)(count / min_D_sbvd)) num_segs = (int)(count / min_D_sbvd);
     if (num_segs < 1) num_segs = 1;
     size_t min_D = (size_t)(M + L) * 2;  /* D must be > M+L for efficiency */
     if (count < min_D * 2) num_segs = 1;
-    if (num_segs > (int)(count / min_D)) num_segs = (int)(count / min_D);
+    if (num_segs > (int)(count / min_D_sbvd)) num_segs = (int)(count / min_D_sbvd);
     if (num_segs < 1) num_segs = 1;
 
     int D = (int)(count / (size_t)num_segs);  /* output samples per segment */
