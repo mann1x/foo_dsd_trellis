@@ -377,13 +377,14 @@ gpu_context_t *gpu_cuda_create(void) {
         if (pfn_cuStreamCreate(&c->streams[i], 0) != CUDA_SUCCESS)
             goto fail;
     }
-    /* Create low-priority stream for SDM (avoids blocking display).
-     * Falls back to default stream if priority not supported. */
+    /* Create high-priority stream for SDM (CUDA async compute doesn't
+     * block display — unlike DX11 which needed low priority).
+     * High priority ensures SDM gets maximum GPU scheduling. */
     if (pfn_cuStreamCreateWithPriority && pfn_cuCtxGetStreamPriorityRange) {
         int lo_pri = 0, hi_pri = 0;
         pfn_cuCtxGetStreamPriorityRange(&lo_pri, &hi_pri);
-        /* lo_pri = lowest priority (highest number), hi_pri = highest */
-        if (pfn_cuStreamCreateWithPriority(&c->sdm_stream, 0, lo_pri) != CUDA_SUCCESS)
+        /* hi_pri = highest priority (lowest number) */
+        if (pfn_cuStreamCreateWithPriority(&c->sdm_stream, 0, hi_pri) != CUDA_SUCCESS)
             c->sdm_stream = c->streams[0];
     } else {
         c->sdm_stream = c->streams[0];
