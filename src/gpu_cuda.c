@@ -842,7 +842,7 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
      * Target: each segment processes ~50K samples (empirically ~50ms
      * on modern GPUs). This adapts to GPU speed automatically —
      * faster GPUs with more SMs get more segments. */
-    int target_D = 50000;  /* target samples per segment output */
+    int target_D = 100000; /* target ~100ms per segment — fewer boundaries, easier stitching */
     int num_segs = (int)(count / (size_t)target_D);
     if (num_segs > c->num_sms) num_segs = c->num_sms;
     if (num_segs < 1) num_segs = 1;
@@ -978,8 +978,8 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
         double audio_ms = (double)count / 2822400.0 * 1000.0; /* approximate */
         char msg[256];
         sprintf_s(msg, sizeof(msg),
-            "[GPU CUDA SBVD] %zu samples, %d segs, %d cands, M=%d D=%d L=%d: kernel=%.1fms total=%.1fms (%.2fx RT)",
-            count, num_segs, nc, M, D, L, kernel_ms, total_ms, total_ms / audio_ms);
+            "[GPU CUDA SBVD] %zu samples, %d/%d segs/SMs, %d cands, M=%d D=%d L=%d: kernel=%.1fms total=%.1fms (%.2fx RT)",
+            count, num_segs, c->num_sms, nc, M, D, L, kernel_ms, total_ms, total_ms / audio_ms);
         trellis_log_c(msg);
     }
 

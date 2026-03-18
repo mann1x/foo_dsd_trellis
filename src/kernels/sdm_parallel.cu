@@ -3,7 +3,7 @@
  *
  * Proper Sliding Block Viterbi Decoder with full traceback history.
  * Each segment: M (convergence) + D (output) + L (lookahead).
- * Optimized: sort uses index array (no history data movement).
+ * Children store their bit choice explicitly (no index tricks).
  */
 
 extern "C" {
@@ -55,12 +55,17 @@ __global__ void trellis_parallel_segments(
     float *seg_out = out + seg_out_starts[seg];
     int total = seg_total_size;
 
-    /* All candidate data in flat arrays. Slots 0..nc-1 = parents,
-     * nc..2*nc-1 = children. Use index array for sort (no data movement). */
-    __shared__ double s_state[MAX_CHILDREN][8];
-    __shared__ double s_cost[MAX_CHILDREN];
-    __shared__ unsigned char s_hist[MAX_CHILDREN][MAX_HIST_BYTES];
-    __shared__ int s_sorted[MAX_CANDS]; /* indices into children (nc..2*nc-1) */
+    /* Parent state: slots 0..nc-1 */
+    __shared__ double p_state[MAX_CANDS][8];
+    __shared__ double p_cost[MAX_CANDS];
+    __shared__ unsigned char p_hist[MAX_CANDS][MAX_HIST_BYTES];
+
+    /* Child state: slots 0..2*nc-1 */
+    __shared__ double c_state[MAX_CHILDREN][8];
+    __shared__ double c_cost[MAX_CHILDREN];
+    __shared__ unsigned char c_hist[MAX_CHILDREN][MAX_HIST_BYTES];
+    __shared__ unsigned c_bit[MAX_CHILDREN]; /* which bit this child chose */
+
     __shared__ int s_active;
     __shared__ unsigned s_output_bit;
     __shared__ int s_hist_pos;
@@ -70,15 +75,15 @@ __global__ void trellis_parallel_segments(
     if (tid < nc) {
         if (seg == 0 && seg0_init_states) {
             for (int k = 0; k < order; k++)
-                s_state[tid][k] = seg0_init_states[tid * 8 + k];
-            s_cost[tid] = seg0_init_costs[tid];
+                p_state[tid][k] = seg0_init_states[tid * 8 + k];
+            p_cost[tid] = seg0_init_costs[tid];
         } else {
             for (int k = 0; k < order; k++)
-                s_state[tid][k] = 0.0;
-            s_cost[tid] = 0.0;
+                p_state[tid][k] = 0.0;
+            p_cost[tid] = 0.0;
         }
         for (int b = 0; b < hist_bytes; b++)
-            s_hist[tid][b] = 0;
+            p_hist[tid][b] = 0;
     }
     if (tid == 0) {
         s_active = nc;
@@ -92,12 +97,12 @@ __global__ void trellis_parallel_segments(
         double x = (double)seg_in[s];
         int ac = s_active;
 
-        /* Phase 1: Parallel candidate expansion (threads 0..2*ac-1) */
+        /* Phase 1: Parallel candidate expansion */
         if (tid < 2 * ac) {
-            int pi = tid / 2;  /* parent index */
+            int pi = tid / 2;
             double y_b = (tid & 1) ? -1.0 : 1.0;
             double d[8];
-            double v = ntf_calc(s_state[pi], d, order, x);
+            double v = ntf_calc(p_state[pi], d, order, x);
             d[0] += y_b;
             if (limit > 0.0) {
                 for (int k = 0; k < order; k++) {
@@ -105,75 +110,66 @@ __global__ void trellis_parallel_segments(
                     else if (d[k] < -limit) d[k] = -limit;
                 }
             }
-            int ci = nc + tid;  /* child slot */
             for (int k = 0; k < order; k++)
-                s_state[ci][k] = d[k];
-            s_cost[ci] = s_cost[pi] + (v + c_ntf_a[0]*y_b)*(v + c_ntf_a[0]*y_b);
+                c_state[tid][k] = d[k];
+            c_cost[tid] = p_cost[pi] + (v + c_ntf_a[0]*y_b)*(v + c_ntf_a[0]*y_b);
+            c_bit[tid] = (tid & 1);  /* 0 = +1.0, 1 = -1.0 */
             /* Copy parent history to child */
             for (int b = 0; b < hist_bytes; b++)
-                s_hist[ci][b] = s_hist[pi][b];
+                c_hist[tid][b] = p_hist[pi][b];
         }
         __syncthreads();
 
-        /* Phase 2: Thread 0 — index-based sort, record history, output */
+        /* Phase 2: Thread 0 — sort, record bit, output */
         if (tid == 0) {
             int tc = 2 * ac;
 
-            /* Init sorted indices pointing to children */
-            for (int i = 0; i < tc; i++)
-                s_sorted[i] = nc + i;
-
-            /* Selection sort by cost — swap indices only, no data movement */
+            /* Selection sort children by cost — swap all data */
             for (int i = 0; i < ac && i < tc; i++) {
-                int best_idx = i;
+                int best = i;
                 for (int j = i + 1; j < tc; j++)
-                    if (s_cost[s_sorted[j]] < s_cost[s_sorted[best_idx]])
-                        best_idx = j;
-                if (best_idx != i) {
-                    int tmp = s_sorted[i];
-                    s_sorted[i] = s_sorted[best_idx];
-                    s_sorted[best_idx] = tmp;
+                    if (c_cost[j] < c_cost[best]) best = j;
+                if (best != i) {
+                    double t_c = c_cost[i]; c_cost[i] = c_cost[best]; c_cost[best] = t_c;
+                    unsigned t_b = c_bit[i]; c_bit[i] = c_bit[best]; c_bit[best] = t_b;
+                    for (int k = 0; k < order; k++) {
+                        double t_s = c_state[i][k]; c_state[i][k] = c_state[best][k]; c_state[best][k] = t_s;
+                    }
+                    for (int b = 0; b < hist_bytes; b++) {
+                        unsigned char t_h = c_hist[i][b]; c_hist[i][b] = c_hist[best][b]; c_hist[best][b] = t_h;
+                    }
                 }
             }
 
-            /* Record bit in history for top-ac candidates */
+            /* Record each selected child's bit in its history */
             int byte_pos = s_hist_pos / 8;
             int bit_pos = s_hist_pos % 8;
             for (int i = 0; i < ac; i++) {
-                int ci = s_sorted[i];
-                unsigned bit = (s_cost[ci] == s_cost[ci]) ? /* NaN check */
-                    ((int)(s_state[ci][0] + 1000.0) & 1) : 0; /* fallback */
-                /* Actually, the bit decision is y=+1 or y=-1 from expansion.
-                 * Child index ci = nc + tid, where tid&1 = bit choice.
-                 * ci - nc = original tid. (ci - nc) & 1 = bit. */
-                bit = ((unsigned)(ci - nc)) & 1;
-                if (bit)
-                    s_hist[ci][byte_pos] |= (1u << bit_pos);
+                if (c_bit[i])
+                    c_hist[i][byte_pos] |= (1u << bit_pos);
                 else
-                    s_hist[ci][byte_pos] &= ~(1u << bit_pos);
+                    c_hist[i][byte_pos] &= ~(1u << bit_pos);
             }
 
-            /* Output: read traceback bit from trellis_lat ago */
+            /* Output: read traceback from best candidate's history */
             if (s_pending >= lat) {
                 int read_pos = (s_hist_pos + 1) % lat;
                 int r_byte = read_pos / 8;
                 int r_bit = read_pos % 8;
-                int best = s_sorted[0];
-                s_output_bit = (s_hist[best][r_byte] >> r_bit) & 1;
+                s_output_bit = (c_hist[0][r_byte] >> r_bit) & 1;
             }
 
             s_hist_pos = (s_hist_pos + 1) % lat;
             if (s_pending < lat) s_pending++;
 
-            /* Move top-ac children to parent slots (compact) */
-            double min_c = s_cost[s_sorted[0]];
+            /* Move top-ac children to parents */
+            double min_c = c_cost[0];
             for (int i = 0; i < ac; i++) {
-                int ci = s_sorted[i];
-                s_cost[i] = s_cost[ci] - min_c;
+                p_cost[i] = c_cost[i] - min_c;
                 for (int k = 0; k < order; k++)
-                    s_state[i][k] = s_state[ci][k];
+                    p_state[i][k] = c_state[i][k];
                 for (int b = 0; b < hist_bytes; b++)
-                    s_hist[i][b] = s_hist[ci][b];
+                    p_hist[i][b] = c_hist[i][b];
             }
         }
         __syncthreads();
@@ -188,8 +184,8 @@ __global__ void trellis_parallel_segments(
     /* Segment 0: save final state */
     if (seg == 0 && seg0_final_states && tid < nc) {
         for (int k = 0; k < order; k++)
-            seg0_final_states[tid * 8 + k] = s_state[tid][k];
-        seg0_final_costs[tid] = s_cost[tid];
+            seg0_final_states[tid * 8 + k] = p_state[tid][k];
+        seg0_final_costs[tid] = p_cost[tid];
     }
 }
 
