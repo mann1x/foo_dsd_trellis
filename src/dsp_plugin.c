@@ -514,8 +514,10 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
             }
         }
         /* Assign GPU context to all engine channels */
-        for (int ch = 0; ch < s->num_channels; ch++)
+        for (int ch = 0; ch < s->num_channels; ch++) {
             s->channels[ch].gpu = s->gpu;
+            s->channels[ch].gpu_sdm = s->config.gpu_sdm_enabled;
+        }
     }
 
     /* Create dedicated IO pool for DoP unpack/pack (2 threads).
@@ -1096,7 +1098,8 @@ size_t plugin_process(plugin_state_t *s,
          * Only use GPU when estimated time < real-time budget.
          * At DSD256+ rates, per-segment work exceeds GPU capacity. */
         bool gpu_sdm_done = false;
-        if (s->gpu && s->config.sdm_mode == SDM_MODE_TRELLIS &&
+        if (s->gpu && s->config.gpu_sdm_enabled &&
+            s->config.sdm_mode == SDM_MODE_TRELLIS &&
             s->channels[0].sdm.trellis_num >= 2) {
             gpu_sdm_done = true;
             for (int ch = 0; ch < num_channels; ch++) {

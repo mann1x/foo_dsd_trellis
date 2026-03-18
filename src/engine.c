@@ -294,17 +294,9 @@ size_t engine_process_block(engine_channel_t *eng,
             /* Re-encode via SDM — try GPU (chunked), fall back to CPU */
             size_t sdm_out;
             bool same_gpu_ok = false;
-            int gpu_rc = -99;
-            {
-                extern void trellis_log_c(const char *);
-                char d[128];
-                sprintf_s(d, sizeof(d), "same-rate GPU check: gpu=%p mode=%d cands=%d count=%zu",
-                    (void*)eng->gpu, eng->sdm_mode, (int)eng->sdm.trellis_num, count);
-                trellis_log_c(d);
-            }
-            if (eng->gpu && eng->sdm_mode == SDM_MODE_TRELLIS &&
+            if (eng->gpu && eng->gpu_sdm && eng->sdm_mode == SDM_MODE_TRELLIS &&
                 eng->sdm.trellis_num >= 2 && count >= GPU_MIN_SAMPLES) {
-                gpu_rc = gpu_trellis_process(eng->gpu, eng->fir_buf, out, count,
+                int gpu_rc = gpu_trellis_process(eng->gpu, eng->fir_buf, out, count,
                                          NULL, NULL, (int)eng->sdm.trellis_num,
                                          eng->sdm.filter->order,
                                          eng->sdm.filter->a,
@@ -318,14 +310,6 @@ size_t engine_process_block(engine_channel_t *eng,
                 }
             }
             if (!same_gpu_ok) {
-                extern void trellis_log_c(const char *);
-                char dbg[128];
-                sprintf_s(dbg, sizeof(dbg),
-                    "GPU SDM fallback: gpu=%p mode=%d cands=%d count=%zu rc=%d",
-                    (void*)eng->gpu, eng->sdm_mode,
-                    (int)eng->sdm.trellis_num, count,
-                    eng->gpu ? gpu_rc : -99);
-                trellis_log_c(dbg);
                 if (eng->sdm_mode == SDM_MODE_PRECORR)
                     sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
                 else
@@ -381,7 +365,7 @@ size_t engine_process_block(engine_channel_t *eng,
     /* SDM — try GPU (chunked sub-dispatches), fall back to CPU */
     size_t sdm_out;
     bool gpu_sdm_ok = false;
-    if (eng->gpu && eng->sdm_mode == SDM_MODE_TRELLIS &&
+    if (eng->gpu && eng->gpu_sdm && eng->sdm_mode == SDM_MODE_TRELLIS &&
         eng->sdm.trellis_num >= 2 && fir_out >= GPU_MIN_SAMPLES) {
         if (gpu_trellis_process(eng->gpu, eng->fir_buf, out, fir_out,
                                  NULL, NULL, (int)eng->sdm.trellis_num,

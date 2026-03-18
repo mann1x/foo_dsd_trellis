@@ -130,10 +130,12 @@ static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
 #define CONFIG_V12_SIZE (CONFIG_V11_SIZE + RATE_MAP_COUNT + 1)
 /* v13: gpu_enabled(1) + gpu_backend(1) + rate_gpu(12) */
 #define CONFIG_V13_SIZE (CONFIG_V12_SIZE + 1 + 1 + RATE_MAP_COUNT)
+/* v14: rate_gpu_sdm(12) */
+#define CONFIG_V14_SIZE (CONFIG_V13_SIZE + RATE_MAP_COUNT)
 
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
-    if (buf_size < CONFIG_V13_SIZE)
+    if (buf_size < CONFIG_V14_SIZE)
         return 0;
 
     size_t pos = 0;
@@ -185,6 +187,10 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     pos = write_u8(buf, pos, cfg->gpu_enabled ? 1 : 0);
     pos = write_u8(buf, pos, (uint8_t)cfg->gpu_backend);
     memcpy(buf + pos, cfg->rate_gpu, RATE_MAP_COUNT);
+    pos += RATE_MAP_COUNT;
+
+    /* v14: per-rate GPU SDM */
+    memcpy(buf + pos, cfg->rate_gpu_sdm, RATE_MAP_COUNT);
     pos += RATE_MAP_COUNT;
 
     return pos;
@@ -304,6 +310,11 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
                 pos = read_u8(buf, pos, &u8); cfg->gpu_enabled = (u8 != 0);
                 pos = read_u8(buf, pos, &u8); cfg->gpu_backend = (int)u8;
                 memcpy(cfg->rate_gpu, buf + pos, RATE_MAP_COUNT);
+                pos += RATE_MAP_COUNT;
+            }
+            /* Version 14 adds per-rate GPU SDM toggle */
+            if (version >= 14 && buf_size >= CONFIG_V14_SIZE) {
+                memcpy(cfg->rate_gpu_sdm, buf + pos, RATE_MAP_COUNT);
                 pos += RATE_MAP_COUNT;
             }
         } else {

@@ -216,12 +216,14 @@ typedef struct {
     int8_t    fir_gain_db;    /* Global FIR gain limit in dB (0 to -12). FIR_GAIN_AUTO = use path_config */
     bool      gpu_enabled;   /* Enable GPU compute offload */
     int       gpu_backend;   /* gpu_backend_t: None(0)/DirectX(1)/CUDA(2)/Auto(3) */
-    int8_t    rate_gpu[RATE_MAP_COUNT]; /* Per-input-rate GPU: -1=Auto, 0=Off, 1=On */
+    int8_t    rate_gpu[RATE_MAP_COUNT];     /* Per-input-rate GPU FIR: -1=Auto, 0=Off, 1=On */
+    int8_t    rate_gpu_sdm[RATE_MAP_COUNT]; /* Per-input-rate GPU SDM: -1=Auto, 0=Off, 1=On */
+    bool      gpu_sdm_enabled;  /* Runtime: resolved per-chunk GPU SDM enable (not serialized) */
     float     state_limit;   /* Runtime: resolved state limiter (0=off, >0=limit). Set per-chunk. */
 } dsd_config_t;
 
 /* Config serialization version */
-#define DSD_CONFIG_VERSION 13
+#define DSD_CONFIG_VERSION 14
 
 /* FIR gain Auto sentinel and default */
 #define FIR_GAIN_AUTO    (-128)
@@ -291,7 +293,8 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     cfg->fir_gain_db = FIR_GAIN_AUTO;  /* Auto = -3 dB */
     cfg->gpu_enabled = false;
     cfg->gpu_backend = 3;  /* GPU_BACKEND_AUTO */
-    memset(cfg->rate_gpu, 0xFF, sizeof(cfg->rate_gpu)); /* -1 = Auto */
+    memset(cfg->rate_gpu, 0xFF, sizeof(cfg->rate_gpu));     /* -1 = Auto */
+    memset(cfg->rate_gpu_sdm, 0xFF, sizeof(cfg->rate_gpu_sdm)); /* -1 = Auto */
     cfg->state_limit = -1.0f;         /* -1 = Auto (use path_config) */
 }
 

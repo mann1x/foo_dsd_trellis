@@ -484,14 +484,15 @@ private:
         m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 44);
         m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 44);
         m_listRate.InsertColumn(6, L"Limiter", LVCFMT_LEFT, 48);
+        m_listRate.InsertColumn(7, L"ML", LVCFMT_LEFT, 40);
         /* Last column: fill remaining width to avoid horizontal scrollbar */
         {
             CRect rc;
             m_listRate.GetClientRect(&rc);
-            int used = 50 + 54 + 46 + 68 + 44 + 44 + 48;
+            int used = 50 + 54 + 46 + 68 + 44 + 44 + 48 + 40;
             int remain = rc.Width() - used - 4;
             if (remain < 40) remain = 40;
-            m_listRate.InsertColumn(7, L"ML", LVCFMT_LEFT, remain);
+            m_listRate.InsertColumn(8, L"GPU", LVCFMT_LEFT, remain);
         }
 
         for (int i = 0; i < RATE_MAP_COUNT; i++) {
@@ -523,6 +524,10 @@ private:
                 if (m_cfg.rate_ml[i] >= 0) {
                     wcscpy_s(buf, m_cfg.rate_ml[i] == 0 ? L"Off" : L"On");
                     m_listRate.SetItemText(i, 7, buf);
+                }
+                if (m_cfg.rate_gpu[i] >= 0) {
+                    wcscpy_s(buf, m_cfg.rate_gpu[i] == 0 ? L"Off" : L"On");
+                    m_listRate.SetItemText(i, 8, buf);
                 }
             }
             /* Resolve Auto values using path-optimal defaults */
@@ -717,7 +722,7 @@ private:
             ShowOutputCombo(nm->iItem);
         } else if (nm->iSubItem == 2) {
             ShowNtfCombo(nm->iItem);
-        } else if (nm->iSubItem >= 3 && nm->iSubItem <= 7) {
+        } else if (nm->iSubItem >= 3 && nm->iSubItem <= 8) {
             ShowPerRateCombo(nm->iItem, nm->iSubItem);
         }
 
@@ -838,6 +843,13 @@ private:
             m_ntfCombo.AddString(L"On");
             int cur = m_cfg.rate_ml[row];
             m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
+        } else if (col == 8) {
+            /* GPU SDM */
+            m_ntfCombo.AddString(L"Auto");
+            m_ntfCombo.AddString(L"Off");
+            m_ntfCombo.AddString(L"On");
+            int cur = m_cfg.rate_gpu_sdm[row];
+            m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
         }
 
         m_editRow = row;
@@ -916,6 +928,12 @@ private:
             m_cfg.rate_ml[m_editRow] = val;
             const wchar_t *names[] = { L"Auto", L"Off", L"On" };
             m_listRate.SetItemText(m_editRow, 7, names[sel < 3 ? sel : 0]);
+        } else if (m_editCol == 8) {
+            /* GPU SDM: 0=Auto, 1=Off, 2=On */
+            int8_t val = (int8_t)(sel == 0 ? -1 : sel - 1);
+            m_cfg.rate_gpu_sdm[m_editRow] = val;
+            const wchar_t *names[] = { L"Auto", L"Off", L"On" };
+            m_listRate.SetItemText(m_editRow, 8, names[sel < 3 ? sel : 0]);
         }
 
         RefreshAutoText(m_editRow);
@@ -1041,6 +1059,26 @@ private:
             /* ML filter status */
             bool ml_active = (m_cfg.rate_ml[row] >= 0) ? (m_cfg.rate_ml[row] != 0) : m_cfg.ml_enabled;
             info << "\nML filter: " << (ml_active ? "On" : "Off");
+
+            /* GPU SDM status */
+            {
+                bool gpu_sdm_active;
+                if (m_cfg.rate_gpu_sdm[row] == 0)
+                    gpu_sdm_active = false;
+                else if (m_cfg.rate_gpu_sdm[row] == 1)
+                    gpu_sdm_active = true;
+                else
+                    gpu_sdm_active = m_cfg.gpu_enabled;  /* Auto = global */
+
+                if (sdm_mode != SDM_MODE_TRELLIS)
+                    info << "\nGPU SDM: N/A (Trellis only)";
+                else if (!m_cfg.gpu_enabled)
+                    info << "\nGPU SDM: Disabled (GPU off)";
+                else if (!gpu_sdm_active)
+                    info << "\nGPU SDM: Off";
+                else
+                    info << "\nGPU SDM: On";
+            }
         }
 
         ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, info);
@@ -1059,6 +1097,8 @@ private:
             m_listRate.SetItemText(row, 6, L"Auto");
         if (m_cfg.rate_ml[row] < 0)
             m_listRate.SetItemText(row, 7, L"Auto");
+        if (m_cfg.rate_gpu_sdm[row] < 0)
+            m_listRate.SetItemText(row, 8, L"Auto");
     }
 
     void UpdatePreset() {
@@ -1286,6 +1326,14 @@ public:
             chunk_cfg.sdm_mode = (int)m_config.rate_sdm[map_idx];
         if (m_config.rate_ml[map_idx] >= 0)
             chunk_cfg.ml_enabled = (m_config.rate_ml[map_idx] != 0);
+
+        /* Per-rate GPU SDM: -1=Auto (use global gpu_enabled), 0=Off, 1=On */
+        if (m_config.rate_gpu_sdm[map_idx] == 0)
+            chunk_cfg.gpu_sdm_enabled = false;
+        else if (m_config.rate_gpu_sdm[map_idx] == 1)
+            chunk_cfg.gpu_sdm_enabled = true;
+        else
+            chunk_cfg.gpu_sdm_enabled = chunk_cfg.gpu_enabled;  /* Auto = follow global */
 
         /* Per-rate state limiter: -1=Auto (engine uses path_config), 0=Off, >0=value */
         if (m_config.rate_limiter[map_idx] >= 0)
