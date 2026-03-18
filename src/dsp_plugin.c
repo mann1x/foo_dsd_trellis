@@ -1161,6 +1161,7 @@ size_t plugin_process(plugin_state_t *s,
             s->fir_tail_valid = true;
         }
     } else if (s->gpu && s->config.gpu_enabled) {
+        gpu_reset_chunk(s->gpu);  /* reset per-channel boxcar history index */
         /* === Sequential path WITH GPU: run on calling thread ===
          * D3D11 contexts are single-threaded — GPU dispatch must run
          * from the thread that created the device. CUDA also benefits

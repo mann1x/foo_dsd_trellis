@@ -55,6 +55,9 @@ gpu_context_t *gpu_create(gpu_backend_t backend);
 /* Destroy GPU context. Safe to call with NULL. */
 void gpu_destroy(gpu_context_t *ctx);
 
+/* Reset per-chunk state (boxcar channel counter). Call at start of each audio chunk. */
+void gpu_reset_chunk(gpu_context_t *ctx);
+
 /* ─── FIR Convolution ─── */
 
 /* Upload FIR coefficients (call once per rate configuration).
@@ -130,6 +133,7 @@ gpu_context_t *gpu_cuda_create(void);
 
 void gpu_dx11_destroy(void *ctx);
 void gpu_cuda_destroy(void *ctx);
+void gpu_cuda_reset_chunk(void *ctx);
 void gpu_dx12_destroy_full(void *ctx);
 
 /* DX12 full backend */

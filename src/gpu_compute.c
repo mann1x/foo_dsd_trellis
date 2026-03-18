@@ -126,6 +126,16 @@ void gpu_destroy(gpu_context_t *ctx) {
     }
 }
 
+void gpu_reset_chunk(gpu_context_t *ctx) {
+    if (!ctx) return;
+    switch (ctx_backend(ctx)) {
+    case GPU_BACKEND_CUDA:
+        gpu_cuda_reset_chunk(ctx);
+        break;
+    default: break;
+    }
+}
+
 /* ─── Dispatched implementations ─── */
 
 int gpu_fir_setup(gpu_context_t *ctx, const float *taps, int ntaps,

@@ -191,11 +191,13 @@ typedef struct {
     double        *h_all_final_states;
     double        *h_all_final_costs;
     int            boundary_alloc;  /* allocated num_segs * nc */
-    /* Boxcar history for chunk continuity */
-    CUdeviceptr    d_boxcar_hist;    /* last taps samples from previous chunk */
-    float         *h_boxcar_hist;    /* host-side copy */
+    /* Boxcar history for chunk continuity — per channel */
+#define BOXCAR_MAX_CH 8
+    CUdeviceptr    d_boxcar_hist;    /* last taps samples (shared device buf) */
+    float         *h_boxcar_hist[BOXCAR_MAX_CH]; /* host-side per-channel */
     int            boxcar_hist_taps; /* allocated size (0 = none) */
-    bool           boxcar_hist_valid;
+    bool           boxcar_hist_valid[BOXCAR_MAX_CH];
+    int            boxcar_ch;       /* current channel index for calls */
 } cuda_context_t;
 
 /* ─── Helpers ─── */
@@ -410,6 +412,11 @@ fail:
     return NULL;
 }
 
+void gpu_cuda_reset_chunk(void *ptr) {
+    cuda_context_t *c = (cuda_context_t *)ptr;
+    if (c) c->boxcar_ch = 0;
+}
+
 void gpu_cuda_destroy(void *ptr) {
     cuda_context_t *c = (cuda_context_t *)ptr;
     if (!c) return;
@@ -434,6 +441,8 @@ void gpu_cuda_destroy(void *ptr) {
     if (c->d_all_final_costs)  pfn_cuMemFree(c->d_all_final_costs);
     free(c->h_all_final_states);
     free(c->h_all_final_costs);
+    if (c->d_boxcar_hist) pfn_cuMemFree(c->d_boxcar_hist);
+    for (int i = 0; i < BOXCAR_MAX_CH; i++) free(c->h_boxcar_hist[i]);
     if (c->mod_sdm_parallel) pfn_cuModuleUnload(c->mod_sdm_parallel);
     if (c->sdm_stream && c->sdm_stream != c->streams[0])
         pfn_cuStreamDestroy(c->sdm_stream);
@@ -725,14 +734,27 @@ int gpu_cuda_boxcar(cuda_context_t *c, const float *in, float *out,
     if (ensure_h_in(c, count) != 0) return -1;
     if (ensure_h_out(c, count) != 0) return -1;
 
-    /* Ensure boxcar history buffer exists */
+    /* Per-channel boxcar history.
+     * boxcar_ch increments per call, reset by gpu_cuda_reset_chunk(). */
+    int ch = c->boxcar_ch % BOXCAR_MAX_CH;
+    c->boxcar_ch++;
+
+    /* Ensure boxcar history buffers exist.
+     * Pre-fill with DSD silence (alternating ±1.0, sums to ~0)
+     * so the very first chunk has valid history. */
     if (c->boxcar_hist_taps < taps) {
         if (c->d_boxcar_hist) pfn_cuMemFree(c->d_boxcar_hist);
-        free(c->h_boxcar_hist);
+        for (int i = 0; i < BOXCAR_MAX_CH; i++) {
+            free(c->h_boxcar_hist[i]);
+            c->h_boxcar_hist[i] = (float *)malloc((size_t)taps * sizeof(float));
+            if (c->h_boxcar_hist[i]) {
+                for (int j = 0; j < taps; j++)
+                    c->h_boxcar_hist[i][j] = (j & 1) ? -1.0f : 1.0f;
+                c->boxcar_hist_valid[i] = true;  /* valid from start */
+            }
+        }
         pfn_cuMemAlloc(&c->d_boxcar_hist, (size_t)taps * sizeof(float));
-        c->h_boxcar_hist = (float *)calloc((size_t)taps, sizeof(float));
         c->boxcar_hist_taps = taps;
-        c->boxcar_hist_valid = false;
     }
 
     CUstream stream = c->streams[s_idx];
@@ -741,10 +763,10 @@ int gpu_cuda_boxcar(cuda_context_t *c, const float *in, float *out,
     pfn_cuMemcpyHtoDAsync(c->d_in[s_idx], c->h_in[s_idx],
                            count * sizeof(float), stream);
 
-    /* Upload history (previous chunk's tail) if available */
+    /* Upload THIS channel's history if available */
     CUdeviceptr hist_ptr = (CUdeviceptr)0;
-    if (c->boxcar_hist_valid) {
-        pfn_cuMemcpyHtoDAsync(c->d_boxcar_hist, c->h_boxcar_hist,
+    if (c->boxcar_hist_valid[ch] && c->h_boxcar_hist[ch]) {
+        pfn_cuMemcpyHtoDAsync(c->d_boxcar_hist, c->h_boxcar_hist[ch],
                                (size_t)taps * sizeof(float), stream);
         hist_ptr = c->d_boxcar_hist;
     }
@@ -758,11 +780,11 @@ int gpu_cuda_boxcar(cuda_context_t *c, const float *in, float *out,
     pfn_cuStreamSynchronize(stream);
     memcpy(out, c->h_out[s_idx], count * sizeof(float));
 
-    /* Save last `taps` samples as history for next chunk */
-    if (count >= (size_t)taps) {
-        memcpy(c->h_boxcar_hist, in + count - (size_t)taps,
+    /* Save last `taps` samples as THIS channel's history */
+    if (count >= (size_t)taps && c->h_boxcar_hist[ch]) {
+        memcpy(c->h_boxcar_hist[ch], in + count - (size_t)taps,
                (size_t)taps * sizeof(float));
-        c->boxcar_hist_valid = true;
+        c->boxcar_hist_valid[ch] = true;
     }
 
     c->active = (s_idx + 1) % NUM_STREAMS;
