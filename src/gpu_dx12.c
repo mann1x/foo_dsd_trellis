@@ -600,7 +600,7 @@ int gpu_dx12_trellis_full(dx12_t *c, const float *in, float *out,
     if (!c || !c->tr_ready || !c->pso[PSO_TRELLIS]) return -1;
 
     int nc = c->tr_cands;
-    int warmup = 2 * c->tr_lat;
+    int warmup = 4 * c->tr_lat;  /* 4× overlap for SDM convergence (matches CPU) */
     size_t base_seg = count / (size_t)num_segs;
     size_t seg_total = base_seg + (size_t)warmup;
     size_t total_out = base_seg * (size_t)num_segs;

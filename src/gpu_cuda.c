@@ -829,7 +829,7 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     int num_segs = c->num_sms;  /* one segment per SM */
 
     /* Minimum segment size: 4× warmup to be worthwhile */
-    int warmup = 2 * lat;  /* overlap for SDM convergence */
+    int warmup = 4 * lat;  /* 4× overlap for SDM convergence (matches CPU) */
     size_t min_seg = (size_t)(warmup * 4);
     if (count < min_seg * 2) num_segs = 1;
     if (num_segs > (int)(count / min_seg)) num_segs = (int)(count / min_seg);

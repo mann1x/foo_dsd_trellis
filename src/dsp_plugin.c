@@ -445,12 +445,14 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                 {
                     gpu_info_t ginfo;
                     gpu_get_info(&ginfo);
+                    const char *be_name =
+                        s->config.gpu_backend == 2 ? "CUDA" :
+                        gpu_dx12_probe() ? "DX12 Async Compute" : "DX11";
                     char gmsg[256];
                     sprintf_s(gmsg, sizeof(gmsg),
-                        "GPU created: %s backend, %s (%zu MB). "
-                        "Offloading: FIR convolution, gain, boxcar, Trellis SDM (chunked %d samples/dispatch)",
-                        ginfo.backend == GPU_BACKEND_CUDA ? "CUDA" : "DirectCompute",
-                        ginfo.device_name, ginfo.vram_mb, GPU_SDM_SUB_CHUNK);
+                        "GPU created: %s, %s (%zu MB). "
+                        "Offloading: FIR, gain, boxcar, Trellis SDM parallel",
+                        be_name, ginfo.device_name, ginfo.vram_mb);
                     trellis_log_c(gmsg);
                 }
                 /* Upload FIR coefficients — reuse the same taps the CPU path uses.
@@ -476,11 +478,18 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                                 actual_cands, f->order,
                                 actual_lat, f->a, f->g,
                                 s->channels[0].sdm.state_limit);
-                    else
-                        rc = gpu_dx11_trellis_setup(s->gpu,
+                    else {
+                        /* Try DX12 first (async compute), fall back to DX11 */
+                        rc = gpu_dx12_trellis_setup_full(s->gpu,
                                 actual_cands, f->order,
                                 actual_lat, f->a, f->g,
                                 s->channels[0].sdm.state_limit);
+                        if (rc != 0)
+                            rc = gpu_dx11_trellis_setup(s->gpu,
+                                    actual_cands, f->order,
+                                    actual_lat, f->a, f->g,
+                                    s->channels[0].sdm.state_limit);
+                    }
                     {
                         extern void log_ring_write(const char *);
                         char msg[256];
