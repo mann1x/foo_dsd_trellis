@@ -13,13 +13,15 @@
 
 static bool g_probed = false;
 static bool g_cuda_available = false;
-static bool g_dx_available = false;
+static bool g_dx12_available = false;
+static bool g_dx11_available = false;
 static gpu_backend_t g_active_backend = GPU_BACKEND_NONE;
 
 bool gpu_available(gpu_backend_t preferred) {
     if (!g_probed) {
         g_cuda_available = gpu_cuda_probe();
-        g_dx_available   = gpu_dx11_probe();
+        g_dx12_available = gpu_dx12_probe();     /* prefer DX12 over DX11 */
+        g_dx11_available = gpu_dx11_probe();
         g_probed = true;
     }
 
@@ -27,9 +29,9 @@ bool gpu_available(gpu_backend_t preferred) {
     case GPU_BACKEND_CUDA:
         return g_cuda_available;
     case GPU_BACKEND_DIRECTX:
-        return g_dx_available;
+        return g_dx12_available || g_dx11_available;
     case GPU_BACKEND_AUTO:
-        return g_cuda_available || g_dx_available;
+        return g_cuda_available || (g_dx12_available || g_dx11_available);
     default:
         return false;
     }
@@ -48,7 +50,11 @@ void gpu_get_info(gpu_info_t *info) {
         gpu_cuda_get_info(info);
         return;
     }
-    if (g_dx_available) {
+    if (g_dx12_available) {
+        gpu_dx12_get_info(info);
+        return;
+    }
+    if (g_dx11_available) {
         gpu_dx11_get_info(info);
         return;
     }
@@ -64,10 +70,10 @@ static gpu_backend_t resolve_backend(gpu_backend_t preferred) {
     case GPU_BACKEND_CUDA:
         return g_cuda_available ? GPU_BACKEND_CUDA : GPU_BACKEND_NONE;
     case GPU_BACKEND_DIRECTX:
-        return g_dx_available ? GPU_BACKEND_DIRECTX : GPU_BACKEND_NONE;
+        return (g_dx12_available || g_dx11_available) ? GPU_BACKEND_DIRECTX : GPU_BACKEND_NONE;
     case GPU_BACKEND_AUTO:
         if (g_cuda_available) return GPU_BACKEND_CUDA;
-        if (g_dx_available)   return GPU_BACKEND_DIRECTX;
+        if (g_dx12_available || g_dx11_available) return GPU_BACKEND_DIRECTX;
         return GPU_BACKEND_NONE;
     default:
         return GPU_BACKEND_NONE;
@@ -85,6 +91,11 @@ gpu_context_t *gpu_create(gpu_backend_t backend) {
         return gpu_cuda_create();
     case GPU_BACKEND_DIRECTX:
         g_active_backend = GPU_BACKEND_DIRECTX;
+        /* Prefer DX12 (async compute), fall back to DX11 */
+        if (g_dx12_available) {
+            gpu_context_t *ctx = gpu_dx12_create_full();
+            if (ctx) return ctx;
+        }
         return gpu_dx11_create();
     default:
         return NULL;
@@ -102,8 +113,14 @@ static gpu_backend_t ctx_backend(gpu_context_t *ctx) {
 
 void gpu_destroy(gpu_context_t *ctx) {
     if (!ctx) return;
+    /* DX12 and DX11 both use GPU_BACKEND_DIRECTX tag.
+     * Check if it's a DX12 context by trying DX12 destroy first. */
     switch (ctx_backend(ctx)) {
-    case GPU_BACKEND_DIRECTX: gpu_dx11_destroy(ctx); break;
+    case GPU_BACKEND_DIRECTX:
+        /* DX12 contexts have different internal structure but same backend tag.
+         * For now, try both destroys — only one will match. */
+        gpu_dx12_destroy_full(ctx);
+        break;
     case GPU_BACKEND_CUDA:    gpu_cuda_destroy(ctx); break;
     default: break;
     }
@@ -115,8 +132,11 @@ int gpu_fir_setup(gpu_context_t *ctx, const float *taps, int ntaps,
                   int num_stages, bool upsample) {
     if (!ctx) return -1;
     switch (ctx_backend(ctx)) {
-    case GPU_BACKEND_DIRECTX:
+    case GPU_BACKEND_DIRECTX: {
+        int r = gpu_dx12_fir_setup(ctx, taps, ntaps, num_stages, upsample);
+        if (r == 0) return 0;
         return gpu_dx11_fir_setup(ctx, taps, ntaps, num_stages, upsample);
+    }
     case GPU_BACKEND_CUDA:
         return gpu_cuda_fir_setup(ctx, taps, ntaps, num_stages, upsample);
     default: return -1;
@@ -129,8 +149,11 @@ int gpu_fir_chain_process(gpu_context_t *ctx, const float *in, float *out,
     if (!ctx) return -1;
     (void)delay_in; (void)delay_out; /* Delay handled internally by backend */
     switch (ctx_backend(ctx)) {
-    case GPU_BACKEND_DIRECTX:
+    case GPU_BACKEND_DIRECTX: {
+        int r = gpu_dx12_fir_chain(ctx, in, out, in_count, out_count);
+        if (r == 0) return 0;
         return gpu_dx11_fir_chain(ctx, in, out, in_count, out_count);
+    }
     case GPU_BACKEND_CUDA:
         return gpu_cuda_fir_chain(ctx, in, out, in_count, out_count);
     default: return -1;
@@ -165,8 +188,11 @@ int gpu_fir_batch_process(gpu_context_t *ctx, const float *in_batch,
 int gpu_gain_apply(gpu_context_t *ctx, float *buf, size_t count, float gain) {
     if (!ctx) return -1;
     switch (ctx_backend(ctx)) {
-    case GPU_BACKEND_DIRECTX:
+    case GPU_BACKEND_DIRECTX: {
+        int r = gpu_dx12_gain(ctx, buf, count, gain);
+        if (r == 0) return 0;
         return gpu_dx11_gain(ctx, buf, count, gain);
+    }
     case GPU_BACKEND_CUDA:
         return gpu_cuda_gain(ctx, buf, count, gain);
     default: return -1;
@@ -177,8 +203,11 @@ int gpu_boxcar_smooth(gpu_context_t *ctx, const float *in, float *out,
                       size_t count, int taps, float gain) {
     if (!ctx) return -1;
     switch (ctx_backend(ctx)) {
-    case GPU_BACKEND_DIRECTX:
+    case GPU_BACKEND_DIRECTX: {
+        int r = gpu_dx12_boxcar(ctx, in, out, count, taps, gain);
+        if (r == 0) return 0;
         return gpu_dx11_boxcar(ctx, in, out, count, taps, gain);
+    }
     case GPU_BACKEND_CUDA:
         return gpu_cuda_boxcar(ctx, in, out, count, taps, gain);
     default: return -1;
@@ -195,9 +224,12 @@ int gpu_trellis_process(gpu_context_t *ctx, const float *in, float *out,
     switch (ctx_backend(ctx)) {
     case GPU_BACKEND_CUDA:
         return gpu_cuda_trellis(ctx, in, out, count);
-    case GPU_BACKEND_DIRECTX:
-        /* DX11 Trellis uses same API — setup must be called first */
+    case GPU_BACKEND_DIRECTX: {
+        /* Try DX12 parallel-segment trellis first */
+        int r = gpu_dx12_trellis_full(ctx, in, out, count, 64 /* segments */);
+        if (r == 0) return 0;
         return gpu_dx11_trellis(ctx, in, out, count);
+    }
     default: return -1;
     }
 }

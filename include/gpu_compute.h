@@ -130,6 +130,23 @@ gpu_context_t *gpu_cuda_create(void);
 
 void gpu_dx11_destroy(void *ctx);
 void gpu_cuda_destroy(void *ctx);
+void gpu_dx12_destroy_full(void *ctx);
+
+/* DX12 full backend */
+bool gpu_dx12_probe(void);
+void gpu_dx12_get_info(gpu_info_t *info);
+gpu_context_t *gpu_dx12_create_full(void);
+int gpu_dx12_fir_setup(void *ctx, const float *taps, int ntaps,
+                        int num_stages, bool upsample);
+int gpu_dx12_fir_chain(void *ctx, const float *in, float *out,
+                        size_t in_count, size_t *out_count);
+int gpu_dx12_gain(void *ctx, float *buf, size_t count, float gain);
+int gpu_dx12_boxcar(void *ctx, const float *in, float *out,
+                     size_t count, int taps, float gain);
+int gpu_dx12_trellis_setup_full(void *ctx, int nc, int ord, int lat,
+                                  const double *a, const double *g, double sl);
+int gpu_dx12_trellis_full(void *ctx, const float *in, float *out,
+                           size_t count, int num_segs);
 
 /* Backend-specific operations (called by gpu_compute.c dispatcher) */
 int gpu_dx11_fir_setup(void *ctx, const float *taps, int ntaps,

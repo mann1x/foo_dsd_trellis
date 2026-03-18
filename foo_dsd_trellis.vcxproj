@@ -223,6 +223,9 @@
     <ClCompile Include="src\gpu_cuda.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\gpu_dx12.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\foo_dsd_trellis.rc" />

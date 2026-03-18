@@ -158,6 +158,7 @@
     <ClCompile Include="src\gpu_compute.c" />
     <ClCompile Include="src\gpu_dx11.c" />
     <ClCompile Include="src\gpu_cuda.c" />
+    <ClCompile Include="src\gpu_dx12.c" />
     <!-- Tools -->
     <ClCompile Include="tools\dsd_encode.c" />
   </ItemGroup>
