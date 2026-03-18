@@ -22,6 +22,7 @@
 #include "kernels/fir_kernels_ptx.h"
 #include "kernels/sdm_kernels_ptx.h"
 #include "kernels/sdm_parallel_ptx.h"
+#include "kernels/sdm_hawksford_ptx.h"
 
 /* ─── CUDA Driver API types (no CUDA headers needed) ─── */
 
@@ -140,6 +141,9 @@ typedef struct {
     /* Parallel-segment SDM (from sdm_parallel.ptx) */
     CUmodule       mod_sdm_parallel;
     CUfunction     fn_trellis_parallel;
+    /* Hawksford intra-step (from sdm_hawksford.ptx) */
+    CUmodule       mod_hawksford;
+    CUfunction     fn_hawksford;
     int            num_sms;  /* GPU SM count for optimal parallelism */
     /* Triple-buffered device memory */
     CUdeviceptr    d_in[NUM_STREAMS];
@@ -387,6 +391,10 @@ gpu_context_t *gpu_cuda_create(void) {
         goto fail;
     c->num_sms = g_sm_count > 0 ? g_sm_count : 64;
 
+    /* Load Hawksford kernel */
+    if (pfn_cuModuleLoadData(&c->mod_hawksford, g_ptx_sdm_hawksford) == CUDA_SUCCESS)
+        pfn_cuModuleGetFunction(&c->fn_hawksford, c->mod_hawksford, "trellis_hawksford");
+
     /* Create streams */
     for (int i = 0; i < NUM_STREAMS; i++) {
         if (pfn_cuStreamCreate(&c->streams[i], 0) != CUDA_SUCCESS)
@@ -444,6 +452,7 @@ void gpu_cuda_destroy(void *ptr) {
     if (c->d_boxcar_hist) pfn_cuMemFree(c->d_boxcar_hist);
     for (int i = 0; i < BOXCAR_MAX_CH; i++) free(c->h_boxcar_hist[i]);
     if (c->mod_sdm_parallel) pfn_cuModuleUnload(c->mod_sdm_parallel);
+    if (c->mod_hawksford)    pfn_cuModuleUnload(c->mod_hawksford);
     if (c->sdm_stream && c->sdm_stream != c->streams[0])
         pfn_cuStreamDestroy(c->sdm_stream);
     if (c->mod_sdm) pfn_cuModuleUnload(c->mod_sdm);
@@ -1143,6 +1152,72 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     }
 
     c->trellis_state_valid = true;
+    return 0;
+}
+
+/* ─── Hawksford intra-step parallel SDM ─── */
+
+int gpu_cuda_trellis_hawksford(cuda_context_t *c, const float *in, float *out,
+                                size_t count) {
+    if (!c || !c->fn_hawksford) return -1;
+    pfn_cuCtxSetCurrent(c->context);
+
+    int lat = c->trellis_lat;
+    CUstream stream = c->sdm_stream;
+
+    /* Upload NTF constants (double) to Hawksford module */
+    {
+        CUdeviceptr d_a, d_g, d_order;
+        size_t sz;
+        pfn_cuModuleGetGlobal(&d_a, &sz, c->mod_hawksford, "c_ntf_a");
+        pfn_cuMemcpyHtoD(d_a, c->trellis_ntf_a, (size_t)c->trellis_order * sizeof(double));
+        pfn_cuModuleGetGlobal(&d_g, &sz, c->mod_hawksford, "c_ntf_g");
+        pfn_cuMemcpyHtoD(d_g, c->trellis_ntf_g, (size_t)c->trellis_order * sizeof(double));
+        pfn_cuModuleGetGlobal(&d_order, &sz, c->mod_hawksford, "c_ntf_order");
+        pfn_cuMemcpyHtoD(d_order, &c->trellis_order, sizeof(int));
+    }
+
+    if (ensure_sdm_bufs(c, count) != 0) return -1;
+
+    static CUdeviceptr d_final_s = 0, d_final_c = 0;
+    static int hawk_alloc = 0;
+    if (!hawk_alloc) {
+        pfn_cuMemAlloc(&d_final_s, 64 * 8 * sizeof(double));
+        pfn_cuMemAlloc(&d_final_c, 64 * sizeof(double));
+        hawk_alloc = 1;
+    }
+
+    pfn_cuMemcpyHtoDAsync(c->d_sdm_in, in, count * sizeof(float), stream);
+
+    LARGE_INTEGER t0, t1, freq;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+
+    int cnt = (int)count;
+    CUdeviceptr null_ptr = (CUdeviceptr)0;
+    void *args[] = {
+        &c->d_sdm_in, &c->d_sdm_out, &cnt, &lat,
+        &null_ptr, &null_ptr,
+        &d_final_s, &d_final_c
+    };
+    pfn_cuLaunchKernel(c->fn_hawksford, 1, 1, 1, 128, 1, 1,
+                        0, stream, args, NULL);
+    pfn_cuStreamSynchronize(stream);
+    QueryPerformanceCounter(&t1);
+
+    pfn_cuMemcpyDtoHAsync(out, c->d_sdm_out, count * sizeof(float), stream);
+    pfn_cuStreamSynchronize(stream);
+
+    {
+        extern void trellis_log_c(const char *);
+        double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+        double audio_ms = (double)count / 2822400.0 * 1000.0;
+        char msg[256];
+        sprintf_s(msg, sizeof(msg),
+            "[GPU Hawksford] %zu samples, nc=64, lat=%d: %.1fms (%.2fx RT)",
+            count, lat, ms, ms / audio_ms);
+        trellis_log_c(msg);
+    }
     return 0;
 }
 

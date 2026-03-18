@@ -3,14 +3,10 @@
  *
  * Single-segment kernel with nc=64 candidates, fully parallel within
  * each time step. No temporal segmentation = no stitching artifacts.
- * Uses double for NTF state (float32 insufficient for noise shaping).
  *
- * Architecture:
- *   128 threads (2*nc) on 1 SM per channel
- *   Phase 1: Parallel NTF expansion (128 threads)
- *   Phase 2: Parallel bitonic sort by cost (128 threads)
- *   Phase 3: Serial dedup + promote (thread 0)
- *   Output:  Best candidate's current bit
+ * Uses proper Viterbi traceback (compact uint32 history) to avoid
+ * truncation noise. Without traceback (Latency=0), the output has
+ * flat baseband noise — the Harpe/Kato "truncation noise" artifact.
  */
 
 extern "C" {
@@ -20,9 +16,9 @@ __constant__ double c_ntf_g[8];
 __constant__ int    c_ntf_order;
 
 #define NC 64
-#define NC2 128  /* 2 * NC */
+#define NC2 128
+#define TB_WORDS 8  /* traceback history: 8 * 32 = 256 bits max */
 
-/* NTF filter calc — double precision */
 __device__ double ntf_calc_d(const double *s, double *d, int order, double x) {
     d[0] = s[0] - c_ntf_g[0] * s[1] + x;
     for (int k = 1; k < order - 1; k++)
@@ -37,27 +33,33 @@ __device__ double ntf_calc_d(const double *s, double *d, int order, double x) {
 __global__ void trellis_hawksford(
     const float *in, float *out, int count,
     int trellis_lat,
-    const double *init_states,   /* [NC*8] or NULL */
-    const double *init_costs,    /* [NC] or NULL */
-    double *final_states,        /* [NC*8] */
-    double *final_costs)         /* [NC] */
+    const double *init_states,
+    const double *init_costs,
+    double *final_states,
+    double *final_costs)
 {
     int tid = threadIdx.x;
     int order = c_ntf_order;
+    int lat = trellis_lat;
+    int tb_words = (lat + 31) / 32;
+    if (tb_words > TB_WORDS) tb_words = TB_WORDS;
 
-    /* Shared memory — double precision for NTF */
+    /* Shared memory */
     __shared__ double p_state[NC][8];
     __shared__ double p_cost[NC];
     __shared__ unsigned p_path[NC];
+    __shared__ unsigned p_tb[NC][TB_WORDS];  /* traceback history per candidate */
 
     __shared__ double c_state[NC2][8];
     __shared__ double c_cost[NC2];
     __shared__ unsigned c_path[NC2];
     __shared__ unsigned c_bit[NC2];
+    __shared__ unsigned c_tb[NC2][TB_WORDS];
 
-    /* Control */
     __shared__ int s_active;
     __shared__ unsigned s_output_bit;
+    __shared__ int s_hist_pos;
+    __shared__ int s_pending;
 
     /* Init parents */
     if (tid < NC) {
@@ -71,18 +73,23 @@ __global__ void trellis_hawksford(
             p_cost[tid] = 0.0;
         }
         p_path[tid] = 0;
+        for (int w = 0; w < tb_words; w++)
+            p_tb[tid][w] = 0;
     }
-    if (tid == 0) s_active = NC;
+    if (tid == 0) {
+        s_active = NC;
+        s_hist_pos = 0;
+        s_pending = 0;
+    }
     __syncthreads();
 
     int out_idx = 0;
-    int lat = trellis_lat;
 
     for (int s = 0; s < count; s++) {
         double x = (double)in[s] * 0.5;
         int ac = s_active;
 
-        /* ══════ Phase 1: Parallel NTF expansion ══════ */
+        /* ══════ Phase 1: Parallel NTF expansion + traceback copy ══════ */
         if (tid < 2 * ac) {
             int pi = tid / 2;
             double y_b = (tid & 1) ? 1.0 : -1.0;
@@ -94,11 +101,13 @@ __global__ void trellis_hawksford(
             c_cost[tid] = p_cost[pi] + (v + c_ntf_a[0] * y_b) * (v + c_ntf_a[0] * y_b);
             c_bit[tid] = (tid & 1) ? 0u : 1u;
             c_path[tid] = (p_path[pi] << 1 | c_bit[tid]) & 0xFF;
+            /* Copy parent's traceback history (compact: tb_words uint32) */
+            for (int w = 0; w < tb_words; w++)
+                c_tb[tid][w] = p_tb[pi][w];
         }
         __syncthreads();
 
-        /* ══════ Phase 2+3: Thread 0 — selection sort + dedup + output ══════
-         * Same algorithm as proven sdm_parallel.cu kernel. */
+        /* ══════ Phase 2+3: Thread 0 — sort + dedup + traceback + output ══════ */
         if (tid == 0) {
             int tc = 2 * ac;
             /* Selection sort children by cost */
@@ -112,6 +121,9 @@ __global__ void trellis_hawksford(
                     unsigned t_p = c_path[i]; c_path[i] = c_path[best]; c_path[best] = t_p;
                     for (int k = 0; k < order; k++) {
                         double t_s = c_state[i][k]; c_state[i][k] = c_state[best][k]; c_state[best][k] = t_s;
+                    }
+                    for (int w = 0; w < tb_words; w++) {
+                        unsigned t_h = c_tb[i][w]; c_tb[i][w] = c_tb[best][w]; c_tb[best][w] = t_h;
                     }
                 }
             }
@@ -129,12 +141,38 @@ __global__ void trellis_hawksford(
                         c_path[deduped] = c_path[i];
                         for (int k = 0; k < order; k++)
                             c_state[deduped][k] = c_state[i][k];
+                        for (int w = 0; w < tb_words; w++)
+                            c_tb[deduped][w] = c_tb[i][w];
                     }
                     deduped++;
                 }
             }
             ac = deduped;
-            s_output_bit = c_bit[0];
+
+            /* Record current bit in traceback history */
+            int byte_pos = s_hist_pos / 32;
+            int bit_pos = s_hist_pos % 32;
+            for (int i = 0; i < ac; i++) {
+                if (c_bit[i])
+                    c_tb[i][byte_pos] |= (1u << bit_pos);
+                else
+                    c_tb[i][byte_pos] &= ~(1u << bit_pos);
+            }
+
+            /* Output: traceback from best candidate's history */
+            if (s_pending >= lat) {
+                /* Read oldest bit from best candidate's history */
+                int next_pos = (s_hist_pos + 1) % lat;
+                int nb = next_pos / 32;
+                int ni = next_pos % 32;
+                s_output_bit = (c_tb[0][nb] >> ni) & 1;
+            } else {
+                s_output_bit = c_bit[0];
+            }
+
+            s_hist_pos = (s_hist_pos + 1) % lat;
+            if (s_pending < lat) s_pending++;
+
             /* Promote to parents */
             double min_c = c_cost[0];
             for (int i = 0; i < ac; i++) {
@@ -142,16 +180,20 @@ __global__ void trellis_hawksford(
                 p_path[i] = c_path[i];
                 for (int k = 0; k < order; k++)
                     p_state[i][k] = c_state[i][k];
+                for (int w = 0; w < tb_words; w++)
+                    p_tb[i][w] = c_tb[i][w];
             }
             s_active = ac;
         }
         __syncthreads();
 
-        if (tid == 0 && s >= lat && out_idx < count) {
+        /* Write output — wait lat steps for traceback to be valid */
+        if (tid == 0 && s_pending >= lat && out_idx < count) {
             out[out_idx++] = s_output_bit ? -1.0f : 1.0f;
         }
     }
 
+    /* Save final state */
     if (final_states && tid < NC) {
         for (int k = 0; k < order; k++)
             final_states[tid * 8 + k] = p_state[tid][k];
