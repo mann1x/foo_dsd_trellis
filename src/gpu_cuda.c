@@ -836,8 +836,11 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     int M = 8 * lat;   /* convergence depth: 8× trellis latency */
     int L = lat;        /* traceback lookahead: 1× trellis latency */
 
-    /* Segment count: use available SMs but ensure segments are large enough */
-    int num_segs = c->num_sms;
+    /* Fewer segments = fewer boundaries + less history overhead.
+     * With full traceback history, each candidate carries hist_bytes
+     * of shared memory that must be swapped during sort. */
+    int num_segs = 8;
+    if (num_segs > c->num_sms) num_segs = c->num_sms;
     size_t min_D = (size_t)(M + L) * 2;  /* D must be > M+L for efficiency */
     if (count < min_D * 2) num_segs = 1;
     if (num_segs > (int)(count / min_D)) num_segs = (int)(count / min_D);

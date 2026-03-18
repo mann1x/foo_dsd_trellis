@@ -312,7 +312,7 @@ static const char g_ptx_sdm_parallel[] =
     "	setp.ne.s64 	%p24, %rd23, 0;\n"
     "	setp.eq.s32 	%p25, %r3, 0;\n"
     "	and.pred  	%p26, %p25, %p24;\n"
-    "	selp.b32 	%r49, 0, %r260, %p26;\n"
+    "	selp.b32 	%r49, %r263, %r260, %p26;\n"
     "	setp.gt.f64 	%p27, %fd1, 0d0000000000000000;\n"
     "	setp.gt.s32 	%p28, %r1, 0;\n"
     "	and.pred  	%p1, %p27, %p28;\n"

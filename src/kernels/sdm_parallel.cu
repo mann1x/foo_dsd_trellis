@@ -186,8 +186,10 @@ __global__ void trellis_parallel_segments(
         __syncthreads();
 
         /* SBVD output: only samples in [M, M+D) are output.
-         * Must also have accumulated enough history (pending >= lat). */
-        int eff_M = (seg == 0 && seg0_init_states) ? 0 : M_convergence;
+         * Must also have accumulated enough history (pending >= lat).
+         * Segment 0 with persistent state: integrators are warm but
+         * history buffer is cold — need lat samples to fill it. */
+        int eff_M = (seg == 0 && seg0_init_states) ? trellis_lat : M_convergence;
         if (tid == 0 && s_pending >= lat && s >= eff_M && out_idx < D_output) {
             seg_out[out_idx++] = s_output_bit ? 1.0f : -1.0f;
         }
