@@ -301,8 +301,10 @@ size_t engine_process_block(engine_channel_t *eng,
                                          eng->sdm.filter->order,
                                          eng->sdm.filter->a,
                                          eng->sdm.filter->g) == 0) {
-                    sdm_out = count > (size_t)cfg->trellis_lat ?
-                              count - (size_t)cfg->trellis_lat : 0;
+                    /* GPU parallel SBVD handles latency internally —
+                     * output count = input count (segment 0 outputs from
+                     * sample 0 with persistent state, no latency gap). */
+                    sdm_out = count;
                     same_gpu_ok = true;
                 }
             }
@@ -369,8 +371,7 @@ size_t engine_process_block(engine_channel_t *eng,
                                  eng->sdm.filter->order,
                                  eng->sdm.filter->a,
                                  eng->sdm.filter->g) == 0) {
-            sdm_out = fir_out > (size_t)cfg->trellis_lat ?
-                      fir_out - (size_t)cfg->trellis_lat : 0;
+            sdm_out = fir_out; /* GPU SBVD handles latency internally */
             gpu_sdm_ok = true;
         }
     }
