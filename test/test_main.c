@@ -45,6 +45,7 @@ static const suite_entry_t suites[] = {
     { "onnx",      "ONNX Filter",       test_onnx_filter_suite, 0 },
     { "gpu",       "GPU Compute",       test_gpu_suite,         0 },
     { "gpusinad",  "GPU SINAD Compare", test_gpu_sinad_comparison, 1 },
+    { "latsweep",  "Lat Sweep",         test_lat_sweep,        1 },
     { "diag",      "SINAD Diagnostics", test_sinad_diag_suite, 1 },
 };
 

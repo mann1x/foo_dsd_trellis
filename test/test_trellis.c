@@ -364,3 +364,21 @@ void test_trellis_suite(void) {
     TEST_RUN(test_sdm_sinad_dsd256);
     TEST_RUN(test_sdm_sinad_dsd512);
 }
+
+/* Temporary: lat sweep for Hawksford investigation */
+void test_lat_sweep(void) {
+    printf("\n=== LAT SWEEP (DSD64, nc=4, depth=8) ===\n");
+    int lats[] = {16, 32, 64, 128, 256};
+    for (int i = 0; i < 5; i++) {
+        printf("  lat=%d: ", lats[i]);
+        double sinad = measure_sinad_1khz(64, 8, 4, lats[i]);
+        printf("  => %.1f dB\n", sinad);
+    }
+    printf("\n=== LAT SWEEP (DSD64, nc=8, depth=8) ===\n");
+    for (int i = 0; i < 5; i++) {
+        printf("  lat=%d: ", lats[i]);
+        double sinad = measure_sinad_1khz(64, 8, 8, lats[i]);
+        printf("  => %.1f dB\n", sinad);
+    }
+    g_tests_run++; g_tests_passed++;
+}

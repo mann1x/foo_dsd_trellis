@@ -258,7 +258,7 @@ static inline float fir_gain_db_to_linear(int8_t db) {
 #define DSD_DEFAULT_GAIN         1.0f
 #define DSD_DEFAULT_TRELLIS_N    8
 #define DSD_DEFAULT_TRELLIS_M    4
-#define DSD_DEFAULT_TRELLIS_LAT  128
+#define DSD_DEFAULT_TRELLIS_LAT  32
 #define DSD_DEFAULT_THREADS      0   /* 0 = auto (all logical cores) */
 
 static inline void dsd_config_defaults(dsd_config_t *cfg) {
