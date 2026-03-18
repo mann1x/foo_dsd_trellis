@@ -38,6 +38,7 @@ __global__ void trellis_parallel_segments(
     int D_output,
     int num_cands,
     int trellis_lat,
+    int overlap,
     const double *seg0_init_states,
     const double *seg0_init_costs,
     double *seg0_final_states,
@@ -99,7 +100,7 @@ __global__ void trellis_parallel_segments(
 
     int out_idx = 0;
     for (int s = 0; s < total; s++) {
-        double x = (double)seg_in[s];
+        double x = (double)seg_in[s] * 0.5;
         int ac = s_active;
 
         /* Phase 0: Compute parent traceback bits (before expansion).
@@ -120,7 +121,12 @@ __global__ void trellis_parallel_segments(
         /* Phase 1: Parallel candidate expansion */
         if (tid < 2 * ac) {
             int pi = tid / 2;
-            double y_b = (tid & 1) ? -1.0 : 1.0;
+            /* y_b is the NEGATED quantizer output: y_b = -y.
+             * CPU: d[0] = s[0] - g[0]*s[1] + x - y
+             * GPU: d[0] = s[0] - g[0]*s[1] + x  (from ntf_calc) + y_b
+             * So y_b must equal -y for the NTF state to match CPU.
+             * tid&1=0 → y_b=-1.0 (CPU y=+1), tid&1=1 → y_b=+1.0 (CPU y=-1) */
+            double y_b = (tid & 1) ? 1.0 : -1.0;
             double d[8];
             double v = ntf_calc(p_state[pi], d, order, x);
             d[0] += y_b;
@@ -134,7 +140,8 @@ __global__ void trellis_parallel_segments(
                 c_state[tid][k] = d[k];
             c_cost[tid] = p_cost[pi] + (v + c_ntf_a[0]*y_b)*(v + c_ntf_a[0]*y_b);
             /* Bit convention: 1 = y=+1.0, 0 = y=-1.0 (matches CPU).
-             * tid&1=0 → y_b=+1.0 → bit=1. tid&1=1 → y_b=-1.0 → bit=0. */
+             * tid&1=0 → y_b=-1.0 → CPU y=+1 → bit=1.
+             * tid&1=1 → y_b=+1.0 → CPU y=-1 → bit=0. */
             c_bit[tid] = (tid & 1) ? 0u : 1u;
             /* Path register for dedup + inherit parent's traceback bit */
             c_path[tid] = (p_path[pi] << 1 | c_bit[tid]) & 0xFF;
@@ -279,13 +286,17 @@ __global__ void trellis_parallel_segments(
         __syncthreads();
 
         /* SBVD output.
-         * Segment 0 with persistent state: output from sample 0 using
-         * immediate best-candidate bit (no traceback wait). Avoids gap.
-         * Segments 1+: wait for both M convergence and lat history fill. */
-        int eff_M = (seg == 0 && seg0_init_states) ? 0 : M_convergence;
+         * Segment 0 with persistent state: output from sample 0.
+         * Segment 0 without persistent state: wait lat warmup.
+         * Segments 1+: output starts at (M - overlap) to provide overlap
+         * region for host-side crossfade. The first `overlap` samples come
+         * from late-M (almost converged), blended by host with previous
+         * segment's tail. D_output includes the overlap samples. */
+        int eff_M = (seg == 0) ? ((seg0_init_states) ? 0 : lat)
+                                : (M_convergence - overlap);
         bool hist_ready = (s_pending >= lat) || (seg == 0 && seg0_init_states);
         if (tid == 0 && hist_ready && s >= eff_M && out_idx < D_output) {
-            seg_out[out_idx++] = s_output_bit ? -1.0f : 1.0f; /* inverted vs intuition */
+            seg_out[out_idx++] = s_output_bit ? -1.0f : 1.0f;
         }
     }
 

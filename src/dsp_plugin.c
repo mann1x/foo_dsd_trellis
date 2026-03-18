@@ -431,6 +431,7 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
             s->config.gpu_enabled, (void*)s->gpu, s->config.gpu_backend);
         trellis_log_c(msg);
     }
+    /* Step 1: Create GPU context if not yet created */
     if (s->config.gpu_enabled && !s->gpu) {
         bool avail = gpu_available((gpu_backend_t)s->config.gpu_backend);
         {
@@ -442,83 +443,79 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         if (avail) {
             s->gpu = gpu_create((gpu_backend_t)s->config.gpu_backend);
             if (s->gpu) {
-                /* Log which backend is active and what it handles */
-                {
-                    gpu_info_t ginfo;
-                    gpu_get_info(&ginfo);
-                    const char *be_name =
-                        s->config.gpu_backend == 2 ? "CUDA" :
-                        gpu_dx12_probe() ? "DX12 Async Compute" : "DX11";
-                    char gmsg[256];
-                    sprintf_s(gmsg, sizeof(gmsg),
-                        "GPU created: %s, %s (%zu MB). "
-                        "Offloading: FIR, gain, boxcar, Trellis SDM parallel",
-                        be_name, ginfo.device_name, ginfo.vram_mb);
-                    trellis_log_c(gmsg);
-                }
-                /* Upload FIR coefficients — reuse the same taps the CPU path uses.
-                 * The FIR chain is initialized per-channel, but all channels share
-                 * the same half-band Kaiser taps. Get them from channel 0. */
-                int num_stages = s->channels[0].fir.num_stages;
-                bool is_upsample = s->channels[0].fir.upsample;
-                if (num_stages > 0) {
-                    extern float g_hb_taps[];
-                    extern int   g_hb_ntaps;
-                    gpu_fir_setup(s->gpu, g_hb_taps, g_hb_ntaps,
-                                  num_stages, is_upsample);
-                }
-                /* Setup persistent SDM buffers on GPU */
-                if (s->config.sdm_mode == SDM_MODE_TRELLIS &&
-                    s->channels[0].sdm.filter) {
-                    const ntf_filter_t *f = s->channels[0].sdm.filter;
-                    int actual_cands = (int)s->channels[0].sdm.trellis_num;
-                    int actual_lat = (int)s->channels[0].sdm.trellis_lat;
-                    int rc;
-                    if (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)
-                        rc = gpu_cuda_trellis_setup(s->gpu,
-                                actual_cands, f->order,
-                                actual_lat, f->a, f->g,
-                                s->channels[0].sdm.state_limit);
-                    else {
-                        /* Try DX12 first (async compute), fall back to DX11 */
-                        rc = gpu_dx12_trellis_setup_full(s->gpu,
-                                actual_cands, f->order,
-                                actual_lat, f->a, f->g,
-                                s->channels[0].sdm.state_limit);
-                        if (rc != 0)
-                            rc = gpu_dx11_trellis_setup(s->gpu,
-                                    actual_cands, f->order,
-                                    actual_lat, f->a, f->g,
-                                    s->channels[0].sdm.state_limit);
-                    }
-                    {
-                        extern void log_ring_write(const char *);
-                        char msg[256];
-                        sprintf_s(msg, sizeof(msg),
-                            "GPU SDM setup: backend=%d trellis cands=%d order=%d lat=%d limit=%.1f rc=%d",
-                            s->config.gpu_backend, actual_cands, f->order,
-                            actual_lat, s->channels[0].sdm.state_limit, rc);
-                        trellis_log_c(msg);
-                    }
-                } else if (s->config.sdm_mode == SDM_MODE_PRECORR) {
-                    const ntf_filter_t *f = s->channels[0].precorr.filter;
-                    if (f) {
-                        float a_f[8], g_f[8];
-                        for (int k = 0; k < f->order; k++) {
-                            a_f[k] = s->channels[0].precorr.a[k];
-                            g_f[k] = s->channels[0].precorr.g[k];
-                        }
-                        gpu_cuda_precorr_setup(s->gpu, f->order, a_f, g_f,
-                            (const float *)s->channels[0].precorr.pred_table,
-                            s->channels[0].precorr.state_limit);
-                    }
-                }
-
-                /* Assign GPU context to all engine channels */
-                for (int ch = 0; ch < s->num_channels; ch++)
-                    s->channels[ch].gpu = s->gpu;
+                gpu_info_t ginfo;
+                gpu_get_info(&ginfo);
+                const char *be_name =
+                    s->config.gpu_backend == 2 ? "CUDA" :
+                    gpu_dx12_probe() ? "DX12 Async Compute" : "DX11";
+                char gmsg[256];
+                sprintf_s(gmsg, sizeof(gmsg),
+                    "GPU created: %s, %s (%zu MB). "
+                    "Offloading: FIR, gain, boxcar, Trellis SDM parallel",
+                    be_name, ginfo.device_name, ginfo.vram_mb);
+                trellis_log_c(gmsg);
             }
         }
+    }
+    /* Step 2: (Re-)configure GPU for current rate/SDM params.
+     * Runs every rate change even if GPU already existed. */
+    if (s->gpu) {
+        /* Upload FIR coefficients for current rate */
+        int num_stages = s->channels[0].fir.num_stages;
+        bool is_upsample = s->channels[0].fir.upsample;
+        if (num_stages > 0) {
+            extern float g_hb_taps[];
+            extern int   g_hb_ntaps;
+            gpu_fir_setup(s->gpu, g_hb_taps, g_hb_ntaps,
+                          num_stages, is_upsample);
+        }
+        /* Setup persistent SDM buffers on GPU */
+        if (s->config.sdm_mode == SDM_MODE_TRELLIS &&
+            s->channels[0].sdm.filter) {
+            const ntf_filter_t *f = s->channels[0].sdm.filter;
+            int actual_cands = (int)s->channels[0].sdm.trellis_num;
+            int actual_lat = (int)s->channels[0].sdm.trellis_lat;
+            int rc;
+            if (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)
+                rc = gpu_cuda_trellis_setup(s->gpu,
+                        actual_cands, f->order,
+                        actual_lat, f->a, f->g,
+                        s->channels[0].sdm.state_limit);
+            else {
+                rc = gpu_dx12_trellis_setup_full(s->gpu,
+                        actual_cands, f->order,
+                        actual_lat, f->a, f->g,
+                        s->channels[0].sdm.state_limit);
+                if (rc != 0)
+                    rc = gpu_dx11_trellis_setup(s->gpu,
+                            actual_cands, f->order,
+                            actual_lat, f->a, f->g,
+                            s->channels[0].sdm.state_limit);
+            }
+            {
+                char msg[256];
+                sprintf_s(msg, sizeof(msg),
+                    "GPU SDM setup: backend=%d trellis cands=%d order=%d lat=%d limit=%.1f rc=%d",
+                    s->config.gpu_backend, actual_cands, f->order,
+                    actual_lat, s->channels[0].sdm.state_limit, rc);
+                trellis_log_c(msg);
+            }
+        } else if (s->config.sdm_mode == SDM_MODE_PRECORR) {
+            const ntf_filter_t *f = s->channels[0].precorr.filter;
+            if (f) {
+                float a_f[8], g_f[8];
+                for (int k = 0; k < f->order; k++) {
+                    a_f[k] = s->channels[0].precorr.a[k];
+                    g_f[k] = s->channels[0].precorr.g[k];
+                }
+                gpu_cuda_precorr_setup(s->gpu, f->order, a_f, g_f,
+                    (const float *)s->channels[0].precorr.pred_table,
+                    s->channels[0].precorr.state_limit);
+            }
+        }
+        /* Assign GPU context to all engine channels */
+        for (int ch = 0; ch < s->num_channels; ch++)
+            s->channels[ch].gpu = s->gpu;
     }
 
     /* Create dedicated IO pool for DoP unpack/pack (2 threads).
@@ -1093,9 +1090,36 @@ size_t plugin_process(plugin_state_t *s,
         LARGE_INTEGER t_sdm_start, t_sdm_end;
         QueryPerformanceCounter(&t_sdm_start);
 
-        for (int i = 0; i < total_blocks; i++)
-            threadpool_submit(s->pool, &blocks[i]);
-        threadpool_wait(s->pool);
+        /* GPU SDM: process each channel's full FIR output on GPU instead
+         * of splitting into segments for the CPU threadpool.
+         * The GPU SBVD handles parallelism internally via SM segments.
+         * Only use GPU when estimated time < real-time budget.
+         * At DSD256+ rates, per-segment work exceeds GPU capacity. */
+        bool gpu_sdm_done = false;
+        if (s->gpu && s->config.sdm_mode == SDM_MODE_TRELLIS &&
+            s->channels[0].sdm.trellis_num >= 2) {
+            gpu_sdm_done = true;
+            for (int ch = 0; ch < num_channels; ch++) {
+                size_t fc = fir_counts[ch];
+                if (fc < GPU_MIN_SAMPLES) { gpu_sdm_done = false; break; }
+                int rc = gpu_trellis_process(s->gpu, fir_data[ch],
+                    s->ch_out[ch], fc, NULL, NULL,
+                    (int)s->channels[ch].sdm.trellis_num,
+                    s->channels[ch].sdm.filter->order,
+                    s->channels[ch].sdm.filter->a,
+                    s->channels[ch].sdm.filter->g);
+                if (rc != 0) { gpu_sdm_done = false; break; }
+                /* Set output count for channel accounting below */
+                blocks[ch * segments_per_ch].out_count = fc;
+                for (int seg = 1; seg < segments_per_ch; seg++)
+                    blocks[ch * segments_per_ch + seg].out_count = 0;
+            }
+        }
+        if (!gpu_sdm_done) {
+            for (int i = 0; i < total_blocks; i++)
+                threadpool_submit(s->pool, &blocks[i]);
+            threadpool_wait(s->pool);
+        }
 
         QueryPerformanceCounter(&t_sdm_end);
         s->time_sdm_ms = perf_ms(t_sdm_start, t_sdm_end);

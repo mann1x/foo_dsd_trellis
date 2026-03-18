@@ -832,33 +832,33 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
      * M = convergence region (trellis paths converge regardless of init state)
      * D = output region (valid samples kept)
      * L = traceback lookahead (ensures correct decisions at end of D)
-     * Total processed per segment: M + D + L
-     * Only D samples are output per segment. */
-    int M = 32 * lat;  /* convergence depth: 32× trellis latency (8192 samples) */
-    int L = lat;        /* traceback lookahead: 1× trellis latency */
+     * Total processed per segment: M + D + L. Only D samples output. */
+    /* Convergence depth scales with trellis latency but capped to keep
+     * per-segment time reasonable. At DSD256 (lat=512), 32×lat=16384
+     * makes segments too large for real-time. Cap M at 8192. */
+    int M = 32 * lat;
+    if (M > 8192) M = 8192;
+    int L = lat;        /* traceback lookahead */
 
-    /* Adaptive segment count: use enough SMs to keep each segment's
-     * processing time reasonable, but not more than available SMs.
-     * Target: each segment processes ~50K samples (empirically ~50ms
-     * on modern GPUs). This adapts to GPU speed automatically —
-     * faster GPUs with more SMs get more segments. */
-    /* Use all SMs for maximum parallelism. The history copy overhead
-     * per sample is fixed regardless of segment count — the total
-     * work is the same whether split into 28 or 84 segments. More
-     * segments just means more SMs working simultaneously. */
+    /* Segment count: balance parallelism vs stitching quality.
+     * Each segment boundary creates a NTF state discontinuity.
+     * Fewer segments = fewer artifacts but longer per-segment time.
+     * Budget: ~400ms per channel (1s chunk, 2ch sequential).
+     * Target: seg_total ≤ ~110K samples → ~330ms per channel. */
     int num_segs = c->num_sms;
-    /* Ensure minimum D (output per segment) > M + L for SBVD to work */
+    if (num_segs < 1) num_segs = 1;
     size_t min_D_sbvd = (size_t)(M + L + 1024);
     if (num_segs > (int)(count / min_D_sbvd)) num_segs = (int)(count / min_D_sbvd);
     if (num_segs < 1) num_segs = 1;
-    size_t min_D = (size_t)(M + L) * 2;  /* D must be > M+L for efficiency */
-    if (count < min_D * 2) num_segs = 1;
-    if (num_segs > (int)(count / min_D_sbvd)) num_segs = (int)(count / min_D_sbvd);
-    if (num_segs < 1) num_segs = 1;
 
-    int D = (int)(count / (size_t)num_segs);  /* output samples per segment */
-    int seg_total = M + D + L;                /* total processed per segment */
-    size_t out_per_seg = (size_t)D;
+    int D = (int)(count / (size_t)num_segs);
+
+    /* seg_total clamp: last segment must not read beyond input */
+    int seg_total = M + D + L;
+    int last_start = (num_segs - 1) * D - M;
+    if (last_start < 0) last_start = 0;
+    int max_total = (int)count - last_start;
+    if (seg_total > max_total) seg_total = max_total;
 
     /* Upload NTF constants to parallel module */
     {
@@ -875,7 +875,7 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
         pfn_cuMemcpyHtoD(d_limit, &sl, sizeof(double));
     }
 
-    /* Allocate segment descriptor arrays */
+    /* Build segment descriptors */
     int *h_seg_starts = (int *)malloc((size_t)num_segs * sizeof(int));
     int *h_seg_out_starts = (int *)malloc((size_t)num_segs * sizeof(int));
     if (!h_seg_starts || !h_seg_out_starts) {
@@ -883,19 +883,19 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
         return -1;
     }
 
+    size_t out_per_seg = (size_t)D;
     for (int i = 0; i < num_segs; i++) {
-        int seg_boundary = i * D;  /* where this segment's output starts in the input */
+        int in_start;
         if (i == 0) {
-            /* Segment 0: persistent state → no M convergence needed.
-             * Starts at input 0, processes D+L samples. */
-            h_seg_starts[i] = 0;
+            in_start = 0;
         } else {
-            /* Segments 1+: start M samples before boundary for convergence,
-             * process M+D+L samples, output only D middle samples. */
-            int in_start = seg_boundary - M;
+            in_start = i * D - M;
             if (in_start < 0) in_start = 0;
-            h_seg_starts[i] = in_start;
         }
+        if (in_start + seg_total > (int)count)
+            in_start = (int)count - seg_total;
+        if (in_start < 0) in_start = 0;
+        h_seg_starts[i] = in_start;
         h_seg_out_starts[i] = (int)((size_t)i * out_per_seg);
     }
 
@@ -920,9 +920,7 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     QueryPerformanceFrequency(&t_freq);
     QueryPerformanceCounter(&t_start_qpc);
 
-    /* Segment 0 persistent state: use trellis_states/costs from setup.
-     * These persist across chunks for continuity (no cold-start pop).
-     * Allocate final state buffers for segment 0's output. */
+    /* Segment 0 persistent state */
     static CUdeviceptr d_seg0_final_s = 0, d_seg0_final_c = 0;
     static int seg0_alloc = 0;
     if (seg0_alloc < nc) {
@@ -933,20 +931,20 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
         seg0_alloc = nc;
     }
 
-    /* Pass persistent state for segment 0 (NULL if first ever chunk) */
     CUdeviceptr seg0_init_s = c->trellis_state_valid ? c->d_trellis_states : (CUdeviceptr)0;
     CUdeviceptr seg0_init_c = c->trellis_state_valid ? c->d_trellis_costs : (CUdeviceptr)0;
 
-    /* Launch: num_segs blocks, each with 2*nc threads */
+    /* Launch kernel */
     int block_size = 2 * nc;
     if (block_size < 32) block_size = 32;
     int seg_total_i = seg_total;
     int M_param = M;
     int D_param = D;
+    int overlap_param = 0;  /* no crossfade — DSD is 1-bit, can't blend */
     void *args[] = {
         &c->d_sdm_in, &c->d_sdm_out,
         &d_seg_starts, &d_seg_out_starts,
-        &seg_total_i, &M_param, &D_param, &nc, &lat,
+        &seg_total_i, &M_param, &D_param, &nc, &lat, &overlap_param,
         &seg0_init_s, &seg0_init_c,
         &d_seg0_final_s, &d_seg0_final_c
     };
@@ -956,7 +954,7 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
                         0, stream, args, NULL);
     pfn_cuStreamSynchronize(stream);
 
-    /* Copy segment 0's final state to persistent buffer for next chunk */
+    /* Copy segment 0's final state to persistent buffer */
     pfn_cuMemcpyDtoD(c->d_trellis_states, d_seg0_final_s,
                       (size_t)nc * 8 * sizeof(double));
     pfn_cuMemcpyDtoD(c->d_trellis_costs, d_seg0_final_c,
@@ -969,7 +967,6 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     pfn_cuStreamSynchronize(stream);
     QueryPerformanceCounter(&t_end);
 
-    /* Cleanup segment descriptors */
     pfn_cuMemFree(d_seg_starts);
     pfn_cuMemFree(d_seg_out_starts);
     free(h_seg_starts);
@@ -980,7 +977,7 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
         extern void trellis_log_c(const char *);
         double kernel_ms = (double)(t_kernel.QuadPart - t_start_qpc.QuadPart) * 1000.0 / (double)t_freq.QuadPart;
         double total_ms = (double)(t_end.QuadPart - t_start_qpc.QuadPart) * 1000.0 / (double)t_freq.QuadPart;
-        double audio_ms = (double)count / 2822400.0 * 1000.0; /* approximate */
+        double audio_ms = (double)count / 2822400.0 * 1000.0;
         char msg[256];
         sprintf_s(msg, sizeof(msg),
             "[GPU CUDA SBVD] %zu samples, %d/%d segs/SMs, %d cands, M=%d D=%d L=%d: kernel=%.1fms total=%.1fms (%.2fx RT)",

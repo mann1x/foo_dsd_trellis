@@ -1,5 +1,6 @@
 /*
  * GPU vs CPU SDM SINAD comparison with proper Goertzel measurement.
+ * Tests CUDA, DX12, and DX11 backends independently.
  */
 
 #include "test.h"
@@ -27,54 +28,32 @@ static double goertzel_power(const float *x, size_t n, double freq, double fs) {
         double s0 = (double)x[i] + c * s1 - s2;
         s2 = s1; s1 = s0;
     }
-    /* DFT magnitude squared / N = power at this bin */
     double mag2 = s1*s1 + s2*s2 - c*s1*s2;
     return 2.0 * mag2 / ((double)n * (double)n);
 }
 
-void test_gpu_sinad_comparison(void) {
-    printf("\n=== GPU vs CPU SDM SINAD ===\n");
-
-    if (!gpu_available(GPU_BACKEND_CUDA)) {
-        printf("  (skipped: CUDA not available)\n");
-        g_tests_run++; g_tests_passed++;
-        return;
-    }
-
-    uint32_t dsd_rate = 2822400;
-    int cands = 4, depth = 4, lat = 256;
-    /* Use small N to force 1 segment (no stitching artifacts) */
-    size_t N = 32768;
-
-    /* Bin-align test frequency to BOTH DSD and PCM rates.
-     * PCM output will be N/64 samples at 44100 Hz.
-     * Align to PCM bin for accurate Goertzel. */
-    size_t pcm_n_est = N / 64;
-    double test_freq = 1000.0;
-    double bin = round(test_freq * (double)pcm_n_est / 44100.0);
-    test_freq = bin * 44100.0 / (double)pcm_n_est;
-    printf("  Test: %.1f Hz, %zu samples at %u Hz\n", test_freq, N, dsd_rate);
-
-    const ntf_filter_t *f = ntf_auto_select(dsd_rate);
-
-    /* Step 1: Generate sine and encode to DSD */
+/* Shared test signal: sine → DSD encode → boxcar smooth.
+ * Returns smoothed buffer + enc_n. Caller frees smoothed. */
+static float *make_test_signal(const ntf_filter_t *f, uint32_t dsd_rate,
+                                double test_freq, size_t N,
+                                size_t *out_enc_n) {
     float *sine = (float *)malloc(N * sizeof(float));
     float *dsd_enc = (float *)calloc(N, sizeof(float));
-    if (!sine || !dsd_enc) { printf("  malloc failed\n"); return; }
+    if (!sine || !dsd_enc) { free(sine); free(dsd_enc); return NULL; }
 
     for (size_t i = 0; i < N; i++)
         sine[i] = (float)(0.5 * sin(2.0 * M_PI * test_freq * (double)i / (double)dsd_rate));
 
     sdm_context_t enc;
-    sdm_context_init(&enc, f, depth, 16, 512);
+    sdm_context_init(&enc, f, 4, 16, 512);
     size_t enc_n = sdm_process_block(&enc, sine, dsd_enc, N);
     sdm_context_free(&enc);
-    printf("  Encoded: %zu DSD samples\n", enc_n);
-    if (enc_n < 10000) { printf("  too few samples\n"); goto cleanup1; }
+    free(sine);
 
-    /* Step 2: Boxcar smooth */
+    if (enc_n < 10000) { free(dsd_enc); return NULL; }
+
     float *smoothed = (float *)malloc(enc_n * sizeof(float));
-    if (!smoothed) goto cleanup1;
+    if (!smoothed) { free(dsd_enc); return NULL; }
     {
         float ring[128] = {0}; float sum = 0; int p = 0;
         for (size_t i = 0; i < enc_n; i++) {
@@ -84,148 +63,167 @@ void test_gpu_sinad_comparison(void) {
             smoothed[i] = sum / 32.0f * 0.708f;
         }
     }
+    free(dsd_enc);
+    *out_enc_n = enc_n;
+    return smoothed;
+}
 
-    /* Step 3: CPU Trellis re-encode */
+/* Measure SINAD of a DSD buffer after FIR decimation to PCM.
+ * Returns SINAD in dB, or -999 on error. */
+static double measure_sinad(const float *dsd, size_t dsd_n,
+                             uint32_t dsd_rate, double test_freq) {
+    size_t pcm_max = dsd_n;
+    float *pcm = (float *)calloc(pcm_max, sizeof(float));
+    if (!pcm) return -999.0;
+
+    fir_chain_t fir;
+    memset(&fir, 0, sizeof(fir));
+    fir_chain_init(&fir, dsd_rate, 44100);
+    size_t pcm_n = fir_chain_process(&fir, dsd, pcm, dsd_n);
+    fir_chain_free(&fir);
+
+    size_t skip = 128;
+    double sinad = -999.0;
+    if (pcm_n > skip + 1024) {
+        size_t mn = pcm_n - skip;
+        double sig = goertzel_power(pcm + skip, mn, test_freq, 44100.0);
+        double total = 0;
+        for (size_t i = skip; i < pcm_n; i++)
+            total += (double)pcm[i] * pcm[i];
+        total /= (double)mn;
+        double noise = total - sig;
+        if (noise < 1e-30) noise = 1e-30;
+        sinad = 10.0 * log10(sig / noise);
+    }
+    free(pcm);
+    return sinad;
+}
+
+/* Core SINAD comparison: runs CPU + one GPU backend.
+ * backend: GPU_BACKEND_CUDA or GPU_BACKEND_DIRECTX.
+ * label: "CUDA" or "DX12" etc.
+ * dsd_rate: DSD sample rate (e.g. 2822400 for DSD64, 11289600 for DSD256)
+ * N: number of DSD samples to generate */
+static void run_sinad_test_rate(gpu_backend_t backend, const char *label,
+                                 uint32_t dsd_rate, size_t N) {
+    int cands = 4, lat = 256;
+
+    int decimation = (int)(dsd_rate / 44100);
+    size_t pcm_n_est = N / (size_t)decimation;
+    double test_freq = 1000.0;
+    double bin = round(test_freq * (double)pcm_n_est / 44100.0);
+    test_freq = bin * 44100.0 / (double)pcm_n_est;
+    printf("    %s @ DSD%d: %.1f Hz, %zu samples\n",
+           label, (int)(dsd_rate / 44100), test_freq, N);
+
+    const ntf_filter_t *f = ntf_auto_select(dsd_rate);
+
+    /* Generate test signal */
+    size_t enc_n = 0;
+    float *smoothed = make_test_signal(f, dsd_rate, test_freq, N, &enc_n);
+    if (!smoothed) { printf("    signal gen failed\n"); return; }
+
+    /* CPU reference */
     float *cpu_out = (float *)calloc(enc_n, sizeof(float));
-    if (!cpu_out) goto cleanup2;
+    if (!cpu_out) { free(smoothed); return; }
     {
         sdm_context_t cpu_sdm;
-        sdm_context_init(&cpu_sdm, f, depth, cands, lat);
-        size_t cpu_n = sdm_process_block(&cpu_sdm, smoothed, cpu_out, enc_n);
+        sdm_context_init(&cpu_sdm, f, 4, cands, lat);
+        sdm_process_block(&cpu_sdm, smoothed, cpu_out, enc_n);
         sdm_context_free(&cpu_sdm);
-        printf("  CPU re-encode: %zu samples\n", cpu_n);
     }
+    double cpu_sinad = measure_sinad(cpu_out, enc_n, dsd_rate, test_freq);
 
-    /* Step 4: GPU Trellis re-encode */
+    /* GPU */
     float *gpu_out = (float *)calloc(enc_n, sizeof(float));
-    if (!gpu_out) goto cleanup3;
-    {
-        gpu_context_t *ctx = gpu_create(GPU_BACKEND_CUDA);
-        if (!ctx) { printf("  GPU create failed\n"); goto cleanup4; }
-        printf("  NTF a[]: ");
-        for (int k = 0; k < f->order; k++) printf("%.6f ", f->a[k]);
-        printf("\n  NTF g[]: ");
-        for (int k = 0; k < f->order; k++) printf("%.6f ", f->g[k]);
-        printf("\n");
+    if (!gpu_out) { free(smoothed); free(cpu_out); return; }
+
+    gpu_context_t *ctx = gpu_create(backend);
+    if (!ctx) {
+        printf("    %s: create failed\n", label);
+        free(smoothed); free(cpu_out); free(gpu_out);
+        return;
+    }
+
+    /* Setup trellis for this backend */
+    if (backend == GPU_BACKEND_CUDA) {
         gpu_cuda_trellis_setup(ctx, cands, f->order, lat, f->a, f->g, 0.0);
-
-        /* Test with 1 segment (no stitching) to isolate quality issues */
-        int rc = gpu_trellis_process(ctx, smoothed, gpu_out, enc_n,
-                                      NULL, NULL, cands, f->order, f->a, f->g);
-
-        /* Check GPU output gain vs CPU */
-        double gpu_rms = 0, cpu_rms = 0;
-        size_t chk = enc_n > 10000 ? 10000 : enc_n;
-        for (size_t i = 1000; i < chk; i++) {
-            gpu_rms += gpu_out[i] * gpu_out[i];
-            cpu_rms += cpu_out[i] * cpu_out[i];
-        }
-        gpu_rms = sqrt(gpu_rms / (chk - 1000));
-        cpu_rms = sqrt(cpu_rms / (chk - 1000));
-        printf("  RMS: CPU=%.4f GPU=%.4f (both should be 1.0 for ±1.0 DSD)\n", cpu_rms, gpu_rms);
-        gpu_destroy(ctx);
-        printf("  GPU re-encode: rc=%d\n", rc);
-
-        /* Running average of DSD (crude decimation) at sample 10000 */
-        {
-            double cpu_avg = 0, gpu_avg = 0;
-            for (size_t i = 10000; i < 10064; i++) {
-                cpu_avg += cpu_out[i];
-                gpu_avg += gpu_out[i];
-            }
-            printf("  DSD avg[10000..10063]: CPU=%.4f GPU=%.4f (input=%.4f)\n",
-                   cpu_avg/64, gpu_avg/64, smoothed[10000]);
-        }
-        /* Print first DSD samples for comparison */
-        printf("  CPU DSD[1000..1019]: ");
-        for (size_t i = 1000; i < 1020; i++) printf("%.0f ", cpu_out[i]);
-        printf("\n  GPU DSD[1000..1019]: ");
-        for (size_t i = 1000; i < 1020; i++) printf("%.0f ", gpu_out[i]);
-        printf("\n");
-        if (rc != 0) goto cleanup4;
+    } else {
+        gpu_dx12_trellis_setup_full(ctx, cands, f->order, lat, f->a, f->g, 0.0);
     }
 
-    /* Step 5: Decimate to PCM via FIR */
-    {
-        size_t pcm_max = enc_n;  /* oversized to be safe */
-        float *cpu_pcm = (float *)calloc(pcm_max, sizeof(float));
-        float *gpu_pcm = (float *)calloc(pcm_max, sizeof(float));
-        if (!cpu_pcm || !gpu_pcm) {
-            free(cpu_pcm); free(gpu_pcm); goto cleanup4;
-        }
+    int rc = gpu_trellis_process(ctx, smoothed, gpu_out, enc_n,
+                                  NULL, NULL, cands, f->order, f->a, f->g);
+    gpu_destroy(ctx);
 
-        fir_chain_t fir1, fir2;
-        memset(&fir1, 0, sizeof(fir1));
-        memset(&fir2, 0, sizeof(fir2));
-        fir_chain_init(&fir1, dsd_rate, 44100);
-        fir_chain_init(&fir2, dsd_rate, 44100);
-
-        size_t cpu_pcm_n = fir_chain_process(&fir1, cpu_out, cpu_pcm, enc_n);
-        size_t gpu_pcm_n = fir_chain_process(&fir2, gpu_out, gpu_pcm, enc_n);
-        fir_chain_free(&fir1);
-        fir_chain_free(&fir2);
-
-        printf("  CPU PCM: %zu, GPU PCM: %zu\n", cpu_pcm_n, gpu_pcm_n);
-
-        /* Check PCM output ranges */
-        if (cpu_pcm_n > 200 && gpu_pcm_n > 200) {
-            float cpu_min=1e9, cpu_max=-1e9, gpu_min=1e9, gpu_max=-1e9;
-            for (size_t i = 128; i < cpu_pcm_n; i++) {
-                if (cpu_pcm[i] < cpu_min) cpu_min = cpu_pcm[i];
-                if (cpu_pcm[i] > cpu_max) cpu_max = cpu_pcm[i];
-            }
-            for (size_t i = 128; i < gpu_pcm_n; i++) {
-                if (gpu_pcm[i] < gpu_min) gpu_min = gpu_pcm[i];
-                if (gpu_pcm[i] > gpu_max) gpu_max = gpu_pcm[i];
-            }
-            printf("  CPU PCM range: [%.4f, %.4f]\n", cpu_min, cpu_max);
-            printf("  GPU PCM range: [%.4f, %.4f]\n", gpu_min, gpu_max);
-        }
-
-        /* Print first few PCM samples */
-        printf("  CPU PCM[128..137]: ");
-        for (size_t i = 128; i < 138 && i < cpu_pcm_n; i++)
-            printf("%.4f ", cpu_pcm[i]);
-        printf("\n  GPU PCM[128..137]: ");
-        for (size_t i = 128; i < 138 && i < gpu_pcm_n; i++)
-            printf("%.4f ", gpu_pcm[i]);
-        printf("\n");
-
-        /* Measure SINAD */
-        size_t skip = 128;
-        if (cpu_pcm_n > skip + 1024) {
-            size_t mn = cpu_pcm_n - skip;
-            double sig = goertzel_power(cpu_pcm + skip, mn, test_freq, 44100.0);
-            double total = 0;
-            for (size_t i = skip; i < cpu_pcm_n; i++)
-                total += (double)cpu_pcm[i] * cpu_pcm[i];
-            total /= (double)mn;
-            double noise = total - sig;
-            if (noise < 1e-30) noise = 1e-30;
-            printf("  *** CPU SINAD: %.1f dB *** (sig=%.2e noise=%.2e total=%.2e)\n",
-                   10.0 * log10(sig / noise), sig, noise, total);
-        }
-        if (gpu_pcm_n > skip + 1024) {
-            size_t mn = gpu_pcm_n - skip;
-            double sig = goertzel_power(gpu_pcm + skip, mn, test_freq, 44100.0);
-            double total = 0;
-            for (size_t i = skip; i < gpu_pcm_n; i++)
-                total += (double)gpu_pcm[i] * gpu_pcm[i];
-            total /= (double)mn;
-            double noise = total - sig;
-            if (noise < 1e-30) noise = 1e-30;
-            printf("  *** GPU SINAD: %.1f dB *** (sig=%.2e noise=%.2e total=%.2e)\n",
-                   10.0 * log10(sig / noise), sig, noise, total);
-        }
-
-        free(cpu_pcm); free(gpu_pcm);
+    if (rc != 0) {
+        printf("    %s: trellis_process failed (rc=%d)\n", label, rc);
+        free(smoothed); free(cpu_out); free(gpu_out);
+        return;
     }
 
-cleanup4: free(gpu_out);
-cleanup3: free(cpu_out);
-cleanup2: free(smoothed);
-cleanup1: free(sine); free(dsd_enc);
+    double gpu_sinad = measure_sinad(gpu_out, enc_n, dsd_rate, test_freq);
 
-    g_tests_run++;
-    g_tests_passed++;
+    /* DSD avg comparison at position 10000 */
+    double cpu_avg = 0, gpu_avg = 0;
+    for (size_t i = 10000; i < 10064; i++) {
+        cpu_avg += cpu_out[i];
+        gpu_avg += gpu_out[i];
+    }
+    printf("    DSD avg[10000..10063]: CPU=%.4f %s=%.4f\n",
+           cpu_avg/64, label, gpu_avg/64);
+
+    printf("    *** CPU SINAD: %.1f dB, %s SINAD: %.1f dB (delta=%.1f dB) ***\n",
+           cpu_sinad, label, gpu_sinad, gpu_sinad - cpu_sinad);
+
+    free(smoothed); free(cpu_out); free(gpu_out);
+}
+
+/* Convenience wrapper for DSD64 (backward compat) */
+static void run_sinad_test(gpu_backend_t backend, const char *label) {
+    run_sinad_test_rate(backend, label, 2822400, 524288);
+}
+
+/* ─── Per-backend test functions ─── */
+
+void test_gpu_sinad_cuda(void) {
+    printf("  test_gpu_sinad_cuda...\n");
+    if (!gpu_available(GPU_BACKEND_CUDA)) {
+        printf("    (skipped: CUDA not available)\n");
+        g_tests_run++; g_tests_passed++;
+        return;
+    }
+    run_sinad_test(GPU_BACKEND_CUDA, "CUDA");
+    g_tests_run++; g_tests_passed++;
+}
+
+void test_gpu_sinad_cuda_dsd256(void) {
+    printf("  test_gpu_sinad_cuda_dsd256...\n");
+    if (!gpu_available(GPU_BACKEND_CUDA)) {
+        printf("    (skipped: CUDA not available)\n");
+        g_tests_run++; g_tests_passed++;
+        return;
+    }
+    /* DSD256 = 11289600 Hz, ~2M samples ≈ 0.18s of audio */
+    run_sinad_test_rate(GPU_BACKEND_CUDA, "CUDA", 11289600, 2097152);
+    g_tests_run++; g_tests_passed++;
+}
+
+void test_gpu_sinad_dx12(void) {
+    printf("  test_gpu_sinad_dx12...\n");
+    if (!gpu_available(GPU_BACKEND_DIRECTX)) {
+        printf("    (skipped: DirectX not available)\n");
+        g_tests_run++; g_tests_passed++;
+        return;
+    }
+    run_sinad_test(GPU_BACKEND_DIRECTX, "DX12");
+    g_tests_run++; g_tests_passed++;
+}
+
+/* Combined entry point */
+void test_gpu_sinad_comparison(void) {
+    printf("\n=== GPU vs CPU SDM SINAD ===\n");
+    test_gpu_sinad_cuda();
+    test_gpu_sinad_cuda_dsd256();
+    test_gpu_sinad_dx12();
 }

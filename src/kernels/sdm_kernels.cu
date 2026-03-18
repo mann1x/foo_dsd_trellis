@@ -101,15 +101,16 @@ __global__ void trellis_chunk(
 
     /* Sequential loop over samples */
     for (int s = 0; s < count; s++) {
-        double x = (double)in[s];
+        double x = (double)in[s] * 0.5;
         int nc = active_cands;
 
         /* Phase 1: Parallel candidate expansion.
          * tid < 2*nc: each thread evaluates one child.
-         * tid/2 = parent index, tid%2 = y=+1 (0) or y=-1 (1) */
+         * y_branch = -y (negated quantizer output) for NTF state update.
+         * tid&1=0 → y_branch=-1 → CPU y=+1, tid&1=1 → y_branch=+1 → CPU y=-1 */
         if (tid < 2 * nc) {
             int pi = tid / 2;
-            double y_branch = (tid & 1) ? -1.0 : 1.0;
+            double y_branch = (tid & 1) ? 1.0 : -1.0;
 
             /* NTF filter calc */
             double d[8];
@@ -132,9 +133,8 @@ __global__ void trellis_chunk(
             for (int k = 0; k < order; k++)
                 children[tid].state[k] = d[k];
 
-            double y_val = (tid & 1) ? -1.0 : 1.0;
             children[tid].cost = parents[pi].cost +
-                (v + c_ntf_a[0] * y_val) * (v + c_ntf_a[0] * y_val);
+                (v + c_ntf_a[0] * y_branch) * (v + c_ntf_a[0] * y_branch);
             children[tid].path = (parents[pi].path << 1 |
                                   (unsigned)(tid & 1)) & ((1u << 8) - 1);
             children[tid].parent_idx = pi;
