@@ -103,12 +103,17 @@ typedef struct {
     size_t        target;       /* target sample count */
     uint32_t      rate;         /* DSD or PCM sample rate */
     int           channels;     /* channel count */
+    int           mode;         /* 0=raw DSD (±1.0), 1=DoP packed */
 } audio_capture_t;
 
 extern audio_capture_t g_audio_capture;
 
-/* Called by audio thread: write samples to capture buffer if recording */
+/* Called by audio thread: write interleaved samples (DoP mode) */
 void capture_write(const float *samples, size_t count, int channels, uint32_t rate);
+
+/* Called by audio thread: write raw DSD per-channel (mode=0).
+ * ch_data[ch] = array of ±1.0 floats, count = samples per channel. */
+void capture_write_dsd(float **ch_data, size_t count, int channels, uint32_t dsd_rate);
 
 /* Called by audio thread: check if capture is armed and start recording */
 static inline bool capture_check_armed(void) {

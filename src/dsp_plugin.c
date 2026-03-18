@@ -25,6 +25,7 @@
 #include "../include/threadpool.h"
 #include "../include/cpuset.h"
 #include "../include/onnx_filter.h"
+#include "../include/httpapi.h"
 
 /*
  * Plugin identity
@@ -1165,6 +1166,13 @@ size_t plugin_process(plugin_state_t *s,
 
     if (dsd_out_count == 0)
         return 0;
+
+    /* On-demand raw DSD capture (mode=0): grab ±1.0 before DoP packing */
+    if (g_audio_capture.mode == 0 &&
+        (g_audio_capture.state == CAPTURE_RECORDING || capture_check_armed())) {
+        capture_write_dsd(s->ch_out, dsd_out_count, num_channels,
+                           s->config.fs_out ? s->config.fs_out : s->config.fs_in);
+    }
 
     LARGE_INTEGER t_pack_start, t_pack_end;
     QueryPerformanceCounter(&t_pack_start);

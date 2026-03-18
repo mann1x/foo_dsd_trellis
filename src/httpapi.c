@@ -88,6 +88,30 @@ void capture_write(const float *samples, size_t count, int channels, uint32_t ra
         InterlockedExchange(&g_audio_capture.state, CAPTURE_DONE);
 }
 
+void capture_write_dsd(float **ch_data, size_t count, int channels, uint32_t dsd_rate) {
+    if (g_audio_capture.state != CAPTURE_RECORDING || g_audio_capture.mode != 0)
+        return;
+
+    g_audio_capture.rate = dsd_rate;
+    g_audio_capture.channels = channels;
+
+    /* Interleave per-channel DSD data into capture buffer */
+    size_t avail = (g_audio_capture.target - g_audio_capture.written) / (size_t)channels;
+    if (count > avail) count = avail;
+
+    if (count > 0 && g_audio_capture.buf) {
+        float *dst = g_audio_capture.buf + g_audio_capture.written;
+        for (size_t s = 0; s < count; s++) {
+            for (int ch = 0; ch < channels; ch++)
+                dst[s * channels + ch] = ch_data[ch][s];
+        }
+        g_audio_capture.written += count * (size_t)channels;
+    }
+
+    if (g_audio_capture.written >= g_audio_capture.target)
+        InterlockedExchange(&g_audio_capture.state, CAPTURE_DONE);
+}
+
 #define HTTP_MAX_REQUEST  8192
 #define HTTP_MAX_RESPONSE 16384
 
@@ -886,6 +910,7 @@ static void handle_request(httpapi_t *api, SOCKET client) {
             int duration = 1;
             uint32_t rate = 2822400;  /* DSD64 default */
             int channels = 2;
+            int mode = 0;  /* 0=raw DSD (±1.0), 1=DoP packed */
             const char *q = strchr(path, '?');
             if (q) {
                 const char *dp = strstr(q, "duration=");
@@ -894,6 +919,7 @@ static void handle_request(httpapi_t *api, SOCKET client) {
                 if (rp) rate = (uint32_t)atoi(rp + 5);
                 const char *cp = strstr(q, "channels=");
                 if (cp) channels = atoi(cp + 9);
+                if (strstr(q, "mode=dop")) mode = 1;
             }
             if (duration < 1) duration = 1;
             if (duration > 10) duration = 10;
@@ -911,6 +937,7 @@ static void handle_request(httpapi_t *api, SOCKET client) {
             g_audio_capture.target = target;
             g_audio_capture.rate = rate;
             g_audio_capture.channels = channels;
+            g_audio_capture.mode = mode;
 
             if (g_audio_capture.buf) {
                 InterlockedExchange(&g_audio_capture.state, CAPTURE_ARMED);

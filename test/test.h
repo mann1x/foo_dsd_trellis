@@ -79,6 +79,7 @@ void test_precorr_suite(void);
 void test_sinad_diag_suite(void);
 void test_onnx_filter_suite(void);
 void test_gpu_suite(void);
+void test_gpu_sinad_comparison(void);
 
 /* Standalone DSD encoder tool (tools/dsd_encode.c) */
 int dsd_encode_main(int argc, char **argv);
