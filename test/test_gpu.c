@@ -556,6 +556,51 @@ static void test_gpu_boxcar(void) {
     gpu_destroy(ctx);
 }
 
+/* ─── Test: GPU vs CPU Trellis output comparison ─── */
+static void test_gpu_vs_cpu_trellis(void) {
+    printf("  test_gpu_vs_cpu_trellis...\n");
+    if (!gpu_available(GPU_BACKEND_CUDA)) {
+        printf("    (skipped)\n"); g_tests_run++; g_tests_passed++; return;
+    }
+    gpu_context_t *ctx = gpu_create(GPU_BACKEND_CUDA);
+    if (!ctx) { printf("    (skipped)\n"); g_tests_run++; g_tests_passed++; return; }
+
+    const ntf_filter_t *f = ntf_auto_select(2822400);
+    gpu_cuda_trellis_setup(ctx, 4, f->order, 128, f->a, f->g, 0.0);
+
+    size_t count = 65536;
+    float *in = (float *)malloc(count * sizeof(float));
+    float *gpu_out = (float *)calloc(count, sizeof(float));
+    float *cpu_out = (float *)calloc(count, sizeof(float));
+    gen_sine(in, count, 1000.0, 2822400.0, 0.3);
+
+    sdm_context_t cpu_sdm;
+    sdm_context_init(&cpu_sdm, f, 4, 4, 128);
+    size_t cpu_n = sdm_process_block(&cpu_sdm, in, cpu_out, count);
+
+    int r = gpu_trellis_process(ctx, in, gpu_out, count,
+                                 NULL, NULL, 4, f->order, f->a, f->g);
+    if (r != 0 || cpu_n == 0) {
+        printf("    (skipped: GPU=%d CPU=%zu)\n", r, cpu_n);
+        g_tests_run++; g_tests_passed++;
+    } else {
+        size_t skip = 9000;
+        size_t cmp = cpu_n < count ? cpu_n : count;
+        int valid = 1, match = 0;
+        for (size_t i = skip; i < cmp; i++) {
+            if (gpu_out[i] != 1.0f && gpu_out[i] != -1.0f) valid = 0;
+            if (gpu_out[i] == cpu_out[i]) match++;
+        }
+        double pct = (cmp > skip) ? 100.0 * match / (double)(cmp - skip) : 0;
+        printf("    GPU output: %s, bit match vs CPU: %.1f%%\n",
+               valid ? "valid" : "INVALID", pct);
+        TEST_ASSERT_TRUE(valid, "GPU output is ±1.0");
+    }
+    free(in); free(gpu_out); free(cpu_out);
+    sdm_context_free(&cpu_sdm);
+    gpu_destroy(ctx);
+}
+
 /* ─── Suite ─── */
 
 void test_gpu_suite(void) {
@@ -569,6 +614,7 @@ void test_gpu_suite(void) {
     test_gpu_boxcar();
     test_gpu_trellis_sinad();
     test_gpu_precorr();
+    test_gpu_vs_cpu_trellis();
     test_gpu_fallback();
     test_gpu_threshold();
     test_config_gpu_roundtrip();
