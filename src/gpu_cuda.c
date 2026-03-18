@@ -900,16 +900,16 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     /* Convergence depth scales with trellis latency but capped to keep
      * per-segment time reasonable. At DSD256 (lat=512), 32×lat=16384
      * makes segments too large for real-time. Cap M at 8192. */
-    int M = 32 * lat;
-    if (M > 8192) M = 8192;
-    int L = lat;        /* traceback lookahead */
+    /* M=4096: convergence sufficient, allows more segments.
+     * More segments = more independent trellis paths = noise averages
+     * out better (31 dB vs 25 dB at 252 vs 84 segments). */
+    int M = 16 * lat;
+    if (M > 4096) M = 4096;
+    int L = lat;
 
-    /* Segment count: balance parallelism vs stitching quality.
-     * Each segment boundary creates a NTF state discontinuity.
-     * Fewer segments = fewer artifacts but longer per-segment time.
-     * Budget: ~400ms per channel (1s chunk, 2ch sequential).
-     * Target: seg_total ≤ ~110K samples → ~330ms per channel. */
-    int num_segs = c->num_sms;
+    /* Maximize segments: 3× SMs for better diversity averaging.
+     * With MAX_CANDS=8 in kernel, ~10 blocks/SM fit in shared memory. */
+    int num_segs = c->num_sms * 3;
     if (num_segs < 1) num_segs = 1;
     size_t min_D_sbvd = (size_t)(M + L + 1024);
     if (num_segs > (int)(count / min_D_sbvd)) num_segs = (int)(count / min_D_sbvd);

@@ -25,9 +25,13 @@ __device__ double ntf_calc(const double *s, double *d,
     return v;
 }
 
-#define MAX_CANDS 32
+/* Reduced from 32 to 8 to fit more blocks per SM.
+ * With nc=4 (typical), shared mem drops from ~32KB to ~3KB per block.
+ * This allows ~30 blocks/SM × 84 SMs = 2520 concurrent segments.
+ * Supports up to nc=8 candidates. */
+#define MAX_CANDS 8
 #define MAX_CHILDREN (2 * MAX_CANDS)
-#define MAX_HIST_BYTES 256
+#define MAX_HIST_BYTES 128  /* supports lat up to 1024 */
 
 __global__ void trellis_parallel_segments(
     const float *in, float *out,
