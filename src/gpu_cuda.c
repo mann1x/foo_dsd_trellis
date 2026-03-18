@@ -783,14 +783,25 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     if (ensure_sdm_bufs(c, sub) != 0)
         return -1;
 
-    /* Allocate final state buffers if needed */
+    /* Allocate final state + path buffers if needed */
     static CUdeviceptr d_final_states = 0, d_final_costs = 0;
+    static CUdeviceptr d_init_paths = 0, d_final_paths = 0;
     static int final_alloc_cands = 0;
     if (final_alloc_cands < nc) {
         if (d_final_states) pfn_cuMemFree(d_final_states);
         if (d_final_costs)  pfn_cuMemFree(d_final_costs);
+        if (d_init_paths)   pfn_cuMemFree(d_init_paths);
+        if (d_final_paths)  pfn_cuMemFree(d_final_paths);
         pfn_cuMemAlloc(&d_final_states, (size_t)nc * 8 * sizeof(double));
         pfn_cuMemAlloc(&d_final_costs, (size_t)nc * sizeof(double));
+        pfn_cuMemAlloc(&d_init_paths, (size_t)nc * sizeof(int));
+        pfn_cuMemAlloc(&d_final_paths, (size_t)nc * sizeof(int));
+        /* Zero-init paths for first invocation */
+        int *zeros = (int *)calloc((size_t)nc, sizeof(int));
+        if (zeros) {
+            pfn_cuMemcpyHtoD(d_init_paths, zeros, (size_t)nc * sizeof(int));
+            free(zeros);
+        }
         final_alloc_cands = nc;
     }
 
@@ -815,22 +826,28 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
         /* Use lat for first sub-chunk only (or if state not yet valid) */
         int sub_lat = first_sub ? lat : 0;
         int cnt = (int)chunk;
+        /* Pass path buffers — NULL (0) on first invocation with fresh state */
+        CUdeviceptr paths_in = (first_sub && !c->trellis_state_valid) ?
+                               (CUdeviceptr)0 : d_init_paths;
         void *args[] = {
             &c->d_sdm_in, &c->d_sdm_out, &cnt,
             &nc, &sub_lat,
             &c->d_trellis_states, &c->d_trellis_costs,
-            &d_final_states, &d_final_costs
+            &d_final_states, &d_final_costs,
+            &paths_in, &d_final_paths
         };
         pfn_cuLaunchKernel(c->fn_trellis_chunk, 1, 1, 1,
                             (unsigned)block_size, 1, 1,
                             0, c->streams[0], args, NULL);
         pfn_cuStreamSynchronize(c->streams[0]);
 
-        /* Rotate state: final → init */
+        /* Rotate state + paths: final → init */
         pfn_cuMemcpyDtoD(c->d_trellis_states, d_final_states,
                           (size_t)nc * 8 * sizeof(double));
         pfn_cuMemcpyDtoD(c->d_trellis_costs, d_final_costs,
                           (size_t)nc * sizeof(double));
+        pfn_cuMemcpyDtoD(d_init_paths, d_final_paths,
+                          (size_t)nc * sizeof(int));
 
         /* Download output */
         size_t sub_out = chunk > (size_t)sub_lat ? chunk - (size_t)sub_lat : 0;

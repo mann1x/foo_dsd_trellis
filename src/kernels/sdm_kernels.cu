@@ -60,12 +60,15 @@ struct cand_t {
 __global__ void trellis_chunk(
     const float *in, float *out, int count,
     int num_cands, int trellis_lat,
-    /* Initial state: num_cands candidates, each with state[order] + cost */
+    /* Initial state: num_cands candidates, each with state[order] + cost + path + next_bit */
     const double *init_states,  /* [num_cands][8] */
     const double *init_costs,   /* [num_cands] */
     /* Output final state */
     double *final_states,       /* [num_cands][8] */
-    double *final_costs)        /* [num_cands] */
+    double *final_costs,        /* [num_cands] */
+    /* Path + next_bit persistence (packed as int: low 8 bits = path, bit 8 = next_bit) */
+    int *init_paths,            /* [num_cands] — NULL on first invocation */
+    int *final_paths)           /* [num_cands] */
 {
     int tid = threadIdx.x;
     int order = c_ntf_order;
@@ -84,8 +87,13 @@ __global__ void trellis_chunk(
         for (int k = 0; k < order; k++)
             parents[tid].state[k] = init_states[tid * 8 + k];
         parents[tid].cost = init_costs[tid];
-        parents[tid].path = 0;
-        parents[tid].next_bit = 0;
+        if (init_paths) {
+            parents[tid].path = (unsigned)(init_paths[tid] & 0xFF);
+            parents[tid].next_bit = (unsigned)((init_paths[tid] >> 8) & 1);
+        } else {
+            parents[tid].path = 0;
+            parents[tid].next_bit = 0;
+        }
     }
     if (tid == 0)
         active_cands = num_cands;
@@ -182,11 +190,14 @@ __global__ void trellis_chunk(
             out[s - trellis_lat] = output_bit ? 1.0f : -1.0f;
     }
 
-    /* Save final state */
+    /* Save final state including path + next_bit */
     if (tid < num_cands) {
         for (int k = 0; k < order; k++)
             final_states[tid * 8 + k] = parents[tid].state[k];
         final_costs[tid] = parents[tid].cost;
+        if (final_paths)
+            final_paths[tid] = (int)(parents[tid].path & 0xFF) |
+                               (int)((parents[tid].next_bit & 1) << 8);
     }
 }
 
