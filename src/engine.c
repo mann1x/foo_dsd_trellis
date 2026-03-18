@@ -291,12 +291,27 @@ size_t engine_process_block(engine_channel_t *eng,
                     }
                 }
             }
-            /* Re-encode via SDM (always CPU — GPU SDM blocks the display) */
+            /* Re-encode via SDM — try GPU (chunked), fall back to CPU */
             size_t sdm_out;
-            if (eng->sdm_mode == SDM_MODE_PRECORR)
-                sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
-            else
-                sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, count);
+            bool same_gpu_ok = false;
+            if (eng->gpu && eng->sdm_mode == SDM_MODE_TRELLIS &&
+                eng->sdm.trellis_num >= 2 && count >= GPU_MIN_SAMPLES) {
+                if (gpu_trellis_process(eng->gpu, eng->fir_buf, out, count,
+                                         NULL, NULL, (int)eng->sdm.trellis_num,
+                                         eng->sdm.filter->order,
+                                         eng->sdm.filter->a,
+                                         eng->sdm.filter->g) == 0) {
+                    sdm_out = count > (size_t)cfg->trellis_lat ?
+                              count - (size_t)cfg->trellis_lat : 0;
+                    same_gpu_ok = true;
+                }
+            }
+            if (!same_gpu_ok) {
+                if (eng->sdm_mode == SDM_MODE_PRECORR)
+                    sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
+                else
+                    sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, count);
+            }
             if (eng->ml_filter)
                 onnx_filter_process(eng->ml_filter, out, sdm_out);
             return sdm_out;
@@ -344,14 +359,27 @@ size_t engine_process_block(engine_channel_t *eng,
             eng->fir_buf[i] *= combined_gain;
     }
 
-    /* SDM always on CPU — GPU SDM dispatches 2.8M sequential samples in
-     * one kernel, blocking the GPU for 6+ seconds and freezing the display.
-     * GPU offload is only used for FIR/gain/boxcar (parallel workloads). */
+    /* SDM — try GPU (chunked sub-dispatches), fall back to CPU */
     size_t sdm_out;
-    if (eng->sdm_mode == SDM_MODE_PRECORR)
-        sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, fir_out);
-    else
-        sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, fir_out);
+    bool gpu_sdm_ok = false;
+    if (eng->gpu && eng->sdm_mode == SDM_MODE_TRELLIS &&
+        eng->sdm.trellis_num >= 2 && fir_out >= GPU_MIN_SAMPLES) {
+        if (gpu_trellis_process(eng->gpu, eng->fir_buf, out, fir_out,
+                                 NULL, NULL, (int)eng->sdm.trellis_num,
+                                 eng->sdm.filter->order,
+                                 eng->sdm.filter->a,
+                                 eng->sdm.filter->g) == 0) {
+            sdm_out = fir_out > (size_t)cfg->trellis_lat ?
+                      fir_out - (size_t)cfg->trellis_lat : 0;
+            gpu_sdm_ok = true;
+        }
+    }
+    if (!gpu_sdm_ok) {
+        if (eng->sdm_mode == SDM_MODE_PRECORR)
+            sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, fir_out);
+        else
+            sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, fir_out);
+    }
     if (eng->ml_filter)
         onnx_filter_process(eng->ml_filter, out, sdm_out);
     return sdm_out;

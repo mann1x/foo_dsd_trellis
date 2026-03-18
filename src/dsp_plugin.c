@@ -441,6 +441,18 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         if (avail) {
             s->gpu = gpu_create((gpu_backend_t)s->config.gpu_backend);
             if (s->gpu) {
+                /* Log which backend is active and what it handles */
+                {
+                    gpu_info_t ginfo;
+                    gpu_get_info(&ginfo);
+                    char gmsg[256];
+                    sprintf_s(gmsg, sizeof(gmsg),
+                        "GPU created: %s backend, %s (%zu MB). "
+                        "Offloading: FIR convolution, gain, boxcar, Trellis SDM (chunked %d samples/dispatch)",
+                        ginfo.backend == GPU_BACKEND_CUDA ? "CUDA" : "DirectCompute",
+                        ginfo.device_name, ginfo.vram_mb, GPU_SDM_SUB_CHUNK);
+                    trellis_log_c(gmsg);
+                }
                 /* Upload FIR coefficients — reuse the same taps the CPU path uses.
                  * The FIR chain is initialized per-channel, but all channels share
                  * the same half-band Kaiser taps. Get them from channel 0. */
@@ -1110,6 +1122,15 @@ size_t plugin_process(plugin_state_t *s,
             }
             s->fir_tail_len = overlap;
             s->fir_tail_valid = true;
+        }
+    } else if (s->gpu && s->config.gpu_enabled) {
+        /* === Sequential path WITH GPU: run on calling thread ===
+         * D3D11 contexts are single-threaded — GPU dispatch must run
+         * from the thread that created the device. CUDA also benefits
+         * from main-thread dispatch (no cuCtxSetCurrent overhead). */
+        for (int ch = 0; ch < num_channels; ch++) {
+            dsd_out_count = engine_process_block(&s->channels[ch],
+                s->ch_in[ch], s->ch_out[ch], dsd_in_count, &s->config);
         }
     } else {
         /* === Sequential path: dispatch full blocks per channel === */

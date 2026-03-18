@@ -302,7 +302,11 @@ gpu_context_t *gpu_cuda_create(void) {
     if (!c) return NULL;
     c->backend = GPU_BACKEND_CUDA;
 
-    if (pfn_cuCtxCreate(&c->context, CU_CTX_SCHED_AUTO, dev) != CUDA_SUCCESS)
+    /* CU_CTX_MAP_HOST enables mapped pinned memory (ReBAR/SAM compatible).
+     * Allows cuMemAllocHost buffers to be directly accessible from GPU
+     * without explicit HtoD copies on ReBAR-enabled systems. */
+    if (pfn_cuCtxCreate(&c->context, CU_CTX_SCHED_AUTO | 0x08 /* CU_CTX_MAP_HOST */,
+                          dev) != CUDA_SUCCESS)
         goto fail;
 
     /* Load PTX module */
@@ -760,6 +764,10 @@ int gpu_cuda_fir_batch(cuda_context_t *c, const float *in_batch,
 /* Persistent-buffer Trellis: no per-chunk alloc/free.
  * State stays on GPU between chunks. Only input/output transferred.
  * Call gpu_cuda_trellis_setup once at engine init. */
+/* Chunked GPU Trellis: subdivide into GPU_SDM_SUB_CHUNK-sized dispatches
+ * to prevent GPU lockup. Each sub-dispatch processes a small batch,
+ * yielding the GPU between dispatches so the display stays responsive.
+ * State persists on device between sub-chunks via DtoD copy. */
 int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
                       size_t count) {
     if (!c || !c->fn_trellis_chunk || c->trellis_cands < 2)
@@ -769,18 +777,13 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
 
     int nc = c->trellis_cands;
     int lat = c->trellis_lat;
-    size_t out_count = count > (size_t)lat ? count - (size_t)lat : 0;
 
-    /* Ensure persistent I/O buffers */
-    if (ensure_sdm_bufs(c, count > out_count ? count : out_count) != 0)
+    /* Ensure persistent I/O buffers for sub-chunk size */
+    size_t sub = GPU_SDM_SUB_CHUNK;
+    if (ensure_sdm_bufs(c, sub) != 0)
         return -1;
 
-    /* Upload input only — state is already on device */
-    pfn_cuMemcpyHtoD(c->d_sdm_in, in, count * sizeof(float));
-
-    /* Use separate init/final buffers — kernel reads init, writes final.
-     * After kernel completes, copy final→init for next chunk. */
-    /* Allocate a second set of state buffers for final output if needed */
+    /* Allocate final state buffers if needed */
     static CUdeviceptr d_final_states = 0, d_final_costs = 0;
     static int final_alloc_cands = 0;
     if (final_alloc_cands < nc) {
@@ -793,27 +796,53 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
 
     int block_size = 2 * nc;
     if (block_size < 64) block_size = 64;
-    int cnt = (int)count;
-    void *args[] = {
-        &c->d_sdm_in, &c->d_sdm_out, &cnt,
-        &nc, &lat,
-        &c->d_trellis_states, &c->d_trellis_costs,
-        &d_final_states, &d_final_costs
-    };
-    pfn_cuLaunchKernel(c->fn_trellis_chunk, 1, 1, 1,
-                        (unsigned)block_size, 1, 1,
-                        0, c->streams[0], args, NULL);
-    pfn_cuStreamSynchronize(c->streams[0]);
 
-    /* Copy final → init for next chunk (device-to-device, ~1KB, fast) */
-    pfn_cuMemcpyDtoD(c->d_trellis_states, d_final_states,
-                      (size_t)nc * 8 * sizeof(double));
-    pfn_cuMemcpyDtoD(c->d_trellis_costs, d_final_costs,
-                      (size_t)nc * sizeof(double));
+    /* Process in sub-chunks. First sub-chunk uses trellis_lat for
+     * initial latency fill. Subsequent sub-chunks use lat=0 (state
+     * is warm, all samples produce output). */
+    size_t samples_processed = 0;
+    size_t out_written = 0;
+    bool first_sub = !c->trellis_state_valid;  /* need latency fill? */
 
-    /* Download output only — state stays on device for next chunk */
-    if (out_count > 0)
-        pfn_cuMemcpyDtoH(out, c->d_sdm_out, out_count * sizeof(float));
+    while (samples_processed < count) {
+        size_t chunk = count - samples_processed;
+        if (chunk > sub) chunk = sub;
+
+        /* Upload sub-chunk input */
+        pfn_cuMemcpyHtoD(c->d_sdm_in, in + samples_processed,
+                          chunk * sizeof(float));
+
+        /* Use lat for first sub-chunk only (or if state not yet valid) */
+        int sub_lat = first_sub ? lat : 0;
+        int cnt = (int)chunk;
+        void *args[] = {
+            &c->d_sdm_in, &c->d_sdm_out, &cnt,
+            &nc, &sub_lat,
+            &c->d_trellis_states, &c->d_trellis_costs,
+            &d_final_states, &d_final_costs
+        };
+        pfn_cuLaunchKernel(c->fn_trellis_chunk, 1, 1, 1,
+                            (unsigned)block_size, 1, 1,
+                            0, c->streams[0], args, NULL);
+        pfn_cuStreamSynchronize(c->streams[0]);
+
+        /* Rotate state: final → init */
+        pfn_cuMemcpyDtoD(c->d_trellis_states, d_final_states,
+                          (size_t)nc * 8 * sizeof(double));
+        pfn_cuMemcpyDtoD(c->d_trellis_costs, d_final_costs,
+                          (size_t)nc * sizeof(double));
+
+        /* Download output */
+        size_t sub_out = chunk > (size_t)sub_lat ? chunk - (size_t)sub_lat : 0;
+        if (sub_out > 0) {
+            pfn_cuMemcpyDtoH(out + out_written,
+                              c->d_sdm_out,
+                              sub_out * sizeof(float));
+        }
+        out_written += sub_out;
+        samples_processed += chunk;
+        first_sub = false;
+    }
 
     c->trellis_state_valid = true;
     return 0;

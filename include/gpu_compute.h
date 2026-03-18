@@ -88,13 +88,15 @@ int gpu_boxcar_smooth(gpu_context_t *ctx, const float *in, float *out,
 
 /* ─── Trellis SDM (cands ≥ 16 only) ─── */
 
-/* Process entire chunk through Trellis SDM on GPU.
- * Sequential per-sample loop with parallel candidate expansion.
- * Only viable when num_cands >= 16. */
+/* Process chunk through Trellis SDM on GPU using sub-chunking.
+ * Subdivides into small GPU dispatches (sub_chunk_size samples each)
+ * to prevent GPU lockup. State persists on device between sub-chunks. */
 int gpu_trellis_process(gpu_context_t *ctx, const float *in, float *out,
                         size_t count, const void *sdm_state_in,
                         void *sdm_state_out, int num_cands, int order,
                         const double *ntf_a, const double *ntf_g);
+
+#define GPU_SDM_SUB_CHUNK 4096  /* samples per GPU SDM dispatch */
 
 /* ─── PreCorr SDM ─── */
 
