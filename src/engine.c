@@ -291,77 +291,12 @@ size_t engine_process_block(engine_channel_t *eng,
                     }
                 }
             }
-            /* Re-encode via SDM — try GPU first */
+            /* Re-encode via SDM (always CPU — GPU SDM blocks the display) */
             size_t sdm_out;
-            bool same_rate_gpu_ok = false;
-
-            if (eng->gpu && eng->sdm_mode == SDM_MODE_TRELLIS &&
-                eng->sdm.trellis_num >= 2 && count >= GPU_MIN_SAMPLES) {
-                LARGE_INTEGER t0, t1, freq;
-                QueryPerformanceFrequency(&freq);
-                QueryPerformanceCounter(&t0);
-                int gr = gpu_trellis_process(eng->gpu, eng->fir_buf, out, count,
-                                         NULL, NULL, (int)eng->sdm.trellis_num,
-                                         eng->sdm.filter->order,
-                                         eng->sdm.filter->a,
-                                         eng->sdm.filter->g);
-                QueryPerformanceCounter(&t1);
-                {
-                    double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
-                    double audio_ms = (double)count / (double)cfg->fs_in * 1000.0;
-                    char msg[256];
-                    sprintf_s(msg, sizeof(msg),
-                        "[GPU SDM] trellis ch%d: %.1fms / %.1fms audio = %.2fx RT, %zu samples, rc=%d\n",
-                        eng->channel, ms, audio_ms, ms / audio_ms, count, gr);
-                    { extern void trellis_log_c(const char *); trellis_log_c(msg); }
-                }
-                if (gr == 0) {
-                    sdm_out = count > (size_t)cfg->trellis_lat ?
-                              count - (size_t)cfg->trellis_lat : 0;
-                    same_rate_gpu_ok = true;
-                }
-            }
-            if (!same_rate_gpu_ok && eng->gpu && eng->sdm_mode == SDM_MODE_PRECORR &&
-                count >= GPU_MIN_SAMPLES) {
-                gpu_precorr_state_t gi, gf;
-                memcpy(gi.state, eng->precorr.state, sizeof(gi.state));
-                gi.prev_y = eng->precorr.prev_y;
-                gi.history = (int)eng->precorr.history;
-                gi.phase = eng->precorr.phase;
-                gi.pad = 0.0f;
-                if (gpu_precorr_process(eng->gpu, eng->fir_buf, out, count,
-                                         eng->precorr.a, eng->precorr.g,
-                                         eng->precorr.filter->order,
-                                         (const float (*)[8])eng->precorr.pred_table,
-                                         &gi, &gf) == 0) {
-                    memcpy(eng->precorr.state, gf.state, sizeof(eng->precorr.state));
-                    eng->precorr.prev_y = gf.prev_y;
-                    eng->precorr.history = (uint8_t)gf.history;
-                    eng->precorr.phase = gf.phase;
-                    sdm_out = count;
-                    same_rate_gpu_ok = true;
-                }
-            }
-            if (!same_rate_gpu_ok) {
-                LARGE_INTEGER t0, t1, freq;
-                QueryPerformanceFrequency(&freq);
-                QueryPerformanceCounter(&t0);
-                if (eng->sdm_mode == SDM_MODE_PRECORR)
-                    sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
-                else
-                    sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, count);
-                QueryPerformanceCounter(&t1);
-                {
-                    double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
-                    double audio_ms = (double)count / (double)cfg->fs_in * 1000.0;
-                    char msg[256];
-                    sprintf_s(msg, sizeof(msg),
-                        "[CPU SDM] %s ch%d: %.1fms / %.1fms audio = %.2fx RT, %zu samples\n",
-                        eng->sdm_mode == SDM_MODE_PRECORR ? "precorr" : "trellis",
-                        eng->channel, ms, audio_ms, ms / audio_ms, count);
-                    { extern void trellis_log_c(const char *); trellis_log_c(msg); }
-                }
-            }
+            if (eng->sdm_mode == SDM_MODE_PRECORR)
+                sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
+            else
+                sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, count);
             if (eng->ml_filter)
                 onnx_filter_process(eng->ml_filter, out, sdm_out);
             return sdm_out;
@@ -409,58 +344,14 @@ size_t engine_process_block(engine_channel_t *eng,
             eng->fir_buf[i] *= combined_gain;
     }
 
-    /* SDM — try GPU with persistent buffers (no per-chunk alloc).
-     * GPU Trellis: cands >= 16, state stays on device between chunks.
-     * GPU PreCorr: state uploaded/downloaded per chunk (small: 48 bytes).
-     * Falls back to CPU if GPU unavailable or not configured. */
+    /* SDM always on CPU — GPU SDM dispatches 2.8M sequential samples in
+     * one kernel, blocking the GPU for 6+ seconds and freezing the display.
+     * GPU offload is only used for FIR/gain/boxcar (parallel workloads). */
     size_t sdm_out;
-    bool gpu_sdm_ok = false;
-
-    if (eng->gpu && eng->sdm_mode == SDM_MODE_TRELLIS &&
-        eng->sdm.trellis_num >= 16 && fir_out >= GPU_MIN_SAMPLES) {
-        /* Persistent Trellis: state on device, only input/output transferred */
-        if (gpu_trellis_process(eng->gpu, eng->fir_buf, out, fir_out,
-                                 NULL, NULL, cfg->trellis_cands,
-                                 eng->sdm.filter->order,
-                                 eng->sdm.filter->a,
-                                 eng->sdm.filter->g) == 0) {
-            sdm_out = fir_out > (size_t)cfg->trellis_lat ?
-                      fir_out - (size_t)cfg->trellis_lat : 0;
-            gpu_sdm_ok = true;
-        }
-    }
-
-    if (!gpu_sdm_ok && eng->gpu && eng->sdm_mode == SDM_MODE_PRECORR &&
-        fir_out >= GPU_MIN_SAMPLES) {
-        /* Persistent PreCorr: pred table on device, state round-tripped */
-        gpu_precorr_state_t gpu_init, gpu_final;
-        memcpy(gpu_init.state, eng->precorr.state, sizeof(gpu_init.state));
-        gpu_init.prev_y = eng->precorr.prev_y;
-        gpu_init.history = (int)eng->precorr.history;
-        gpu_init.phase = eng->precorr.phase;
-        gpu_init.pad = 0.0f;
-
-        if (gpu_precorr_process(eng->gpu, eng->fir_buf, out, fir_out,
-                                 eng->precorr.a, eng->precorr.g,
-                                 eng->precorr.filter->order,
-                                 (const float (*)[8])eng->precorr.pred_table,
-                                 &gpu_init, &gpu_final) == 0) {
-            memcpy(eng->precorr.state, gpu_final.state, sizeof(eng->precorr.state));
-            eng->precorr.prev_y = gpu_final.prev_y;
-            eng->precorr.history = (uint8_t)gpu_final.history;
-            eng->precorr.phase = gpu_final.phase;
-            sdm_out = fir_out;
-            gpu_sdm_ok = true;
-        }
-    }
-
-    if (!gpu_sdm_ok) {
-        /* CPU SDM fallback */
-        if (eng->sdm_mode == SDM_MODE_PRECORR)
-            sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, fir_out);
-        else
-            sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, fir_out);
-    }
+    if (eng->sdm_mode == SDM_MODE_PRECORR)
+        sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, fir_out);
+    else
+        sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, fir_out);
     if (eng->ml_filter)
         onnx_filter_process(eng->ml_filter, out, sdm_out);
     return sdm_out;

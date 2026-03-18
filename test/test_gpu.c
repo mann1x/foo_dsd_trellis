@@ -13,6 +13,9 @@
 #include "../include/trellis.h"
 #include "../include/precorr.h"
 #include <stdlib.h>
+
+/* Stub for test exe (trellis_log_c is in dsp_fb2k.cpp, not linked in tests) */
+void trellis_log_c(const char *msg) { printf("  [log] %s\n", msg); }
 #include <math.h>
 
 #ifndef M_PI
