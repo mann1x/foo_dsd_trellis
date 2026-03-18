@@ -933,7 +933,7 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     void *args[] = {
         &c->d_sdm_in, &c->d_sdm_out,
         &d_seg_starts, &d_seg_out_starts,
-        &seg_total_i, &M_param, &D_param, &nc,
+        &seg_total_i, &M_param, &D_param, &nc, &lat,
         &seg0_init_s, &seg0_init_c,
         &d_seg0_final_s, &d_seg0_final_c
     };
