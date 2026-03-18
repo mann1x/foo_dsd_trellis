@@ -121,11 +121,11 @@ static int grow_buf(dx12_t *c, ID3D12Resource **b, size_t *cap, size_t need,
 }
 
 #define GR_IN(c,n)  grow_buf(c,&(c)->b_in, &(c)->cap_in, n, D3D12_HEAP_TYPE_DEFAULT, \
-    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
 #define GR_OUT(c,n) grow_buf(c,&(c)->b_out,&(c)->cap_out,n, D3D12_HEAP_TYPE_DEFAULT, \
-    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
 #define GR_AUX(c,n) grow_buf(c,&(c)->b_aux,&(c)->cap_aux,n, D3D12_HEAP_TYPE_DEFAULT, \
-    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
 #define GR_UP(c,n)  grow_buf(c,&(c)->b_up, &(c)->cap_up, n, D3D12_HEAP_TYPE_UPLOAD, \
     D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE)
 #define GR_RB(c,n)  grow_buf(c,&(c)->b_rb, &(c)->cap_rb, n, D3D12_HEAP_TYPE_READBACK, \
@@ -471,10 +471,13 @@ int gpu_dx12_fir_chain(dx12_t *c, const float *in, float *out,
         GR_UP(c, max_sz > taps_sz ? max_sz : taps_sz) || GR_RB(c, max_sz))
         return -1;
 
+    /* Upload input data */
     begin_cmd(c);
-    /* Upload input */
     upload(c, c->b_in, in, in_count * sizeof(float));
-    /* Upload taps to aux buffer */
+    exec_cmd(c);
+
+    /* Upload taps separately (b_up is shared, can't do two uploads in one cmd) */
+    begin_cmd(c);
     upload(c, c->b_aux, c->fir_taps, taps_sz);
     exec_cmd(c);
 
@@ -482,7 +485,6 @@ int gpu_dx12_fir_chain(dx12_t *c, const float *in, float *out,
     cur = in_count;
     for (int s = 0; s < c->num_stages; s++) {
         size_t next = c->upsample ? cur*2 : cur/2;
-        begin_cmd(c);
 
         /* Update CB: in_count, out_count, ntaps */
         if (c->cb_map) {
@@ -490,15 +492,36 @@ int gpu_dx12_fir_chain(dx12_t *c, const float *in, float *out,
             memcpy(c->cb_map, params, 16);
         }
 
-        /* u0=in, u1=out, u2=taps */
+        /* Dispatch: u0=b_in(input), u1=b_out(output), u2=b_aux(taps) */
+        begin_cmd(c);
         dispatch(c, c->upsample ? PSO_FIR_UP : PSO_FIR_DOWN, (UINT)((next+255)/256), 1);
         exec_cmd(c);
 
-        /* Swap in↔out for next stage */
+        /* For multi-stage: copy output→input for next stage */
         if (s < c->num_stages - 1) {
-            ID3D12Resource *tmp = c->b_in;
-            c->b_in = c->b_out; c->b_out = tmp;
-            size_t tc = c->cap_in; c->cap_in = c->cap_out; c->cap_out = tc;
+            begin_cmd(c);
+            /* Barrier: b_out UAV→COPY_SOURCE */
+            D3D12_RESOURCE_BARRIER bar = {0};
+            bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            bar.Transition.pResource = c->b_out;
+            bar.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            ID3D12GraphicsCommandList_ResourceBarrier(c->cmd, 1, &bar);
+
+            ID3D12GraphicsCommandList_CopyBufferRegion(c->cmd,
+                c->b_in, 0, c->b_out, 0, next * sizeof(float));
+
+            /* Barrier: b_out back to UAV, b_in back to UAV */
+            D3D12_RESOURCE_BARRIER bars[2] = {0};
+            bars[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            bars[0].Transition.pResource = c->b_out;
+            bars[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            bars[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            bars[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            bars[1].UAV.pResource = c->b_in;
+            ID3D12GraphicsCommandList_ResourceBarrier(c->cmd, 2, bars);
+
+            exec_cmd(c);
         }
         cur = next;
     }
@@ -639,7 +662,7 @@ int gpu_dx12_trellis_full(dx12_t *c, const float *in, float *out,
     /* Actually, we need to split b_aux or use a 4th buffer.
      * For simplicity, create b_seg_out as a 4th default-heap buffer. */
     ID3D12Resource *b_seg_out = mk_buf(c->dev, seg_bytes, D3D12_HEAP_TYPE_DEFAULT,
-        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     if (!b_seg_out) return -1;
 
     /* Upload seg_out_starts separately */
