@@ -142,6 +142,7 @@
     <ClCompile Include="test\test_onnx_filter.c" />
     <ClCompile Include="test\test_gpu.c" />
     <ClCompile Include="test\test_gpu_sinad.c" />
+    <ClCompile Include="test\test_offline_gpu.c" />
     <!-- Library sources (linked directly, no DLL dependency) -->
     <ClCompile Include="src\config.c" />
     <ClCompile Include="src\dop.c" />

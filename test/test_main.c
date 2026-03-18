@@ -121,6 +121,10 @@ int main(int argc, char **argv) {
     /* Dispatch to dsd_encode tool if --encode is first arg */
     if (argc >= 2 && strcmp(argv[1], "--encode") == 0)
         return dsd_encode_main(argc - 1, argv + 1);
+    /* Dispatch to GPU Trellis offline tool */
+    extern int gpu_trellis_offline(int, char **);
+    if (argc >= 2 && strcmp(argv[1], "--gpu-trellis") == 0)
+        return gpu_trellis_offline(argc - 1, argv + 1);
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
