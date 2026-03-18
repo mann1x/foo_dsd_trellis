@@ -205,12 +205,11 @@ __global__ void trellis_parallel_segments(
                 ac = deduped;  /* may be less than nc */
             }
 
-            /* Output: best candidate's current bit (no traceback).
-             * Traceback causes LF noise from the mode transition when
-             * s_pending reaches lat — the output jumps from current-best
-             * to a historical bit, creating 84 discontinuities/sec.
-             * Without traceback, c_bit[0] gives clean LF performance. */
-            s_output_bit = c_bit[0];
+            /* Output: best candidate's traceback bit (standard Viterbi).
+             * eff_M >= lat ensures s_pending >= lat before first output,
+             * so traceback is always valid — no mode transition artifact.
+             * No majority vote or candidate filtering (destroys diversity). */
+            s_output_bit = c_next[0];
 
             /* Record each selected child's bit in its history */
             int byte_pos = s_hist_pos / 8;
@@ -240,15 +239,13 @@ __global__ void trellis_parallel_segments(
         __syncthreads();
 
         /* SBVD output.
-         * Segment 0 with persistent state: output from sample 0.
-         * Segment 0 without persistent state: wait lat warmup.
-         * Segments 1+: output starts at (M - overlap) to provide overlap
-         * region for host-side crossfade. The first `overlap` samples come
-         * from late-M (almost converged), blended by host with previous
-         * segment's tail. D_output includes the overlap samples. */
+         * Segment 0: wait lat samples for history to fill.
+         * Segments 1+: wait M samples for NTF convergence.
+         * Traceback uses c_next[0] (best candidate, no majority vote). */
         int eff_M = (seg == 0) ? ((seg0_init_states) ? 0 : lat)
                                 : (M_convergence - overlap);
-        bool hist_ready = (s_pending >= lat) || (seg == 0 && seg0_init_states);
+        if (eff_M < lat) eff_M = lat;  /* ensure history valid */
+        bool hist_ready = (s_pending >= lat);
         if (tid == 0 && hist_ready && s >= eff_M && out_idx < D_output) {
             seg_out[out_idx++] = s_output_bit ? -1.0f : 1.0f;
         }
