@@ -834,7 +834,7 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
      * L = traceback lookahead (ensures correct decisions at end of D)
      * Total processed per segment: M + D + L
      * Only D samples are output per segment. */
-    int M = 8 * lat;   /* convergence depth: 8× trellis latency */
+    int M = 32 * lat;  /* convergence depth: 32× trellis latency (8192 samples) */
     int L = lat;        /* traceback lookahead: 1× trellis latency */
 
     /* Adaptive segment count: use enough SMs to keep each segment's

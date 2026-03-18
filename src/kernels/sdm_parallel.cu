@@ -59,12 +59,14 @@ __global__ void trellis_parallel_segments(
     __shared__ double p_state[MAX_CANDS][8];
     __shared__ double p_cost[MAX_CANDS];
     __shared__ unsigned char p_hist[MAX_CANDS][MAX_HIST_BYTES];
+    __shared__ unsigned p_path[MAX_CANDS]; /* path bits for dedup */
 
     /* Child state: slots 0..2*nc-1 */
     __shared__ double c_state[MAX_CHILDREN][8];
     __shared__ double c_cost[MAX_CHILDREN];
     __shared__ unsigned char c_hist[MAX_CHILDREN][MAX_HIST_BYTES];
     __shared__ unsigned c_bit[MAX_CHILDREN]; /* which bit this child chose */
+    __shared__ unsigned c_path[MAX_CHILDREN]; /* path bits for dedup */
 
     __shared__ int s_active;
     __shared__ unsigned s_output_bit;
@@ -84,6 +86,7 @@ __global__ void trellis_parallel_segments(
         }
         for (int b = 0; b < hist_bytes; b++)
             p_hist[tid][b] = 0;
+        p_path[tid] = 0;
     }
     if (tid == 0) {
         s_active = nc;
@@ -116,6 +119,8 @@ __global__ void trellis_parallel_segments(
             /* Bit convention: 1 = y=+1.0, 0 = y=-1.0 (matches CPU).
              * tid&1=0 → y_b=+1.0 → bit=1. tid&1=1 → y_b=-1.0 → bit=0. */
             c_bit[tid] = (tid & 1) ? 0u : 1u;
+            /* Path register for dedup: accumulate bit decisions */
+            c_path[tid] = (p_path[pi] << 1 | c_bit[tid]) & 0xFF;
             /* Copy parent history to child */
             for (int b = 0; b < hist_bytes; b++)
                 c_hist[tid][b] = p_hist[pi][b];
@@ -126,7 +131,10 @@ __global__ void trellis_parallel_segments(
         if (tid == 0) {
             int tc = 2 * ac;
 
-            /* Selection sort children by cost — swap all data */
+            /* Selection sort children by cost with path deduplication.
+             * After sorting by cost, skip children with duplicate path
+             * bits — they represent identical future trajectories and
+             * waste candidate slots. Matches CPU hash-based dedup. */
             for (int i = 0; i < ac && i < tc; i++) {
                 int best = i;
                 for (int j = i + 1; j < tc; j++)
@@ -134,6 +142,7 @@ __global__ void trellis_parallel_segments(
                 if (best != i) {
                     double t_c = c_cost[i]; c_cost[i] = c_cost[best]; c_cost[best] = t_c;
                     unsigned t_b = c_bit[i]; c_bit[i] = c_bit[best]; c_bit[best] = t_b;
+                    unsigned t_p = c_path[i]; c_path[i] = c_path[best]; c_path[best] = t_p;
                     for (int k = 0; k < order; k++) {
                         double t_s = c_state[i][k]; c_state[i][k] = c_state[best][k]; c_state[best][k] = t_s;
                     }
@@ -141,6 +150,31 @@ __global__ void trellis_parallel_segments(
                         unsigned char t_h = c_hist[i][b]; c_hist[i][b] = c_hist[best][b]; c_hist[best][b] = t_h;
                     }
                 }
+            }
+            /* Path dedup: collapse children with identical paths.
+             * Keep lowest-cost (already sorted). Remove duplicates by
+             * shifting remaining entries down. */
+            {
+                int deduped = 1; /* first is always unique */
+                for (int i = 1; i < ac; i++) {
+                    int dup = 0;
+                    for (int j = 0; j < deduped; j++) {
+                        if (c_path[i] == c_path[j]) { dup = 1; break; }
+                    }
+                    if (!dup) {
+                        if (deduped != i) {
+                            c_cost[deduped] = c_cost[i];
+                            c_bit[deduped] = c_bit[i];
+                            c_path[deduped] = c_path[i];
+                            for (int k = 0; k < order; k++)
+                                c_state[deduped][k] = c_state[i][k];
+                            for (int b = 0; b < hist_bytes; b++)
+                                c_hist[deduped][b] = c_hist[i][b];
+                        }
+                        deduped++;
+                    }
+                }
+                ac = deduped;  /* may be less than nc */
             }
 
             /* Record each selected child's bit in its history */
@@ -169,10 +203,12 @@ __global__ void trellis_parallel_segments(
             s_hist_pos = (s_hist_pos + 1) % lat;
             if (s_pending < lat) s_pending++;
 
-            /* Move top-ac children to parents */
+            /* Move deduped children to parents */
+            s_active = ac;
             double min_c = c_cost[0];
             for (int i = 0; i < ac; i++) {
                 p_cost[i] = c_cost[i] - min_c;
+                p_path[i] = c_path[i];
                 for (int k = 0; k < order; k++)
                     p_state[i][k] = c_state[i][k];
                 for (int b = 0; b < hist_bytes; b++)
