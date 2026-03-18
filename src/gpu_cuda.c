@@ -1194,13 +1194,18 @@ int gpu_cuda_trellis_hawksford(cuda_context_t *c, const float *in, float *out,
     QueryPerformanceCounter(&t0);
 
     int cnt = (int)count;
+    int nc = c->trellis_cands;
+    if (nc > 64) nc = 64;
+    if (nc < 4) nc = 4;
+    int block_threads = 2 * nc;
+    if (block_threads < 32) block_threads = 32;
     CUdeviceptr null_ptr = (CUdeviceptr)0;
     void *args[] = {
-        &c->d_sdm_in, &c->d_sdm_out, &cnt, &lat,
+        &c->d_sdm_in, &c->d_sdm_out, &cnt, &nc, &lat,
         &null_ptr, &null_ptr,
         &d_final_s, &d_final_c
     };
-    pfn_cuLaunchKernel(c->fn_hawksford, 1, 1, 1, 128, 1, 1,
+    pfn_cuLaunchKernel(c->fn_hawksford, 1, 1, 1, (unsigned)block_threads, 1, 1,
                         0, stream, args, NULL);
     pfn_cuStreamSynchronize(stream);
     QueryPerformanceCounter(&t1);
@@ -1214,8 +1219,8 @@ int gpu_cuda_trellis_hawksford(cuda_context_t *c, const float *in, float *out,
         double audio_ms = (double)count / 2822400.0 * 1000.0;
         char msg[256];
         sprintf_s(msg, sizeof(msg),
-            "[GPU Hawksford] %zu samples, nc=64, lat=%d: %.1fms (%.2fx RT)",
-            count, lat, ms, ms / audio_ms);
+            "[GPU Hawksford] %zu samples, nc=%d, lat=%d: %.1fms (%.2fx RT)",
+            count, nc, lat, ms, ms / audio_ms);
         trellis_log_c(msg);
     }
     return 0;

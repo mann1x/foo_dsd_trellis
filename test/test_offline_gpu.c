@@ -55,13 +55,19 @@ int gpu_trellis_offline(int argc, char **argv) {
     if (!ctx) { printf("GPU create failed\n"); return 1; }
 
     const ntf_filter_t *f = ntf_auto_select(2822400);
-    int use_hawksford = (argc > 3 && strcmp(argv[3], "hawk") == 0);
+    /* hawk or hawk=N for Hawksford with dynamic nc */
+    int hawk_nc = 0;
+    if (argc > 3 && strncmp(argv[3], "hawk", 4) == 0) {
+        hawk_nc = 64;  /* default */
+        if (argv[3][4] == '=') hawk_nc = atoi(argv[3] + 5);
+        if (hawk_nc < 4) hawk_nc = 4;
+        if (hawk_nc > 64) hawk_nc = 64;
+    }
 
-    if (use_hawksford) {
-        /* Hawksford: nc=64, single segment, intra-step parallel */
+    if (hawk_nc > 0) {
         extern int gpu_cuda_trellis_hawksford(void *, const float *, float *, size_t);
-        gpu_cuda_trellis_setup(ctx, 4, f->order, 256, f->a, f->g, 0.0);
-        printf("Processing %zu samples through Hawksford (nc=64)...\n", n_samples);
+        gpu_cuda_trellis_setup(ctx, hawk_nc, f->order, 256, f->a, f->g, 0.0);
+        printf("Processing %zu samples through Hawksford (nc=%d)...\n", n_samples, hawk_nc);
         int rc = gpu_cuda_trellis_hawksford(ctx, smoothed, output, n_samples);
         printf("Done, rc=%d\n", rc);
     } else {
