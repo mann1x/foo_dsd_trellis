@@ -837,11 +837,15 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     int M = 8 * lat;   /* convergence depth: 8× trellis latency */
     int L = lat;        /* traceback lookahead: 1× trellis latency */
 
-    /* Fewer segments = fewer boundaries + less history overhead.
-     * With full traceback history, each candidate carries hist_bytes
-     * of shared memory that must be swapped during sort. */
-    int num_segs = 8;
+    /* Adaptive segment count: use enough SMs to keep each segment's
+     * processing time reasonable, but not more than available SMs.
+     * Target: each segment processes ~50K samples (empirically ~50ms
+     * on modern GPUs). This adapts to GPU speed automatically —
+     * faster GPUs with more SMs get more segments. */
+    int target_D = 50000;  /* target samples per segment output */
+    int num_segs = (int)(count / (size_t)target_D);
     if (num_segs > c->num_sms) num_segs = c->num_sms;
+    if (num_segs < 1) num_segs = 1;
     size_t min_D = (size_t)(M + L) * 2;  /* D must be > M+L for efficiency */
     if (count < min_D * 2) num_segs = 1;
     if (num_segs > (int)(count / min_D)) num_segs = (int)(count / min_D);
