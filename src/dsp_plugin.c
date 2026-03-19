@@ -55,6 +55,7 @@ typedef struct plugin_state {
     int                active_sdm_mode;   /* SDM mode engine was initialized with */
     int                active_cands;      /* Trellis cands engine was initialized with */
     int                active_depth;      /* Trellis depth engine was initialized with */
+    bool               active_gpu;        /* GPU state engine was initialized with */
     bool               needs_warmup;      /* true after flush — prime SDM with real audio */
     int                chunk_counter;     /* chunks since init — for startup pacing */
 
@@ -386,6 +387,7 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     s->active_sdm_mode = s->config.sdm_mode;
     s->active_cands = s->config.trellis_cands;
     s->active_depth = s->config.trellis_depth;
+    s->active_gpu = s->config.gpu_enabled;
 
     s->channels = (engine_channel_t *)calloc(
         (size_t)num_channels, sizeof(engine_channel_t));
@@ -465,6 +467,9 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         s->channels = NULL;
         return -1;
     }
+
+    /* Reset worker log counter so tasks get logged on each engine init */
+    threadpool_reset_log(s->pool);
 
     /* Create GPU compute context if enabled */
     {
@@ -844,13 +849,14 @@ size_t plugin_process(plugin_state_t *s,
     s->config.fs_in = dsd_rate;
 
     /* Initialize engine on first use, channel/rate change, output rate,
-     * SDM mode, or cands/depth change (path_config may change these) */
+     * SDM mode, cands/depth, or GPU toggle */
     if (!s->initialized || s->num_channels != num_channels ||
         s->detected_dsd_rate != dsd_rate ||
         s->active_fs_out != s->config.fs_out ||
         s->active_sdm_mode != s->config.sdm_mode ||
         s->active_cands != s->config.trellis_cands ||
-        s->active_depth != s->config.trellis_depth) {
+        s->active_depth != s->config.trellis_depth ||
+        s->active_gpu != s->config.gpu_enabled) {
         /* Tear down old state — keep threadpool alive (expensive to recreate:
          * 16 CreateThread + SetThreadAffinityMask + core unpark = 500ms+).
          * Pool is reused across track/rate changes. */
@@ -1487,7 +1493,8 @@ size_t plugin_process_pcm(plugin_state_t *s,
         s->active_fs_out != s->config.fs_out ||
         s->active_sdm_mode != s->config.sdm_mode ||
         s->active_cands != s->config.trellis_cands ||
-        s->active_depth != s->config.trellis_depth) {
+        s->active_depth != s->config.trellis_depth ||
+        s->active_gpu != s->config.gpu_enabled) {
         /* Tear down old state */
         if (s->initialized) {
             if (s->pool) {

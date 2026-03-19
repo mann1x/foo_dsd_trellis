@@ -118,6 +118,7 @@ struct threadpool {
     uint8_t     *lp_indices;        /* [thread_count] logical processor indices */
     uint16_t    *groups;            /* [thread_count] processor groups */
     int          cpuset_id_count;
+    volatile LONG reset_log_count;  /* set to 1 to reset worker log counter */
 
 };
 
@@ -197,6 +198,10 @@ static DWORD WINAPI worker_func(LPVOID param) {
         /* Log task: what the worker is doing and which core it runs on */
         {
             static volatile LONG s_log_count = 0;
+            if (pool->reset_log_count) {
+                InterlockedExchange(&s_log_count, 0);
+                InterlockedExchange(&pool->reset_log_count, 0);
+            }
             if (InterlockedIncrement(&s_log_count) <= 40) {
                 DWORD cpu = GetCurrentProcessorNumber();
                 const char *job = "Process";
@@ -516,6 +521,10 @@ void threadpool_destroy(threadpool_t *pool) {
 
 int threadpool_get_thread_count(threadpool_t *pool) {
     return pool ? pool->thread_count : 0;
+}
+
+void threadpool_reset_log(threadpool_t *pool) {
+    if (pool) InterlockedExchange(&pool->reset_log_count, 1);
 }
 
 int threadpool_get_stressed_thread(threadpool_t *pool, double *stressed_ratio) {

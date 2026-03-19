@@ -58,6 +58,9 @@ void threadpool_destroy(threadpool_t *pool);
 /* Get number of active worker threads. */
 int threadpool_get_thread_count(threadpool_t *pool);
 
+/* Reset worker task log counter (re-enables first-N task logging). */
+void threadpool_reset_log(threadpool_t *pool);
+
 /* Check if any worker reported RT stress after the last batch.
  * Returns the index of the most stressed thread, or -1 if none.
  * stressed_ratio receives the worst RT ratio. */
