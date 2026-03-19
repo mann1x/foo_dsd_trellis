@@ -64,7 +64,7 @@ int sdm_context_init(sdm_context_t *ctx, const ntf_filter_t *filter,
  * Output: float32 ±1.0 (1-bit decisions)
  * Returns number of output samples produced. */
 size_t sdm_process_block(sdm_context_t *ctx,
-                         const float *in, float *out, size_t count);
+                         const double *in, float *out, size_t count);
 
 /* Drain pending samples (flush at end of stream). */
 size_t sdm_drain(sdm_context_t *ctx, float *out, size_t max_out);

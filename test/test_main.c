@@ -46,6 +46,7 @@ static const suite_entry_t suites[] = {
     { "gpu",       "GPU Compute",       test_gpu_suite,         0 },
     { "gpusinad",  "GPU SINAD Compare", test_gpu_sinad_comparison, 1 },
     { "latsweep",  "Lat Sweep",         test_lat_sweep,        1 },
+    { "pipeline",  "Pipeline SINAD",    test_pipeline_sinad,   1 },
     { "diag",      "SINAD Diagnostics", test_sinad_diag_suite, 1 },
 };
 
@@ -118,6 +119,44 @@ static void list_suites(void) {
     }
 }
 
+/* Duplicate stdout to log file (overwrites previous run) */
+static FILE *g_log_fp = NULL;
+static int g_log_fd_orig = -1;
+
+static void open_test_log(const char *exe_path) {
+    /* Place log next to the exe */
+    char log_path[512];
+    const char *last_sep = strrchr(exe_path, '\\');
+    if (!last_sep) last_sep = strrchr(exe_path, '/');
+    if (last_sep) {
+        size_t dir_len = (size_t)(last_sep - exe_path + 1);
+        if (dir_len >= sizeof(log_path)) dir_len = sizeof(log_path) - 32;
+        memcpy(log_path, exe_path, dir_len);
+        strcpy_s(log_path + dir_len, sizeof(log_path) - dir_len, "foo_dsd_trellis_test.log");
+    } else {
+        strcpy_s(log_path, sizeof(log_path), "foo_dsd_trellis_test.log");
+    }
+    fopen_s(&g_log_fp, log_path, "w");
+    setvbuf(stdout, NULL, _IONBF, 0);
+}
+
+static void close_test_log(void) {
+    if (g_log_fp) { fclose(g_log_fp); g_log_fp = NULL; }
+}
+
+/* Override printf to also write to log file */
+#include <stdarg.h>
+int test_printf(const char *fmt, ...) {
+    va_list args, args2;
+    va_start(args, fmt);
+    va_copy(args2, args);
+    int r = vprintf(fmt, args);
+    if (g_log_fp) { vfprintf(g_log_fp, fmt, args2); fflush(g_log_fp); }
+    va_end(args2);
+    va_end(args);
+    return r;
+}
+
 int main(int argc, char **argv) {
     /* Dispatch to dsd_encode tool if --encode is first arg */
     if (argc >= 2 && strcmp(argv[1], "--encode") == 0)
@@ -126,6 +165,10 @@ int main(int argc, char **argv) {
     extern int gpu_trellis_offline(int, char **);
     if (argc >= 2 && strcmp(argv[1], "--gpu-trellis") == 0)
         return gpu_trellis_offline(argc - 1, argv + 1);
+    /* Dispatch to DSD re-encode comparison */
+    extern int dsd_reencode_main(int, char **);
+    if (argc >= 2 && strcmp(argv[1], "--reencode") == 0)
+        return dsd_reencode_main(argc - 1, argv + 1);
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -151,6 +194,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    open_test_log(argv[0]);
     printf("foo_dsd_trellis test suite\n");
 
     int suites_run = 0;
@@ -172,5 +216,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    close_test_log();
     TEST_SUMMARY();
 }

@@ -130,12 +130,14 @@ static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
 #define CONFIG_V12_SIZE (CONFIG_V11_SIZE + RATE_MAP_COUNT + 1)
 /* v13: gpu_enabled(1) + gpu_backend(1) + rate_gpu(12) */
 #define CONFIG_V13_SIZE (CONFIG_V12_SIZE + 1 + 1 + RATE_MAP_COUNT)
-/* v14: rate_gpu_sdm(12) */
+/* v14: rate_gpu_sdm(12) — legacy, read and discard */
 #define CONFIG_V14_SIZE (CONFIG_V13_SIZE + RATE_MAP_COUNT)
+/* v15: rate_fir_mode(12) + rate_lat(24 = 12 × int16_t) */
+#define CONFIG_V15_SIZE (CONFIG_V14_SIZE + RATE_MAP_COUNT + RATE_MAP_COUNT * 2)
 
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
-    if (buf_size < CONFIG_V14_SIZE)
+    if (buf_size < CONFIG_V15_SIZE)
         return 0;
 
     size_t pos = 0;
@@ -189,9 +191,15 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     memcpy(buf + pos, cfg->rate_gpu, RATE_MAP_COUNT);
     pos += RATE_MAP_COUNT;
 
-    /* v14: per-rate GPU SDM */
-    memcpy(buf + pos, cfg->rate_gpu_sdm, RATE_MAP_COUNT);
+    /* v14: legacy rate_gpu_sdm — write zeros for forward compat */
+    memset(buf + pos, 0xFF, RATE_MAP_COUNT);
     pos += RATE_MAP_COUNT;
+
+    /* v15: per-rate pre-SDM filter mode + trellis latency */
+    memcpy(buf + pos, cfg->rate_fir_mode, RATE_MAP_COUNT);
+    pos += RATE_MAP_COUNT;
+    memcpy(buf + pos, cfg->rate_lat, RATE_MAP_COUNT * sizeof(int16_t));
+    pos += RATE_MAP_COUNT * sizeof(int16_t);
 
     return pos;
 }
@@ -312,10 +320,16 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
                 memcpy(cfg->rate_gpu, buf + pos, RATE_MAP_COUNT);
                 pos += RATE_MAP_COUNT;
             }
-            /* Version 14 adds per-rate GPU SDM toggle */
+            /* Version 14 had per-rate GPU SDM toggle — read and discard */
             if (version >= 14 && buf_size >= CONFIG_V14_SIZE) {
-                memcpy(cfg->rate_gpu_sdm, buf + pos, RATE_MAP_COUNT);
+                pos += RATE_MAP_COUNT; /* skip legacy rate_gpu_sdm */
+            }
+            /* Version 15 adds per-rate FIR mode + trellis latency */
+            if (version >= 15 && buf_size >= CONFIG_V15_SIZE) {
+                memcpy(cfg->rate_fir_mode, buf + pos, RATE_MAP_COUNT);
                 pos += RATE_MAP_COUNT;
+                memcpy(cfg->rate_lat, buf + pos, RATE_MAP_COUNT * sizeof(int16_t));
+                pos += RATE_MAP_COUNT * sizeof(int16_t);
             }
         } else {
             /* Migrate from v1-v7: use fs_out + proc_mode to populate rate_map */

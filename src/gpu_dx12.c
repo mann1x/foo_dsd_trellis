@@ -577,6 +577,19 @@ int gpu_dx12_boxcar(dx12_t *c, const float *in, float *out,
     return download(c, c->b_out, out, bytes);
 }
 
+/* ─── FIR Lowpass (stub — falls back to CPU) ─── */
+
+int gpu_dx12_fir_lowpass_setup(dx12_t *c, const float *taps, int ntaps) {
+    (void)c; (void)taps; (void)ntaps;
+    return -1;  /* Not implemented — CPU fallback */
+}
+
+int gpu_dx12_fir_lowpass(dx12_t *c, const float *in, float *out,
+                          size_t count, float gain) {
+    (void)c; (void)in; (void)out; (void)count; (void)gain;
+    return -1;  /* Not implemented — CPU fallback */
+}
+
 /* ─── Trellis Setup ─── */
 
 int gpu_dx12_trellis_setup_full(dx12_t *c, int nc, int ord, int lat,

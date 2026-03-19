@@ -33,8 +33,9 @@ void dop_pack(const float *bits, float *pcm24, size_t bit_count);
 /* Pack float32 +/-1.0 DSD bits into 24-bit LE integer DoP frames.
  * Output: 3 bytes per frame [dsd_lo, dsd_hi, marker].
  * out buffer must hold bit_count / 16 * 3 bytes.
- * Use with set_data_fixedpoint(out, bytes, rate, ch, 24, ch_config). */
-void dop_pack_i24(const float *bits, uint8_t *out, size_t bit_count);
+ * marker_phase: 0 = start with A (0x05), 1 = start with B (0xFA).
+ * Returns the next marker phase (for chunk continuity). */
+int dop_pack_i24(const float *bits, uint8_t *out, size_t bit_count, int marker_phase);
 
 /* Unpack raw bitstream bytes to float32 ±1.0 (native ASIO path).
  * Each bit becomes one float: 1 → +1.0f, 0 → -1.0f */

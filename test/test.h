@@ -26,6 +26,10 @@ extern int g_tests_run;
 extern int g_tests_passed;
 extern int g_tests_failed;
 
+/* Log-tee printf: writes to both stdout and foo_dsd_trellis_test.log */
+int test_printf(const char *fmt, ...);
+#define printf test_printf
+
 /* Suite filter state (defined in test_main.c) */
 extern int test_should_run_suite(const char *suite_tag);
 
@@ -81,6 +85,7 @@ void test_onnx_filter_suite(void);
 void test_gpu_suite(void);
 void test_gpu_sinad_comparison(void);
 void test_lat_sweep(void);
+void test_pipeline_sinad(void);
 
 /* Standalone DSD encoder tool (tools/dsd_encode.c) */
 int dsd_encode_main(int argc, char **argv);

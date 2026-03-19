@@ -17,10 +17,10 @@
  * output that Trellis SDM can track. */
 #define BOXCAR_MAX_TAPS 128
 typedef struct {
-    float ring[BOXCAR_MAX_TAPS];
-    float sum;
-    int   pos;
-    int   taps;   /* runtime tap count (set at init) */
+    double ring[BOXCAR_MAX_TAPS];
+    double sum;
+    int    pos;
+    int    taps;   /* runtime tap count (set at init) */
 } boxcar_t;
 
 /* Per-channel processing state */
@@ -30,8 +30,8 @@ typedef struct {
     fir_chain_t      fir;        /* FIR rate conversion chain */
     boxcar_t         boxcar;     /* DSD-Wide smoothing (PreCorr fallback) */
     fir_lowpass_t    lowpass;    /* DSD-Wide FIR lowpass (Trellis same-rate) */
-    float           *fir_buf;    /* Post-FIR intermediate buffer */
-    size_t           fir_buf_sz; /* Allocated size of fir_buf */
+    double          *fir_buf;    /* Post-FIR intermediate buffer (fp64 for SDM precision) */
+    size_t           fir_buf_sz; /* Allocated size of fir_buf in bytes */
     int              channel;    /* Channel index (0=L, 1=R, ...) */
     float            fir_gain;   /* FIR output attenuation (path-adaptive) */
     int              sdm_mode;   /* Cached sdm_mode_t for dispatch */
@@ -39,7 +39,6 @@ typedef struct {
     bool             fir_only;   /* true for DSD→PCM decimation (no SDM) */
     onnx_filter_t   *ml_filter;  /* ONNX ML post-filter (NULL if disabled) */
     gpu_context_t   *gpu;        /* GPU compute context (shared, NULL if disabled) */
-    bool             gpu_sdm;    /* GPU SDM enabled for this channel's rate */
 } engine_channel_t;
 
 /* Block processing mode */
@@ -51,7 +50,8 @@ typedef struct {
 
 /* Work item dispatched to thread pool */
 typedef struct {
-    float              *in;      /* Float32 DSD samples at Fs_in (unpacked) */
+    double             *in;      /* FP64 samples (post-FIR, for SDM input) */
+    float              *in_f32;  /* Float32 raw DSD input (for FIR mode) */
     float              *out;     /* Float32 DSD samples at Fs_out (before repack) */
     size_t              count;   /* Sample count at Fs_in */
     size_t              out_count; /* Output sample count (may differ if rate-converting) */
@@ -62,7 +62,7 @@ typedef struct {
     int                 mode;      /* BLOCK_MODE_FULL, _SDM, or _FIR */
     sdm_context_t      *sdm_ctx;   /* SDM context for segment processing */
     size_t              discard;    /* Output samples to discard (warmup) */
-    float              *fir_out;   /* [FIR mode] pointer to FIR output buffer */
+    double             *fir_out;   /* [FIR mode] pointer to FIR output buffer (fp64) */
     /* Unpack/pack mode fields */
     float              *pcm_interleaved; /* [UNPACK/PACK] interleaved PCM buffer */
     float              *dsd_channel;     /* [UNPACK/PACK] per-channel DSD buffer */
@@ -110,7 +110,7 @@ int engine_channel_reconfigure(engine_channel_t *eng,
 size_t engine_process_fir_gain(engine_channel_t *eng,
                                 const float *in, size_t count,
                                 const dsd_config_t *cfg,
-                                float **fir_out);
+                                double **fir_out);
 
 /* Process SDM segment with optional warmup discard.
  * For fresh SDM contexts, the first trellis_lat samples fill the latency
@@ -118,7 +118,7 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
  * (convergence warmup). Remaining input produces kept output.
  * Returns number of output samples kept. */
 size_t sdm_segment_process(sdm_context_t *sdm,
-                            const float *in, float *out,
+                            const double *in, float *out,
                             size_t count, size_t discard);
 
 /* Path info for UI display — resolved parameters for a given conversion path */

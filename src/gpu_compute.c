@@ -195,6 +195,35 @@ int gpu_fir_batch_process(gpu_context_t *ctx, const float *in_batch,
     }
 }
 
+int gpu_fir_lowpass_setup(gpu_context_t *ctx, const float *taps, int ntaps) {
+    if (!ctx) return -1;
+    switch (ctx_backend(ctx)) {
+    case GPU_BACKEND_DIRECTX: {
+        int r = gpu_dx12_fir_lowpass_setup(ctx, taps, ntaps);
+        if (r == 0) return 0;
+        return gpu_dx11_fir_lowpass_setup(ctx, taps, ntaps);
+    }
+    case GPU_BACKEND_CUDA:
+        return gpu_cuda_fir_lowpass_setup(ctx, taps, ntaps);
+    default: return -1;
+    }
+}
+
+int gpu_fir_lowpass(gpu_context_t *ctx, const float *in, float *out,
+                    size_t count, float gain) {
+    if (!ctx) return -1;
+    switch (ctx_backend(ctx)) {
+    case GPU_BACKEND_DIRECTX: {
+        int r = gpu_dx12_fir_lowpass(ctx, in, out, count, gain);
+        if (r == 0) return 0;
+        return gpu_dx11_fir_lowpass(ctx, in, out, count, gain);
+    }
+    case GPU_BACKEND_CUDA:
+        return gpu_cuda_fir_lowpass(ctx, in, out, count, gain);
+    default: return -1;
+    }
+}
+
 int gpu_gain_apply(gpu_context_t *ctx, float *buf, size_t count, float gain) {
     if (!ctx) return -1;
     switch (ctx_backend(ctx)) {

@@ -146,7 +146,7 @@ static DWORD WINAPI worker_func(LPVOID param) {
                                                      block->count, block->discard);
         } else if (block->mode == BLOCK_MODE_FIR) {
             block->out_count = engine_process_fir_gain(block->eng,
-                                                        block->in, block->count,
+                                                        block->in_f32, block->count,
                                                         block->cfg, &block->fir_out);
         } else if (block->mode == BLOCK_MODE_UNPACK) {
             /* DoP unpack: extract this channel from interleaved PCM.
@@ -170,16 +170,21 @@ static DWORD WINAPI worker_func(LPVOID param) {
             }
             block->out_count = frames * DOP_BITS_PER_FRAME;
         } else if (block->mode == BLOCK_MODE_PACK) {
-            /* DoP pack: pack this channel's DSD into interleaved PCM */
+            /* DoP pack: pack this channel's DSD into interleaved i24 */
             int ch = block->channel;
             int nch = block->num_channels;
             size_t dsd_count = block->count;
             size_t pcm_frames = dsd_count / DOP_BITS_PER_FRAME;
-            float *pcm_temp = block->pcm_temp;
-            dop_pack(block->dsd_channel, pcm_temp, dsd_count);
-            float *out = block->pcm_interleaved;
-            for (size_t f = 0; f < pcm_frames; f++)
-                out[f * (size_t)nch + (size_t)ch] = pcm_temp[f];
+            uint8_t *i24_temp = (uint8_t *)block->pcm_temp;
+            dop_pack_i24(block->dsd_channel, i24_temp, dsd_count, (int)block->discard);
+            uint8_t *out_i24 = (uint8_t *)block->pcm_interleaved;
+            for (size_t f = 0; f < pcm_frames; f++) {
+                size_t dst = (f * (size_t)nch + (size_t)ch) * 3;
+                size_t src = f * 3;
+                out_i24[dst]     = i24_temp[src];
+                out_i24[dst + 1] = i24_temp[src + 1];
+                out_i24[dst + 2] = i24_temp[src + 2];
+            }
             block->out_count = pcm_frames;
         } else {
             block->out_count = engine_process_block(block->eng, block->in,

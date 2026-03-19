@@ -890,6 +890,19 @@ int gpu_dx11_boxcar(dx11_context_t *c, const float *in, float *out,
     return download_buf(c->ctx, c->buf_out, c->buf_staging, out, count);
 }
 
+/* ─── DX11 FIR Lowpass (stub — falls back to CPU) ─── */
+
+int gpu_dx11_fir_lowpass_setup(dx11_context_t *c, const float *taps, int ntaps) {
+    (void)c; (void)taps; (void)ntaps;
+    return -1;  /* Not implemented — CPU fallback */
+}
+
+int gpu_dx11_fir_lowpass(dx11_context_t *c, const float *in, float *out,
+                          size_t count, float gain) {
+    (void)c; (void)in; (void)out; (void)count; (void)gain;
+    return -1;  /* Not implemented — CPU fallback */
+}
+
 /* ─── DX11 Trellis SDM ─── */
 
 /* Trellis constant buffer layout (must match HLSL cbuffer TrellisParams).

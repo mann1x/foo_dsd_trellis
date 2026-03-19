@@ -235,13 +235,13 @@ static void test_onnx_sinad_dsd64_comparison(void) {
     sdm_context_t ctx;
     sdm_context_init(&ctx, f, 8, 16, lat);
 
-    float *in = (float *)malloc(n_dsd * sizeof(float));
+    double *in = (double *)malloc(n_dsd * sizeof(double));
     float *out = (float *)malloc(n_dsd * sizeof(float));
     float *out_ml = (float *)malloc(n_dsd * sizeof(float));
 
     /* Generate 1kHz sine */
     for (unsigned i = 0; i < n_dsd; i++)
-        in[i] = (float)(0.5 * sin(2.0 * M_PI * freq * i / dsd_rate));
+        in[i] = 0.5 * sin(2.0 * M_PI * freq * i / dsd_rate);
 
     /* Encode through SDM */
     size_t produced = sdm_process_block(&ctx, in, out, n_dsd);

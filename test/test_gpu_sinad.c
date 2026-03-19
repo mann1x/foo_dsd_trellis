@@ -37,12 +37,12 @@ static double goertzel_power(const float *x, size_t n, double freq, double fs) {
 static float *make_test_signal(const ntf_filter_t *f, uint32_t dsd_rate,
                                 double test_freq, size_t N,
                                 size_t *out_enc_n) {
-    float *sine = (float *)malloc(N * sizeof(float));
+    double *sine = (double *)malloc(N * sizeof(double));
     float *dsd_enc = (float *)calloc(N, sizeof(float));
     if (!sine || !dsd_enc) { free(sine); free(dsd_enc); return NULL; }
 
     for (size_t i = 0; i < N; i++)
-        sine[i] = (float)(0.5 * sin(2.0 * M_PI * test_freq * (double)i / (double)dsd_rate));
+        sine[i] = 0.5 * sin(2.0 * M_PI * test_freq * (double)i / (double)dsd_rate);
 
     sdm_context_t enc;
     sdm_context_init(&enc, f, 4, 16, 512);
@@ -123,15 +123,18 @@ static void run_sinad_test_rate(gpu_backend_t backend, const char *label,
     float *smoothed = make_test_signal(f, dsd_rate, test_freq, N, &enc_n);
     if (!smoothed) { printf("    signal gen failed\n"); return; }
 
-    /* CPU reference */
+    /* CPU reference — sdm_process_block takes double* input */
     float *cpu_out = (float *)calloc(enc_n, sizeof(float));
-    if (!cpu_out) { free(smoothed); return; }
+    double *smoothed_d = (double *)malloc(enc_n * sizeof(double));
+    if (!cpu_out || !smoothed_d) { free(smoothed); free(cpu_out); free(smoothed_d); return; }
+    for (size_t i = 0; i < enc_n; i++) smoothed_d[i] = (double)smoothed[i];
     {
         sdm_context_t cpu_sdm;
         sdm_context_init(&cpu_sdm, f, 4, cands, lat);
-        sdm_process_block(&cpu_sdm, smoothed, cpu_out, enc_n);
+        sdm_process_block(&cpu_sdm, smoothed_d, cpu_out, enc_n);
         sdm_context_free(&cpu_sdm);
     }
+    free(smoothed_d);
     double cpu_sinad = measure_sinad(cpu_out, enc_n, dsd_rate, test_freq);
 
     /* GPU */

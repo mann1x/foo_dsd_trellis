@@ -437,9 +437,11 @@ static void test_gpu_precorr(void) {
 
     size_t count = 16384;
     float *in = (float *)malloc(count * sizeof(float));
+    double *in_d = (double *)malloc(count * sizeof(double));
     float *gpu_out = (float *)calloc(count, sizeof(float));
     float *cpu_out = (float *)calloc(count, sizeof(float));
     gen_sine(in, count, 1000.0, 2822400.0, 0.3);
+    for (size_t i = 0; i < count; i++) in_d[i] = (double)in[i];
 
     /* CPU reference — capture initial state BEFORE processing */
     precorr_context_t pc_cpu;
@@ -464,7 +466,7 @@ static void test_gpu_precorr(void) {
     gpu_init.phase = pc_cpu.phase;
 
     /* Now run CPU reference */
-    precorr_process_block(&pc_cpu, in, cpu_out, count);
+    precorr_process_block(&pc_cpu, in_d, cpu_out, count);
 
     int r = gpu_precorr_process(ctx, in, gpu_out, count,
                                  ntf_a_f, ntf_g_f, f->order,
@@ -487,7 +489,7 @@ static void test_gpu_precorr(void) {
         TEST_ASSERT_TRUE(pct > 70.0, "GPU PreCorr > 70% match with CPU");
     }
 
-    free(in); free(gpu_out); free(cpu_out);
+    free(in); free(in_d); free(gpu_out); free(cpu_out);
     precorr_context_free(&pc);
     precorr_context_free(&pc_cpu);
     gpu_destroy(ctx);
@@ -570,13 +572,15 @@ static void test_gpu_vs_cpu_trellis(void) {
 
     size_t count = 65536;
     float *in = (float *)malloc(count * sizeof(float));
+    double *in_d = (double *)malloc(count * sizeof(double));
     float *gpu_out = (float *)calloc(count, sizeof(float));
     float *cpu_out = (float *)calloc(count, sizeof(float));
     gen_sine(in, count, 1000.0, 2822400.0, 0.3);
+    for (size_t i = 0; i < count; i++) in_d[i] = (double)in[i];
 
     sdm_context_t cpu_sdm;
     sdm_context_init(&cpu_sdm, f, 4, 4, 128);
-    size_t cpu_n = sdm_process_block(&cpu_sdm, in, cpu_out, count);
+    size_t cpu_n = sdm_process_block(&cpu_sdm, in_d, cpu_out, count);
 
     int r = gpu_trellis_process(ctx, in, gpu_out, count,
                                  NULL, NULL, 4, f->order, f->a, f->g);
@@ -607,7 +611,7 @@ static void test_gpu_vs_cpu_trellis(void) {
                valid ? "valid" : "INVALID", pct, gpu_sinad, cpu_sinad);
         TEST_ASSERT_TRUE(valid, "GPU output is ±1.0");
     }
-    free(in); free(gpu_out); free(cpu_out);
+    free(in); free(in_d); free(gpu_out); free(cpu_out);
     sdm_context_free(&cpu_sdm);
     gpu_destroy(ctx);
 }

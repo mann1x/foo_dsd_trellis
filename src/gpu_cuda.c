@@ -130,6 +130,7 @@ typedef struct {
     CUfunction     fn_fir_down;
     CUfunction     fn_gain;
     CUfunction     fn_boxcar;
+    CUfunction     fn_fir_lowpass;
     /* Batched multi-channel kernels */
     CUfunction     fn_fir_up_batch;
     CUfunction     fn_fir_down_batch;
@@ -202,6 +203,12 @@ typedef struct {
     int            boxcar_hist_taps; /* allocated size (0 = none) */
     bool           boxcar_hist_valid[BOXCAR_MAX_CH];
     int            boxcar_ch;       /* current channel index for calls */
+    /* FIR lowpass history for chunk continuity — per channel */
+    CUdeviceptr    d_lp_hist;        /* last ntaps-1 samples (device) */
+    float         *h_lp_hist[BOXCAR_MAX_CH]; /* host-side per-channel */
+    int            lp_hist_len;      /* allocated history length (ntaps-1) */
+    bool           lp_hist_valid[BOXCAR_MAX_CH];
+    int            lp_ch;            /* current lowpass channel index */
 } cuda_context_t;
 
 /* ─── Helpers ─── */
@@ -367,6 +374,8 @@ gpu_context_t *gpu_cuda_create(void) {
         goto fail;
     if (pfn_cuModuleGetFunction(&c->fn_boxcar, c->module, "boxcar_smooth") != CUDA_SUCCESS)
         goto fail;
+    if (pfn_cuModuleGetFunction(&c->fn_fir_lowpass, c->module, "fir_lowpass") != CUDA_SUCCESS)
+        goto fail;
     /* Batched multi-channel kernels */
     if (pfn_cuModuleGetFunction(&c->fn_fir_up_batch, c->module, "fir_upsample_2x_batch") != CUDA_SUCCESS)
         goto fail;
@@ -422,7 +431,7 @@ fail:
 
 void gpu_cuda_reset_chunk(void *ptr) {
     cuda_context_t *c = (cuda_context_t *)ptr;
-    if (c) c->boxcar_ch = 0;
+    if (c) { c->boxcar_ch = 0; c->lp_ch = 0; }
 }
 
 void gpu_cuda_destroy(void *ptr) {
@@ -451,6 +460,8 @@ void gpu_cuda_destroy(void *ptr) {
     free(c->h_all_final_costs);
     if (c->d_boxcar_hist) pfn_cuMemFree(c->d_boxcar_hist);
     for (int i = 0; i < BOXCAR_MAX_CH; i++) free(c->h_boxcar_hist[i]);
+    if (c->d_lp_hist) pfn_cuMemFree(c->d_lp_hist);
+    for (int i = 0; i < BOXCAR_MAX_CH; i++) free(c->h_lp_hist[i]);
     if (c->mod_sdm_parallel) pfn_cuModuleUnload(c->mod_sdm_parallel);
     if (c->mod_hawksford)    pfn_cuModuleUnload(c->mod_hawksford);
     if (c->sdm_stream && c->sdm_stream != c->streams[0])
@@ -794,6 +805,94 @@ int gpu_cuda_boxcar(cuda_context_t *c, const float *in, float *out,
         memcpy(c->h_boxcar_hist[ch], in + count - (size_t)taps,
                (size_t)taps * sizeof(float));
         c->boxcar_hist_valid[ch] = true;
+    }
+
+    c->active = (s_idx + 1) % NUM_STREAMS;
+    return 0;
+}
+
+/* ─── FIR Lowpass (same-rate pre-SDM) ─── */
+
+int gpu_cuda_fir_lowpass_setup(cuda_context_t *c, const float *taps, int ntaps) {
+    if (!c || !taps || ntaps <= 0 || ntaps > 128) return -1;
+
+    /* Upload lowpass taps to c_lp_taps constant memory */
+    CUdeviceptr d_lp_taps;
+    size_t sz;
+    if (pfn_cuModuleGetGlobal(&d_lp_taps, &sz, c->module, "c_lp_taps") != CUDA_SUCCESS)
+        return -1;
+    if (pfn_cuMemcpyHtoD(d_lp_taps, taps, ntaps * sizeof(float)) != CUDA_SUCCESS)
+        return -1;
+
+    CUdeviceptr d_lp_ntaps;
+    if (pfn_cuModuleGetGlobal(&d_lp_ntaps, &sz, c->module, "c_lp_ntaps") != CUDA_SUCCESS)
+        return -1;
+    if (pfn_cuMemcpyHtoD(d_lp_ntaps, &ntaps, sizeof(int)) != CUDA_SUCCESS)
+        return -1;
+
+    /* Allocate per-channel history buffers (ntaps-1 samples) */
+    int hist_len = ntaps - 1;
+    if (c->lp_hist_len < hist_len) {
+        if (c->d_lp_hist) pfn_cuMemFree(c->d_lp_hist);
+        for (int i = 0; i < BOXCAR_MAX_CH; i++) {
+            free(c->h_lp_hist[i]);
+            c->h_lp_hist[i] = (float *)malloc((size_t)hist_len * sizeof(float));
+            if (c->h_lp_hist[i]) {
+                /* Pre-fill with DSD silence (alternating ±1.0) */
+                for (int j = 0; j < hist_len; j++)
+                    c->h_lp_hist[i][j] = (j & 1) ? -1.0f : 1.0f;
+                c->lp_hist_valid[i] = true;
+            }
+        }
+        pfn_cuMemAlloc(&c->d_lp_hist, (size_t)hist_len * sizeof(float));
+        c->lp_hist_len = hist_len;
+    }
+    return 0;
+}
+
+int gpu_cuda_fir_lowpass(cuda_context_t *c, const float *in, float *out,
+                          size_t count, float gain) {
+    if (!c || count < GPU_MIN_SAMPLES) return -1;
+
+    int s_idx = c->active;
+    CUstream stream = c->streams[s_idx];
+
+    if (ensure_d_in(c, count) != 0 || ensure_d_out(c, count) != 0)
+        return -1;
+    if (ensure_h_in(c, count) != 0 || ensure_h_out(c, count) != 0)
+        return -1;
+
+    /* Per-channel history (same pattern as boxcar) */
+    int ch = c->lp_ch % BOXCAR_MAX_CH;
+    c->lp_ch++;
+
+    /* Upload input */
+    memcpy(c->h_in[s_idx], in, count * sizeof(float));
+    pfn_cuMemcpyHtoDAsync(c->d_in[s_idx], c->h_in[s_idx],
+                           count * sizeof(float), stream);
+
+    /* Upload history for this channel */
+    CUdeviceptr hist_ptr = (CUdeviceptr)0;
+    if (c->lp_hist_valid[ch] && c->h_lp_hist[ch] && c->lp_hist_len > 0) {
+        pfn_cuMemcpyHtoDAsync(c->d_lp_hist, c->h_lp_hist[ch],
+                               (size_t)c->lp_hist_len * sizeof(float), stream);
+        hist_ptr = c->d_lp_hist;
+    }
+
+    int cnt = (int)count;
+    void *args[] = { &c->d_in[s_idx], &c->d_out[s_idx], &cnt, &gain, &hist_ptr };
+    launch_kernel(c, c->fn_fir_lowpass, args, (int)count);
+
+    pfn_cuMemcpyDtoHAsync(c->h_out[s_idx], c->d_out[s_idx],
+                           count * sizeof(float), stream);
+    pfn_cuStreamSynchronize(stream);
+    memcpy(out, c->h_out[s_idx], count * sizeof(float));
+
+    /* Save last hist_len samples as this channel's history */
+    if (count >= (size_t)c->lp_hist_len && c->h_lp_hist[ch]) {
+        memcpy(c->h_lp_hist[ch], in + count - (size_t)c->lp_hist_len,
+               (size_t)c->lp_hist_len * sizeof(float));
+        c->lp_hist_valid[ch] = true;
     }
 
     c->active = (s_idx + 1) % NUM_STREAMS;

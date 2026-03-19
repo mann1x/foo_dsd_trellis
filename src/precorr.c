@@ -216,7 +216,7 @@ int precorr_context_init(precorr_context_t *ctx, const ntf_filter_t *filter) {
 }
 
 size_t precorr_process_block(precorr_context_t *ctx,
-                             const float *in, float *out, size_t count) {
+                             const double *in, float *out, size_t count) {
     const float *a = ctx->a;
     const float *g = ctx->g;
     const int order = ctx->order;
@@ -225,7 +225,7 @@ size_t precorr_process_block(precorr_context_t *ctx,
     float prev_y = ctx->prev_y;
 
     for (size_t i = 0; i < count; i++) {
-        float x = in[i];
+        float x = (float)in[i];
 
         /* NTF filter calc */
         float d[MAX_NTF_ORDER];

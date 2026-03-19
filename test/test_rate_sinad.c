@@ -16,6 +16,16 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* Helper: convert float buffer to double for sdm_process_block input */
+static double *float_to_double(const float *src, size_t count) {
+    double *dst = (double *)malloc(count * sizeof(double));
+    if (dst) {
+        for (size_t i = 0; i < count; i++)
+            dst[i] = (double)src[i];
+    }
+    return dst;
+}
+
 #define SINAD_TRELLIS_DEPTH  8
 #define SINAD_TRELLIS_CANDS  16
 #define SINAD_TRELLIS_LAT    512
@@ -82,12 +92,12 @@ static size_t generate_dsd_sine(uint32_t dsd_rate, double freq_hz,
                          SINAD_TRELLIS_LAT) != 0)
         return 0;
 
-    float *sine = (float *)malloc(n_samples * sizeof(float));
+    double *sine = (double *)malloc(n_samples * sizeof(double));
     if (!sine) { sdm_context_free(&ctx); return 0; }
 
     for (size_t i = 0; i < n_samples; i++)
-        sine[i] = (float)(amplitude * sin(2.0 * M_PI * freq_hz *
-                                          (double)i / (double)dsd_rate));
+        sine[i] = amplitude * sin(2.0 * M_PI * freq_hz *
+                                   (double)i / (double)dsd_rate);
 
     size_t produced = sdm_process_block(&ctx, sine, dsd_out, n_samples);
 
@@ -189,7 +199,10 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     }
     if (pi.state_limit > 0.0)
         sdm.state_limit = pi.state_limit;
-    size_t out_count = sdm_process_block(&sdm, fir_buf, dsd_out, fir_count);
+    double *sdm_in_d = float_to_double(fir_buf, fir_count);
+    if (!sdm_in_d) { sdm_context_free(&sdm); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+    size_t out_count = sdm_process_block(&sdm, sdm_in_d, dsd_out, fir_count);
+    free(sdm_in_d);
     sdm_context_free(&sdm);
 
     if (out_count < 1024) {
@@ -643,7 +656,10 @@ static double measure_rate_sinad_with_limit(uint32_t fs_in, uint32_t fs_out,
         return -999.0;
     }
     sdm.state_limit = state_limit;
-    size_t out_count = sdm_process_block(&sdm, fir_buf, dsd_out, fir_count);
+    double *sdm_in_d = float_to_double(fir_buf, fir_count);
+    if (!sdm_in_d) { sdm_context_free(&sdm); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+    size_t out_count = sdm_process_block(&sdm, sdm_in_d, dsd_out, fir_count);
+    free(sdm_in_d);
     sdm_context_free(&sdm);
 
     if (out_count < 1024) {
@@ -704,10 +720,10 @@ static double measure_rate_sinad_with_filter_limit(uint32_t fs_in, uint32_t fs_o
                          SWEEP_TRELLIS_LAT) != 0) {
         free(dsd_in); free(fir_buf); free(dsd_out); return -999.0;
     }
-    float *sine = (float *)malloc(n_in * sizeof(float));
+    double *sine = (double *)malloc(n_in * sizeof(double));
     if (!sine) { sdm_context_free(&gen); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
     for (size_t i = 0; i < n_in; i++)
-        sine[i] = (float)(0.5 * sin(2.0 * M_PI * freq * (double)i / (double)fs_in));
+        sine[i] = 0.5 * sin(2.0 * M_PI * freq * (double)i / (double)fs_in);
     size_t dsd_in_count = sdm_process_block(&gen, sine, dsd_in, n_in);
     free(sine);
     sdm_context_free(&gen);
@@ -742,7 +758,10 @@ static double measure_rate_sinad_with_filter_limit(uint32_t fs_in, uint32_t fs_o
         return -999.0;
     }
     sdm.state_limit = state_limit;
-    size_t out_count = sdm_process_block(&sdm, fir_buf, dsd_out, fir_count);
+    double *sdm_in_d = float_to_double(fir_buf, fir_count);
+    if (!sdm_in_d) { sdm_context_free(&sdm); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+    size_t out_count = sdm_process_block(&sdm, sdm_in_d, dsd_out, fir_count);
+    free(sdm_in_d);
     sdm_context_free(&sdm);
 
     if (out_count < 512) {
@@ -979,10 +998,10 @@ static double measure_rate_sinad_cands_lat(uint32_t fs_in, uint32_t fs_out,
     if (sdm_context_init(&gen, f_in, SINAD_TRELLIS_DEPTH, cands, latency) != 0) {
         free(dsd_in); free(fir_buf); free(dsd_out); return -999.0;
     }
-    float *sine = (float *)malloc(n_in * sizeof(float));
+    double *sine = (double *)malloc(n_in * sizeof(double));
     if (!sine) { sdm_context_free(&gen); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
     for (size_t i = 0; i < n_in; i++)
-        sine[i] = (float)(0.5 * sin(2.0 * M_PI * freq * (double)i / (double)fs_in));
+        sine[i] = 0.5 * sin(2.0 * M_PI * freq * (double)i / (double)fs_in);
     size_t dsd_in_count = sdm_process_block(&gen, sine, dsd_in, n_in);
     free(sine);
     sdm_context_free(&gen);
@@ -1006,7 +1025,10 @@ static double measure_rate_sinad_cands_lat(uint32_t fs_in, uint32_t fs_out,
         free(dsd_in); free(fir_buf); free(dsd_out); return -999.0;
     }
     sdm.state_limit = state_limit;
-    size_t out_count = sdm_process_block(&sdm, fir_buf, dsd_out, fir_count);
+    double *sdm_in_d = float_to_double(fir_buf, fir_count);
+    if (!sdm_in_d) { sdm_context_free(&sdm); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+    size_t out_count = sdm_process_block(&sdm, sdm_in_d, dsd_out, fir_count);
+    free(sdm_in_d);
     sdm_context_free(&sdm);
     if (out_count < 512) { free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
 
@@ -1172,7 +1194,10 @@ static double measure_rate_sinad_gain_limit(uint32_t fs_in, uint32_t fs_out,
         return -999.0;
     }
     sdm.state_limit = state_limit;
-    size_t out_count = sdm_process_block(&sdm, fir_buf, dsd_out, fir_count);
+    double *sdm_in_d = float_to_double(fir_buf, fir_count);
+    if (!sdm_in_d) { sdm_context_free(&sdm); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+    size_t out_count = sdm_process_block(&sdm, sdm_in_d, dsd_out, fir_count);
+    free(sdm_in_d);
     sdm_context_free(&sdm);
 
     if (out_count < 1024) {
@@ -1308,7 +1333,10 @@ static double measure_gain_sweep_sinad(uint32_t fs_in, uint32_t fs_out,
     }
     if (state_limit > 0.0)
         sdm.state_limit = state_limit;
-    size_t out_count = sdm_process_block(&sdm, fir_buf, dsd_out, fir_count);
+    double *sdm_in_d = float_to_double(fir_buf, fir_count);
+    if (!sdm_in_d) { sdm_context_free(&sdm); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+    size_t out_count = sdm_process_block(&sdm, sdm_in_d, dsd_out, fir_count);
+    free(sdm_in_d);
     sdm_context_free(&sdm);
 
     if (out_count < 1024) {
@@ -1510,7 +1538,10 @@ static double measure_weak_path_sinad(uint32_t fs_in, uint32_t fs_out,
     }
     if (state_limit > 0.0)
         sdm.state_limit = state_limit;
-    size_t out_count = sdm_process_block(&sdm, fir_buf, dsd_out, fir_count);
+    double *sdm_in_d = float_to_double(fir_buf, fir_count);
+    if (!sdm_in_d) { sdm_context_free(&sdm); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+    size_t out_count = sdm_process_block(&sdm, sdm_in_d, dsd_out, fir_count);
+    free(sdm_in_d);
     sdm_context_free(&sdm);
 
     if (out_count < 1024) {

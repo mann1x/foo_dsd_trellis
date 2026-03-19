@@ -52,7 +52,7 @@ int precorr_context_init(precorr_context_t *ctx, const ntf_filter_t *filter);
  * Input: FIR-upsampled float samples. Output: ±1.0f DSD bits.
  * Returns the number of output samples written (== count, no latency). */
 size_t precorr_process_block(precorr_context_t *ctx,
-                             const float *in, float *out, size_t count);
+                             const double *in, float *out, size_t count);
 
 /* Drain remaining samples (PreCorr has no latency, always returns 0). */
 size_t precorr_drain(precorr_context_t *ctx, float *out, size_t max_out);

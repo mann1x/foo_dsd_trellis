@@ -503,6 +503,10 @@ int fir_lowpass_init(fir_lowpass_t *lp, uint32_t dsd_rate) {
         return -1;
     }
 
+    lp->coeffs = (float *)malloc(LP_NTAPS * sizeof(float));
+    if (lp->coeffs)
+        memcpy(lp->coeffs, taps, LP_NTAPS * sizeof(float));
+
     lp->taps = LP_NTAPS;
     lp->initialized = true;
     return 0;
@@ -528,5 +532,6 @@ void fir_lowpass_free(fir_lowpass_t *lp) {
     if (lp->spec) { ippsFree(lp->spec); lp->spec = NULL; }
     if (lp->buf)  { ippsFree(lp->buf);  lp->buf = NULL; }
     if (lp->dly)  { ippsFree(lp->dly);  lp->dly = NULL; }
+    if (lp->coeffs) { free(lp->coeffs); lp->coeffs = NULL; }
     lp->initialized = false;
 }

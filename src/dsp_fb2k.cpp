@@ -40,16 +40,16 @@ void            plugin_set_config(plugin_state_t *s, const dsd_config_t *cfg);
 const dsd_config_t *plugin_get_config(const plugin_state_t *s);
 const engine_channel_t *plugin_get_channels(const plugin_state_t *s);
 size_t          plugin_process(plugin_state_t *s,
-                               const float *in_pcm, float *out_pcm,
+                               const float *in_pcm, uint8_t *out_i24,
                                size_t pcm_frames, int num_channels,
                                uint32_t pcm_rate);
 size_t          plugin_process_pcm(plugin_state_t *s,
-                                    const float *in_pcm, float *out_pcm,
+                                    const float *in_pcm, uint8_t *out_i24,
                                     size_t pcm_frames, int num_channels,
                                     uint32_t pcm_rate);
-size_t          plugin_drain(plugin_state_t *s, float *out_pcm,
+size_t          plugin_drain(plugin_state_t *s, uint8_t *out_i24,
                              int num_channels);
-size_t          plugin_generate_tail(plugin_state_t *s, float *out_pcm,
+size_t          plugin_generate_tail(plugin_state_t *s, uint8_t *out_i24,
                                       int num_channels, int ms);
 double          plugin_get_latency(const plugin_state_t *s);
 void            plugin_flush(plugin_state_t *s);
@@ -480,19 +480,21 @@ private:
         m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 50);
         m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 54);
         m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 46);
-        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 68);
-        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 44);
-        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 44);
-        m_listRate.InsertColumn(6, L"Limiter", LVCFMT_LEFT, 48);
-        m_listRate.InsertColumn(7, L"ML", LVCFMT_LEFT, 40);
+        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 58);
+        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 40);
+        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 40);
+        m_listRate.InsertColumn(6, L"Limiter", LVCFMT_LEFT, 46);
+        m_listRate.InsertColumn(7, L"ML", LVCFMT_LEFT, 30);
+        m_listRate.InsertColumn(8, L"GPU", LVCFMT_LEFT, 34);
+        m_listRate.InsertColumn(9, L"FIR", LVCFMT_LEFT, 48);
         /* Last column: fill remaining width to avoid horizontal scrollbar */
         {
             CRect rc;
             m_listRate.GetClientRect(&rc);
-            int used = 50 + 54 + 46 + 68 + 44 + 44 + 48 + 40;
+            int used = 50 + 54 + 46 + 58 + 40 + 40 + 46 + 30 + 34 + 48;
             int remain = rc.Width() - used - 4;
-            if (remain < 40) remain = 40;
-            m_listRate.InsertColumn(8, L"GPU", LVCFMT_LEFT, remain);
+            if (remain < 36) remain = 36;
+            m_listRate.InsertColumn(10, L"Lat", LVCFMT_LEFT, remain);
         }
 
         for (int i = 0; i < RATE_MAP_COUNT; i++) {
@@ -528,6 +530,14 @@ private:
                 if (m_cfg.rate_gpu[i] >= 0) {
                     wcscpy_s(buf, m_cfg.rate_gpu[i] == 0 ? L"Off" : L"On");
                     m_listRate.SetItemText(i, 8, buf);
+                }
+                if (m_cfg.rate_fir_mode[i] >= 0) {
+                    wcscpy_s(buf, m_cfg.rate_fir_mode[i] == FIR_MODE_BOXCAR ? L"Boxcar" : L"FIR");
+                    m_listRate.SetItemText(i, 9, buf);
+                }
+                if (m_cfg.rate_lat[i] > 0) {
+                    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_lat[i]);
+                    m_listRate.SetItemText(i, 10, buf);
                 }
             }
             /* Resolve Auto values using path-optimal defaults */
@@ -722,7 +732,7 @@ private:
             ShowOutputCombo(nm->iItem);
         } else if (nm->iSubItem == 2) {
             ShowNtfCombo(nm->iItem);
-        } else if (nm->iSubItem >= 3 && nm->iSubItem <= 8) {
+        } else if (nm->iSubItem >= 3 && nm->iSubItem <= 10) {
             ShowPerRateCombo(nm->iItem, nm->iSubItem);
         }
 
@@ -844,12 +854,31 @@ private:
             int cur = m_cfg.rate_ml[row];
             m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
         } else if (col == 8) {
-            /* GPU SDM */
+            /* GPU FIR */
             m_ntfCombo.AddString(L"Auto");
             m_ntfCombo.AddString(L"Off");
             m_ntfCombo.AddString(L"On");
-            int cur = m_cfg.rate_gpu_sdm[row];
+            int cur = m_cfg.rate_gpu[row];
             m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
+        } else if (col == 9) {
+            /* FIR mode: pre-SDM filter */
+            m_ntfCombo.AddString(L"Auto");
+            m_ntfCombo.AddString(L"Boxcar");
+            m_ntfCombo.AddString(L"FIR");
+            int cur = m_cfg.rate_fir_mode[row];
+            m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
+        } else if (col == 10) {
+            /* Trellis latency */
+            m_ntfCombo.AddString(L"Auto");
+            m_ntfCombo.AddString(L"16"); m_ntfCombo.AddString(L"32");
+            m_ntfCombo.AddString(L"64"); m_ntfCombo.AddString(L"128");
+            m_ntfCombo.AddString(L"256"); m_ntfCombo.AddString(L"512");
+            int16_t cur = m_cfg.rate_lat[row];
+            int sel = 0;
+            if (cur == 16) sel = 1; else if (cur == 32) sel = 2;
+            else if (cur == 64) sel = 3; else if (cur == 128) sel = 4;
+            else if (cur == 256) sel = 5; else if (cur == 512) sel = 6;
+            m_ntfCombo.SetCurSel(sel);
         }
 
         m_editRow = row;
@@ -929,11 +958,27 @@ private:
             const wchar_t *names[] = { L"Auto", L"Off", L"On" };
             m_listRate.SetItemText(m_editRow, 7, names[sel < 3 ? sel : 0]);
         } else if (m_editCol == 8) {
-            /* GPU SDM: 0=Auto, 1=Off, 2=On */
+            /* GPU FIR: 0=Auto, 1=Off, 2=On */
             int8_t val = (int8_t)(sel == 0 ? -1 : sel - 1);
-            m_cfg.rate_gpu_sdm[m_editRow] = val;
+            m_cfg.rate_gpu[m_editRow] = val;
             const wchar_t *names[] = { L"Auto", L"Off", L"On" };
             m_listRate.SetItemText(m_editRow, 8, names[sel < 3 ? sel : 0]);
+        } else if (m_editCol == 9) {
+            /* FIR mode: 0=Auto, 1=Boxcar, 2=FIR */
+            int8_t val = (int8_t)(sel == 0 ? -1 : sel - 1);
+            m_cfg.rate_fir_mode[m_editRow] = val;
+            const wchar_t *names[] = { L"Auto", L"Boxcar", L"FIR" };
+            m_listRate.SetItemText(m_editRow, 9, names[sel < 3 ? sel : 0]);
+        } else if (m_editCol == 10) {
+            /* Trellis latency: 0=Auto, 1=16, 2=32, 3=64, 4=128, 5=256, 6=512 */
+            static const int16_t lvals[] = { 0, 16, 32, 64, 128, 256, 512 };
+            int16_t val = (sel >= 0 && sel < 7) ? lvals[sel] : 0;
+            m_cfg.rate_lat[m_editRow] = val;
+            if (val > 0) {
+                wchar_t buf[16];
+                _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", val);
+                m_listRate.SetItemText(m_editRow, 10, buf);
+            }
         }
 
         RefreshAutoText(m_editRow);
@@ -1060,24 +1105,30 @@ private:
             bool ml_active = (m_cfg.rate_ml[row] >= 0) ? (m_cfg.rate_ml[row] != 0) : m_cfg.ml_enabled;
             info << "\nML filter: " << (ml_active ? "On" : "Off");
 
-            /* GPU SDM status */
+            /* Pre-SDM filter mode */
             {
-                bool gpu_sdm_active;
-                if (m_cfg.rate_gpu_sdm[row] == 0)
-                    gpu_sdm_active = false;
-                else if (m_cfg.rate_gpu_sdm[row] == 1)
-                    gpu_sdm_active = true;
+                int fir = m_cfg.rate_fir_mode[row];
+                const char *fir_name;
+                if (fir == FIR_MODE_BOXCAR)
+                    fir_name = "Boxcar";
+                else if (fir == FIR_MODE_FIR)
+                    fir_name = "FIR Lowpass";
                 else
-                    gpu_sdm_active = m_cfg.gpu_enabled;  /* Auto = global */
+                    fir_name = (sdm_mode == SDM_MODE_TRELLIS) ? "FIR Lowpass (auto)" : "Boxcar (auto)";
+                info << "\nPre-SDM: " << fir_name;
+            }
 
-                if (sdm_mode != SDM_MODE_TRELLIS)
-                    info << "\nGPU SDM: N/A (Trellis only)";
-                else if (!m_cfg.gpu_enabled)
-                    info << "\nGPU SDM: Disabled (GPU off)";
-                else if (!gpu_sdm_active)
-                    info << "\nGPU SDM: Off";
+            /* GPU FIR status */
+            {
+                bool gpu_fir_active;
+                if (m_cfg.rate_gpu[row] == 0)
+                    gpu_fir_active = false;
+                else if (m_cfg.rate_gpu[row] == 1)
+                    gpu_fir_active = true;
                 else
-                    info << "\nGPU SDM: On";
+                    gpu_fir_active = m_cfg.gpu_enabled;
+
+                info << "\nGPU FIR: " << (gpu_fir_active ? "On" : "Off");
             }
         }
 
@@ -1097,8 +1148,12 @@ private:
             m_listRate.SetItemText(row, 6, L"Auto");
         if (m_cfg.rate_ml[row] < 0)
             m_listRate.SetItemText(row, 7, L"Auto");
-        if (m_cfg.rate_gpu_sdm[row] < 0)
+        if (m_cfg.rate_gpu[row] < 0)
             m_listRate.SetItemText(row, 8, L"Auto");
+        if (m_cfg.rate_fir_mode[row] < 0)
+            m_listRate.SetItemText(row, 9, L"Auto");
+        if (m_cfg.rate_lat[row] <= 0)
+            m_listRate.SetItemText(row, 10, L"Auto");
     }
 
     void UpdatePreset() {
@@ -1327,13 +1382,8 @@ public:
         if (m_config.rate_ml[map_idx] >= 0)
             chunk_cfg.ml_enabled = (m_config.rate_ml[map_idx] != 0);
 
-        /* Per-rate GPU SDM: -1=Auto (use global gpu_enabled), 0=Off, 1=On */
-        if (m_config.rate_gpu_sdm[map_idx] == 0)
-            chunk_cfg.gpu_sdm_enabled = false;
-        else if (m_config.rate_gpu_sdm[map_idx] == 1)
-            chunk_cfg.gpu_sdm_enabled = true;
-        else
-            chunk_cfg.gpu_sdm_enabled = chunk_cfg.gpu_enabled;  /* Auto = follow global */
+        /* Per-rate pre-SDM filter mode: -1=Auto, 0=Boxcar, 1=FIR */
+        chunk_cfg.fir_mode = (int)m_config.rate_fir_mode[map_idx];
 
         /* Per-rate state limiter: -1=Auto (engine uses path_config), 0=Off, >0=value */
         if (m_config.rate_limiter[map_idx] >= 0)
@@ -1372,21 +1422,22 @@ public:
                     chunk_cfg.trellis_depth = (int)m_config.rate_depth[map_idx];
             }
 
-            /* Auto-compute optimal trellis latency from DSD rate.
-             * Full nc×lat sweep results (best SINAD per rate):
-             *   DSD64:  nc=4, lat=32  → 102.6 dB
-             *   DSD128: nc=4, lat=32  → 97.9 dB (NTF sweep pending)
-             *   DSD256: nc=2, lat=128 → 151.7 dB
-             *   DSD512: nc=2, lat=16  → 129.4 dB (lat=128 too slow for RT)
-             * Balance quality vs real-time budget. */
-            {
-                uint32_t dsd_rate = chunk_cfg.fs_out ? chunk_cfg.fs_out : chunk_cfg.fs_in;
-                if (dsd_rate >= DSD_RATE_512)
-                    chunk_cfg.trellis_lat = 16;   /* DSD512: RT-constrained */
-                else if (dsd_rate >= DSD_RATE_256)
-                    chunk_cfg.trellis_lat = 128;  /* DSD256: NTF headroom */
+            /* Trellis latency: per-rate override or auto-compute from DSD rate.
+             * From sweep with stability analysis (2026-03-19, nc=2):
+             *   DSD64:  lat=32  → 103.5 dB, 0 collapse
+             *   DSD128: lat=128 → 127.4 dB, 0 collapse
+             *   DSD256: lat=128 → 143.5 dB, 0 collapse
+             *   DSD512: lat=32  → 137.6 dB, 0 collapse */
+            if (m_config.rate_lat[map_idx] > 0) {
+                chunk_cfg.trellis_lat = (int)m_config.rate_lat[map_idx];
+            } else {
+                uint32_t out_dsd = chunk_cfg.fs_out ? chunk_cfg.fs_out : chunk_cfg.fs_in;
+                if (out_dsd >= DSD_RATE_512)
+                    chunk_cfg.trellis_lat = 32;
+                else if (out_dsd >= DSD_RATE_128)
+                    chunk_cfg.trellis_lat = 128;
                 else
-                    chunk_cfg.trellis_lat = 32;   /* DSD64/128: sweet spot */
+                    chunk_cfg.trellis_lat = 32;   /* DSD64 */
             }
         }
 
@@ -1419,8 +1470,11 @@ public:
         size_t max_ratio = is_dop ? 8 : (out_rate > pcm_rate ? out_rate / pcm_rate : 1);
         if (max_ratio < 8) max_ratio = 8;
         size_t max_out_frames = pcm_frames * max_ratio;
-        pfc::array_staticsize_t<float> out_buf;
-        out_buf.set_size_discard(max_out_frames * channels);
+        /* Output buffer: i24 for DoP (3 bytes/sample), float for PCM (4 bytes/sample).
+         * Allocate max of both sizes to share one buffer. */
+        size_t out_buf_bytes = max_out_frames * channels * 4; /* 4 >= 3 */
+        pfc::array_staticsize_t<uint8_t> out_buf;
+        out_buf.set_size_discard(out_buf_bytes);
 
         LARGE_INTEGER t0, t1, freq;
         QueryPerformanceCounter(&t0);
@@ -1441,6 +1495,7 @@ public:
 
             out_frames = plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
                                         pcm_frames, (int)channels, pcm_rate);
+
         } else {
             /* PCM input — convert to DSD */
             if (!m_logged_processing) {
@@ -1487,12 +1542,7 @@ public:
         m_last_pcm_rate = pcm_rate;
         m_last_is_dop_input = is_dop;
 
-        /* Convert float output back to audio_sample */
         size_t total_out = out_frames * channels;
-        pfc::array_staticsize_t<audio_sample> out_as;
-        out_as.set_size_discard(total_out);
-        for (size_t i = 0; i < total_out; i++)
-            out_as[i] = (audio_sample)out_buf[i];
 
         {
             double chunk_ms = (double)pcm_frames / (double)pcm_rate * 1000.0;
@@ -1666,13 +1716,37 @@ public:
             }
         }
 
-        chunk->set_data(out_as.get_ptr(), out_frames, channels, out_pcm_rate);
+        if (out_is_pcm) {
+            /* PCM output: data is float, convert to audio_sample */
+            const float *pcm_f = (const float *)out_buf.get_ptr();
+            pfc::array_staticsize_t<audio_sample> pcm_as;
+            pcm_as.set_size_discard(total_out);
+            for (size_t i = 0; i < total_out; i++)
+                pcm_as[i] = (audio_sample)pcm_f[i];
+            chunk->set_data(pcm_as.get_ptr(), out_frames, channels, out_pcm_rate);
+        } else {
+            /* DoP output: data is 24-bit signed LE, pass directly */
+            chunk->set_data_fixedpoint_ex(
+                out_buf.get_ptr(), total_out * 3,
+                out_pcm_rate, channels, 24,
+                audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
+                audio_chunk::g_guess_channel_config(channels));
+        }
 
-        /* On-demand audio capture: DoP mode (mode=1) captures packed output */
+        /* On-demand audio capture: DoP mode (mode=1) captures packed output.
+         * Capture still uses float for file format compatibility. */
         if (g_audio_capture.mode == 1 &&
             (g_audio_capture.state == CAPTURE_RECORDING || capture_check_armed())) {
-            capture_write((const float *)out_as.get_ptr(),
-                          out_frames, channels, out_pcm_rate);
+            /* Convert i24 back to float for capture (capture path only, not hot) */
+            pfc::array_staticsize_t<float> cap_f;
+            cap_f.set_size_discard(total_out);
+            const uint8_t *src = out_buf.get_ptr();
+            for (size_t i = 0; i < total_out; i++) {
+                int32_t v = (int32_t)src[i*3] | ((int32_t)src[i*3+1] << 8) | ((int32_t)src[i*3+2] << 16);
+                if (v & 0x800000) v |= (int32_t)0xFF000000;
+                cap_f[i] = (float)((double)v / 8388608.0);
+            }
+            capture_write(cap_f.get_ptr(), out_frames, channels, out_pcm_rate);
         }
 
         return true;
@@ -1687,8 +1761,8 @@ public:
          * the preserved state for the next play (crash on rapid stop→play). */
         if (!m_config.antipop) {
             size_t max_drain_frames = 2048 / 16;
-            pfc::array_staticsize_t<float> drain_buf;
-            drain_buf.set_size_discard(max_drain_frames * (unsigned)m_channels);
+            pfc::array_staticsize_t<uint8_t> drain_buf;
+            drain_buf.set_size_discard(max_drain_frames * (unsigned)m_channels * 3);
 
             size_t drain_frames = plugin_drain(m_state, drain_buf.get_ptr(),
                                                m_channels);
@@ -1699,14 +1773,12 @@ public:
                     out_pcm_rate = m_pcm_rate;
 
                 size_t total = drain_frames * (unsigned)m_channels;
-                pfc::array_staticsize_t<audio_sample> drain_as;
-                drain_as.set_size_discard(total);
-                for (size_t i = 0; i < total; i++)
-                    drain_as[i] = (audio_sample)drain_buf[i];
-
                 audio_chunk_impl chunk_out;
-                chunk_out.set_data(drain_as.get_ptr(), drain_frames,
-                                   (unsigned)m_channels, out_pcm_rate);
+                chunk_out.set_data_fixedpoint_ex(
+                    drain_buf.get_ptr(), total * 3,
+                    out_pcm_rate, (unsigned)m_channels, 24,
+                    audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
+                    audio_chunk::g_guess_channel_config((unsigned)m_channels));
                 insert_chunk(chunk_out);
             }
         }
@@ -1836,15 +1908,11 @@ private:
             return;
 
         size_t sil_total = sil_frames * (size_t)num_channels;
-        pfc::array_staticsize_t<audio_sample> sil_as;
-        sil_as.set_size_discard(sil_total);
 
         if (is_dop_output) {
-            /* DoP silence: DSD idle pattern 0x69 (01101001) → dop_pack.
+            /* DoP silence: DSD idle pattern 0x69 (01101001) → dop_pack_i24.
              * 0x69 is the standard DSD silence byte — a toggling pattern
-             * with zero DC content. Using this instead of 0xAA ensures the
-             * DAC sees a proper DSD idle signal while DoP markers keep it
-             * in DSD mode, preventing the PCM mode-revert pop. */
+             * with zero DC content. */
             static const float dsd_0x69[8] = {
                 -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f
             };
@@ -1854,21 +1922,39 @@ private:
             for (size_t i = 0; i < dsd_per_frame; i++)
                 dsd_idle[i] = dsd_0x69[i & 7];
 
-            pfc::array_staticsize_t<float> dop_pcm;
-            dop_pcm.set_size_discard(sil_frames);
-            dop_pack(dsd_idle.get_ptr(), dop_pcm.get_ptr(), dsd_per_frame);
+            pfc::array_staticsize_t<uint8_t> dop_i24;
+            dop_i24.set_size_discard(sil_frames * 3);
+            dop_pack_i24(dsd_idle.get_ptr(), dop_i24.get_ptr(), dsd_per_frame, 0);
 
+            /* Interleave: replicate mono i24 to all channels */
+            pfc::array_staticsize_t<uint8_t> sil_i24;
+            sil_i24.set_size_discard(sil_total * 3);
             for (size_t f = 0; f < sil_frames; f++)
-                for (int ch = 0; ch < num_channels; ch++)
-                    sil_as[f * num_channels + ch] = (audio_sample)dop_pcm[f];
-        } else {
-            memset(sil_as.get_ptr(), 0, sil_total * sizeof(audio_sample));
-        }
+                for (int ch = 0; ch < num_channels; ch++) {
+                    size_t dst = (f * num_channels + ch) * 3;
+                    size_t src = f * 3;
+                    sil_i24[dst]     = dop_i24[src];
+                    sil_i24[dst + 1] = dop_i24[src + 1];
+                    sil_i24[dst + 2] = dop_i24[src + 2];
+                }
 
-        audio_chunk_impl chunk_out;
-        chunk_out.set_data(sil_as.get_ptr(), sil_frames,
-                           (unsigned)num_channels, out_pcm_rate);
-        insert_chunk(chunk_out);
+            audio_chunk_impl chunk_out;
+            chunk_out.set_data_fixedpoint_ex(
+                sil_i24.get_ptr(), sil_total * 3,
+                out_pcm_rate, (unsigned)num_channels, 24,
+                audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
+                audio_chunk::g_guess_channel_config((unsigned)num_channels));
+            insert_chunk(chunk_out);
+        } else {
+            pfc::array_staticsize_t<audio_sample> sil_as;
+            sil_as.set_size_discard(sil_total);
+            memset(sil_as.get_ptr(), 0, sil_total * sizeof(audio_sample));
+
+            audio_chunk_impl chunk_out;
+            chunk_out.set_data(sil_as.get_ptr(), sil_frames,
+                               (unsigned)num_channels, out_pcm_rate);
+            insert_chunk(chunk_out);
+        }
     }
 
     /* Insert trailing silence to flush ASIO buffer before stop.

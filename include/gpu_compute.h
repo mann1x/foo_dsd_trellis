@@ -79,6 +79,19 @@ int gpu_fir_batch_process(gpu_context_t *ctx, const float *in_batch,
                           float *out_batch, size_t samples_per_ch,
                           int num_channels, size_t *out_count_per_ch);
 
+/* ─── FIR Lowpass (same-rate pre-SDM filter) ─── */
+
+/* Upload FIR lowpass coefficients (call once per rate configuration).
+ * taps: filter coefficients, ntaps: tap count (e.g. 63).
+ * Separate from rate conversion FIR taps. */
+int gpu_fir_lowpass_setup(gpu_context_t *ctx, const float *taps, int ntaps);
+
+/* Process FIR lowpass for one channel (same-rate, no up/downsampling).
+ * Input is ±1.0 DSD, output is multi-bit smoothed + gained.
+ * gain: combined FIR gain × volume gain. */
+int gpu_fir_lowpass(gpu_context_t *ctx, const float *in, float *out,
+                    size_t count, float gain);
+
 /* ─── Gain & Boxcar ─── */
 
 /* Apply gain multiply in-place. */
@@ -153,6 +166,13 @@ int gpu_dx12_trellis_full(void *ctx, const float *in, float *out,
                            size_t count, int num_segs);
 
 /* Backend-specific operations (called by gpu_compute.c dispatcher) */
+int gpu_dx11_fir_lowpass_setup(void *ctx, const float *taps, int ntaps);
+int gpu_dx11_fir_lowpass(void *ctx, const float *in, float *out,
+                          size_t count, float gain);
+int gpu_dx12_fir_lowpass_setup(void *ctx, const float *taps, int ntaps);
+int gpu_dx12_fir_lowpass(void *ctx, const float *in, float *out,
+                          size_t count, float gain);
+
 int gpu_dx11_fir_setup(void *ctx, const float *taps, int ntaps,
                         int num_stages, bool upsample);
 int gpu_dx11_fir_chain(void *ctx, const float *in, float *out,
@@ -160,6 +180,10 @@ int gpu_dx11_fir_chain(void *ctx, const float *in, float *out,
 int gpu_dx11_gain(void *ctx, float *buf, size_t count, float gain);
 int gpu_dx11_boxcar(void *ctx, const float *in, float *out,
                      size_t count, int taps, float gain);
+
+int gpu_cuda_fir_lowpass_setup(void *ctx, const float *taps, int ntaps);
+int gpu_cuda_fir_lowpass(void *ctx, const float *in, float *out,
+                          size_t count, float gain);
 
 int gpu_cuda_fir_setup(void *ctx, const float *taps, int ntaps,
                         int num_stages, bool upsample);

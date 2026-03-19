@@ -733,10 +733,9 @@ int sdm_context_init(sdm_context_t *ctx, const ntf_filter_t *filter,
 }
 
 size_t sdm_process_block(sdm_context_t *ctx,
-                         const float *in, float *out, size_t count) {
+                         const double *in, float *out, size_t count) {
     float *outp = out;
     size_t len = count;
-    double x;
 
     /* Fill latency buffer first (no output produced) */
     if (ctx->pending < ctx->trellis_lat) {
@@ -746,15 +745,13 @@ size_t sdm_process_block(sdm_context_t *ctx,
         ctx->pending += (unsigned)pre;
         len -= pre;
         while (pre--) {
-            x = (double)*in++ * 0.5;
-            sdm_sample_trellis(ctx, x);
+            sdm_sample_trellis(ctx, *in++ * 0.5);
         }
     }
 
     /* Produce output samples */
     while (len--) {
-        x = (double)*in++ * 0.5;
-        *outp++ = (float)sdm_sample_trellis(ctx, x);
+        *outp++ = (float)sdm_sample_trellis(ctx, *in++ * 0.5);
     }
 
     return (size_t)(outp - out);

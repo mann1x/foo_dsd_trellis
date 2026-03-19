@@ -6,6 +6,7 @@
 #include "test.h"
 #include "../include/trellis.h"
 #include "../include/ntf.h"
+#include "../include/fir.h"
 #include <math.h>
 
 #ifndef M_PI
@@ -54,9 +55,9 @@ static void test_sdm_reset(void) {
     sdm_context_init(&ctx, f, 8, 16, 64);
 
     /* Process some samples to dirty the state */
-    float in[32], out[32];
+    double in[32]; float out[32];
     for (int i = 0; i < 32; i++)
-        in[i] = (float)sin(2.0 * M_PI * i / 32.0) * 0.5f;
+        in[i] = sin(2.0 * M_PI * i / 32.0) * 0.5;
     sdm_process_block(&ctx, in, out, 32);
 
     /* Reset and verify clean state */
@@ -79,9 +80,9 @@ static void test_sdm_output_binary(void) {
 
     const unsigned dsd_rate = 64 * 44100;
     const unsigned n = 256;
-    float in[256], out[256];
+    double in[256]; float out[256];
     for (unsigned i = 0; i < n; i++)
-        in[i] = (float)(0.5 * sin(2.0 * M_PI * 1000.0 * i / dsd_rate));
+        in[i] = 0.5 * sin(2.0 * M_PI * 1000.0 * i / dsd_rate);
 
     size_t produced = sdm_process_block(&ctx, in, out, n);
 
@@ -103,9 +104,9 @@ static void test_sdm_latency(void) {
     unsigned lat = 64;
     sdm_context_init(&ctx, f, 8, 16, lat);
 
-    float in[128], out[128];
+    double in[128]; float out[128];
     for (int i = 0; i < 128; i++)
-        in[i] = 0.5f;
+        in[i] = 0.5;
 
     size_t produced = sdm_process_block(&ctx, in, out, 128);
     TEST_ASSERT_EQ(produced, (size_t)(128 - lat),
@@ -120,9 +121,9 @@ static void test_sdm_drain_basic(void) {
     unsigned lat = 64;
     sdm_context_init(&ctx, f, 8, 16, lat);
 
-    float in[64], out[256];
+    double in[64]; float out[256];
     for (int i = 0; i < 64; i++)
-        in[i] = 0.0f;
+        in[i] = 0.0;
     size_t produced = sdm_process_block(&ctx, in, out, 64);
     TEST_ASSERT_EQ(produced, 0u, "no output during latency fill");
 
@@ -200,8 +201,8 @@ static double measure_sinad_1khz(unsigned dsd_rate_mult, int trellis_depth,
                          trellis_lat) != 0)
         return -999.0;
 
-    float *in  = (float *)malloc(n_dsd * sizeof(float));
-    float *out = (float *)malloc(n_dsd * sizeof(float));
+    double *in = (double *)malloc(n_dsd * sizeof(double));
+    float *out  = (float *)malloc(n_dsd * sizeof(float));
     if (!in || !out) {
         free(in); free(out);
         sdm_context_free(&ctx);
@@ -210,7 +211,7 @@ static double measure_sinad_1khz(unsigned dsd_rate_mult, int trellis_depth,
 
     /* Generate sine at bin-aligned frequency, amplitude 0.5 */
     for (unsigned i = 0; i < n_dsd; i++)
-        in[i] = (float)(0.5 * sin(2.0 * M_PI * freq * i / dsd_rate));
+        in[i] = 0.5 * sin(2.0 * M_PI * freq * i / dsd_rate);
 
     /* Process through SDM */
     size_t produced = sdm_process_block(&ctx, in, out, n_dsd);
@@ -255,9 +256,12 @@ static double measure_sinad_1khz(unsigned dsd_rate_mult, int trellis_depth,
 
     printf("    [SINAD] DSD%u: %zu samples, "
            "signal=%.2e noise=%.2e SINAD=%.1f dB "
-           "(conv_fail=%llu, %u bins)\n",
+           "(conv_fail=%llu collapse=%llu drops=%.1f%%, %u bins)\n",
            dsd_rate_mult, produced, signal_power, noise_power, sinad_db,
-           (unsigned long long)ctx.conv_fail, max_bin);
+           (unsigned long long)ctx.conv_fail,
+           (unsigned long long)ctx.cands_collapse,
+           ctx.total_children > 0 ? 100.0 * ctx.next_filter_drops / ctx.total_children : 0.0,
+           max_bin);
 
     (void)drained;
     free(in);
@@ -300,7 +304,7 @@ static void test_sdm_dc_stability(void) {
     sdm_context_t ctx;
     sdm_context_init(&ctx, f, 8, 16, 128);
 
-    float in[1024], out[1024];
+    double in[1024]; float out[1024];
     memset(in, 0, sizeof(in));
 
     size_t produced = sdm_process_block(&ctx, in, out, 1024);
@@ -332,11 +336,11 @@ static void test_sdm_conv_fail_low(void) {
     sdm_context_init(&ctx, f, 8, 16, 256);
 
     unsigned n = 4096;
-    float *in  = (float *)malloc(n * sizeof(float));
+    double *in = (double *)malloc(n * sizeof(double));
     float *out = (float *)malloc(n * sizeof(float));
 
     for (unsigned i = 0; i < n; i++)
-        in[i] = (float)(0.3 * sin(2.0 * M_PI * 1000.0 * i / (64 * 44100)));
+        in[i] = 0.3 * sin(2.0 * M_PI * 1000.0 * i / (64 * 44100));
 
     sdm_process_block(&ctx, in, out, n);
 
@@ -368,6 +372,127 @@ void test_trellis_suite(void) {
     TEST_RUN(test_sdm_sinad_dsd512);
 }
 
+/* ─── Pipeline SINAD: simulate actual engine path ─── */
+
+static double measure_pipeline_sinad(unsigned rate_mult, int nc, int lat,
+                                      int use_fir_lowpass) {
+    const unsigned dsd_rate = rate_mult * 44100;
+    /* Use same sample counts as the SINAD tests for fast Goertzel */
+    const unsigned n_dsd = (rate_mult <= 64)  ? 262144u :
+                           (rate_mult <= 128) ? 524288u :
+                           (rate_mult <= 256) ? 1048576u : 2097152u;
+
+    const ntf_filter_t *f = ntf_auto_select(dsd_rate);
+    if (tls_ntf_override) f = tls_ntf_override;
+    if (!f) return -999.0;
+
+    sdm_context_t ctx;
+    if (sdm_context_init(&ctx, f, 8, nc, lat) != 0)
+        return -999.0;
+
+    /* Generate 1kHz DSD signal: encode sine through a reference SDM first */
+    double freq = 1000.0;
+    float *dsd_in = (float *)malloc(n_dsd * sizeof(float));
+    double *smooth = (double *)malloc(n_dsd * sizeof(double));
+    float *out = (float *)malloc(n_dsd * sizeof(float));
+    if (!dsd_in || !smooth || !out) {
+        free(dsd_in); free(smooth); free(out);
+        sdm_context_free(&ctx); return -999.0;
+    }
+
+    /* Create DSD input: ±1.0 from sine (hard quantize) */
+    for (unsigned i = 0; i < n_dsd; i++) {
+        double s = 0.5 * sin(2.0 * M_PI * freq * i / dsd_rate);
+        dsd_in[i] = (s >= 0.0) ? 1.0f : -1.0f;
+    }
+
+    /* Simulate pipeline: boxcar or FIR lowpass → gain → SDM */
+    if (use_fir_lowpass) {
+        /* FIR lowpass path (IPP float, widen to double) */
+        fir_lowpass_t lp;
+        fir_lowpass_init(&lp, dsd_rate);
+        float *lp_in = (float *)malloc(n_dsd * sizeof(float));
+        float *lp_out_f = (float *)malloc(n_dsd * sizeof(float));
+        for (unsigned i = 0; i < n_dsd; i++)
+            lp_in[i] = dsd_in[i];
+        fir_lowpass_process(&lp, lp_in, lp_out_f, n_dsd);
+        double gain = 0.708;
+        for (unsigned i = 0; i < n_dsd; i++)
+            smooth[i] = (double)lp_out_f[i] * gain;
+        free(lp_in); free(lp_out_f);
+        fir_lowpass_free(&lp);
+    } else {
+        /* Boxcar path */
+        int taps = (dsd_rate >= DSD_RATE_512) ? 128 :
+                   (dsd_rate >= DSD_RATE_128) ? 64 : 32;
+        double sum = 0.0;
+        double ring[128] = {0};
+        int pos = 0;
+        double inv_n = 1.0 / (double)taps;
+        double gain = 0.708;
+        for (unsigned i = 0; i < n_dsd; i++) {
+            double s = dsd_in[i] >= 0.0f ? 1.0 : -1.0;
+            sum -= ring[pos];
+            ring[pos] = s;
+            sum += s;
+            pos = (pos + 1) % taps;
+            smooth[i] = sum * inv_n * gain;
+        }
+    }
+
+    /* Process through SDM */
+    size_t produced = sdm_process_block(&ctx, smooth, out, n_dsd);
+
+    /* Measure SINAD */
+    if (produced < 1024) {
+        free(dsd_in); free(smooth); free(out);
+        sdm_context_free(&ctx); return -999.0;
+    }
+    double actual_bw = (double)dsd_rate / (double)produced;
+    unsigned sig_bin = (unsigned)(freq / actual_bw + 0.5);
+    double signal_power = goertzel_power(out, produced, freq, (double)dsd_rate);
+    unsigned max_bin = (unsigned)(22050.0 / actual_bw);
+    double noise = 0.0;
+    for (unsigned b = 1; b <= max_bin; b++) {
+        if (b >= sig_bin - 1 && b <= sig_bin + 1) continue;
+        noise += goertzel_power(out, produced, b * actual_bw, (double)dsd_rate);
+    }
+    if (noise <= 0.0) noise = 1e-30;
+    double sinad = 10.0 * log10(signal_power / noise);
+
+    printf("  DSD%u %s nc=%d lat=%d: SINAD=%.1f dB "
+           "(conv_fail=%llu collapse=%llu drops=%.1f%%)\n",
+           rate_mult, use_fir_lowpass ? "FIR" : "BOX", nc, lat, sinad,
+           (unsigned long long)ctx.conv_fail,
+           (unsigned long long)ctx.cands_collapse,
+           ctx.total_children > 0 ? 100.0 * ctx.next_filter_drops / ctx.total_children : 0.0);
+
+    free(dsd_in); free(smooth); free(out);
+    sdm_context_free(&ctx);
+    return sinad;
+}
+
+void test_pipeline_sinad(void) {
+    printf("\n=== Pipeline SINAD (boxcar/FIR → gain → SDM, 2s signal) ===\n");
+
+    /* DSD64 — baseline */
+    measure_pipeline_sinad(64, 2, 32, 0);   /* boxcar */
+    measure_pipeline_sinad(64, 2, 32, 1);   /* FIR */
+    /* DSD128 — compare */
+    measure_pipeline_sinad(128, 2, 128, 0);  /* boxcar */
+    measure_pipeline_sinad(128, 2, 128, 1);  /* FIR */
+    /* DSD128 with DSD64's NTF for isolation */
+    tls_ntf_override = ntf_get_filter(NTF_CLANS_6, DSD_RATE_128);
+    measure_pipeline_sinad(128, 2, 128, 0);
+    measure_pipeline_sinad(128, 2, 128, 1);
+    tls_ntf_override = NULL;
+    /* DSD128 at lat=32 (DSD64's latency) */
+    measure_pipeline_sinad(128, 2, 32, 0);
+    measure_pipeline_sinad(128, 2, 32, 1);
+
+    g_tests_run++; g_tests_passed++;
+}
+
 /* NTF sweep at optimal nc/lat for specific rates */
 void test_lat_sweep(void) {
     /* NTF IDs: 0=CLANS4, 1=SDM4, 2=CLANS5, 3=SDM5, 4=CLANS6, 5=SDM6,
@@ -377,17 +502,20 @@ void test_lat_sweep(void) {
         "SDM6", "CLANS7", "SDM7", "CLANS8", "SDM8"
     };
 
-    /* Sweep NTFs at the optimal nc/lat for DSD128 and DSD512 */
+    /* Sweep NTFs across rates, nc, and lat.
+     * Includes stability-relevant configs (nc=2 vs nc=4, various lat). */
     struct { int rate; int nc; int lat; } configs[] = {
-        {128, 4, 32},
-        {128, 2, 32},
-        {128, 4, 64},
-        {128, 4, 128},
-        {512, 2, 128},
-        {512, 4, 128},
-        {512, 2, 64},
+        /* DSD64 */
+        {64, 2, 32},  {64, 4, 32},  {64, 2, 128}, {64, 4, 128},
+        /* DSD128 */
+        {128, 2, 32}, {128, 4, 32}, {128, 2, 64}, {128, 4, 64},
+        {128, 2, 128},{128, 4, 128},
+        /* DSD256 */
+        {256, 2, 32}, {256, 2, 128},
+        /* DSD512 */
+        {512, 2, 16}, {512, 2, 32}, {512, 2, 128},
     };
-    int n_configs = 7;
+    int n_configs = sizeof(configs) / sizeof(configs[0]);
 
     for (int ci = 0; ci < n_configs; ci++) {
         int rate = configs[ci].rate;

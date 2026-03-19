@@ -147,4 +147,36 @@ __global__ void gain_apply_batch(float *buf, int total_count, float gain) {
         buf[i] *= gain;
 }
 
+/* ─── FIR Lowpass (same-rate pre-SDM filter) ───
+ * Direct-form FIR with separate taps from rate conversion.
+ * Input is ±1.0 DSD, output is multi-bit smoothed signal.
+ * `hist` contains the last lp_ntaps-1 samples from previous chunk
+ * for continuity (NULL on first chunk — uses 0.0). */
+__constant__ float c_lp_taps[128];
+__constant__ int   c_lp_ntaps;
+
+__global__ void fir_lowpass(const float *in, float *out,
+                             int count, float gain,
+                             const float *hist) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+
+    float acc = 0.0f;
+    int ntaps = c_lp_ntaps;
+    for (int k = 0; k < ntaps; k++) {
+        int si = i - k;
+        float v;
+        if (si >= 0)
+            v = __ldg(&in[si]);
+        else if (hist)
+            v = hist[ntaps - 1 + si];  /* hist[ntaps-2] = in[-1], hist[0] = in[-(ntaps-1)] */
+        else
+            v = 0.0f;
+        /* Quantize to ±1.0 (DSD hard decision) */
+        v = (v >= 0.0f) ? 1.0f : -1.0f;
+        acc += c_lp_taps[k] * v;
+    }
+    out[i] = acc * gain;
+}
+
 } /* extern "C" */

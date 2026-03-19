@@ -66,6 +66,7 @@ typedef struct {
     void   *spec;       /* IppsFIRSpec_32f* */
     void   *buf;        /* Ipp8u* work buffer */
     float  *dly;        /* Delay line */
+    float  *coeffs;     /* Tap coefficients (kept for GPU upload) */
     int     taps;       /* Filter length */
     bool    initialized;
 } fir_lowpass_t;

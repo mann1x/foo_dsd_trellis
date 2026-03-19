@@ -61,10 +61,10 @@ static double trellis_sinad(unsigned dsd_rate, const ntf_filter_t *f,
     if (sdm_context_init(&ctx, f, depth, cands, lat) != 0)
         return -999.0;
 
-    float *in = (float *)malloc(n_dsd * sizeof(float));
+    double *in = (double *)malloc(n_dsd * sizeof(double));
     float *out = (float *)malloc(n_dsd * sizeof(float));
     for (unsigned j = 0; j < n_dsd; j++)
-        in[j] = (float)(0.5 * sin(2.0 * M_PI * freq * j / dsd_rate));
+        in[j] = 0.5 * sin(2.0 * M_PI * freq * j / dsd_rate);
 
     size_t produced = sdm_process_block(&ctx, in, out, n_dsd);
     double sinad = calc_sinad(out, produced, freq, (double)dsd_rate);
@@ -157,10 +157,10 @@ static void test_diag_precorr_dsd128_warmup(void) {
     unsigned bin = (unsigned)(1000.0 / bw + 0.5);
     double freq = bin * bw;
 
-    float *in = (float *)malloc(total_n * sizeof(float));
+    double *in = (double *)malloc(total_n * sizeof(double));
     float *out = (float *)malloc(total_n * sizeof(float));
     for (size_t i = 0; i < total_n; i++)
-        in[i] = (float)(0.5 * sin(2.0 * M_PI * freq * i / dsd_rate));
+        in[i] = 0.5 * sin(2.0 * M_PI * freq * i / dsd_rate);
 
     precorr_context_t ctx;
     precorr_context_init(&ctx, f);
@@ -203,10 +203,10 @@ static void test_diag_precorr_all_rates_warmup(void) {
         unsigned bin = (unsigned)(1000.0 / bw + 0.5);
         double freq = bin * bw;
 
-        float *in = (float *)malloc(total_n * sizeof(float));
+        double *in = (double *)malloc(total_n * sizeof(double));
         float *out = (float *)malloc(total_n * sizeof(float));
         for (size_t i = 0; i < total_n; i++)
-            in[i] = (float)(0.5 * sin(2.0 * M_PI * freq * i / rates[r]));
+            in[i] = 0.5 * sin(2.0 * M_PI * freq * i / rates[r]);
 
         precorr_context_t ctx;
         precorr_context_init(&ctx, f);
@@ -251,10 +251,10 @@ static void test_diag_precorr_dsd128_ntf_sweep(void) {
         unsigned bin = (unsigned)(1000.0 / bw + 0.5);
         double freq = bin * bw;
 
-        float *in = (float *)malloc(n * sizeof(float));
+        double *in = (double *)malloc(n * sizeof(double));
         float *out = (float *)malloc(n * sizeof(float));
         for (size_t j = 0; j < n; j++)
-            in[j] = (float)(0.5 * sin(2.0 * M_PI * freq * j / dsd_rate));
+            in[j] = 0.5 * sin(2.0 * M_PI * freq * j / dsd_rate);
 
         precorr_process_block(&ctx, in, out, n);
         double s = calc_sinad(out, n, freq, (double)dsd_rate);

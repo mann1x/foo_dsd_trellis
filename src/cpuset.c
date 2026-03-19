@@ -526,10 +526,10 @@ static double benchmark_one_core(void) {
         return 1.0;
 
     /* Generate 2048 test samples (alternating ±0.5) */
-    float in_buf[2048];
+    double in_buf[2048];
     float out_buf[2048];
     for (int i = 0; i < 2048; i++)
-        in_buf[i] = (i & 1) ? 0.5f : -0.5f;
+        in_buf[i] = (i & 1) ? 0.5 : -0.5;
 
     LARGE_INTEGER t0, t1, freq;
     QueryPerformanceFrequency(&freq);

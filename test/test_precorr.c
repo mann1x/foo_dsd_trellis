@@ -35,10 +35,10 @@ static void test_precorr_output_binary(void) {
     precorr_context_init(&ctx, f);
 
     /* Feed a mix of signals */
-    float in[1024];
+    double in[1024];
     float out[1024];
     for (int i = 0; i < 1024; i++)
-        in[i] = 0.3f * sinf((float)(2.0 * M_PI * 1000.0 * i / (5644800.0)));
+        in[i] = 0.3 * sin(2.0 * M_PI * 1000.0 * i / 5644800.0);
 
     size_t n = precorr_process_block(&ctx, in, out, 1024);
     TEST_ASSERT_EQ(n, 1024u, "output count should equal input count");
@@ -61,7 +61,7 @@ static void test_precorr_no_latency(void) {
     precorr_context_init(&ctx, f);
 
     /* Various block sizes */
-    float in[512], out[512];
+    double in[512]; float out[512];
     memset(in, 0, sizeof(in));
 
     size_t sizes[] = {1, 7, 32, 128, 512};
@@ -83,9 +83,9 @@ static void test_precorr_reset(void) {
     precorr_context_init(&ctx, f);
 
     /* Process some data to dirty state */
-    float in[256], out[256];
+    double in[256]; float out[256];
     for (int i = 0; i < 256; i++)
-        in[i] = 0.1f * sinf((float)(2.0 * M_PI * 440.0 * i / 2822400.0));
+        in[i] = 0.1 * sin(2.0 * M_PI * 440.0 * i / 2822400.0);
     precorr_process_block(&ctx, in, out, 256);
 
     /* Save prediction table before reset */
@@ -121,7 +121,7 @@ static void test_precorr_dc_stability(void) {
     precorr_context_init(&ctx, f);
 
     /* DC=0 input should produce roughly balanced +1/-1 output */
-    float in[4096], out[4096];
+    double in[4096]; float out[4096];
     memset(in, 0, sizeof(in));
 
     precorr_process_block(&ctx, in, out, 4096);
@@ -215,12 +215,12 @@ static void test_precorr_sinad(void) {
         double freq = bin * bw;
         double amp = 0.5;
 
-        float *in  = (float *)malloc(n * sizeof(float));
+        double *in = (double *)malloc(n * sizeof(double));
         float *out = (float *)malloc(n * sizeof(float));
         if (!in || !out) { free(in); free(out); continue; }
 
         for (size_t i = 0; i < n; i++)
-            in[i] = (float)(amp * sin(2.0 * M_PI * freq * i / rates[r]));
+            in[i] = amp * sin(2.0 * M_PI * freq * i / rates[r]);
 
         precorr_process_block(&ctx, in, out, n);
 
@@ -247,7 +247,7 @@ static void test_precorr_all_rates(void) {
         int ret = precorr_context_init(&ctx, f);
         TEST_ASSERT_EQ(ret, 0, "init should succeed for all DSD rates");
 
-        float in[64], out[64];
+        double in[64]; float out[64];
         memset(in, 0, sizeof(in));
         size_t n = precorr_process_block(&ctx, in, out, 64);
         TEST_ASSERT_EQ(n, 64u, "should process 64 samples at each rate");

@@ -61,6 +61,7 @@ typedef struct plugin_state {
     float            **ch_in;        /* [ch][dsd_samples] unpacked DSD input */
     float            **ch_out;       /* [ch][dsd_samples] processed DSD output */
     size_t             ch_buf_size;  /* Current allocation per channel (floats) */
+    int                dop_marker_phase; /* DoP marker A/B phase for chunk continuity */
 
     /* CPU topology (detected once, reused) */
     cpu_topology_t     topology;
@@ -94,12 +95,12 @@ typedef struct plugin_state {
     int                cached_temp_sdm_count;
     channel_block_t   *cached_blocks;
     int                cached_block_count;
-    float             *cached_pcm_temp;
-    size_t             cached_pcm_temp_sz;
+    uint8_t           *cached_pcm_temp;     /* i24 per-channel pack buffer */
+    size_t             cached_pcm_temp_sz;  /* frames capacity */
 
     /* Cached per-channel pack temp buffers (avoid per-chunk malloc/free) */
-    float            **cached_pack_temps;
-    size_t             cached_pack_temps_sz;  /* floats per channel */
+    uint8_t          **cached_pack_temps;
+    size_t             cached_pack_temps_sz;  /* frames per channel */
     int                cached_pack_temps_n;   /* number of channels */
 
     /* GPU compute context (shared across all channels, NULL if disabled) */
@@ -108,8 +109,8 @@ typedef struct plugin_state {
     /* Previous chunk FIR tail for parallel SDM segment 0 warmup.
      * Fixes chunk-boundary state discontinuity: after first chunk,
      * segment 0 also uses a temp SDM with warmup from this tail. */
-    float            **fir_tail;        /* [ch][overlap] last FIR samples */
-    float            **seg0_buf;        /* [ch][overlap + seg0_size] contiguous buffer */
+    double           **fir_tail;        /* [ch][overlap] last FIR samples (fp64) */
+    double           **seg0_buf;        /* [ch][overlap + seg0_size] contiguous buffer (fp64) */
     size_t             seg0_buf_sz;     /* allocated size per channel */
     size_t             fir_tail_len;    /* = overlap */
     bool               fir_tail_valid;  /* false until first chunk completes */
@@ -241,6 +242,9 @@ plugin_state_t *plugin_create(void) {
 void plugin_destroy(plugin_state_t *s) {
     if (!s)
         return;
+
+    /* Allow system to idle/sleep again */
+    SetThreadExecutionState(ES_CONTINUOUS);
 
     if (s->pool) {
         threadpool_destroy(s->pool);
@@ -469,6 +473,14 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
             gpu_fir_setup(s->gpu, g_hb_taps, g_hb_ntaps,
                           num_stages, is_upsample);
         }
+        /* Upload FIR lowpass coefficients for same-rate path */
+        if (s->channels[0].lowpass.initialized && s->channels[0].lowpass.coeffs) {
+            int lp_rc = gpu_fir_lowpass_setup(s->gpu, s->channels[0].lowpass.coeffs,
+                                               s->channels[0].lowpass.taps);
+            trellis_log_c(lp_rc == 0 ? "GPU FIR lowpass setup OK" : "GPU FIR lowpass setup FAILED");
+        } else {
+            trellis_log_c("GPU FIR lowpass: not initialized (lowpass not active for this rate)");
+        }
         /* Setup persistent SDM buffers on GPU */
         if (s->config.sdm_mode == SDM_MODE_TRELLIS &&
             s->channels[0].sdm.filter) {
@@ -516,7 +528,6 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         /* Assign GPU context to all engine channels */
         for (int ch = 0; ch < s->num_channels; ch++) {
             s->channels[ch].gpu = s->gpu;
-            s->channels[ch].gpu_sdm = s->config.gpu_sdm_enabled;
         }
     }
 
@@ -542,6 +553,13 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     s->initialized = true;
     s->fir_tail_valid = false;  /* new engine — no previous FIR tail */
     s->needs_warmup = true;    /* prime SDM with real audio on first chunk */
+
+    /* Prevent system idle/sleep during playback — discourages core parking.
+     * Windows parks cores when the system appears idle. MMCSS "Pro Audio"
+     * helps but doesn't fully prevent parking. ES_SYSTEM_REQUIRED keeps
+     * the system in an active power state. */
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+
     return 0;
 }
 
@@ -631,7 +649,7 @@ bool plugin_get_cpuset_change(const plugin_state_t *s, uint64_t *mask) {
  *          If return is 0, caller should pass chunk unmodified.
  */
 size_t plugin_process(plugin_state_t *s,
-                      const float *in_pcm, float *out_pcm,
+                      const float *in_pcm, uint8_t *out_i24,
                       size_t pcm_frames, int num_channels,
                       uint32_t pcm_rate) {
     if (!s)
@@ -857,17 +875,64 @@ size_t plugin_process(plugin_state_t *s,
     if (segments_per_ch > 1) {
         /* === Parallel SDM path: FIR+gain sequential, SDM parallel === */
 
+        /* Reset GPU per-chunk state (channel counters for boxcar/lowpass history) */
+        if (s->gpu)
+            gpu_reset_chunk(s->gpu);
+
         /* Phase 1: FIR + gain per channel (parallel via threadpool) */
         LARGE_INTEGER t_fir_start, t_fir_end;
         QueryPerformanceCounter(&t_fir_start);
 
-        float *fir_data[32];  /* max 32 channels */
+        double *fir_data[32];  /* max 32 channels (fp64 pipeline) */
         size_t fir_counts[32];
 
         /* GPU FIR: single batched dispatch for all channels when available.
          * Falls back to threadpool FIR on GPU failure or small buffers. */
         bool gpu_fir_ok = false;
+
+        /* GPU FIR lowpass for same-rate path (no rate conversion stages).
+         * Runs on main thread (GPU not thread-safe). */
         if (s->gpu && dsd_in_count >= GPU_MIN_SAMPLES &&
+            s->channels[0].fir.num_stages == 0 &&
+            s->channels[0].lowpass.initialized) {
+            float combined = s->channels[0].fir_gain * s->config.gain;
+            /* GPU outputs float — use TLS buffer, widen to double fir_buf */
+            static float *s_gpu_lp_tmp = NULL;
+            static size_t s_gpu_lp_sz = 0;
+            if (s_gpu_lp_sz < dsd_in_count) {
+                free(s_gpu_lp_tmp);
+                s_gpu_lp_tmp = (float *)malloc(dsd_in_count * sizeof(float));
+                s_gpu_lp_sz = s_gpu_lp_tmp ? dsd_in_count : 0;
+            }
+            gpu_fir_ok = (s_gpu_lp_tmp != NULL);
+            for (int ch = 0; ch < num_channels && gpu_fir_ok; ch++) {
+                /* Ensure double fir_buf */
+                if (s->channels[ch].fir_buf_sz < dsd_in_count * sizeof(double)) {
+                    free(s->channels[ch].fir_buf);
+                    s->channels[ch].fir_buf = (double *)malloc(dsd_in_count * sizeof(double));
+                    s->channels[ch].fir_buf_sz = s->channels[ch].fir_buf ? dsd_in_count * sizeof(double) : 0;
+                }
+                if (!s->channels[ch].fir_buf) { gpu_fir_ok = false; break; }
+                if (gpu_fir_lowpass(s->gpu, s->ch_in[ch], s_gpu_lp_tmp,
+                                     dsd_in_count, combined) != 0) {
+                    gpu_fir_ok = false; break;
+                }
+                /* Widen float GPU output to double */
+                for (size_t i = 0; i < dsd_in_count; i++)
+                    s->channels[ch].fir_buf[i] = (double)s_gpu_lp_tmp[i];
+                fir_counts[ch] = dsd_in_count;
+                fir_data[ch] = s->channels[ch].fir_buf;
+            }
+            if (gpu_fir_ok) {
+                static int lp_log_count = 0;
+                if (lp_log_count++ < 3)
+                    trellis_log_c("GPU FIR lowpass: dispatched on main thread");
+            }
+        }
+
+        /* GPU rate conversion FIR disabled — fir_buf is double, GPU outputs float.
+         * Falls back to CPU threadpool which widens float→double properly. */
+        if (0 && !gpu_fir_ok && s->gpu && dsd_in_count >= GPU_MIN_SAMPLES &&
             s->channels[0].fir.num_stages > 0) {
             /* Estimate output count for buffer sizing */
             size_t est_out = dsd_in_count;
@@ -910,13 +975,18 @@ size_t plugin_process(plugin_state_t *s,
         }
 
         if (!gpu_fir_ok) {
-            /* Threadpool FIR fallback */
+            /* Threadpool FIR fallback (CPU) */
+            {
+                static int cpu_fir_log = 0;
+                if (cpu_fir_log++ < 3)
+                    trellis_log_c("FIR: CPU threadpool fallback");
+            }
             channel_block_t fir_blocks[32];
             memset(fir_blocks, 0, (size_t)num_channels * sizeof(channel_block_t));
             for (int ch = 0; ch < num_channels; ch++) {
                 fir_blocks[ch].mode    = BLOCK_MODE_FIR;
                 fir_blocks[ch].eng     = &s->channels[ch];
-                fir_blocks[ch].in      = s->ch_in[ch];
+                fir_blocks[ch].in_f32  = s->ch_in[ch];
                 fir_blocks[ch].count   = dsd_in_count;
                 fir_blocks[ch].cfg     = &s->config;
                 fir_blocks[ch].channel = ch;
@@ -999,8 +1069,8 @@ size_t plugin_process(plugin_state_t *s,
 
         /* Allocate FIR tail and seg0 buffers if needed */
         if (!s->fir_tail && num_channels > 0) {
-            s->fir_tail = (float **)calloc((size_t)num_channels, sizeof(float *));
-            s->seg0_buf = (float **)calloc((size_t)num_channels, sizeof(float *));
+            s->fir_tail = (double **)calloc((size_t)num_channels, sizeof(double *));
+            s->seg0_buf = (double **)calloc((size_t)num_channels, sizeof(double *));
         }
 
         for (int ch = 0; ch < num_channels; ch++) {
@@ -1020,14 +1090,14 @@ size_t plugin_process(plugin_state_t *s,
                 if (s->seg0_buf_sz < seg0_total) {
                     for (int c = 0; c < num_channels; c++) {
                         free(s->seg0_buf[c]);
-                        s->seg0_buf[c] = (float *)malloc(seg0_total * sizeof(float));
+                        s->seg0_buf[c] = (double *)malloc(seg0_total * sizeof(double));
                     }
                     s->seg0_buf_sz = seg0_total;
                 }
 
                 /* Build contiguous buffer: prev_fir_tail + seg0_data */
-                memcpy(s->seg0_buf[ch], s->fir_tail[ch], overlap * sizeof(float));
-                memcpy(s->seg0_buf[ch] + overlap, fir_data[ch], seg0_size * sizeof(float));
+                memcpy(s->seg0_buf[ch], s->fir_tail[ch], overlap * sizeof(double));
+                memcpy(s->seg0_buf[ch] + overlap, fir_data[ch], seg0_size * sizeof(double));
 
                 int temp_idx = ch * temps_per_ch + 0;
                 blocks[bi].mode     = BLOCK_MODE_SDM;
@@ -1092,37 +1162,10 @@ size_t plugin_process(plugin_state_t *s,
         LARGE_INTEGER t_sdm_start, t_sdm_end;
         QueryPerformanceCounter(&t_sdm_start);
 
-        /* GPU SDM: process each channel's full FIR output on GPU instead
-         * of splitting into segments for the CPU threadpool.
-         * The GPU SBVD handles parallelism internally via SM segments.
-         * Only use GPU when estimated time < real-time budget.
-         * At DSD256+ rates, per-segment work exceeds GPU capacity. */
-        bool gpu_sdm_done = false;
-        if (s->gpu && s->config.gpu_sdm_enabled &&
-            s->config.sdm_mode == SDM_MODE_TRELLIS &&
-            s->channels[0].sdm.trellis_num >= 2) {
-            gpu_sdm_done = true;
-            for (int ch = 0; ch < num_channels; ch++) {
-                size_t fc = fir_counts[ch];
-                if (fc < GPU_MIN_SAMPLES) { gpu_sdm_done = false; break; }
-                int rc = gpu_trellis_process(s->gpu, fir_data[ch],
-                    s->ch_out[ch], fc, NULL, NULL,
-                    (int)s->channels[ch].sdm.trellis_num,
-                    s->channels[ch].sdm.filter->order,
-                    s->channels[ch].sdm.filter->a,
-                    s->channels[ch].sdm.filter->g);
-                if (rc != 0) { gpu_sdm_done = false; break; }
-                /* Set output count for channel accounting below */
-                blocks[ch * segments_per_ch].out_count = fc;
-                for (int seg = 1; seg < segments_per_ch; seg++)
-                    blocks[ch * segments_per_ch + seg].out_count = 0;
-            }
-        }
-        if (!gpu_sdm_done) {
-            for (int i = 0; i < total_blocks; i++)
-                threadpool_submit(s->pool, &blocks[i]);
-            threadpool_wait(s->pool);
-        }
+        /* SDM: CPU threadpool (GPU SDM disabled — quality issues with stitching) */
+        for (int i = 0; i < total_blocks; i++)
+            threadpool_submit(s->pool, &blocks[i]);
+        threadpool_wait(s->pool);
 
         QueryPerformanceCounter(&t_sdm_end);
         s->time_sdm_ms = perf_ms(t_sdm_start, t_sdm_end);
@@ -1150,11 +1193,11 @@ size_t plugin_process(plugin_state_t *s,
                 size_t fir_count = fir_counts[ch];
                 if (fir_count >= overlap) {
                     if (!s->fir_tail[ch])
-                        s->fir_tail[ch] = (float *)malloc(overlap * sizeof(float));
+                        s->fir_tail[ch] = (double *)malloc(overlap * sizeof(double));
                     if (s->fir_tail[ch])
                         memcpy(s->fir_tail[ch],
                                fir_data[ch] + fir_count - overlap,
-                               overlap * sizeof(float));
+                               overlap * sizeof(double));
                 }
             }
             s->fir_tail_len = overlap;
@@ -1209,10 +1252,12 @@ size_t plugin_process(plugin_state_t *s,
     bool fir_only = (s->channels && s->channels[0].fir_only);
 
     if (fir_only) {
-        /* DSD→PCM: output is already multi-bit PCM, just interleave */
+        /* DSD→PCM: output is already multi-bit PCM, interleave as float.
+         * Reinterpret out_i24 as float* — caller provides float-sized buffer. */
+        float *out_f = (float *)out_i24;
         for (int ch = 0; ch < num_channels; ch++) {
             for (size_t f = 0; f < dsd_out_count; f++)
-                out_pcm[f * (size_t)num_channels + (size_t)ch] = s->ch_out[ch][f];
+                out_f[f * (size_t)num_channels + (size_t)ch] = s->ch_out[ch][f];
         }
         QueryPerformanceCounter(&t_pack_end);
         s->time_pack_ms = perf_ms(t_pack_start, t_pack_end);
@@ -1238,10 +1283,10 @@ size_t plugin_process(plugin_state_t *s,
                     free(s->cached_pack_temps[j]);
                 free(s->cached_pack_temps);
             }
-            s->cached_pack_temps = (float **)calloc((size_t)num_channels, sizeof(float *));
+            s->cached_pack_temps = (uint8_t **)calloc((size_t)num_channels, sizeof(uint8_t *));
             if (s->cached_pack_temps) {
                 for (int ch = 0; ch < num_channels; ch++)
-                    s->cached_pack_temps[ch] = (float *)malloc(out_pcm_frames * sizeof(float));
+                    s->cached_pack_temps[ch] = (uint8_t *)malloc(out_pcm_frames * 3);
                 s->cached_pack_temps_sz = out_pcm_frames;
                 s->cached_pack_temps_n = num_channels;
             }
@@ -1255,26 +1300,35 @@ size_t plugin_process(plugin_state_t *s,
             pack_blocks[ch].channel = ch;
             pack_blocks[ch].cfg = &s->config;
             pack_blocks[ch].dsd_channel = s->ch_out[ch];
-            pack_blocks[ch].pcm_interleaved = out_pcm;
-            pack_blocks[ch].pcm_temp = s->cached_pack_temps[ch];
+            pack_blocks[ch].pcm_interleaved = (float *)out_i24; /* reinterpret for i24 */
+            pack_blocks[ch].pcm_temp = (float *)s->cached_pack_temps[ch];
             pack_blocks[ch].count = dsd_out_count;
             pack_blocks[ch].num_channels = num_channels;
+            pack_blocks[ch].discard = (size_t)s->dop_marker_phase; /* pass marker phase */
             threadpool_submit(io_pack, &pack_blocks[ch]);
         }
         threadpool_wait(io_pack);
+        /* Update marker phase from channel 0's result */
+        s->dop_marker_phase = (int)((out_pcm_frames + s->dop_marker_phase) & 1);
     } else {
-        /* Fallback: sequential pack */
+        /* Fallback: sequential pack to i24 */
         if (s->cached_pcm_temp_sz < out_pcm_frames) {
             free(s->cached_pcm_temp);
-            s->cached_pcm_temp = (float *)malloc(out_pcm_frames * sizeof(float));
+            s->cached_pcm_temp = (uint8_t *)malloc(out_pcm_frames * 3);
             s->cached_pcm_temp_sz = s->cached_pcm_temp ? out_pcm_frames : 0;
         }
-        float *pcm_temp2 = s->cached_pcm_temp;
-        if (!pcm_temp2) return 0;
+        uint8_t *i24_temp = s->cached_pcm_temp;
+        if (!i24_temp) return 0;
         for (int ch = 0; ch < num_channels; ch++) {
-            dop_pack(s->ch_out[ch], pcm_temp2, dsd_out_count);
-            for (size_t f = 0; f < out_pcm_frames; f++)
-                out_pcm[f * (size_t)num_channels + (size_t)ch] = pcm_temp2[f];
+            int next_phase = dop_pack_i24(s->ch_out[ch], i24_temp, dsd_out_count, s->dop_marker_phase);
+            if (ch == 0) s->dop_marker_phase = next_phase;
+            for (size_t f = 0; f < out_pcm_frames; f++) {
+                size_t dst = (f * (size_t)num_channels + (size_t)ch) * 3;
+                size_t src = f * 3;
+                out_i24[dst]     = i24_temp[src];
+                out_i24[dst + 1] = i24_temp[src + 1];
+                out_i24[dst + 2] = i24_temp[src + 2];
+            }
         }
     }
 
@@ -1296,7 +1350,7 @@ size_t plugin_process(plugin_state_t *s,
  * Returns: number of output PCM frames per channel (DoP), or 0 on error.
  */
 size_t plugin_process_pcm(plugin_state_t *s,
-                           const float *in_pcm, float *out_pcm,
+                           const float *in_pcm, uint8_t *out_i24,
                            size_t pcm_frames, int num_channels,
                            uint32_t pcm_rate) {
     if (!s)
@@ -1391,17 +1445,23 @@ size_t plugin_process_pcm(plugin_state_t *s,
 
     if (s->cached_pcm_temp_sz < out_pcm_frames) {
         free(s->cached_pcm_temp);
-        s->cached_pcm_temp = (float *)malloc(out_pcm_frames * sizeof(float));
+        s->cached_pcm_temp = (uint8_t *)malloc(out_pcm_frames * 3);
         s->cached_pcm_temp_sz = s->cached_pcm_temp ? out_pcm_frames : 0;
     }
-    float *pcm_temp = s->cached_pcm_temp;
-    if (!pcm_temp)
+    uint8_t *i24_temp = s->cached_pcm_temp;
+    if (!i24_temp)
         return 0;
 
     for (int ch = 0; ch < num_channels; ch++) {
-        dop_pack(s->ch_out[ch], pcm_temp, sdm_out_count);
-        for (size_t f = 0; f < out_pcm_frames; f++)
-            out_pcm[f * (size_t)num_channels + (size_t)ch] = pcm_temp[f];
+        int next_phase = dop_pack_i24(s->ch_out[ch], i24_temp, sdm_out_count, s->dop_marker_phase);
+        if (ch == 0) s->dop_marker_phase = next_phase;
+        for (size_t f = 0; f < out_pcm_frames; f++) {
+            size_t dst = (f * (size_t)num_channels + (size_t)ch) * 3;
+            size_t src = f * 3;
+            out_i24[dst]     = i24_temp[src];
+            out_i24[dst + 1] = i24_temp[src + 1];
+            out_i24[dst + 2] = i24_temp[src + 2];
+        }
     }
 
     QueryPerformanceCounter(&t_pack_end);
@@ -1414,7 +1474,7 @@ size_t plugin_process_pcm(plugin_state_t *s,
  * Drain remaining SDM latency at end of playback.
  * Returns number of output PCM frames per channel.
  */
-size_t plugin_drain(plugin_state_t *s, float *out_pcm, int num_channels) {
+size_t plugin_drain(plugin_state_t *s, uint8_t *out_i24, int num_channels) {
     if (!s || !s->initialized || !s->channels)
         return 0;
 
@@ -1430,8 +1490,8 @@ size_t plugin_drain(plugin_state_t *s, float *out_pcm, int num_channels) {
 
     size_t min_drained = max_drain;
 
-    float *pcm_temp = (float *)malloc((max_drain / DOP_BITS_PER_FRAME + 1) * sizeof(float));
-    if (!pcm_temp) {
+    uint8_t *i24_temp = (uint8_t *)malloc((max_drain / DOP_BITS_PER_FRAME + 1) * 3);
+    if (!i24_temp) {
         free(drain_buf);
         return 0;
     }
@@ -1441,18 +1501,23 @@ size_t plugin_drain(plugin_state_t *s, float *out_pcm, int num_channels) {
         if (drained < min_drained)
             min_drained = drained;
 
-        /* Pack to DoP and interleave */
+        /* Pack to DoP i24 and interleave */
         size_t pcm_frames = drained / DOP_BITS_PER_FRAME;
-        dop_pack(drain_buf, pcm_temp, drained);
+        dop_pack_i24(drain_buf, i24_temp, drained, s->dop_marker_phase);
 
-        for (size_t f = 0; f < pcm_frames; f++)
-            out_pcm[f * (size_t)num_channels + (size_t)ch] = pcm_temp[f];
+        for (size_t f = 0; f < pcm_frames; f++) {
+            size_t dst = (f * (size_t)num_channels + (size_t)ch) * 3;
+            size_t src = f * 3;
+            out_i24[dst]     = i24_temp[src];
+            out_i24[dst + 1] = i24_temp[src + 1];
+            out_i24[dst + 2] = i24_temp[src + 2];
+        }
     }
 
     size_t out_frames = min_drained / DOP_BITS_PER_FRAME;
 
     free(drain_buf);
-    free(pcm_temp);
+    free(i24_temp);
 
     return out_frames;
 }
@@ -1463,7 +1528,7 @@ size_t plugin_drain(plugin_state_t *s, float *out_pcm, int num_channels) {
  * avoiding the hard discontinuity of raw idle pattern insertion.
  * Returns number of output DoP PCM frames per channel.
  */
-size_t plugin_generate_tail(plugin_state_t *s, float *out_pcm,
+size_t plugin_generate_tail(plugin_state_t *s, uint8_t *out_i24,
                             int num_channels, int ms) {
     if (!s || !s->initialized || !s->channels || num_channels <= 0 || ms <= 0)
         return 0;
@@ -1481,9 +1546,9 @@ size_t plugin_generate_tail(plugin_state_t *s, float *out_pcm,
     float *sil_in  = (float *)calloc(dsd_count, sizeof(float));
     float *dsd_out = (float *)malloc(dsd_count * sizeof(float));
     size_t pcm_frames = dsd_count / DOP_BITS_PER_FRAME;
-    float *pcm_temp = (float *)malloc((pcm_frames + 1) * sizeof(float));
-    if (!sil_in || !dsd_out || !pcm_temp) {
-        free(sil_in); free(dsd_out); free(pcm_temp);
+    uint8_t *i24_temp = (uint8_t *)malloc((pcm_frames + 1) * 3);
+    if (!sil_in || !dsd_out || !i24_temp) {
+        free(sil_in); free(dsd_out); free(i24_temp);
         return 0;
     }
 
@@ -1495,15 +1560,20 @@ size_t plugin_generate_tail(plugin_state_t *s, float *out_pcm,
 
         size_t frames = n / DOP_BITS_PER_FRAME;
         if (frames > pcm_frames) frames = pcm_frames;
-        dop_pack(dsd_out, pcm_temp, frames * DOP_BITS_PER_FRAME);
+        dop_pack_i24(dsd_out, i24_temp, frames * DOP_BITS_PER_FRAME, 0);
 
-        for (size_t f = 0; f < frames; f++)
-            out_pcm[f * (size_t)num_channels + (size_t)ch] = pcm_temp[f];
+        for (size_t f = 0; f < frames; f++) {
+            size_t dst = (f * (size_t)num_channels + (size_t)ch) * 3;
+            size_t src = f * 3;
+            out_i24[dst]     = i24_temp[src];
+            out_i24[dst + 1] = i24_temp[src + 1];
+            out_i24[dst + 2] = i24_temp[src + 2];
+        }
     }
 
     free(sil_in);
     free(dsd_out);
-    free(pcm_temp);
+    free(i24_temp);
 
     return pcm_frames;
 }
@@ -1535,6 +1605,7 @@ void plugin_flush(plugin_state_t *s) {
         engine_channel_reset(&s->channels[i], preserve);
     s->fir_tail_valid = false;
     s->needs_warmup = true;  /* prime SDM with real audio on next chunk */
+    s->dop_marker_phase = 0; /* reset DoP marker phase */
 }
 
 /* Reconfigure with new settings */

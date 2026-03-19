@@ -163,6 +163,7 @@
     <ClCompile Include="src\gpu_dx12.c" />
     <!-- Tools -->
     <ClCompile Include="tools\dsd_encode.c" />
+    <ClCompile Include="tools\dsd_reencode.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\dsd_types.h" />

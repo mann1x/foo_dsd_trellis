@@ -40,11 +40,16 @@ static const path_config_t path_table[] = {
     /* All paths use 0.708 (-3 dB) gain for uniform volume across rates.
      * lat = 0 means "auto" (computed as cands * 8 at runtime).
      * Optimal lat from nc×lat sweep: nc=2→16, nc=4→32, nc=8→64. */
-    /* Same-rate re-encode (boxcar → SDM).
-     * Optimal nc from sweep: DSD64=4, DSD128=4, DSD256/512=2. */
-    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  4,  0, 4, 0.708f },
-    { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_5, 0.0,  4,  0, 4, 0.708f },
-    { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_5, 0.0,  2,  0, 4, 0.708f },
+    /* Same-rate re-encode (boxcar/FIR → SDM).
+     * nc=2 for all same-rate: nc=4 causes candidate collapse over time.
+     * Optimal NTF + lat from comprehensive sweep (2026-03-19):
+     *   DSD64:  CLANS6/nc=2/lat=32  → 103.5 dB, 0 collapse
+     *   DSD128: SDM6/nc=2/lat=128   → 127.4 dB, 0 collapse
+     *   DSD256: CLANS6/nc=2/lat=128 → 143.5 dB, 0 collapse
+     *   DSD512: SDM6/nc=2/lat=32    → 137.6 dB, 0 collapse */
+    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
+    { DSD_RATE_128, DSD_RATE_128, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
+    { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_512, DSD_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
     /* Upsample paths */
     { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },
@@ -95,9 +100,21 @@ int engine_channel_init(engine_channel_t *eng, int channel,
     eng->sdm_mode = cfg->sdm_mode;
     eng->fir_gain = 1.0f;  /* default, may be overridden by path_table */
 
-    /* FIR lowpass for same-rate Trellis (smooth output, no stitching pops) */
-    if (cfg->fs_in == fs_out && cfg->sdm_mode == SDM_MODE_TRELLIS && !cfg->mute)
-        fir_lowpass_init(&eng->lowpass, cfg->fs_in);
+    /* FIR lowpass for same-rate pre-SDM filtering.
+     * fir_mode: Auto (-1) = FIR for Trellis at DSD64-256, Boxcar at DSD512.
+     * DSD512: FIR lowpass cutoff is 0.44% of bandwidth (50kHz/11.3MHz) —
+     * near-DC output causes SDM integrator windup over time.
+     * Boxcar is numerically stable and has GPU-accelerated path.
+     * Explicit FIR (1) or Boxcar (0) overrides the auto default. */
+    if (cfg->fs_in == fs_out && !cfg->mute) {
+        bool use_fir = (cfg->sdm_mode == SDM_MODE_TRELLIS && cfg->fs_in < DSD_RATE_512);
+        if (cfg->fir_mode == FIR_MODE_FIR)
+            use_fir = true;
+        else if (cfg->fir_mode == FIR_MODE_BOXCAR)
+            use_fir = false;
+        if (use_fir)
+            fir_lowpass_init(&eng->lowpass, cfg->fs_in);
+    }
 
     /* DSD→PCM decimation: FIR only, no SDM */
     eng->fir_only = (fs_out < DSD_RATE_64 && cfg->fs_in >= DSD_RATE_64);
@@ -195,18 +212,18 @@ void engine_channel_warmup(engine_channel_t *eng, const float *in,
     if (warmup > (size_t)eng->boxcar.taps * 2)
         warmup = (size_t)eng->boxcar.taps * 2;  /* only need 2x taps */
 
-    float *tmp = (float *)malloc(warmup * sizeof(float));
+    double *tmp = (double *)malloc(warmup * sizeof(double));
     if (!tmp) return;
 
     boxcar_t *bc = &eng->boxcar;
-    const float inv_n = 1.0f / (float)bc->taps;
+    const double inv_n = 1.0 / (double)bc->taps;
     for (size_t i = 0; i < warmup; i++) {
-        float s = in[i] >= 0.0f ? 1.0f : -1.0f;
+        double s = in[i] >= 0.0f ? 1.0 : -1.0;
         bc->sum -= bc->ring[bc->pos];
         bc->ring[bc->pos] = s;
         bc->sum += s;
         bc->pos = (bc->pos + 1) % bc->taps;
-        tmp[i] = bc->sum * inv_n * eng->fir_gain * cfg->gain;
+        tmp[i] = bc->sum * inv_n * (double)eng->fir_gain * (double)cfg->gain;
     }
 
     /* Feed through SDM (discard output) */
@@ -240,81 +257,52 @@ size_t engine_process_block(engine_channel_t *eng,
             /* DSD-Wide: smooth ±1.0 → multi-bit, apply gain, re-encode via SDM.
              * Trellis: use FIR lowpass (smooth output for parallel stitching).
              * PreCorr: use boxcar (fast, sufficient for greedy quantizer). */
-            if (eng->fir_buf_sz < count * sizeof(float)) {
+            if (eng->fir_buf_sz < count * sizeof(double)) {
                 free(eng->fir_buf);
-                eng->fir_buf = (float *)malloc(count * sizeof(float));
-                eng->fir_buf_sz = eng->fir_buf ? count * sizeof(float) : 0;
+                eng->fir_buf = (double *)malloc(count * sizeof(double));
+                eng->fir_buf_sz = eng->fir_buf ? count * sizeof(double) : 0;
             }
             if (!eng->fir_buf)
                 return 0;
 
             if (eng->lowpass.initialized) {
-                /* FIR lowpass: quantize ±1.0 into fir_buf, filter into a
-                 * second buffer, then swap. Avoids per-call malloc. */
-                for (size_t i = 0; i < count; i++)
-                    eng->fir_buf[i] = in[i] >= 0.0f ? 1.0f : -1.0f;
-                /* Allocate/grow a second buffer for FIR output */
-                static __declspec(thread) float *tls_lp_buf = NULL;
+                /* FIR lowpass — CPU: IPP outputs float, widen to double */
+                static __declspec(thread) float *tls_lp_in = NULL;
+                static __declspec(thread) float *tls_lp_out = NULL;
                 static __declspec(thread) size_t tls_lp_sz = 0;
                 if (tls_lp_sz < count) {
-                    free(tls_lp_buf);
-                    tls_lp_buf = (float *)malloc(count * sizeof(float));
-                    tls_lp_sz = tls_lp_buf ? count : 0;
+                    free(tls_lp_in); free(tls_lp_out);
+                    tls_lp_in = (float *)malloc(count * sizeof(float));
+                    tls_lp_out = (float *)malloc(count * sizeof(float));
+                    tls_lp_sz = (tls_lp_in && tls_lp_out) ? count : 0;
                 }
-                if (!tls_lp_buf) return 0;
-                fir_lowpass_process(&eng->lowpass, eng->fir_buf, tls_lp_buf, count);
-                /* Apply gain and copy to fir_buf */
-                float combined = eng->fir_gain * cfg->gain;
+                if (!tls_lp_in || !tls_lp_out) return 0;
                 for (size_t i = 0; i < count; i++)
-                    eng->fir_buf[i] = tls_lp_buf[i] * combined;
+                    tls_lp_in[i] = in[i] >= 0.0f ? 1.0f : -1.0f;
+                fir_lowpass_process(&eng->lowpass, tls_lp_in, tls_lp_out, count);
+                double combined = (double)eng->fir_gain * (double)cfg->gain;
+                for (size_t i = 0; i < count; i++)
+                    eng->fir_buf[i] = (double)tls_lp_out[i] * combined;
             } else {
-                /* Boxcar: try GPU, fall back to CPU */
-                float combined = eng->fir_gain * cfg->gain;
-                bool boxcar_gpu_ok = false;
-                if (eng->gpu && count >= GPU_MIN_SAMPLES) {
-                    if (gpu_boxcar_smooth(eng->gpu, in, eng->fir_buf,
-                                           count, eng->boxcar.taps,
-                                           combined) == 0)
-                        boxcar_gpu_ok = true;
-                }
-                if (!boxcar_gpu_ok) {
-                    /* CPU boxcar fallback */
-                    boxcar_t *bc = &eng->boxcar;
-                    const float inv_n = 1.0f / (float)bc->taps;
-                    for (size_t i = 0; i < count; i++) {
-                        float s = in[i] >= 0.0f ? 1.0f : -1.0f;
-                        bc->sum -= bc->ring[bc->pos];
-                        bc->ring[bc->pos] = s;
-                        bc->sum += s;
-                        bc->pos = (bc->pos + 1) % bc->taps;
-                        eng->fir_buf[i] = bc->sum * inv_n * eng->fir_gain * cfg->gain;
-                    }
+                /* Boxcar: CPU fp64 */
+                boxcar_t *bc = &eng->boxcar;
+                const double inv_n = 1.0 / (double)bc->taps;
+                double combined = (double)eng->fir_gain * (double)cfg->gain;
+                for (size_t i = 0; i < count; i++) {
+                    double s = in[i] >= 0.0f ? 1.0 : -1.0;
+                    bc->sum -= bc->ring[bc->pos];
+                    bc->ring[bc->pos] = s;
+                    bc->sum += s;
+                    bc->pos = (bc->pos + 1) % bc->taps;
+                    eng->fir_buf[i] = bc->sum * inv_n * combined;
                 }
             }
-            /* Re-encode via SDM — try GPU (chunked), fall back to CPU */
+            /* Re-encode via SDM (CPU only) */
             size_t sdm_out;
-            bool same_gpu_ok = false;
-            if (eng->gpu && eng->gpu_sdm && eng->sdm_mode == SDM_MODE_TRELLIS &&
-                eng->sdm.trellis_num >= 2 && count >= GPU_MIN_SAMPLES) {
-                int gpu_rc = gpu_trellis_process(eng->gpu, eng->fir_buf, out, count,
-                                         NULL, NULL, (int)eng->sdm.trellis_num,
-                                         eng->sdm.filter->order,
-                                         eng->sdm.filter->a,
-                                         eng->sdm.filter->g);
-                if (gpu_rc == 0) {
-                    /* GPU parallel SBVD handles latency internally —
-                     * output count = input count (segment 0 outputs from
-                     * sample 0 with persistent state, no latency gap). */
-                    sdm_out = count;
-                    same_gpu_ok = true;
-                }
-            }
-            if (!same_gpu_ok) {
-                if (eng->sdm_mode == SDM_MODE_PRECORR)
-                    sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
-                else
-                    sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, count);
-            }
+            if (eng->sdm_mode == SDM_MODE_PRECORR)
+                sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
+            else
+                sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, count);
             if (eng->ml_filter)
                 onnx_filter_process(eng->ml_filter, out, sdm_out);
             return sdm_out;
@@ -343,45 +331,38 @@ size_t engine_process_block(engine_channel_t *eng,
     if (fs_out < cfg->fs_in && count / 2 > buf_need)
         buf_need = count / 2;
 
-    /* Ensure intermediate buffer */
-    if (eng->fir_buf_sz < buf_need * sizeof(float)) {
+    /* Ensure intermediate buffers: float for FIR chain (IPP), double for SDM */
+    if (eng->fir_buf_sz < buf_need * sizeof(double)) {
         free(eng->fir_buf);
-        eng->fir_buf = (float *)malloc(buf_need * sizeof(float));
-        eng->fir_buf_sz = eng->fir_buf ? buf_need * sizeof(float) : 0;
+        eng->fir_buf = (double *)malloc(buf_need * sizeof(double));
+        eng->fir_buf_sz = eng->fir_buf ? buf_need * sizeof(double) : 0;
     }
     if (!eng->fir_buf)
         return 0;
 
-    size_t fir_out = fir_chain_process(&eng->fir, in, eng->fir_buf, count);
-
-    /* Apply FIR output attenuation (path-adaptive SDM overload prevention)
-     * and user gain in a single pass */
-    float combined_gain = eng->fir_gain * cfg->gain;
-    if (combined_gain != 1.0f) {
-        for (size_t i = 0; i < fir_out; i++)
-            eng->fir_buf[i] *= combined_gain;
+    /* FIR chain outputs float — use TLS buffer, then widen to double */
+    static __declspec(thread) float *tls_fir_f = NULL;
+    static __declspec(thread) size_t tls_fir_sz = 0;
+    if (tls_fir_sz < buf_need) {
+        free(tls_fir_f);
+        tls_fir_f = (float *)malloc(buf_need * sizeof(float));
+        tls_fir_sz = tls_fir_f ? buf_need : 0;
     }
+    if (!tls_fir_f) return 0;
 
-    /* SDM — try GPU (chunked sub-dispatches), fall back to CPU */
+    size_t fir_out = fir_chain_process(&eng->fir, in, tls_fir_f, count);
+
+    /* Widen to double and apply gain in one pass */
+    double combined_gain = (double)eng->fir_gain * (double)cfg->gain;
+    for (size_t i = 0; i < fir_out; i++)
+        eng->fir_buf[i] = (double)tls_fir_f[i] * combined_gain;
+
+    /* SDM (CPU only) */
     size_t sdm_out;
-    bool gpu_sdm_ok = false;
-    if (eng->gpu && eng->gpu_sdm && eng->sdm_mode == SDM_MODE_TRELLIS &&
-        eng->sdm.trellis_num >= 2 && fir_out >= GPU_MIN_SAMPLES) {
-        if (gpu_trellis_process(eng->gpu, eng->fir_buf, out, fir_out,
-                                 NULL, NULL, (int)eng->sdm.trellis_num,
-                                 eng->sdm.filter->order,
-                                 eng->sdm.filter->a,
-                                 eng->sdm.filter->g) == 0) {
-            sdm_out = fir_out; /* GPU SBVD handles latency internally */
-            gpu_sdm_ok = true;
-        }
-    }
-    if (!gpu_sdm_ok) {
-        if (eng->sdm_mode == SDM_MODE_PRECORR)
-            sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, fir_out);
-        else
-            sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, fir_out);
-    }
+    if (eng->sdm_mode == SDM_MODE_PRECORR)
+        sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, fir_out);
+    else
+        sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, fir_out);
     if (eng->ml_filter)
         onnx_filter_process(eng->ml_filter, out, sdm_out);
     return sdm_out;
@@ -439,7 +420,7 @@ int engine_channel_reconfigure(engine_channel_t *eng,
 size_t engine_process_fir_gain(engine_channel_t *eng,
                                 const float *in, size_t count,
                                 const dsd_config_t *cfg,
-                                float **fir_out_ptr) {
+                                double **fir_out_ptr) {
     uint32_t fs_out = cfg->fs_out ? cfg->fs_out : cfg->fs_in;
     size_t fir_out_count;
     if (fs_out >= cfg->fs_in)
@@ -447,47 +428,44 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
     else
         fir_out_count = count / (cfg->fs_in / fs_out);
 
-    /* For multi-stage downsample, fir_chain_process uses out as a ping-pong
-     * buffer with scratch. The first intermediate result written to out can
-     * be up to count/2 samples, so we must allocate for that, not just the
-     * final output size. */
     size_t buf_need = fir_out_count;
     if (fs_out < cfg->fs_in && count / 2 > buf_need)
         buf_need = count / 2;
 
-    if (eng->fir_buf_sz < buf_need * sizeof(float)) {
+    if (eng->fir_buf_sz < buf_need * sizeof(double)) {
         free(eng->fir_buf);
-        eng->fir_buf = (float *)malloc(buf_need * sizeof(float));
-        eng->fir_buf_sz = buf_need * sizeof(float);
+        eng->fir_buf = (double *)malloc(buf_need * sizeof(double));
+        eng->fir_buf_sz = buf_need * sizeof(double);
     }
 
     size_t fir_count;
     uint32_t fs_out_actual = cfg->fs_out ? cfg->fs_out : cfg->fs_in;
     if (cfg->fs_in == fs_out_actual) {
-        /* Same-rate: smooth ±1.0 → multi-bit.
-         * Trellis: FIR lowpass (smooth output for parallel stitching).
-         * PreCorr: boxcar (fast, sufficient). */
+        /* Same-rate: smooth ±1.0 → multi-bit (fp64 pipeline) */
         if (eng->lowpass.initialized) {
-            /* FIR lowpass: quantize then filter */
-            /* Quantize into fir_buf, filter into TLS buffer, copy back */
-            for (size_t i = 0; i < count; i++)
-                eng->fir_buf[i] = in[i] >= 0.0f ? 1.0f : -1.0f;
-            static __declspec(thread) float *tls_lp_buf2 = NULL;
+            /* FIR lowpass — IPP float, widen to double */
+            static __declspec(thread) float *tls_lp_in2 = NULL;
+            static __declspec(thread) float *tls_lp_out2 = NULL;
             static __declspec(thread) size_t tls_lp_sz2 = 0;
             if (tls_lp_sz2 < count) {
-                free(tls_lp_buf2);
-                tls_lp_buf2 = (float *)malloc(count * sizeof(float));
-                tls_lp_sz2 = tls_lp_buf2 ? count : 0;
+                free(tls_lp_in2); free(tls_lp_out2);
+                tls_lp_in2 = (float *)malloc(count * sizeof(float));
+                tls_lp_out2 = (float *)malloc(count * sizeof(float));
+                tls_lp_sz2 = (tls_lp_in2 && tls_lp_out2) ? count : 0;
             }
-            if (tls_lp_buf2) {
-                fir_lowpass_process(&eng->lowpass, eng->fir_buf, tls_lp_buf2, count);
-                memcpy(eng->fir_buf, tls_lp_buf2, count * sizeof(float));
+            if (tls_lp_in2 && tls_lp_out2) {
+                for (size_t i = 0; i < count; i++)
+                    tls_lp_in2[i] = in[i] >= 0.0f ? 1.0f : -1.0f;
+                fir_lowpass_process(&eng->lowpass, tls_lp_in2, tls_lp_out2, count);
+                for (size_t i = 0; i < count; i++)
+                    eng->fir_buf[i] = (double)tls_lp_out2[i];
             }
         } else {
+            /* Boxcar fp64 */
             boxcar_t *bc = &eng->boxcar;
-            const float inv_n = 1.0f / (float)bc->taps;
+            const double inv_n = 1.0 / (double)bc->taps;
             for (size_t i = 0; i < count; i++) {
-                float s = in[i] >= 0.0f ? 1.0f : -1.0f;
+                double s = in[i] >= 0.0f ? 1.0 : -1.0;
                 bc->sum -= bc->ring[bc->pos];
                 bc->ring[bc->pos] = s;
                 bc->sum += s;
@@ -497,11 +475,23 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
         }
         fir_count = count;
     } else {
-        fir_count = fir_chain_process(&eng->fir, in, eng->fir_buf, count);
+        /* Rate conversion: FIR chain (float) → widen to double */
+        static __declspec(thread) float *tls_fir_f2 = NULL;
+        static __declspec(thread) size_t tls_fir_sz2 = 0;
+        if (tls_fir_sz2 < buf_need) {
+            free(tls_fir_f2);
+            tls_fir_f2 = (float *)malloc(buf_need * sizeof(float));
+            tls_fir_sz2 = tls_fir_f2 ? buf_need : 0;
+        }
+        if (!tls_fir_f2) { *fir_out_ptr = NULL; return 0; }
+        fir_count = fir_chain_process(&eng->fir, in, tls_fir_f2, count);
+        for (size_t i = 0; i < fir_count; i++)
+            eng->fir_buf[i] = (double)tls_fir_f2[i];
     }
 
-    float combined_gain = eng->fir_gain * cfg->gain;
-    if (combined_gain != 1.0f) {
+    /* Apply gain in double precision */
+    double combined_gain = (double)eng->fir_gain * (double)cfg->gain;
+    if (combined_gain != 1.0) {
         for (size_t i = 0; i < fir_count; i++)
             eng->fir_buf[i] *= combined_gain;
     }
@@ -525,7 +515,7 @@ static float *get_trash_buf(size_t need) {
 }
 
 size_t sdm_segment_process(sdm_context_t *sdm,
-                            const float *in, float *out,
+                            const double *in, float *out,
                             size_t count, size_t discard) {
     if (discard == 0)
         return sdm_process_block(sdm, in, out, count);
@@ -611,18 +601,19 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
     }
 
     /* Auto-compute optimal lat when lat=0 (auto).
-     * Rate-dependent from nc×lat sweep:
-     *   DSD64/128: lat=32  (102.6/97.9 dB)
-     *   DSD256:    lat=128 (151.7 dB, NTF headroom)
-     *   DSD512:    lat=16  (129.4 dB, RT-constrained) */
+     * From comprehensive nc×lat sweep with stability analysis (2026-03-19):
+     *   DSD64:     lat=32  (103.5 dB, 0 collapse)
+     *   DSD128:    lat=128 (127.4 dB, 0 collapse) — lat=32 was only 107 dB
+     *   DSD256:    lat=128 (143.5 dB, 0 collapse)
+     *   DSD512:    lat=32  (137.6 dB, 0 collapse) — lat=16 was 124.8 dB */
     if (info->lat <= 0) {
         uint32_t rate = (fs_out > fs_in) ? fs_out : fs_in;
         if (rate >= DSD_RATE_512)
-            info->lat = 16;
-        else if (rate >= DSD_RATE_256)
+            info->lat = 32;
+        else if (rate >= DSD_RATE_128)
             info->lat = 128;
         else
-            info->lat = 32;
+            info->lat = 32;   /* DSD64 */
     }
 
     return 0;
