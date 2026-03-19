@@ -831,9 +831,8 @@ size_t plugin_process(plugin_state_t *s,
     int segments_per_ch = 1;
     size_t overlap = 0;
 
-    /* DSD64 same-rate: sequential (trivially fast at nc=2).
-     * DSD128+: parallel with state-seeded segments (no stitching artifacts).
-     * Segment 0 runs on persistent SDM, then state is copied to temp SDMs. */
+    /* Parallel path: state-seeded segments + channel parallelism.
+     * DSD64 same-rate is trivially fast — skip parallel overhead. */
     uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
     bool is_same_rate = (s->config.fs_in == fs_out);
     bool skip_parallel = (is_same_rate && fs_out <= DSD_RATE_64);
@@ -848,13 +847,14 @@ size_t plugin_process(plugin_state_t *s,
         overlap = (is_same_rate ? 4 : 2) * (size_t)s->config.trellis_lat;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
+        /* State-seeded parallelism: max 2 segments (seg0 persistent, seg1 seeded).
+         * DSD512 stereo: 2 segments + 2 phases is slower than 1 segment.
+         * With 1 segment, channel parallelism alone gives 2x speedup. */
         int max_seg;
-        if (!is_same_rate)
-            max_seg = 4;                   /* rate conversion: 4 segments */
-        else if (fs_out >= DSD_RATE_512)
-            max_seg = 4;                   /* DSD512 same-rate: 4 for RT budget */
+        if (is_same_rate && fs_out >= DSD_RATE_512 && num_channels <= 2)
+            max_seg = 1;   /* channel-parallel only */
         else
-            max_seg = 2;                   /* DSD128/256 same-rate: 2 segments */
+            max_seg = 2;
         if (segments_per_ch > max_seg) segments_per_ch = max_seg;
 
         /* Ensure minimum segment size (at least 4x overlap) */
@@ -1145,11 +1145,14 @@ size_t plugin_process(plugin_state_t *s,
             threadpool_submit(s->pool, &blocks[i]);
         threadpool_wait(s->pool);
 
-        /* Copy last segment's final state back into persistent SDM. */
-        for (int ch = 0; ch < num_channels; ch++) {
-            int last_temp = ch * temps_per_ch + (segments_per_ch - 2);
-            if (last_temp >= 0 && last_temp < temp_sdm_count)
-                sdm_context_copy_state(&s->channels[ch].sdm, &temp_sdms[last_temp]);
+        /* Copy last segment's final state back into persistent SDM.
+         * Skip if only 1 segment (persistent SDM already has correct state). */
+        if (segments_per_ch > 1) {
+            for (int ch = 0; ch < num_channels; ch++) {
+                int last_temp = ch * temps_per_ch + (segments_per_ch - 2);
+                if (last_temp >= 0 && last_temp < temp_sdm_count)
+                    sdm_context_copy_state(&s->channels[ch].sdm, &temp_sdms[last_temp]);
+            }
         }
 
         QueryPerformanceCounter(&t_sdm_end);
@@ -1586,9 +1589,12 @@ double plugin_get_latency(const plugin_state_t *s) {
 void plugin_flush(plugin_state_t *s) {
     if (!s || !s->initialized)
         return;
-    bool preserve = s->config.antipop;
+    /* Always fully reset SDM state on flush. With state-seeded parallelism,
+     * the persistent SDM gets overwritten by temp SDM state each chunk.
+     * Preserving this stale state across stop→play causes massive pops.
+     * Anti-pop lead-in silence handles DAC mode-switch pops instead. */
     for (int i = 0; i < s->num_channels; i++)
-        engine_channel_reset(&s->channels[i], preserve);
+        engine_channel_reset(&s->channels[i], false);
     s->fir_tail_valid = false;
     s->needs_warmup = true;  /* prime SDM with real audio on next chunk */
     s->dop_marker_phase = 0; /* reset DoP marker phase */
