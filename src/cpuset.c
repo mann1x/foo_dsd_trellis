@@ -714,13 +714,16 @@ int cpuset_select(const cpu_topology_t *topo,
          * time most cores appear parked even when they'll be active
          * under load. Treat all enabled cores equally. */
 
-        /* Avoid only the busiest cores (sched_class >= 13).
-         * Mid-range cores (sched 8-12) are fine — they have some OS
-         * activity but not enough to impact our workload.
-         * This keeps workers on a mix of CCDs instead of exiling
-         * everything to the cold CCD. */
+        /* Core 0 (LP0) is reserved for OS/fb2k main thread.
+         * Exclude it unless we have no other cores. */
+        if (e->logical_index == 0) {
+            prio += 10000;  /* effectively exclude */
+            /* Will only be used if all other cores are exhausted */
+        }
+
+        /* Avoid the busiest cores (sched_class >= 13). */
         if (e->scheduling_class >= 13)
-            prio += 50;  /* push LP0/LP2/LP10 to end */
+            prio += 50;
 
         /* SMT: T0 preferred over T1 */
         if (e->smt_thread > 0)
