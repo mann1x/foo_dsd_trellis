@@ -847,12 +847,12 @@ size_t plugin_process(plugin_state_t *s,
         overlap = (is_same_rate ? 4 : 2) * (size_t)s->config.trellis_lat;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
-        /* State-seeded parallelism: max 2 segments (seg0 persistent, seg1 seeded).
-         * DSD512 stereo: 2 segments + 2 phases is slower than 1 segment.
-         * With 1 segment, channel parallelism alone gives 2x speedup. */
+        /* State-seeded parallelism: 2 segments (seg0 persistent, seg1 seeded).
+         * DSD512 stereo: 1 segment — channel parallelism only via submit_to.
+         * Two-phase seeding adds latency (2×750ms vs 1×750ms channel-parallel). */
         int max_seg;
-        if (is_same_rate && fs_out >= DSD_RATE_512 && num_channels <= 2)
-            max_seg = 1;   /* channel-parallel only */
+        if (is_same_rate && fs_out >= DSD_RATE_512 && num_channels >= 2)
+            max_seg = 1;
         else
             max_seg = 2;
         if (segments_per_ch > max_seg) segments_per_ch = max_seg;
@@ -873,8 +873,8 @@ size_t plugin_process(plugin_state_t *s,
 
     size_t dsd_out_count;
 
-    if (segments_per_ch > 1) {
-        /* === Parallel SDM path: FIR+gain sequential, SDM parallel === */
+    if (segments_per_ch >= 1 && !skip_parallel) {
+        /* === Parallel SDM path: FIR+gain, then SDM via submit_to === */
 
         /* Reset GPU per-chunk state (channel counters for boxcar/lowpass history) */
         if (s->gpu)
@@ -1078,7 +1078,8 @@ size_t plugin_process(plugin_state_t *s,
         QueryPerformanceCounter(&t_sdm_start);
 
         /* Phase 2a: Run segment 0 for all channels in parallel on threadpool.
-         * Each channel's segment 0 uses its persistent SDM. */
+         * Each channel's segment 0 uses its persistent SDM.
+         * Use submit_to for guaranteed core distribution (heavy SDM tasks). */
         size_t seg0_sizes[32], seg0_outs[32];
         {
             channel_block_t seg0_blocks[32];
@@ -1096,7 +1097,8 @@ size_t plugin_process(plugin_state_t *s,
                 seg0_blocks[ch].count   = seg0_sizes[ch];
                 seg0_blocks[ch].discard = 0;
                 seg0_blocks[ch].channel = ch;
-                threadpool_submit(s->pool, &seg0_blocks[ch]);
+                /* Pin each channel to a dedicated worker for guaranteed parallelism */
+                threadpool_submit_to(s->pool, ch, &seg0_blocks[ch]);
             }
             threadpool_wait(s->pool);
             for (int ch = 0; ch < num_channels; ch++)
@@ -1140,9 +1142,11 @@ size_t plugin_process(plugin_state_t *s,
             }
         }
 
-        /* Launch segments 1+ in parallel */
-        for (int i = 0; i < par_blocks; i++)
-            threadpool_submit(s->pool, &blocks[i]);
+        /* Launch segments 1+ in parallel — pin to dedicated workers */
+        for (int i = 0; i < par_blocks; i++) {
+            int worker = num_channels + i;  /* workers 0..nch-1 used by seg0 */
+            threadpool_submit_to(s->pool, worker % num_threads, &blocks[i]);
+        }
         threadpool_wait(s->pool);
 
         /* Copy last segment's final state back into persistent SDM.

@@ -28,6 +28,11 @@ threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids, int cpuset_co
  * Non-blocking; the block is queued for a worker thread. */
 int threadpool_submit(threadpool_t *pool, channel_block_t *block);
 
+/* Submit a task to a specific worker by index.
+ * Guarantees the task runs on that worker's pinned core.
+ * Use for heavy tasks (SDM) that need dedicated cores. */
+int threadpool_submit_to(threadpool_t *pool, int worker_index, channel_block_t *block);
+
 /* Submit multiple blocks and wake all workers simultaneously.
  * Returns number of blocks submitted. */
 int threadpool_submit_batch(threadpool_t *pool, channel_block_t **blocks, int count);

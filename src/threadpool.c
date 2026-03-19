@@ -13,6 +13,9 @@
 #include "../include/threadpool.h"
 #include "../include/dop.h"
 
+extern void trellis_log_c(const char *msg);
+#include <stdio.h>
+
 #ifndef DOP_BITS_PER_FRAME
 #define DOP_BITS_PER_FRAME 16
 #endif
@@ -68,6 +71,15 @@ static void mmcss_unregister(HANDLE h) {
         g_pfn_revert_mmthread(h);
 }
 
+#define PER_WORKER_QUEUE_SIZE 8
+
+/* Per-worker direct queue for targeted task assignment */
+typedef struct {
+    channel_block_t *queue[PER_WORKER_QUEUE_SIZE];
+    volatile LONG    count;
+    HANDLE           wake_event;  /* Auto-reset event for targeted wakeup */
+} worker_queue_t;
+
 struct threadpool {
     int          thread_count;
     DWORD        affinity_mask;
@@ -75,15 +87,18 @@ struct threadpool {
     /* Worker threads */
     HANDLE      *threads;
 
-    /* Work queue (ring buffer, protected by critical section) */
+    /* Shared work queue (ring buffer, protected by critical section) */
     CRITICAL_SECTION queue_cs;
     channel_block_t *queue[MAX_QUEUE_SIZE];
     int              queue_head;    /* Next item to dequeue */
     int              queue_tail;    /* Next slot to enqueue */
     int              queue_count;   /* Items in queue */
 
+    /* Per-worker direct queues (for submit_to) */
+    worker_queue_t  *worker_queues; /* [thread_count] */
+
     /* Synchronization */
-    HANDLE       work_sem;          /* Signaled when work available */
+    HANDLE       work_sem;          /* Signaled when work available (shared queue) */
     HANDLE       done_event;        /* Signaled when batch complete */
     volatile LONG pending;          /* Items remaining in current batch */
     volatile LONG shutdown;         /* Non-zero = workers should exit */
@@ -115,26 +130,59 @@ static DWORD WINAPI worker_func(LPVOID param) {
     /* Register with MMCSS for real-time audio scheduling */
     HANDLE mmcss_handle = mmcss_register();
 
+    /* Build wait handles: [0] = per-worker event, [1] = shared semaphore */
+    worker_queue_t *my_queue = (pool->worker_queues) ? &pool->worker_queues[my_index] : NULL;
+    HANDLE wait_handles[2];
+    int n_handles = 0;
+    if (my_queue) wait_handles[n_handles++] = my_queue->wake_event;
+    wait_handles[n_handles++] = pool->work_sem;
+
     for (;;) {
-        /* Wait for work or shutdown */
-        WaitForSingleObject(pool->work_sem, INFINITE);
+        /* Wait for per-worker task, shared task, or shutdown */
+        WaitForMultipleObjects((DWORD)n_handles, wait_handles, FALSE, INFINITE);
 
         if (InterlockedCompareExchange(&pool->shutdown, 0, 0))
             break;
 
-        /* Dequeue a work item */
+        /* Check per-worker queue first (targeted tasks) */
         channel_block_t *block = NULL;
-
-        EnterCriticalSection(&pool->queue_cs);
-        if (pool->queue_count > 0) {
-            block = pool->queue[pool->queue_head];
-            pool->queue_head = (pool->queue_head + 1) % MAX_QUEUE_SIZE;
-            pool->queue_count--;
+        if (my_queue && InterlockedCompareExchange(&my_queue->count, 0, 0) > 0) {
+            LONG idx = InterlockedDecrement(&my_queue->count);
+            if (idx >= 0)
+                block = my_queue->queue[idx];
         }
-        LeaveCriticalSection(&pool->queue_cs);
+
+        /* Fall back to shared queue */
+        if (!block) {
+            EnterCriticalSection(&pool->queue_cs);
+            if (pool->queue_count > 0) {
+                block = pool->queue[pool->queue_head];
+                pool->queue_head = (pool->queue_head + 1) % MAX_QUEUE_SIZE;
+                pool->queue_count--;
+            }
+            LeaveCriticalSection(&pool->queue_cs);
+        }
 
         if (!block)
             continue;
+
+        /* Log task assignment: worker index, CPU thread, task mode */
+        {
+            static volatile LONG s_log_count = 0;
+            if (InterlockedIncrement(&s_log_count) <= 20) {
+                DWORD cpu = GetCurrentProcessorNumber();
+                const char *mode_name = "FULL";
+                if (block->mode == BLOCK_MODE_SDM) mode_name = "SDM";
+                else if (block->mode == BLOCK_MODE_FIR) mode_name = "FIR";
+                else if (block->mode == BLOCK_MODE_UNPACK) mode_name = "UNPACK";
+                else if (block->mode == BLOCK_MODE_PACK) mode_name = "PACK";
+                char msg[128];
+                sprintf_s(msg, sizeof(msg),
+                    "worker %d: %s ch=%d count=%zu on CPU#%u",
+                    my_index, mode_name, block->channel, block->count, cpu);
+                trellis_log_c(msg);
+            }
+        }
 
         /* Process the block based on mode, with RT headroom measurement */
         LARGE_INTEGER t_start, t_end, freq;
@@ -268,9 +316,11 @@ threadpool_t *threadpool_create(int thread_count, DWORD affinity_mask) {
     /* Create worker threads + tracking arrays */
     pool->threads = (HANDLE *)calloc((size_t)thread_count, sizeof(HANDLE));
     pool->last_rt_ratio = (double *)calloc((size_t)thread_count, sizeof(double));
-    if (!pool->threads || !pool->last_rt_ratio) {
+    pool->worker_queues = (worker_queue_t *)calloc((size_t)thread_count, sizeof(worker_queue_t));
+    if (!pool->threads || !pool->last_rt_ratio || !pool->worker_queues) {
         free(pool->threads);
         free(pool->last_rt_ratio);
+        free(pool->worker_queues);
         CloseHandle(pool->done_event);
         CloseHandle(pool->work_sem);
         DeleteCriticalSection(&pool->queue_cs);
@@ -279,13 +329,13 @@ threadpool_t *threadpool_create(int thread_count, DWORD affinity_mask) {
     }
 
     for (int i = 0; i < thread_count; i++) {
+        pool->worker_queues[i].wake_event = CreateEventW(NULL, FALSE, FALSE, NULL);
         worker_context_t *wctx = (worker_context_t *)malloc(sizeof(worker_context_t));
         if (!wctx) break;
         wctx->pool = pool;
         wctx->thread_index = i;
         pool->threads[i] = CreateThread(NULL, 0, worker_func, wctx, 0, NULL);
         if (!pool->threads[i]) {
-            /* Cleanup already-created threads */
             InterlockedExchange(&pool->shutdown, 1);
             ReleaseSemaphore(pool->work_sem, i, NULL);
             for (int j = 0; j < i; j++) {
@@ -300,7 +350,6 @@ threadpool_t *threadpool_create(int thread_count, DWORD affinity_mask) {
             return NULL;
         }
 
-        /* Set CPU affinity if requested */
         if (affinity_mask != 0)
             SetThreadAffinityMask(pool->threads[i], (DWORD_PTR)affinity_mask);
     }
@@ -326,6 +375,23 @@ int threadpool_submit(threadpool_t *pool, channel_block_t *block) {
     InterlockedIncrement(&pool->pending);
     ReleaseSemaphore(pool->work_sem, 1, NULL);
 
+    return 0;
+}
+
+int threadpool_submit_to(threadpool_t *pool, int worker_index, channel_block_t *block) {
+    if (!pool || worker_index < 0 || worker_index >= pool->thread_count)
+        return -1;
+    if (!pool->worker_queues)
+        return threadpool_submit(pool, block);  /* fallback to shared queue */
+
+    worker_queue_t *wq = &pool->worker_queues[worker_index];
+    LONG idx = InterlockedIncrement(&wq->count) - 1;
+    if (idx >= PER_WORKER_QUEUE_SIZE)
+        return -1;  /* per-worker queue full */
+    wq->queue[idx] = block;
+
+    InterlockedIncrement(&pool->pending);
+    SetEvent(wq->wake_event);  /* wake this specific worker */
     return 0;
 }
 
@@ -376,6 +442,10 @@ void threadpool_destroy(threadpool_t *pool) {
 
     /* Wake all workers so they can see the shutdown flag */
     ReleaseSemaphore(pool->work_sem, pool->thread_count, NULL);
+    if (pool->worker_queues) {
+        for (int i = 0; i < pool->thread_count; i++)
+            SetEvent(pool->worker_queues[i].wake_event);
+    }
 
     /* Wait for all workers to exit */
     WaitForMultipleObjects((DWORD)pool->thread_count, pool->threads,
@@ -387,6 +457,11 @@ void threadpool_destroy(threadpool_t *pool) {
     free(pool->threads);
     free(pool->last_rt_ratio);
     free(pool->cpuset_ids);
+    if (pool->worker_queues) {
+        for (int i = 0; i < pool->thread_count; i++)
+            CloseHandle(pool->worker_queues[i].wake_event);
+        free(pool->worker_queues);
+    }
     CloseHandle(pool->done_event);
     CloseHandle(pool->work_sem);
     DeleteCriticalSection(&pool->queue_cs);
@@ -474,10 +549,12 @@ threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids, int cpuset_co
     pool->threads = (HANDLE *)calloc((size_t)cpuset_count, sizeof(HANDLE));
     pool->last_rt_ratio = (double *)calloc((size_t)cpuset_count, sizeof(double));
     pool->cpuset_ids = (uint32_t *)malloc((size_t)cpuset_count * sizeof(uint32_t));
-    if (!pool->threads || !pool->last_rt_ratio || !pool->cpuset_ids) {
+    pool->worker_queues = (worker_queue_t *)calloc((size_t)cpuset_count, sizeof(worker_queue_t));
+    if (!pool->threads || !pool->last_rt_ratio || !pool->cpuset_ids || !pool->worker_queues) {
         free(pool->threads);
         free(pool->last_rt_ratio);
         free(pool->cpuset_ids);
+        free(pool->worker_queues);
         CloseHandle(pool->done_event);
         CloseHandle(pool->work_sem);
         DeleteCriticalSection(&pool->queue_cs);
@@ -486,6 +563,10 @@ threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids, int cpuset_co
     }
     memcpy(pool->cpuset_ids, cpuset_ids, (size_t)cpuset_count * sizeof(uint32_t));
     pool->cpuset_id_count = cpuset_count;
+
+    /* Initialize per-worker wake events */
+    for (int i = 0; i < cpuset_count; i++)
+        pool->worker_queues[i].wake_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
     /* Load SetThreadSelectedCpuSets dynamically */
     PFN_SetThreadSelectedCpuSets pfn_set_cpusets =

@@ -1622,7 +1622,7 @@ public:
                 double stressed_ratio = 0.0;
                 int stressed_idx = plugin_get_stressed_worker(m_state, &stressed_ratio);
                 if (stressed_idx >= 0) {
-                    int core_ids[64];
+                    uint32_t core_ids[64];
                     int n_cores = plugin_get_selected_cores(m_state, core_ids, 64);
                     int core_lp = (stressed_idx < n_cores) ? core_ids[stressed_idx] : -1;
                     trellis_log("  WARNING: worker %d stressed (%.0f%% RT budget) on LP%d",
