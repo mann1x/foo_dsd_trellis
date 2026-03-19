@@ -396,7 +396,10 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         s->topology_detected = true;
     }
 
-    /* Select threads based on topology and config */
+    /* Update per-core load before selecting */
+    cpuset_update_load(&s->topology);
+
+    /* Select threads based on topology, load, and config */
     uint32_t selected_ids[CPUSET_MAX_CPUS];
     int max_t = s->config.thread_count > 0 ? s->config.thread_count : 0;
     int selected = cpuset_select(&s->topology,
@@ -729,6 +732,7 @@ size_t plugin_process(plugin_state_t *s,
                 threadpool_destroy(s->pool);
                 s->pool = NULL;
 
+                cpuset_update_load(&s->topology);
                 uint32_t selected_ids[CPUSET_MAX_CPUS];
                 int max_t = s->config.thread_count > 0 ? s->config.thread_count : 0;
                 int selected = cpuset_select(&s->topology,

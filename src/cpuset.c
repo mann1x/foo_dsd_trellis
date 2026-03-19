@@ -639,18 +639,90 @@ void cpuset_benchmark(cpu_topology_t *topo) {
     free(works);
 }
 
+/* ─── Per-core CPU load monitoring ─── */
+
+/* NtQuerySystemInformation for per-processor performance data */
+typedef LONG NTSTATUS;
+typedef struct {
+    LARGE_INTEGER IdleTime;
+    LARGE_INTEGER KernelTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER DpcTime;
+    LARGE_INTEGER InterruptTime;
+    ULONG InterruptCount;
+} SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION;
+
+#define SystemProcessorPerformanceInformation 8
+
+typedef NTSTATUS (NTAPI *PFN_NtQuerySystemInformation)(
+    ULONG SystemInformationClass, PVOID SystemInformation,
+    ULONG SystemInformationLength, PULONG ReturnLength);
+
+/* Cached previous measurement for delta computation */
+static LARGE_INTEGER g_prev_idle[CPUSET_MAX_CPUS];
+static LARGE_INTEGER g_prev_total[CPUSET_MAX_CPUS];
+static bool g_load_initialized = false;
+
+void cpuset_update_load(cpu_topology_t *topo) {
+    if (!topo->initialized || topo->count == 0)
+        return;
+
+    static PFN_NtQuerySystemInformation pfn_query = NULL;
+    if (!pfn_query) {
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll)
+            pfn_query = (PFN_NtQuerySystemInformation)
+                GetProcAddress(ntdll, "NtQuerySystemInformation");
+        if (!pfn_query) return;
+    }
+
+    SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION info[CPUSET_MAX_CPUS];
+    ULONG ret_len = 0;
+    NTSTATUS status = pfn_query(SystemProcessorPerformanceInformation,
+        info, (ULONG)(sizeof(info[0]) * topo->count), &ret_len);
+    if (status != 0) return;
+
+    int n_procs = (int)(ret_len / sizeof(info[0]));
+    for (int i = 0; i < topo->count && i < n_procs; i++) {
+        int lp = topo->entries[i].logical_index;
+        if (lp >= n_procs) continue;
+
+        LARGE_INTEGER idle = info[lp].IdleTime;
+        LARGE_INTEGER total;
+        total.QuadPart = info[lp].KernelTime.QuadPart + info[lp].UserTime.QuadPart;
+
+        if (g_load_initialized) {
+            LONGLONG d_total = total.QuadPart - g_prev_total[lp].QuadPart;
+            LONGLONG d_idle = idle.QuadPart - g_prev_idle[lp].QuadPart;
+            if (d_total > 0)
+                topo->entries[i].load = 1.0 - (double)d_idle / (double)d_total;
+            else
+                topo->entries[i].load = 0.0;
+        }
+
+        g_prev_idle[lp] = idle;
+        g_prev_total[lp] = total;
+    }
+    g_load_initialized = true;
+}
+
 /* ─── Thread selection ─── */
 
 /* Comparison function for sorting entries by preference */
 typedef struct {
     int     entry_index;
     int     priority;     /* Lower = preferred */
+    int     load_bin;     /* 0-9: 0=0-10% load, 9=90-100% */
     double  perf;         /* Higher = preferred */
 } select_candidate_t;
 
 static int cmp_candidate(const void *a, const void *b) {
     const select_candidate_t *ca = (const select_candidate_t *)a;
     const select_candidate_t *cb = (const select_candidate_t *)b;
+    /* Sort by load bin first (lowest load = preferred) */
+    if (ca->load_bin != cb->load_bin)
+        return ca->load_bin - cb->load_bin;
+    /* Within same load bin, sort by priority (lowest = preferred) */
     if (ca->priority != cb->priority)
         return ca->priority - cb->priority;
     /* Higher perf score first */
@@ -742,7 +814,13 @@ int cpuset_select(const cpu_topology_t *topo,
                 prio += 500;  /* E-cores last */
         }
 
+        /* Load bin: 0=0-10%, 1=10-20%, ..., 9=90-100% */
+        int load_bin = (int)(e->load * 10.0);
+        if (load_bin < 0) load_bin = 0;
+        if (load_bin > 9) load_bin = 9;
+
         cands[ncands].entry_index = i;
+        cands[ncands].load_bin = load_bin;
         cands[ncands].priority = prio;
         cands[ncands].perf = e->perf_score;
         ncands++;

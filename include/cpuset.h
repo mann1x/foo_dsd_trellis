@@ -59,6 +59,7 @@ typedef struct {
     bool     allocated_to_target; /* Allocated to this process */
     bool     realtime;          /* Marked as real-time capable */
     uint8_t  raw_flags;         /* Raw AllFlags byte from GetSystemCpuSetInformation */
+    double   load;              /* CPU load 0.0-1.0 (updated by cpuset_update_load) */
 } cpuset_entry_t;
 
 /* Cluster (CCD/Intel cluster) summary */
@@ -92,6 +93,11 @@ int cpuset_detect(cpu_topology_t *topo);
 /* Run micro-benchmark on each core to estimate performance.
  * Updates perf_score in each entry. */
 void cpuset_benchmark(cpu_topology_t *topo);
+
+/* Update per-core CPU load (0.0-1.0) by querying OS processor times.
+ * Call periodically (e.g., every few chunks) — caches internally. */
+/* Note: mutates topo->entries[].load — not const despite only updating load. */
+void cpuset_update_load(cpu_topology_t *topo);
 
 /* Select which logical processors to use for thread pool workers.
  * Returns number of selected CPUs. selected_ids[] is filled with
