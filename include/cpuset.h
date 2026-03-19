@@ -100,8 +100,12 @@ void cpuset_benchmark(cpu_topology_t *topo);
 void cpuset_update_load(cpu_topology_t *topo);
 
 /* Select which logical processors to use for thread pool workers.
- * Returns number of selected CPUs. selected_ids[] is filled with
- * CPU set IDs suitable for SetThreadSelectedCpuSets.
+ * Returns number of selected CPUs.
+ * selected_ids[]: CPU set IDs (for tracking/logging).
+ * selected_lps[]: logical processor indices (for SetThreadAffinityMask).
+ *                 May be NULL if not needed.
+ * selected_groups[]: processor groups (for >64 CPU systems).
+ *                    May be NULL if not needed.
  * max_threads: 0 = auto (select based on modes). */
 int cpuset_select(const cpu_topology_t *topo,
                   smt_mode_t smt_mode,
@@ -109,6 +113,8 @@ int cpuset_select(const cpu_topology_t *topo,
                   ecore_mode_t ecore_mode,
                   int max_threads,
                   uint32_t *selected_ids,
+                  uint8_t *selected_lps,
+                  uint16_t *selected_groups,
                   int max_ids);
 
 /* Pin a thread to a specific CPU set ID. Returns 0 on success. */
@@ -130,5 +136,29 @@ uint64_t cpuset_refresh(cpu_topology_t *topo, bool *changed);
  * log_fn signature: void(*)(const char *line, void *ctx) */
 typedef void (*cpuset_log_fn)(const char *line, void *ctx);
 void cpuset_log_detail(const cpu_topology_t *topo, cpuset_log_fn log_fn, void *ctx);
+
+/* ─── Background CPU Monitor ─── */
+
+/* Opaque background monitor that periodically updates load and CPUSET flags.
+ * All mutation happens on a dedicated thread — audio thread never blocks. */
+typedef struct cpuset_monitor cpuset_monitor_t;
+
+/* Create background monitor. topo must be initialized via cpuset_detect() first.
+ * interval_ms: load update interval (recommended 500-1000).
+ * refresh_every: call cpuset_refresh every N load cycles (recommended 30).
+ * Returns NULL on failure. */
+cpuset_monitor_t *cpuset_monitor_create(cpu_topology_t *topo,
+                                         int interval_ms, int refresh_every);
+
+/* Stop and destroy the monitor thread. Safe with NULL. */
+void cpuset_monitor_destroy(cpuset_monitor_t *mon);
+
+/* Read the latest topology snapshot (never blocks — SRWLOCK shared read).
+ * Copies the last completed snapshot into *out. */
+void cpuset_monitor_read(const cpuset_monitor_t *mon, cpu_topology_t *out);
+
+/* Check if the CPUSET mask changed since last call to this function.
+ * Returns true if changed, and writes the new mask to *new_mask. */
+bool cpuset_monitor_changed(cpuset_monitor_t *mon, uint64_t *new_mask);
 
 #endif /* CPUSET_H */

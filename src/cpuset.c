@@ -706,28 +706,40 @@ void cpuset_update_load(cpu_topology_t *topo) {
     g_load_initialized = true;
 }
 
-/* ─── Thread selection ─── */
+/* ─── Thread selection (tiered) ─── */
 
-/* Comparison function for sorting entries by preference */
+/*
+ * Tier-based core selection:
+ *   Tier 1 (IDEAL):      T0 + P-core + load 0-30%
+ *   Tier 2 (GOOD):       T0 + P-core + load 30-70%
+ *   Tier 3 (ACCEPTABLE): T0 + P-core + load 70%+  OR  T0 + E-core + load 0-30%
+ *   Tier 4 (LAST RESORT): T1 (SMT)  OR  E-core + load >30%
+ *
+ * Within each tier: load_bin ASC → scheduling_class ASC → cluster ASC → perf DESC
+ */
+
 typedef struct {
     int     entry_index;
-    int     priority;     /* Lower = preferred */
-    int     load_bin;     /* 0-9: 0=0-10% load, 9=90-100% */
-    double  perf;         /* Higher = preferred */
+    int     tier;         /* 1-4 */
+    int     load_bin;     /* 0-9 */
+    int     cluster;      /* cluster index (CCD_AUTO) or 0 (CCD_ALL) */
+    double  perf;         /* perf_score (from benchmark, higher=faster) */
 } select_candidate_t;
 
 static int cmp_candidate(const void *a, const void *b) {
     const select_candidate_t *ca = (const select_candidate_t *)a;
     const select_candidate_t *cb = (const select_candidate_t *)b;
-    /* Sort by load bin first (lowest load = preferred) */
-    if (ca->load_bin != cb->load_bin)
-        return ca->load_bin - cb->load_bin;
-    /* Within same load bin, sort by priority (lowest = preferred) */
-    if (ca->priority != cb->priority)
-        return ca->priority - cb->priority;
-    /* Higher perf score first */
+    /* Primary: tier ASC (exhaust tier 1 before tier 2, etc.) */
+    if (ca->tier != cb->tier) return ca->tier - cb->tier;
+    /* Secondary: load_bin ASC (lightest first) */
+    if (ca->load_bin != cb->load_bin) return ca->load_bin - cb->load_bin;
+    /* Tertiary: perf_score DESC (fastest core wins — benchmark is the
+     * ground truth for core capability, not scheduling_class which has
+     * platform-specific semantics) */
     if (ca->perf > cb->perf) return -1;
     if (ca->perf < cb->perf) return 1;
+    /* Quaternary: cluster ASC (CCD_AUTO preference) */
+    if (ca->cluster != cb->cluster) return ca->cluster - cb->cluster;
     return 0;
 }
 
@@ -737,27 +749,40 @@ int cpuset_select(const cpu_topology_t *topo,
                   ecore_mode_t ecore_mode,
                   int max_threads,
                   uint32_t *selected_ids,
+                  uint8_t *selected_lps,
+                  uint16_t *selected_groups,
                   int max_ids) {
     if (!topo->initialized || topo->count == 0)
         return 0;
+
+    /* Count enabled cores for LP0 decision */
+    int available_count = 0;
+    for (int i = 0; i < topo->count; i++) {
+        if (topo->entries[i].enabled)
+            available_count++;
+    }
 
     select_candidate_t cands[CPUSET_MAX_CPUS];
     int ncands = 0;
 
     for (int i = 0; i < topo->count; i++) {
         const cpuset_entry_t *e = &topo->entries[i];
+
+        /* ── Hard filters (Phase 1) ── */
+
+        /* F1: Must be enabled */
         if (!e->enabled)
             continue;
-        /* Don't exclude parked cores — SetThreadSelectedCpuSets will
-         * cause the OS to unpark them when needed. Excluding parked
-         * cores means we'd only use the busy/hot cores, which is the
-         * opposite of what we want. */
 
-        /* SMT filtering */
+        /* F2: LP0 — hard reject when >4 cores available */
+        if (e->logical_index == 0 && available_count > 4)
+            continue;
+
+        /* F3: SMT filter */
         if (smt_mode == SMT_T0_ONLY && e->smt_thread != 0)
             continue;
 
-        /* E-core filtering (Intel hybrid) */
+        /* F4: E-core filter (Intel hybrid) */
         if (topo->is_hybrid) {
             if (ecore_mode == ECORE_EXCLUDE && e->efficiency_class == 0)
                 continue;
@@ -765,78 +790,56 @@ int cpuset_select(const cpu_topology_t *topo,
                 continue;
         }
 
-        /* Compute priority: lower = more preferred.
-         *
-         * Strategy: avoid cores that Windows uses heavily (high
-         * scheduling_class). Prefer parked/idle cores that will be
-         * unparked on demand — they're less likely to compete with
-         * the OS and other apps for the same cores.
-         *
-         * Priority bands:
-         *   0-99:    T0 threads, sorted by scheduling_class (low = idle)
-         *   100-199: T0 threads on parked cores (OS will unpark)
-         *   1000+:   T1 (SMT sibling) threads — last resort
-         *
-         * Within each band, lower scheduling_class = preferred.
-         * Ties broken by perf_score (higher = better). */
-        int prio = 0;
+        /* ── Tier classification (Phase 2) ── */
 
-        /* Don't penalize parked cores — the Parked flag is transient
-         * (Windows parks idle cores and unparks on demand). At query
-         * time most cores appear parked even when they'll be active
-         * under load. Treat all enabled cores equally. */
+        bool is_t0 = (e->smt_thread == 0);
+        bool is_pcore = (e->efficiency_class > 0 || !topo->is_hybrid);
 
-        /* Core 0 (LP0) is reserved for OS/fb2k main thread.
-         * Exclude it unless we have no other cores. */
-        if (e->logical_index == 0) {
-            prio += 10000;  /* effectively exclude */
-            /* Will only be used if all other cores are exhausted */
-        }
-
-        /* Avoid the busiest cores (sched_class >= 13). */
-        if (e->scheduling_class >= 13)
-            prio += 50;
-
-        /* SMT: T0 preferred over T1 */
-        if (e->smt_thread > 0)
-            prio += 1000;
-
-        /* CCD/cluster preference — minimal penalty.
-         * Idle cores on any cluster beat loaded cores on preferred cluster. */
-        if (ccd_mode == CCD_AUTO) {
-            prio += e->cluster * 1;
-        }
-        /* CCD_ALL: all clusters equally preferred (no cluster penalty) */
-
-        /* E-core: P-cores preferred in AUTO mode */
-        if (topo->is_hybrid && ecore_mode == ECORE_AUTO) {
-            if (e->efficiency_class == 0)
-                prio += 500;  /* E-cores last */
-        }
-
-        /* Load bin: 0=0-10%, 1=10-20%, ..., 9=90-100% */
         int load_bin = (int)(e->load * 10.0);
         if (load_bin < 0) load_bin = 0;
         if (load_bin > 9) load_bin = 9;
 
+        /* High scheduling_class (>=12) = OS-preferred core = always busy
+         * with background work. Treat as implicitly loaded even if
+         * measured load is 0% (parked cores freeze counters). */
+        bool os_hot = (e->scheduling_class >= 12);
+        int eff_load_bin = load_bin;
+        if (os_hot && eff_load_bin < 4)
+            eff_load_bin = 4;  /* floor at 40% for OS-hot cores */
+
+        int tier;
+        if (is_t0 && is_pcore && eff_load_bin <= 2)
+            tier = 1;  /* IDEAL: T0 P-core, idle */
+        else if (is_t0 && is_pcore && eff_load_bin <= 6)
+            tier = 2;  /* GOOD: T0 P-core, moderate load */
+        else if (is_t0 && is_pcore)
+            tier = 3;  /* ACCEPTABLE: T0 P-core, heavy load */
+        else if (is_t0 && !is_pcore && eff_load_bin <= 2)
+            tier = 3;  /* ACCEPTABLE: idle E-core */
+        else
+            tier = 4;  /* LAST RESORT: T1 or loaded E-core */
+
+        /* ── Intra-tier sorting fields (Phase 3) ── */
+
         cands[ncands].entry_index = i;
-        cands[ncands].load_bin = load_bin;
-        cands[ncands].priority = prio;
+        cands[ncands].tier = tier;
+        cands[ncands].load_bin = eff_load_bin;
+        cands[ncands].cluster = (ccd_mode == CCD_AUTO) ? (int)e->cluster : 0;
         cands[ncands].perf = e->perf_score;
         ncands++;
     }
 
-    /* Sort by priority then by performance */
+    /* Sort by tier → load → sched_class → cluster → perf */
     qsort(cands, (size_t)ncands, sizeof(select_candidate_t), cmp_candidate);
 
-    /* Determine how many to select.
-     * max_threads=0 (auto): cap to physical core count.
-     * T1 (SMT) threads share physical cores and cause contention. */
+    /* ── Phase 4: Select top N ── */
+
     int select_count = ncands;
     if (max_threads > 0) {
         if (max_threads < select_count)
             select_count = max_threads;
     } else {
+        /* Auto: cap to physical core count */
         int phys = topo->num_physical_cores > 0 ? topo->num_physical_cores : ncands;
         if (phys < select_count)
             select_count = phys;
@@ -844,8 +847,14 @@ int cpuset_select(const cpu_topology_t *topo,
     if (select_count > max_ids)
         select_count = max_ids;
 
-    for (int i = 0; i < select_count; i++)
-        selected_ids[i] = topo->entries[cands[i].entry_index].id;
+    for (int i = 0; i < select_count; i++) {
+        const cpuset_entry_t *e = &topo->entries[cands[i].entry_index];
+        selected_ids[i] = e->id;
+        if (selected_lps)
+            selected_lps[i] = e->logical_index;
+        if (selected_groups)
+            selected_groups[i] = e->group;
+    }
 
     return select_count;
 }
@@ -984,4 +993,121 @@ void cpuset_log_detail(const cpu_topology_t *topo, cpuset_log_fn log_fn, void *c
 
 void cpuset_free(cpu_topology_t *topo) {
     memset(topo, 0, sizeof(*topo));
+}
+
+/* ─── Background CPU Monitor ─── */
+
+struct cpuset_monitor {
+    cpu_topology_t *live;           /* mutable, written by monitor thread only */
+    cpu_topology_t  snapshot;       /* double-buffered snapshot for readers */
+    SRWLOCK         lock;           /* protects snapshot (shared read / exclusive write) */
+    HANDLE          thread;
+    HANDLE          stop_event;     /* signaled to request shutdown */
+    int             interval_ms;
+    int             refresh_every;
+    volatile LONG   mask_changed;   /* flag for cpuset_monitor_changed */
+    uint64_t        reported_mask;  /* last mask returned by _changed */
+};
+
+static DWORD WINAPI monitor_thread_func(LPVOID param) {
+    cpuset_monitor_t *mon = (cpuset_monitor_t *)param;
+    int cycle = 0;
+
+    for (;;) {
+        /* Sleep for interval or until stop_event is signaled */
+        DWORD wait = WaitForSingleObject(mon->stop_event, (DWORD)mon->interval_ms);
+        if (wait == WAIT_OBJECT_0)
+            break;  /* shutdown requested */
+
+        /* Update per-core load (NtQuerySystemInformation) */
+        cpuset_update_load(mon->live);
+
+        /* Periodically refresh CPUSET flags (detect CPUDoc changes) */
+        cycle++;
+        if (cycle >= mon->refresh_every) {
+            cycle = 0;
+            bool changed = false;
+            cpuset_refresh(mon->live, &changed);
+            if (changed)
+                InterlockedExchange(&mon->mask_changed, 1);
+        }
+
+        /* Publish snapshot — exclusive lock for ~1 microsecond (memcpy ~10KB) */
+        AcquireSRWLockExclusive(&mon->lock);
+        memcpy(&mon->snapshot, mon->live, sizeof(cpu_topology_t));
+        ReleaseSRWLockExclusive(&mon->lock);
+    }
+
+    return 0;
+}
+
+cpuset_monitor_t *cpuset_monitor_create(cpu_topology_t *topo,
+                                         int interval_ms, int refresh_every) {
+    if (!topo || !topo->initialized)
+        return NULL;
+
+    cpuset_monitor_t *mon = (cpuset_monitor_t *)calloc(1, sizeof(cpuset_monitor_t));
+    if (!mon) return NULL;
+
+    mon->live = topo;
+    mon->interval_ms = (interval_ms > 0) ? interval_ms : 750;
+    mon->refresh_every = (refresh_every > 0) ? refresh_every : 30;
+    InitializeSRWLock(&mon->lock);
+
+    /* Take initial snapshot */
+    memcpy(&mon->snapshot, topo, sizeof(cpu_topology_t));
+    mon->reported_mask = topo->last_cpuset_mask;
+
+    /* Create stop event (manual-reset, initially non-signaled) */
+    mon->stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!mon->stop_event) {
+        free(mon);
+        return NULL;
+    }
+
+    /* Start monitor thread */
+    mon->thread = CreateThread(NULL, 0, monitor_thread_func, mon, 0, NULL);
+    if (!mon->thread) {
+        CloseHandle(mon->stop_event);
+        free(mon);
+        return NULL;
+    }
+
+    return mon;
+}
+
+void cpuset_monitor_destroy(cpuset_monitor_t *mon) {
+    if (!mon) return;
+
+    /* Signal shutdown and wait */
+    SetEvent(mon->stop_event);
+    WaitForSingleObject(mon->thread, 5000);
+    CloseHandle(mon->thread);
+    CloseHandle(mon->stop_event);
+    free(mon);
+}
+
+void cpuset_monitor_read(const cpuset_monitor_t *mon, cpu_topology_t *out) {
+    if (!mon || !out) return;
+    /* Shared read lock — multiple audio threads can read concurrently */
+    AcquireSRWLockShared((PSRWLOCK)&mon->lock);
+    memcpy(out, &mon->snapshot, sizeof(cpu_topology_t));
+    ReleaseSRWLockShared((PSRWLOCK)&mon->lock);
+}
+
+bool cpuset_monitor_changed(cpuset_monitor_t *mon, uint64_t *new_mask) {
+    if (!mon) return false;
+
+    if (InterlockedCompareExchange(&mon->mask_changed, 0, 1) == 1) {
+        /* Mask changed — read the current value */
+        AcquireSRWLockShared(&mon->lock);
+        uint64_t mask = mon->snapshot.last_cpuset_mask;
+        ReleaseSRWLockShared(&mon->lock);
+        mon->reported_mask = mask;
+        if (new_mask) *new_mask = mask;
+        return true;
+    }
+
+    if (new_mask) *new_mask = mon->reported_mask;
+    return false;
 }

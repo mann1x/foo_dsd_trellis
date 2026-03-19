@@ -1834,6 +1834,7 @@ public:
             int lp = -1;
             int cluster = -1;
             double perf = 0.0;
+            double load = 0.0;
             bool parked = false;
             if (topo) {
                 for (int j = 0; j < topo->count; j++) {
@@ -1842,6 +1843,7 @@ public:
                         smt_tag = topo->entries[j].smt_thread == 0 ? "T0" : "T1";
                         cluster = topo->entries[j].cluster;
                         perf = topo->entries[j].perf_score;
+                        load = topo->entries[j].load;
                         parked = topo->entries[j].parked;
                         break;
                     }
@@ -1849,8 +1851,8 @@ public:
             }
             if (i > 0) pos += snprintf(buf + pos, sizeof(buf) - pos, ", ");
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                           "LP%d/%s/C%d(%.0f%%%s)",
-                           lp, smt_tag, cluster, perf * 100,
+                           "LP%d/%s/C%d(perf=%.0f%% load=%.0f%%%s)",
+                           lp, smt_tag, cluster, perf * 100, load * 100,
                            parked ? " parked" : "");
         }
         trellis_log("%s", buf);

@@ -72,6 +72,7 @@ static void mmcss_unregister(HANDLE h) {
 }
 
 #define PER_WORKER_QUEUE_SIZE 8
+#define RT_WINDOW_SIZE 5
 
 /* Per-worker direct queue for targeted task assignment */
 typedef struct {
@@ -79,6 +80,13 @@ typedef struct {
     volatile LONG    count;
     HANDLE           wake_event;  /* Auto-reset event for targeted wakeup */
 } worker_queue_t;
+
+/* Per-worker rolling RT% window for stress detection */
+typedef struct {
+    double   samples[RT_WINDOW_SIZE];  /* circular buffer */
+    int      pos;                       /* next write position */
+    int      count;                     /* filled entries (0..RT_WINDOW_SIZE) */
+} rt_window_t;
 
 struct threadpool {
     int          thread_count;
@@ -105,13 +113,22 @@ struct threadpool {
 
     /* Per-thread RT stress tracking */
     double      *last_rt_ratio;     /* [thread_count] last RT ratio per worker */
+    rt_window_t *rt_windows;        /* [thread_count] rolling RT% windows */
     uint32_t    *cpuset_ids;        /* [thread_count] current CPU set IDs */
+    uint8_t     *lp_indices;        /* [thread_count] logical processor indices */
+    uint16_t    *groups;            /* [thread_count] processor groups */
     int          cpuset_id_count;
+
 };
 
 /* SetThreadSelectedCpuSets — loaded dynamically (Windows 10+) */
 typedef BOOL (WINAPI *PFN_SetThreadSelectedCpuSets)(
     HANDLE Thread, const ULONG *CpuSetIds, ULONG CpuSetIdCount);
+
+/* SetThreadGroupAffinity — for hard affinity on >64 CPU systems */
+typedef BOOL (WINAPI *PFN_SetThreadGroupAffinity)(
+    HANDLE hThread, const GROUP_AFFINITY *GroupAffinity,
+    GROUP_AFFINITY *PreviousGroupAffinity);
 
 /* Per-worker context passed to the thread function */
 typedef struct {
@@ -127,8 +144,19 @@ static DWORD WINAPI worker_func(LPVOID param) {
     int my_index = ctx->thread_index;
     free(ctx);  /* context was heap-allocated */
 
-    /* Register with MMCSS for real-time audio scheduling */
-    HANDLE mmcss_handle = mmcss_register();
+    /* MMCSS disabled — its scheduling constraints halve performance
+     * (1.57x RT with MMCSS vs 0.77x without, both with hard pin).
+     * THREAD_PRIORITY_HIGHEST provides sufficient priority elevation. */
+    HANDLE mmcss_handle = NULL;
+
+    /* Hard-pin this thread to its designated LP.
+     * SetThreadAffinityMask is a hard constraint the OS cannot override. */
+    if (pool->lp_indices && my_index < pool->cpuset_id_count) {
+        DWORD_PTR mask = (DWORD_PTR)1 << pool->lp_indices[my_index];
+        SetThreadAffinityMask(GetCurrentThread(), mask);
+    }
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
     /* Build wait handles: [0] = per-worker event, [1] = shared semaphore */
     worker_queue_t *my_queue = (pool->worker_queues) ? &pool->worker_queues[my_index] : NULL;
@@ -166,20 +194,23 @@ static DWORD WINAPI worker_func(LPVOID param) {
         if (!block)
             continue;
 
-        /* Log task assignment: worker index, CPU thread, task mode */
+        /* Log task: what the worker is doing and which core it runs on */
         {
             static volatile LONG s_log_count = 0;
-            if (InterlockedIncrement(&s_log_count) <= 20) {
+            if (InterlockedIncrement(&s_log_count) <= 40) {
                 DWORD cpu = GetCurrentProcessorNumber();
-                const char *mode_name = "FULL";
-                if (block->mode == BLOCK_MODE_SDM) mode_name = "SDM";
-                else if (block->mode == BLOCK_MODE_FIR) mode_name = "FIR";
-                else if (block->mode == BLOCK_MODE_UNPACK) mode_name = "UNPACK";
-                else if (block->mode == BLOCK_MODE_PACK) mode_name = "PACK";
+                const char *job = "Process";
+                switch (block->mode) {
+                case BLOCK_MODE_SDM:    job = "SDM";     break;
+                case BLOCK_MODE_FIR:    job = "FIR";     break;
+                case BLOCK_MODE_UNPACK: job = "Unpack";  break;
+                case BLOCK_MODE_PACK:   job = "Pack";    break;
+                case BLOCK_MODE_FULL:   job = "Full";    break;
+                }
                 char msg[128];
                 sprintf_s(msg, sizeof(msg),
-                    "worker %d: %s ch=%d count=%zu on CPU#%u",
-                    my_index, mode_name, block->channel, block->count, cpu);
+                    "%s (ch %d) on LP%u [w%d, %zu samples]",
+                    job, block->channel, cpu, my_index, block->count);
                 trellis_log_c(msg);
             }
         }
@@ -262,8 +293,18 @@ static DWORD WINAPI worker_func(LPVOID param) {
 
             /* Record per-thread stress and which worker processed this block */
             block->worker_index = my_index;
-            if (my_index >= 0 && my_index < pool->thread_count && pool->last_rt_ratio)
-                pool->last_rt_ratio[my_index] = block->rt_ratio;
+            if (my_index >= 0 && my_index < pool->thread_count) {
+                if (pool->last_rt_ratio)
+                    pool->last_rt_ratio[my_index] = block->rt_ratio;
+                /* Push to rolling window (only for SDM blocks — the heavy work) */
+                if (pool->rt_windows && block->mode == BLOCK_MODE_SDM) {
+                    rt_window_t *w = &pool->rt_windows[my_index];
+                    w->samples[w->pos] = block->rt_ratio;
+                    w->pos = (w->pos + 1) % RT_WINDOW_SIZE;
+                    if (w->count < RT_WINDOW_SIZE)
+                        w->count++;
+                }
+            }
         }
 
         /* Decrement pending counter; if zero, signal done */
@@ -316,10 +357,12 @@ threadpool_t *threadpool_create(int thread_count, DWORD affinity_mask) {
     /* Create worker threads + tracking arrays */
     pool->threads = (HANDLE *)calloc((size_t)thread_count, sizeof(HANDLE));
     pool->last_rt_ratio = (double *)calloc((size_t)thread_count, sizeof(double));
+    pool->rt_windows = (rt_window_t *)calloc((size_t)thread_count, sizeof(rt_window_t));
     pool->worker_queues = (worker_queue_t *)calloc((size_t)thread_count, sizeof(worker_queue_t));
-    if (!pool->threads || !pool->last_rt_ratio || !pool->worker_queues) {
+    if (!pool->threads || !pool->last_rt_ratio || !pool->rt_windows || !pool->worker_queues) {
         free(pool->threads);
         free(pool->last_rt_ratio);
+        free(pool->rt_windows);
         free(pool->worker_queues);
         CloseHandle(pool->done_event);
         CloseHandle(pool->work_sem);
@@ -456,7 +499,10 @@ void threadpool_destroy(threadpool_t *pool) {
 
     free(pool->threads);
     free(pool->last_rt_ratio);
+    free(pool->rt_windows);
     free(pool->cpuset_ids);
+    free(pool->lp_indices);
+    free(pool->groups);
     if (pool->worker_queues) {
         for (int i = 0; i < pool->thread_count; i++)
             CloseHandle(pool->worker_queues[i].wake_event);
@@ -497,27 +543,116 @@ int threadpool_migrate_thread(threadpool_t *pool, int thread_index, uint32_t new
     if (!pool->threads[thread_index])
         return -1;
 
-    PFN_SetThreadSelectedCpuSets pfn_set_cpusets =
-        (PFN_SetThreadSelectedCpuSets)GetProcAddress(
-            GetModuleHandleW(L"kernel32.dll"), "SetThreadSelectedCpuSets");
-    if (!pfn_set_cpusets)
-        return -1;
+    /* We need the LP index for SetThreadAffinityMask.
+     * The cpuset_id encodes the LP (id = base + lp_index on most systems).
+     * Compute LP from the offset to the first known cpuset_id. */
+    uint8_t new_lp = 0;
+    if (pool->cpuset_ids && pool->lp_indices && pool->cpuset_id_count > 0) {
+        /* Find LP index for this cpuset_id by offset from known base */
+        uint32_t base_id = pool->cpuset_ids[0];
+        uint8_t base_lp = pool->lp_indices[0];
+        new_lp = (uint8_t)((int)base_lp + ((int)new_cpuset_id - (int)base_id));
+    }
 
-    ULONG id = new_cpuset_id;
-    if (!pfn_set_cpusets(pool->threads[thread_index], &id, 1))
-        return -1;
+    /* Hard affinity — check if multi-group */
+    bool multi_group = false;
+    if (pool->groups) {
+        for (int i = 0; i < pool->cpuset_id_count; i++) {
+            if (pool->groups[i] > 0) { multi_group = true; break; }
+        }
+    }
 
-    /* Update tracked cpuset ID */
+    if (multi_group) {
+        PFN_SetThreadGroupAffinity pfn_ga = (PFN_SetThreadGroupAffinity)
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadGroupAffinity");
+        if (pfn_ga) {
+            /* Find group for this cpuset_id (search known entries, fallback to 0) */
+            uint16_t grp = 0;
+            for (int i = 0; i < pool->cpuset_id_count; i++) {
+                if (pool->cpuset_ids[i] == new_cpuset_id) {
+                    grp = pool->groups[i];
+                    break;
+                }
+            }
+            GROUP_AFFINITY ga;
+            memset(&ga, 0, sizeof(ga));
+            ga.Group = grp;
+            ga.Mask = (KAFFINITY)1 << new_lp;
+            pfn_ga(pool->threads[thread_index], &ga, NULL);
+        }
+    } else {
+        DWORD_PTR mask = (DWORD_PTR)1 << new_lp;
+        SetThreadAffinityMask(pool->threads[thread_index], mask);
+    }
+
+    /* Update tracked cpuset ID and LP index */
     if (pool->cpuset_ids && thread_index < pool->cpuset_id_count)
         pool->cpuset_ids[thread_index] = new_cpuset_id;
+    if (pool->lp_indices && thread_index < pool->cpuset_id_count)
+        pool->lp_indices[thread_index] = new_lp;
 
     return 0;
 }
 
+/* ─── Rolling RT% stress detection ─── */
+
+worker_stress_level_t threadpool_get_worker_stress(threadpool_t *pool, int worker_index) {
+    if (!pool || !pool->rt_windows || worker_index < 0 || worker_index >= pool->thread_count)
+        return WORKER_HEALTHY;
+
+    rt_window_t *w = &pool->rt_windows[worker_index];
+    if (w->count == 0)
+        return WORKER_HEALTHY;
+
+    /* CRITICAL: any of the last 1 entry > 1.0 */
+    int newest = (w->pos + RT_WINDOW_SIZE - 1) % RT_WINDOW_SIZE;
+    if (w->samples[newest] > 1.0)
+        return WORKER_CRITICAL;
+
+    /* WARN: last 3+ consecutive entries all > 0.9 */
+    if (w->count >= 3) {
+        int warn_count = 0;
+        for (int i = 0; i < w->count && i < RT_WINDOW_SIZE; i++) {
+            int idx = (w->pos + RT_WINDOW_SIZE - 1 - i) % RT_WINDOW_SIZE;
+            if (w->samples[idx] > 0.9)
+                warn_count++;
+            else
+                break;  /* must be consecutive */
+        }
+        if (warn_count >= 3)
+            return WORKER_WARN;
+    }
+
+    return WORKER_HEALTHY;
+}
+
+double threadpool_get_worker_avg_rt(threadpool_t *pool, int worker_index) {
+    if (!pool || !pool->rt_windows || worker_index < 0 || worker_index >= pool->thread_count)
+        return 0.0;
+
+    rt_window_t *w = &pool->rt_windows[worker_index];
+    if (w->count == 0)
+        return 0.0;
+
+    double sum = 0.0;
+    for (int i = 0; i < w->count; i++)
+        sum += w->samples[i];
+    return sum / (double)w->count;
+}
+
+uint32_t threadpool_get_worker_cpuset(threadpool_t *pool, int worker_index) {
+    if (!pool || !pool->cpuset_ids || worker_index < 0 || worker_index >= pool->cpuset_id_count)
+        return 0;
+    return pool->cpuset_ids[worker_index];
+}
+
 /* ─── CPUSET-aware thread pool creation ─── */
 
-threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids, int cpuset_count) {
-    if (!cpuset_ids || cpuset_count < 1)
+threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids,
+                                       const uint8_t *lp_indices,
+                                       const uint16_t *groups,
+                                       int count) {
+    if (!cpuset_ids || !lp_indices || count < 1)
         return NULL;
 
     mmcss_init();
@@ -526,7 +661,7 @@ threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids, int cpuset_co
     if (!pool)
         return NULL;
 
-    pool->thread_count = cpuset_count;
+    pool->thread_count = count;
     pool->affinity_mask = 0;
 
     InitializeCriticalSection(&pool->queue_cs);
@@ -546,14 +681,21 @@ threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids, int cpuset_co
         return NULL;
     }
 
-    pool->threads = (HANDLE *)calloc((size_t)cpuset_count, sizeof(HANDLE));
-    pool->last_rt_ratio = (double *)calloc((size_t)cpuset_count, sizeof(double));
-    pool->cpuset_ids = (uint32_t *)malloc((size_t)cpuset_count * sizeof(uint32_t));
-    pool->worker_queues = (worker_queue_t *)calloc((size_t)cpuset_count, sizeof(worker_queue_t));
-    if (!pool->threads || !pool->last_rt_ratio || !pool->cpuset_ids || !pool->worker_queues) {
+    pool->threads = (HANDLE *)calloc((size_t)count, sizeof(HANDLE));
+    pool->last_rt_ratio = (double *)calloc((size_t)count, sizeof(double));
+    pool->rt_windows = (rt_window_t *)calloc((size_t)count, sizeof(rt_window_t));
+    pool->cpuset_ids = (uint32_t *)malloc((size_t)count * sizeof(uint32_t));
+    pool->lp_indices = (uint8_t *)malloc((size_t)count * sizeof(uint8_t));
+    pool->groups = (uint16_t *)calloc((size_t)count, sizeof(uint16_t));
+    pool->worker_queues = (worker_queue_t *)calloc((size_t)count, sizeof(worker_queue_t));
+    if (!pool->threads || !pool->last_rt_ratio || !pool->rt_windows ||
+        !pool->cpuset_ids || !pool->lp_indices || !pool->groups || !pool->worker_queues) {
         free(pool->threads);
         free(pool->last_rt_ratio);
+        free(pool->rt_windows);
         free(pool->cpuset_ids);
+        free(pool->lp_indices);
+        free(pool->groups);
         free(pool->worker_queues);
         CloseHandle(pool->done_event);
         CloseHandle(pool->work_sem);
@@ -561,25 +703,25 @@ threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids, int cpuset_co
         free(pool);
         return NULL;
     }
-    memcpy(pool->cpuset_ids, cpuset_ids, (size_t)cpuset_count * sizeof(uint32_t));
-    pool->cpuset_id_count = cpuset_count;
+    memcpy(pool->cpuset_ids, cpuset_ids, (size_t)count * sizeof(uint32_t));
+    memcpy(pool->lp_indices, lp_indices, (size_t)count * sizeof(uint8_t));
+    if (groups)
+        memcpy(pool->groups, groups, (size_t)count * sizeof(uint16_t));
+    pool->cpuset_id_count = count;
 
     /* Initialize per-worker wake events */
-    for (int i = 0; i < cpuset_count; i++)
+    for (int i = 0; i < count; i++)
         pool->worker_queues[i].wake_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
-    /* Load SetThreadSelectedCpuSets dynamically */
-    PFN_SetThreadSelectedCpuSets pfn_set_cpusets =
-        (PFN_SetThreadSelectedCpuSets)GetProcAddress(
-            GetModuleHandleW(L"kernel32.dll"), "SetThreadSelectedCpuSets");
-
-    for (int i = 0; i < cpuset_count; i++) {
+    for (int i = 0; i < count; i++) {
         worker_context_t *wctx = (worker_context_t *)malloc(sizeof(worker_context_t));
         if (!wctx) break;
         wctx->pool = pool;
         wctx->thread_index = i;
+
         pool->threads[i] = CreateThread(NULL, 0, worker_func, wctx, 0, NULL);
         if (!pool->threads[i]) {
+            free(wctx);
             InterlockedExchange(&pool->shutdown, 1);
             ReleaseSemaphore(pool->work_sem, i, NULL);
             for (int j = 0; j < i; j++) {
@@ -587,18 +729,19 @@ threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids, int cpuset_co
                 CloseHandle(pool->threads[j]);
             }
             free(pool->threads);
+            free(pool->last_rt_ratio);
+            free(pool->rt_windows);
+            free(pool->cpuset_ids);
+            free(pool->lp_indices);
+            free(pool->groups);
+            free(pool->worker_queues);
             CloseHandle(pool->done_event);
             CloseHandle(pool->work_sem);
             DeleteCriticalSection(&pool->queue_cs);
             free(pool);
             return NULL;
         }
-
-        /* Pin worker to its designated CPU set */
-        if (pfn_set_cpusets) {
-            ULONG id = cpuset_ids[i];
-            pfn_set_cpusets(pool->threads[i], &id, 1);
-        }
+        /* Hard affinity is set inside worker_func via SetThreadAffinityMask */
     }
 
     return pool;

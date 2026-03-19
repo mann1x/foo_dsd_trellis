@@ -11,18 +11,30 @@
 /* Opaque thread pool handle */
 typedef struct threadpool threadpool_t;
 
+/* Worker stress level (based on rolling RT% window) */
+typedef enum {
+    WORKER_HEALTHY  = 0,   /* <70% for 5+ consecutive — no action */
+    WORKER_WARN     = 1,   /* >90% for 3+ consecutive — start probe */
+    WORKER_CRITICAL = 2,   /* >100% for 1 chunk — immediate probe */
+} worker_stress_level_t;
+
 /* Create thread pool with given worker count.
  * If thread_count == 0, uses logical_cpu_count.
  * affinity_mask: per-worker CPU affinity (0 = OS default).
  * Returns NULL on failure. */
 threadpool_t *threadpool_create(int thread_count, DWORD affinity_mask);
 
-/* Create thread pool with CPUSET-based thread placement.
- * Each worker is pinned to the corresponding cpuset_id.
- * cpuset_ids: array of CPU set IDs (one per worker thread).
- * cpuset_count: number of IDs (= number of worker threads).
+/* Create thread pool with hard per-core thread pinning.
+ * Each worker is pinned to the corresponding logical processor.
+ * cpuset_ids: array of CPU set IDs (for tracking/logging).
+ * lp_indices: array of logical processor indices (for SetThreadAffinityMask).
+ * groups: array of processor groups (for >64 CPU support, NULL if single group).
+ * count: number of entries (= number of worker threads).
  * Returns NULL on failure. */
-threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids, int cpuset_count);
+threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids,
+                                       const uint8_t *lp_indices,
+                                       const uint16_t *groups,
+                                       int count);
 
 /* Submit a channel block for processing.
  * Non-blocking; the block is queued for a worker thread. */
@@ -55,5 +67,19 @@ int threadpool_get_stressed_thread(threadpool_t *pool, double *stressed_ratio);
  * thread_index: 0-based index of the worker to migrate.
  * new_cpuset_id: the CPU set ID to assign. */
 int threadpool_migrate_thread(threadpool_t *pool, int thread_index, uint32_t new_cpuset_id);
+
+/* Get stress level for a specific worker based on rolling RT% window.
+ * CRITICAL: >100% for 1 chunk (immediate probe)
+ * WARN:     >90% for 3+ consecutive (start probe)
+ * HEALTHY:  default (no action needed) */
+worker_stress_level_t threadpool_get_worker_stress(threadpool_t *pool, int worker_index);
+
+/* Get average RT% for a worker over the rolling window.
+ * Returns 0.0 if no data. */
+double threadpool_get_worker_avg_rt(threadpool_t *pool, int worker_index);
+
+/* Get the CPU set ID currently assigned to a worker.
+ * Returns 0 if not available. */
+uint32_t threadpool_get_worker_cpuset(threadpool_t *pool, int worker_index);
 
 #endif /* THREADPOOL_H */

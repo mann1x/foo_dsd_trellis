@@ -56,6 +56,7 @@ typedef struct plugin_state {
     int                active_cands;      /* Trellis cands engine was initialized with */
     int                active_depth;      /* Trellis depth engine was initialized with */
     bool               needs_warmup;      /* true after flush — prime SDM with real audio */
+    int                chunk_counter;     /* chunks since init — for startup pacing */
 
     /* Per-channel buffers for unpack/repack */
     float            **ch_in;        /* [ch][dsd_samples] unpacked DSD input */
@@ -79,10 +80,8 @@ typedef struct plugin_state {
     uint32_t           selected_core_ids[CPUSET_MAX_CPUS];
     int                selected_core_count;
 
-    /* CPUSET change hysteresis — avoid rebuilding threadpool on transient OS parking */
-    uint64_t           pending_cpuset_mask;  /* mask we're considering switching to */
-    int                cpuset_stable_count;  /* how many checks the pending mask has been stable */
-    int                cpuset_check_counter; /* throttle: only check every N chunks */
+    /* Background CPU monitor (owns load updates + CPUSET refresh) */
+    cpuset_monitor_t  *cpu_monitor;
 
     /* Per-phase timing (milliseconds) */
     double             time_unpack_ms;
@@ -114,6 +113,17 @@ typedef struct plugin_state {
     size_t             seg0_buf_sz;     /* allocated size per channel */
     size_t             fir_tail_len;    /* = overlap */
     bool               fir_tail_valid;  /* false until first chunk completes */
+
+    /* ── Worker migration (dry-run probe) ── */
+    struct {
+        bool     active;              /* probe in flight */
+        int      stressed_worker;     /* worker being evaluated */
+        uint32_t original_cpuset;     /* so we can revert on abandon */
+        uint32_t candidate_cpuset;    /* core being tested */
+        double   pre_avg_rt;          /* avg RT% before migration */
+        int      probe_chunks;        /* chunks remaining in probe */
+        int      cooldown_chunks;     /* chunks before next attempt */
+    } migration;
 } plugin_state_t;
 
 /* ─── Timing helper ─── */
@@ -245,6 +255,12 @@ void plugin_destroy(plugin_state_t *s) {
 
     /* Allow system to idle/sleep again */
     SetThreadExecutionState(ES_CONTINUOUS);
+
+    /* Stop background CPU monitor first (before threadpool) */
+    if (s->cpu_monitor) {
+        cpuset_monitor_destroy(s->cpu_monitor);
+        s->cpu_monitor = NULL;
+    }
 
     if (s->pool) {
         threadpool_destroy(s->pool);
@@ -393,20 +409,36 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     if (!s->topology_detected) {
         cpuset_detect(&s->topology);
         cpuset_benchmark(&s->topology);
+        /* Seed per-core load data during first-time topology detection.
+         * 5 reads at 100ms intervals — happens once per plugin lifetime,
+         * NOT on every track/rate change. */
+        for (int i = 0; i < 5; i++) {
+            cpuset_update_load(&s->topology);
+            Sleep(100);
+        }
         s->topology_detected = true;
     }
 
-    /* Update per-core load before selecting */
-    cpuset_update_load(&s->topology);
+    /* Start background CPU monitor (load + CPUSET refresh on dedicated thread).
+     * First call: creates monitor. Subsequent calls: read latest snapshot. */
+    if (!s->cpu_monitor && s->topology.initialized)
+        s->cpu_monitor = cpuset_monitor_create(&s->topology, 750, 30);
+
+    /* Read latest load snapshot from background monitor (never blocks) */
+    if (s->cpu_monitor)
+        cpuset_monitor_read(s->cpu_monitor, &s->topology);
 
     /* Select threads based on topology, load, and config */
     uint32_t selected_ids[CPUSET_MAX_CPUS];
+    uint8_t  selected_lps[CPUSET_MAX_CPUS];
+    uint16_t selected_groups[CPUSET_MAX_CPUS];
     int max_t = s->config.thread_count > 0 ? s->config.thread_count : 0;
     int selected = cpuset_select(&s->topology,
                                   (smt_mode_t)s->config.smt_mode,
                                   (ccd_mode_t)s->config.ccd_mode,
                                   (ecore_mode_t)s->config.ecore_mode,
-                                  max_t, selected_ids, CPUSET_MAX_CPUS);
+                                  max_t, selected_ids, selected_lps,
+                                  selected_groups, CPUSET_MAX_CPUS);
 
     /* Store selected core IDs for logging */
     s->selected_core_count = selected > 0 ? selected : 0;
@@ -415,11 +447,16 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                (size_t)selected * sizeof(uint32_t));
     }
 
-    if (selected > 0 && s->topology.initialized) {
-        s->pool = threadpool_create_cpuset(selected_ids, selected);
-    } else {
-        int tc = s->config.thread_count > 0 ? s->config.thread_count : 0;
-        s->pool = threadpool_create(tc, s->config.affinity_mask);
+    /* Reuse existing threadpool if available (avoids 500ms+ cold start
+     * from 16x CreateThread + SetThreadAffinityMask + core unpark). */
+    if (!s->pool) {
+        if (selected > 0 && s->topology.initialized) {
+            s->pool = threadpool_create_cpuset(selected_ids, selected_lps,
+                                                selected_groups, selected);
+        } else {
+            int tc = s->config.thread_count > 0 ? s->config.thread_count : 0;
+            s->pool = threadpool_create(tc, s->config.affinity_mask);
+        }
     }
     if (!s->pool) {
         for (int i = 0; i < num_channels; i++)
@@ -537,8 +574,8 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     /* Create dedicated IO pool for DoP unpack/pack (2 threads).
      * Separate from SDM pool so unpack/pack don't compete with
      * audio processing for cores. Uses OS scheduling (no pinning). */
-    if (!s->io_pool)
-        s->io_pool = threadpool_create(num_channels, 0);
+    /* io_pool disabled — use main pool for unpack/pack too.
+     * Separate unpinned io_pool causes those tasks to land on LP0/LP1. */
 
     /* Create ML post-filters if enabled and ONNX Runtime is available */
     if (s->config.ml_enabled && onnx_runtime_available()) {
@@ -556,6 +593,7 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     s->initialized = true;
     s->fir_tail_valid = false;  /* new engine — no previous FIR tail */
     s->needs_warmup = true;    /* prime SDM with real audio on first chunk */
+    s->chunk_counter = 0;      /* reset for startup pacing */
 
     /* Prevent system idle/sleep during playback — discourages core parking.
      * Windows parks cores when the system appears idle. MMCSS "Pro Audio"
@@ -639,6 +677,141 @@ bool plugin_get_cpuset_change(const plugin_state_t *s, uint64_t *mask) {
     return s->cpuset_changed;
 }
 
+/* ─── Worker migration (dry-run probe) ─── */
+
+#define MIGRATION_PROBE_CHUNKS  5     /* chunks to measure on new core */
+#define MIGRATION_COOLDOWN      50    /* chunks between migration attempts */
+#define MIGRATION_THRESHOLD     0.15  /* 15% improvement required to keep */
+
+static void migration_tick(plugin_state_t *s) {
+    if (!s->pool || !s->topology_detected)
+        return;
+
+    extern void trellis_log_c(const char *);
+
+    /* Cooldown */
+    if (s->migration.cooldown_chunks > 0) {
+        s->migration.cooldown_chunks--;
+        /* Allow bypass for CRITICAL (checked below) */
+    }
+
+    int num_workers = threadpool_get_thread_count(s->pool);
+
+    /* ── If a probe is active, count down and evaluate ── */
+    if (s->migration.active) {
+        s->migration.probe_chunks--;
+        if (s->migration.probe_chunks <= 0) {
+            /* Probe complete — evaluate */
+            int w = s->migration.stressed_worker;
+            double post_avg = threadpool_get_worker_avg_rt(s->pool, w);
+            double improvement = s->migration.pre_avg_rt - post_avg;
+
+            char msg[192];
+            if (improvement >= MIGRATION_THRESHOLD) {
+                /* WIRE: keep the new core assignment */
+                sprintf_s(msg, sizeof(msg),
+                    "migration: worker %d kept on LP%u (%.0f%% -> %.0f%% RT, -%.0f%%)",
+                    w, s->migration.candidate_cpuset,
+                    s->migration.pre_avg_rt * 100.0, post_avg * 100.0,
+                    improvement * 100.0);
+                trellis_log_c(msg);
+                /* Update tracked core IDs */
+                if (w < s->selected_core_count)
+                    s->selected_core_ids[w] = s->migration.candidate_cpuset;
+            } else {
+                /* ABANDON: revert to original core */
+                threadpool_migrate_thread(s->pool, w, s->migration.original_cpuset);
+                sprintf_s(msg, sizeof(msg),
+                    "migration: worker %d reverted to LP%u (%.0f%% -> %.0f%% RT, only -%.0f%%)",
+                    w, s->migration.original_cpuset,
+                    s->migration.pre_avg_rt * 100.0, post_avg * 100.0,
+                    improvement * 100.0);
+                trellis_log_c(msg);
+            }
+            s->migration.active = false;
+            s->migration.cooldown_chunks = MIGRATION_COOLDOWN;
+        }
+        return;  /* don't start new probe while one is active */
+    }
+
+    /* ── Find most stressed worker ── */
+    int worst = -1;
+    worker_stress_level_t worst_level = WORKER_HEALTHY;
+    for (int i = 0; i < num_workers; i++) {
+        worker_stress_level_t level = threadpool_get_worker_stress(s->pool, i);
+        if (level > worst_level) {
+            worst_level = level;
+            worst = i;
+        }
+    }
+
+    if (worst_level == WORKER_HEALTHY)
+        return;
+
+    /* Respect cooldown unless CRITICAL */
+    if (s->migration.cooldown_chunks > 0 && worst_level != WORKER_CRITICAL)
+        return;
+
+    /* ── Start probe: migrate to best available core ── */
+
+    /* Read latest topology snapshot from background monitor */
+    cpu_topology_t snap;
+    if (s->cpu_monitor)
+        cpuset_monitor_read(s->cpu_monitor, &snap);
+    else
+        memcpy(&snap, &s->topology, sizeof(snap));
+
+    /* Select the best single core not currently used by any worker */
+    uint32_t best_ids[CPUSET_MAX_CPUS];
+    int best_count = cpuset_select(&snap,
+        (smt_mode_t)s->config.smt_mode,
+        (ccd_mode_t)s->config.ccd_mode,
+        (ecore_mode_t)s->config.ecore_mode,
+        0, best_ids, NULL, NULL, CPUSET_MAX_CPUS);
+
+    /* Find first core not already assigned to any worker */
+    uint32_t candidate = 0;
+    for (int i = 0; i < best_count; i++) {
+        bool in_use = false;
+        for (int w = 0; w < s->selected_core_count; w++) {
+            if (s->selected_core_ids[w] == best_ids[i]) {
+                in_use = true;
+                break;
+            }
+        }
+        if (!in_use) {
+            candidate = best_ids[i];
+            break;
+        }
+    }
+
+    if (candidate == 0)
+        return;  /* no free cores available */
+
+    /* Record pre-migration stats and migrate */
+    s->migration.active = true;
+    s->migration.stressed_worker = worst;
+    s->migration.original_cpuset = threadpool_get_worker_cpuset(s->pool, worst);
+    s->migration.candidate_cpuset = candidate;
+    s->migration.pre_avg_rt = threadpool_get_worker_avg_rt(s->pool, worst);
+    s->migration.probe_chunks = MIGRATION_PROBE_CHUNKS;
+
+    /* Migrate the stressed worker's thread to the candidate core.
+     * The worker keeps producing audio — zero gap. We measure its
+     * performance on the new core for PROBE_CHUNKS and decide. */
+    threadpool_migrate_thread(s->pool, worst, candidate);
+
+    {
+        char msg[192];
+        sprintf_s(msg, sizeof(msg),
+            "migration: probing worker %d from LP%u to LP%u (avg %.0f%% RT, %s)",
+            worst, s->migration.original_cpuset, candidate,
+            s->migration.pre_avg_rt * 100.0,
+            worst_level == WORKER_CRITICAL ? "CRITICAL" : "WARN");
+        trellis_log_c(msg);
+    }
+}
+
 /*
  * Process an interleaved DoP PCM chunk.
  *
@@ -678,12 +851,11 @@ size_t plugin_process(plugin_state_t *s,
         s->active_sdm_mode != s->config.sdm_mode ||
         s->active_cands != s->config.trellis_cands ||
         s->active_depth != s->config.trellis_depth) {
-        /* Tear down old state */
+        /* Tear down old state — keep threadpool alive (expensive to recreate:
+         * 16 CreateThread + SetThreadAffinityMask + core unpark = 500ms+).
+         * Pool is reused across track/rate changes. */
         if (s->initialized) {
-            if (s->pool) {
-                threadpool_destroy(s->pool);
-                s->pool = NULL;
-            }
+            /* pool kept alive — NOT destroyed here */
             if (s->channels) {
                 for (int i = 0; i < s->num_channels; i++)
                     engine_channel_free(&s->channels[i]);
@@ -696,65 +868,14 @@ size_t plugin_process(plugin_state_t *s,
             return 0;
     }
 
-    /* Check for system CPUSET changes (CPUDoc dynamic core management).
-     * Only check every CPUSET_CHECK_INTERVAL chunks to avoid
-     * kernel syscall overhead on every audio chunk. */
-    #define CPUSET_CHECK_INTERVAL   100  /* check every ~100 chunks */
-    #define CPUSET_STABLE_THRESHOLD 5    /* 5 consecutive checks stable = rebuild */
+    /* CPUSET changes detected by background monitor — just log, don't rebuild.
+     * Rebuilding mid-playback causes heap corruption (worker TLS in use). */
     s->cpuset_changed = false;
-    /* CPUSET refresh: detect core changes but DON'T rebuild threadpool
-     * during playback. Rebuilding mid-playback causes heap corruption
-     * (worker threads destroyed while TLS buffers in use). Changes are
-     * applied on next engine reinit (rate/settings change). */
-    s->cpuset_check_counter++;
-    if (s->topology_detected && (s->cpuset_check_counter % CPUSET_CHECK_INTERVAL) == 0) {
-        bool mask_changed = false;
-        cpuset_refresh(&s->topology, &mask_changed);
-        /* Just log, don't rebuild */
-    }
-    if (false && s->topology_detected && (s->cpuset_check_counter % CPUSET_CHECK_INTERVAL) == 0) {
-        bool mask_changed = false;
-        uint64_t new_mask = cpuset_refresh(&s->topology, &mask_changed);
-        if (mask_changed && s->pool) {
-            if (new_mask == s->pending_cpuset_mask) {
-                s->cpuset_stable_count++;
-            } else {
-                s->pending_cpuset_mask = new_mask;
-                s->cpuset_stable_count = 1;
-            }
-
-            if (s->cpuset_stable_count >= CPUSET_STABLE_THRESHOLD) {
-                s->cpuset_changed = true;
-                s->last_cpuset_mask = new_mask;
-                s->cpuset_stable_count = 0;
-
-                /* Rebuild thread pool with new set of enabled cores */
-                threadpool_destroy(s->pool);
-                s->pool = NULL;
-
-                cpuset_update_load(&s->topology);
-                uint32_t selected_ids[CPUSET_MAX_CPUS];
-                int max_t = s->config.thread_count > 0 ? s->config.thread_count : 0;
-                int selected = cpuset_select(&s->topology,
-                                              (smt_mode_t)s->config.smt_mode,
-                                              (ccd_mode_t)s->config.ccd_mode,
-                                              (ecore_mode_t)s->config.ecore_mode,
-                                              max_t, selected_ids, CPUSET_MAX_CPUS);
-                /* Update selected core IDs for logging */
-                s->selected_core_count = selected > 0 ? selected : 0;
-                if (selected > 0) {
-                    memcpy(s->selected_core_ids, selected_ids,
-                           (size_t)selected * sizeof(uint32_t));
-                    s->pool = threadpool_create_cpuset(selected_ids, selected);
-                }
-                if (!s->pool)
-                    s->pool = threadpool_create(
-                        s->config.thread_count > 0 ? s->config.thread_count : 0,
-                        s->config.affinity_mask);
-            }
-        } else {
-            /* Mask didn't change — reset hysteresis counter */
-            s->cpuset_stable_count = 0;
+    if (s->cpu_monitor) {
+        uint64_t new_mask = 0;
+        if (cpuset_monitor_changed(s->cpu_monitor, &new_mask)) {
+            s->cpuset_changed = true;
+            s->last_cpuset_mask = new_mask;
         }
     }
 
@@ -1226,6 +1347,9 @@ size_t plugin_process(plugin_state_t *s,
         dsd_out_count = blocks[0].out_count;
         /* blocks is stack-allocated, no free needed */
     }
+
+    /* Worker migration tick — evaluate/start probes after SDM completes */
+    migration_tick(s);
 
     if (dsd_out_count == 0)
         return 0;
