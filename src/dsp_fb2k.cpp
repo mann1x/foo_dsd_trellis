@@ -1372,19 +1372,21 @@ public:
                     chunk_cfg.trellis_depth = (int)m_config.rate_depth[map_idx];
             }
 
-            /* Auto-compute optimal trellis latency from nc and DSD rate.
+            /* Auto-compute optimal trellis latency from DSD rate.
              * Full nc×lat sweep results (best SINAD per rate):
              *   DSD64:  nc=4, lat=32  → 102.6 dB
-             *   DSD128: nc=8, lat=32  → 117.0 dB (or nc=2, lat=32 → 112.7)
+             *   DSD128: nc=4, lat=32  → 97.9 dB (NTF sweep pending)
              *   DSD256: nc=2, lat=128 → 151.7 dB
-             *   DSD512: nc=2, lat=128 → 139.9 dB
-             * Pattern: DSD64/128 → lat=32, DSD256/512 → lat=128. */
+             *   DSD512: nc=2, lat=16  → 129.4 dB (lat=128 too slow for RT)
+             * Balance quality vs real-time budget. */
             {
                 uint32_t dsd_rate = chunk_cfg.fs_out ? chunk_cfg.fs_out : chunk_cfg.fs_in;
-                if (dsd_rate >= DSD_RATE_256)
-                    chunk_cfg.trellis_lat = 128;
+                if (dsd_rate >= DSD_RATE_512)
+                    chunk_cfg.trellis_lat = 16;   /* DSD512: RT-constrained */
+                else if (dsd_rate >= DSD_RATE_256)
+                    chunk_cfg.trellis_lat = 128;  /* DSD256: NTF headroom */
                 else
-                    chunk_cfg.trellis_lat = 32;
+                    chunk_cfg.trellis_lat = 32;   /* DSD64/128: sweet spot */
             }
         }
 

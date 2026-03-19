@@ -173,6 +173,7 @@ static double goertzel_power(const float *x, size_t n, double freq_hz,
  *  3. Goertzel at many freqs in 0-20kHz -> total in-band power
  *  4. SINAD = signal / (total_in_band - signal)
  */
+static const ntf_filter_t *tls_ntf_override = NULL;
 static double measure_sinad_1khz(unsigned dsd_rate_mult, int trellis_depth,
                                  int trellis_cands, int trellis_lat) {
     const unsigned base_rate = 44100;
@@ -191,6 +192,8 @@ static double measure_sinad_1khz(unsigned dsd_rate_mult, int trellis_depth,
 
     const ntf_filter_t *f = ntf_auto_select(dsd_rate);
     if (!f) return -999.0;
+    /* Allow override via thread-local for sweep */
+    if (tls_ntf_override) f = tls_ntf_override;
 
     sdm_context_t ctx;
     if (sdm_context_init(&ctx, f, trellis_depth, trellis_cands,
@@ -365,27 +368,41 @@ void test_trellis_suite(void) {
     TEST_RUN(test_sdm_sinad_dsd512);
 }
 
-/* NC × LAT sweep across all DSD rates */
+/* NTF sweep at optimal nc/lat for specific rates */
 void test_lat_sweep(void) {
-    int ncs[] = {2, 4, 8, 16, 32};
-    int lats[] = {16, 32, 64, 128};
-    int n_nc = 5, n_lat = 4;
-    int rates[] = {64, 128, 256, 512};
-    int n_rates = 4;
+    /* NTF IDs: 0=CLANS4, 1=SDM4, 2=CLANS5, 3=SDM5, 4=CLANS6, 5=SDM6,
+     *          6=CLANS7, 7=SDM7, 8=CLANS8, 9=SDM8 */
+    const char *ntf_names[] = {
+        "CLANS4", "SDM4", "CLANS5", "SDM5", "CLANS6",
+        "SDM6", "CLANS7", "SDM7", "CLANS8", "SDM8"
+    };
 
-    for (int r = 0; r < n_rates; r++) {
-        printf("\n=== DSD%d NC x LAT sweep (depth=8) ===\n", rates[r]);
-        printf("%8s", "nc\\lat");
-        for (int j = 0; j < n_lat; j++) printf("  lat=%-4d", lats[j]);
-        printf("\n");
+    /* Sweep NTFs at the optimal nc/lat for DSD128 and DSD512 */
+    struct { int rate; int nc; int lat; } configs[] = {
+        {128, 4, 32},
+        {128, 2, 32},
+        {128, 4, 64},
+        {128, 4, 128},
+        {512, 2, 128},
+        {512, 4, 128},
+        {512, 2, 64},
+    };
+    int n_configs = 7;
 
-        for (int i = 0; i < n_nc; i++) {
-            printf("  nc=%-3d", ncs[i]);
-            for (int j = 0; j < n_lat; j++) {
-                double sinad = measure_sinad_1khz(rates[r], 8, ncs[i], lats[j]);
-                printf("  %5.1f dB", sinad);
-            }
-            printf("\n");
+    for (int ci = 0; ci < n_configs; ci++) {
+        int rate = configs[ci].rate;
+        int nc = configs[ci].nc;
+        int lat = configs[ci].lat;
+        unsigned dsd_rate = (unsigned)rate * 44100;
+
+        printf("\n=== DSD%d NTF sweep (nc=%d, lat=%d, depth=8) ===\n", rate, nc, lat);
+        for (int ntf_id = 0; ntf_id < 10; ntf_id++) {
+            const ntf_filter_t *f = ntf_get_filter((ntf_filter_id_t)ntf_id, dsd_rate);
+            if (!f) { printf("  %-6s: N/A\n", ntf_names[ntf_id]); continue; }
+            tls_ntf_override = f;
+            double sinad = measure_sinad_1khz((unsigned)rate, 8, nc, lat);
+            printf("  => %5.1f dB\n", sinad);
+            tls_ntf_override = NULL;
         }
     }
     g_tests_run++; g_tests_passed++;

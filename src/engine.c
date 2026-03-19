@@ -45,7 +45,7 @@ static const path_config_t path_table[] = {
     { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  4,  0, 4, 0.708f },
     { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_5, 0.0,  4,  0, 4, 0.708f },
     { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_5, 0.0,  2,  0, 4, 0.708f },
-    { DSD_RATE_512, DSD_RATE_512, NTF_CLANS_5, 0.0,  2,  0, 4, 0.708f },
+    { DSD_RATE_512, DSD_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
     /* Upsample paths */
     { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 0.708f },
@@ -612,10 +612,14 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
 
     /* Auto-compute optimal lat when lat=0 (auto).
      * Rate-dependent from nc×lat sweep:
-     *   DSD64/128:  lat=32  (best at nc=4/lat=32: 102.6 dB)
-     *   DSD256/512: lat=128 (best at nc=2/lat=128: 151.7 dB) */
+     *   DSD64/128: lat=32  (102.6/97.9 dB)
+     *   DSD256:    lat=128 (151.7 dB, NTF headroom)
+     *   DSD512:    lat=16  (129.4 dB, RT-constrained) */
     if (info->lat <= 0) {
-        if (fs_out >= DSD_RATE_256 || fs_in >= DSD_RATE_256)
+        uint32_t rate = (fs_out > fs_in) ? fs_out : fs_in;
+        if (rate >= DSD_RATE_512)
+            info->lat = 16;
+        else if (rate >= DSD_RATE_256)
             info->lat = 128;
         else
             info->lat = 32;
