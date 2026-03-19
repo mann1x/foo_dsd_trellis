@@ -479,14 +479,14 @@ private:
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
         m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 50);
         m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 54);
-        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 46);
-        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 58);
-        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 40);
-        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 40);
+        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 42);
+        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 50);
+        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 42);
+        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 42);
         m_listRate.InsertColumn(6, L"Limiter", LVCFMT_LEFT, 46);
-        m_listRate.InsertColumn(7, L"ML", LVCFMT_LEFT, 30);
+        m_listRate.InsertColumn(7, L"ML", LVCFMT_LEFT, 36);
         m_listRate.InsertColumn(8, L"GPU", LVCFMT_LEFT, 34);
-        m_listRate.InsertColumn(9, L"FIR", LVCFMT_LEFT, 48);
+        m_listRate.InsertColumn(9, L"FIR", LVCFMT_LEFT, 42);
         /* Last column: fill remaining width to avoid horizontal scrollbar */
         {
             CRect rc;
