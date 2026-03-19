@@ -40,7 +40,8 @@ static const path_config_t path_table[] = {
     /* All paths use 0.708 (-3 dB) gain for uniform volume across rates.
      * lat = 0 means "auto" (computed as cands * 8 at runtime).
      * Optimal lat from nc×lat sweep: nc=2→16, nc=4→32, nc=8→64. */
-    /* Same-rate re-encode (boxcar → SDM) */
+    /* Same-rate re-encode (boxcar → SDM).
+     * Optimal nc from sweep: DSD64=4, DSD128=4, DSD256/512=2. */
     { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  4,  0, 4, 0.708f },
     { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_5, 0.0,  4,  0, 4, 0.708f },
     { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_5, 0.0,  2,  0, 4, 0.708f },
@@ -609,13 +610,15 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
         info->fir_gain = 1.0f;
     }
 
-    /* Auto-compute optimal lat from candidate count when lat=0 (auto).
-     * Sweep shows optimal lat = cands * 8:
-     *   nc=2 → lat=16, nc=4 → lat=32, nc=8 → lat=64
-     * Minimum 16 for path convergence. */
+    /* Auto-compute optimal lat when lat=0 (auto).
+     * Rate-dependent from nc×lat sweep:
+     *   DSD64/128:  lat=32  (best at nc=4/lat=32: 102.6 dB)
+     *   DSD256/512: lat=128 (best at nc=2/lat=128: 151.7 dB) */
     if (info->lat <= 0) {
-        info->lat = info->cands * 8;
-        if (info->lat < 16) info->lat = 16;
+        if (fs_out >= DSD_RATE_256 || fs_in >= DSD_RATE_256)
+            info->lat = 128;
+        else
+            info->lat = 32;
     }
 
     return 0;
