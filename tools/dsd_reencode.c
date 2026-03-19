@@ -297,6 +297,75 @@ int dsd_reencode_main(int argc, char **argv) {
         free(fir_tail);
     }
 
+    /* ─── Convergence test: measure SDM state error vs overlap size ─── */
+    printf("\n=== SDM state convergence vs overlap ===\n");
+    printf("  Processing seg0 (%zu samples) to get reference state...\n", n/2);
+    {
+        sdm_context_t ref;
+        sdm_context_init(&ref, f, 8, nc, lat);
+
+        /* Process full first half to get reference final state */
+        float *tmp_out = (float *)malloc(n * sizeof(float));
+        sdm_process_block(&ref, smooth, tmp_out, n/2);
+
+        /* Extract reference state from best candidate */
+        int order = ref.filter->order;
+        double ref_state[8];
+        double ref_prev_y = ref.prev_y;
+        for (int k = 0; k < order; k++)
+            ref_state[k] = ref.trellis[ref.idx].act[0]->state[k];
+
+        printf("  Reference state: [");
+        for (int k = 0; k < order; k++)
+            printf("%.6f%s", ref_state[k], k < order-1 ? ", " : "");
+        printf("] prev_y=%.1f\n", ref_prev_y);
+
+        /* Test convergence at various overlap sizes */
+        size_t overlaps[] = { 128, 256, 512, 1024, 2048, 4096, 8192,
+                              16384, 32768, 65536, n/4, n/2 };
+        int n_overlaps = sizeof(overlaps) / sizeof(overlaps[0]);
+
+        printf("\n  %8s  %12s  %12s  %s\n", "overlap", "max_err", "rms_err", "converged");
+        for (int oi = 0; oi < n_overlaps; oi++) {
+            size_t ov = overlaps[oi];
+            if (ov > n/2) continue;
+
+            /* Start from beginning, process 'ov' samples as warmup */
+            size_t warmup_start = (n/2 > ov) ? (n/2 - ov) : 0;
+            size_t warmup_len = n/2 - warmup_start;
+
+            sdm_context_t test;
+            sdm_context_init(&test, f, 8, nc, lat);
+
+            /* Feed warmup */
+            float *tw = (float *)malloc((warmup_len + lat) * sizeof(float));
+            sdm_process_block(&test, smooth + warmup_start, tw, warmup_len + lat);
+            free(tw);
+
+            /* Compare states */
+            double max_err = 0.0;
+            double rms_err = 0.0;
+            for (int k = 0; k < order; k++) {
+                double err = fabs(test.trellis[test.idx].act[0]->state[k] - ref_state[k]);
+                if (err > max_err) max_err = err;
+                rms_err += err * err;
+            }
+            /* Also check prev_y */
+            double py_err = fabs(test.prev_y - ref_prev_y);
+            rms_err = sqrt(rms_err / order);
+
+            printf("  %8zu  %12.2e  %12.2e  %s (prev_y err=%.2e)\n",
+                   ov, max_err, rms_err,
+                   max_err < 1e-10 ? "YES" : (max_err < 1e-6 ? "almost" : "no"),
+                   py_err);
+
+            sdm_context_free(&test);
+        }
+
+        free(tmp_out);
+        sdm_context_free(&ref);
+    }
+
     /* Write DSF files */
     char seq_path[256], par_path[256], chunked_path[256];
     sprintf_s(seq_path, sizeof(seq_path), "reencode_dsd%d_seq.dsf", rate_mult);

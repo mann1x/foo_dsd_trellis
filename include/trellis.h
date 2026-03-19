@@ -69,6 +69,10 @@ size_t sdm_process_block(sdm_context_t *ctx,
 /* Drain pending samples (flush at end of stream). */
 size_t sdm_drain(sdm_context_t *ctx, float *out, size_t max_out);
 
+/* Copy full SDM state from src to dst (for seeding parallel segments).
+ * dst must already be initialized with same filter/params. */
+void sdm_context_copy_state(sdm_context_t *dst, const sdm_context_t *src);
+
 /* Reset SDM state (on seek / discontinuity). */
 void sdm_context_reset(sdm_context_t *ctx);
 

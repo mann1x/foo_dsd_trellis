@@ -831,8 +831,9 @@ size_t plugin_process(plugin_state_t *s,
     int segments_per_ch = 1;
     size_t overlap = 0;
 
-    /* DSD64 same-rate: sequential (fast enough even at cands=4).
-     * DSD128+: parallel with FIR lowpass (needed for RT at cands=4). */
+    /* DSD64 same-rate: sequential (trivially fast at nc=2).
+     * DSD128+: parallel with state-seeded segments (no stitching artifacts).
+     * Segment 0 runs on persistent SDM, then state is copied to temp SDMs. */
     uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
     bool is_same_rate = (s->config.fs_in == fs_out);
     bool skip_parallel = (is_same_rate && fs_out <= DSD_RATE_64);
@@ -1005,7 +1006,7 @@ size_t plugin_process(plugin_state_t *s,
 
         /* Phase 2: Get temp SDM contexts.
          * When fir_tail is available (chunk 2+), ALL segments use temp SDMs.
-         * This avoids persistent SDM state discontinuity at chunk boundaries. */
+         * This keeps segment boundary artifacts symmetric (both sides warmup). */
         bool use_fir_tail = s->fir_tail_valid && s->fir_tail_len == overlap;
         int temps_per_ch = use_fir_tail ? segments_per_ch : (segments_per_ch - 1);
         int temp_sdm_count = num_channels * temps_per_ch;
@@ -1073,68 +1074,45 @@ size_t plugin_process(plugin_state_t *s,
             s->seg0_buf = (double **)calloc((size_t)num_channels, sizeof(double *));
         }
 
+        LARGE_INTEGER t_sdm_start, t_sdm_end;
+        QueryPerformanceCounter(&t_sdm_start);
+
+        /* Phase 2a: Run segment 0 for all channels in parallel on threadpool.
+         * Each channel's segment 0 uses its persistent SDM. */
+        size_t seg0_sizes[32], seg0_outs[32];
+        {
+            channel_block_t seg0_blocks[32];
+            memset(seg0_blocks, 0, (size_t)num_channels * sizeof(channel_block_t));
+            for (int ch = 0; ch < num_channels; ch++) {
+                size_t fir_count = fir_counts[ch];
+                size_t base_seg = fir_count / (size_t)segments_per_ch;
+                size_t remainder = fir_count % (size_t)segments_per_ch;
+                seg0_sizes[ch] = base_seg + (0 < remainder ? 1 : 0);
+
+                seg0_blocks[ch].mode    = BLOCK_MODE_SDM;
+                seg0_blocks[ch].sdm_ctx = &s->channels[ch].sdm;
+                seg0_blocks[ch].in      = fir_data[ch];
+                seg0_blocks[ch].out     = s->ch_out[ch];
+                seg0_blocks[ch].count   = seg0_sizes[ch];
+                seg0_blocks[ch].discard = 0;
+                seg0_blocks[ch].channel = ch;
+                threadpool_submit(s->pool, &seg0_blocks[ch]);
+            }
+            threadpool_wait(s->pool);
+            for (int ch = 0; ch < num_channels; ch++)
+                seg0_outs[ch] = seg0_blocks[ch].out_count;
+        }
+
+        /* Phase 2b: Seed temp SDMs from persistent SDM state, then
+         * launch segments 1+ in parallel on threadpool. */
+        int par_blocks = 0;
         for (int ch = 0; ch < num_channels; ch++) {
             size_t fir_count = fir_counts[ch];
             size_t base_seg = fir_count / (size_t)segments_per_ch;
             size_t remainder = fir_count % (size_t)segments_per_ch;
-            size_t seg0_size = base_seg + (0 < remainder ? 1 : 0);
 
-            int bi = ch * segments_per_ch;
-
-            if (use_fir_tail) {
-                /* All-temp mode: segment 0 uses temp SDM with warmup from
-                 * previous chunk's FIR tail. No persistent SDM state needed. */
-                size_t seg0_total = seg0_size + overlap;
-
-                /* Grow seg0_buf if needed */
-                if (s->seg0_buf_sz < seg0_total) {
-                    for (int c = 0; c < num_channels; c++) {
-                        free(s->seg0_buf[c]);
-                        s->seg0_buf[c] = (double *)malloc(seg0_total * sizeof(double));
-                    }
-                    s->seg0_buf_sz = seg0_total;
-                }
-
-                /* Build contiguous buffer: prev_fir_tail + seg0_data */
-                memcpy(s->seg0_buf[ch], s->fir_tail[ch], overlap * sizeof(double));
-                memcpy(s->seg0_buf[ch] + overlap, fir_data[ch], seg0_size * sizeof(double));
-
-                int temp_idx = ch * temps_per_ch + 0;
-                blocks[bi].mode     = BLOCK_MODE_SDM;
-                blocks[bi].sdm_ctx  = &temp_sdms[temp_idx];
-                blocks[bi].in       = s->seg0_buf[ch];
-                blocks[bi].out      = s->ch_out[ch];
-                blocks[bi].count    = seg0_total;
-                blocks[bi].discard  = discard;
-                blocks[bi].channel  = ch;
-            } else {
-                /* First chunk: use persistent SDM (handles initial latency fill) */
-                blocks[bi].mode     = BLOCK_MODE_SDM;
-                blocks[bi].sdm_ctx  = &s->channels[ch].sdm;
-                blocks[bi].in       = fir_data[ch];
-                blocks[bi].out      = s->ch_out[ch];
-                blocks[bi].count    = seg0_size;
-                blocks[bi].discard  = 0;
-                blocks[bi].channel  = ch;
-            }
-
-            /* Compute segment 0 output size for offset calculation */
-            size_t seg0_out;
-            if (use_fir_tail) {
-                /* Temp SDM: overlap warmup, so output = seg0_size */
-                seg0_out = seg0_size;
-            } else {
-                /* Persistent SDM: subtract remaining latency fill */
-                size_t actual_lat = s->channels[ch].sdm.trellis_lat;
-                if (actual_lat == 0) actual_lat = (size_t)s->config.trellis_lat;
-                size_t pending = s->channels[ch].sdm.pending;
-                size_t lat_rem = (pending < actual_lat) ? (actual_lat - pending) : 0;
-                seg0_out = (seg0_size > lat_rem) ? (seg0_size - lat_rem) : 0;
-            }
-
-            /* Segments 1..N-1: temp SDM contexts with overlap warmup */
-            size_t seg_start = seg0_size;
-            size_t out_offset = seg0_out;
+            size_t seg_start = seg0_sizes[ch];
+            size_t out_offset = seg0_outs[ch];
 
             for (int seg = 1; seg < segments_per_ch; seg++) {
                 size_t this_seg;
@@ -1143,37 +1121,46 @@ size_t plugin_process(plugin_state_t *s,
                 else
                     this_seg = base_seg + ((size_t)seg < remainder ? 1 : 0);
 
-                int temp_idx = ch * temps_per_ch + (use_fir_tail ? seg : (seg - 1));
-                int block_idx = bi + seg;
+                int temp_idx = ch * temps_per_ch + (seg - 1);
 
-                blocks[block_idx].mode     = BLOCK_MODE_SDM;
-                blocks[block_idx].sdm_ctx  = &temp_sdms[temp_idx];
-                blocks[block_idx].in       = fir_data[ch] + seg_start - overlap;
-                blocks[block_idx].out      = s->ch_out[ch] + out_offset;
-                blocks[block_idx].count    = this_seg + overlap;
-                blocks[block_idx].discard  = discard;
-                blocks[block_idx].channel  = ch;
+                /* Seed temp SDM from persistent SDM's current state */
+                sdm_context_copy_state(&temp_sdms[temp_idx], &s->channels[ch].sdm);
+
+                blocks[par_blocks].mode     = BLOCK_MODE_SDM;
+                blocks[par_blocks].sdm_ctx  = &temp_sdms[temp_idx];
+                blocks[par_blocks].in       = fir_data[ch] + seg_start;
+                blocks[par_blocks].out      = s->ch_out[ch] + out_offset;
+                blocks[par_blocks].count    = this_seg;
+                blocks[par_blocks].discard  = 0;
+                blocks[par_blocks].channel  = ch;
+                par_blocks++;
 
                 seg_start += this_seg;
                 out_offset += this_seg;
             }
         }
 
-        LARGE_INTEGER t_sdm_start, t_sdm_end;
-        QueryPerformanceCounter(&t_sdm_start);
-
-        /* SDM: CPU threadpool (GPU SDM disabled — quality issues with stitching) */
-        for (int i = 0; i < total_blocks; i++)
+        /* Launch segments 1+ in parallel */
+        for (int i = 0; i < par_blocks; i++)
             threadpool_submit(s->pool, &blocks[i]);
         threadpool_wait(s->pool);
+
+        /* Copy last segment's final state back into persistent SDM. */
+        for (int ch = 0; ch < num_channels; ch++) {
+            int last_temp = ch * temps_per_ch + (segments_per_ch - 2);
+            if (last_temp >= 0 && last_temp < temp_sdm_count)
+                sdm_context_copy_state(&s->channels[ch].sdm, &temp_sdms[last_temp]);
+        }
 
         QueryPerformanceCounter(&t_sdm_end);
         s->time_sdm_ms = perf_ms(t_sdm_start, t_sdm_end);
 
-        /* Sum output counts per channel */
-        dsd_out_count = 0;
-        for (int seg = 0; seg < segments_per_ch; seg++)
-            dsd_out_count += blocks[seg].out_count;  /* channel 0 */
+        /* Sum output counts: seg0 (processed above) + parallel segments */
+        dsd_out_count = seg0_outs[0];  /* channel 0, segment 0 */
+        for (int i = 0; i < par_blocks; i++) {
+            if (blocks[i].channel == 0)
+                dsd_out_count += blocks[i].out_count;
+        }
 
         /* Accumulate temp SDM diagnostics into persistent SDM for logging */
         if (temp_sdms && temp_sdm_count > 0) {
@@ -1185,9 +1172,8 @@ size_t plugin_process(plugin_state_t *s,
             }
         }
 
-        /* Save FIR tail for next chunk's segment 0 warmup.
-         * This enables all-temp SDM mode from chunk 2 onward,
-         * eliminating the persistent SDM state gap at chunk boundaries. */
+        /* FIR tail no longer needed for segment warmup (state seeding replaces it).
+         * Keep saving for potential future use. */
         if (s->fir_tail) {
             for (int ch = 0; ch < num_channels; ch++) {
                 size_t fir_count = fir_counts[ch];

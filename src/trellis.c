@@ -779,6 +779,36 @@ size_t sdm_drain(sdm_context_t *ctx, float *out, size_t max_out) {
     return len;
 }
 
+void sdm_context_copy_state(sdm_context_t *dst, const sdm_context_t *src) {
+    /* sdm_context_t has no external pointers — full memcpy is a valid deep copy.
+     * But internal pointers (act[], path_hash[]) point into the source's arrays
+     * and need fixing up or clearing. */
+    memcpy(dst, src, sizeof(*dst));
+
+    /* Fix up act[] pointers in both trellis banks.
+     * The SDM ping-pongs between trellis[0] and trellis[1]. */
+    for (int bank = 0; bank < 2; bank++) {
+        unsigned nc = dst->num_cands;
+        if (nc > SDM_TRELLIS_MAX_NUM) nc = SDM_TRELLIS_MAX_NUM;
+        for (unsigned i = 0; i < nc; i++) {
+            if (src->trellis[bank].act[i]) {
+                ptrdiff_t offset = src->trellis[bank].act[i] - &src->trellis[bank].sdm[0];
+                dst->trellis[bank].act[i] = &dst->trellis[bank].sdm[0] + offset;
+            }
+        }
+    }
+
+    /* Clear path_hash — contains stale pointers into src's trellis.
+     * Will be rebuilt on the first sample processing step. */
+    memset(dst->path_hash, 0, sizeof(dst->path_hash));
+
+    /* Reset diagnostic counters for this segment */
+    dst->conv_fail = 0;
+    dst->cands_collapse = 0;
+    dst->next_filter_drops = 0;
+    dst->total_children = 0;
+}
+
 void sdm_context_reset(sdm_context_t *ctx) {
     if (!ctx->filter)
         return;
