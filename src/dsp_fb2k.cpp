@@ -1680,14 +1680,11 @@ public:
             m_antipop_pending = false;
 
             if (m_trail_inserted) {
-                /* Trail already primed the DAC — just insert target-rate
-                 * silence to re-establish DSD mode at correct rate. */
-                int post_trail_ms = ANTIPOP_LEADIN_MS + 5; /* slightly longer */
+                int post_trail_ms = ANTIPOP_LEADIN_MS + 5;
                 trellis_log("anti-pop lead-in: %dms at %u Hz (trail active, skip rate switch)",
                             post_trail_ms, out_pcm_rate);
                 insert_silence_chunk(channels, out_pcm_rate, true, post_trail_ms);
             } else {
-                /* Cold start — full rate-switch trick */
                 int half_ms = ANTIPOP_LEADIN_MS / 2;
                 uint32_t alt_rate = (out_pcm_rate == 176400) ? 352800 : 176400;
                 trellis_log("anti-pop lead-in: %dms at %u Hz + %dms at %u Hz",

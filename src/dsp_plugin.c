@@ -950,14 +950,17 @@ size_t plugin_process(plugin_state_t *s,
     QueryPerformanceCounter(&t_end);
     s->time_unpack_ms = perf_ms(t_start, t_end);
 
-    /* No warmup — boxcar+SDM state is preserved across flush for Trellis,
-     * and reset for PreCorr. Warmup corrupted the boxcar ring buffer by
-     * processing audio twice. The play-start pop is DAC/ASIO, not our code. */
-
     /* Determine if parallel SDM segmentation is beneficial.
      * Worth it only when rate-converting (SDM is the bottleneck)
      * and we have more threads than channels. */
     bool need_rate_conv = !s->channels[0].passthrough && !s->config.mute;
+
+    /* Warmup: prime SDM integrators with real audio on first chunk after
+     * flush/init. SDM is fully reset on flush (preserve_sdm=false), so
+     * without warmup the integrators start from zero → DC transient pop.
+     * Feed real audio through boxcar→SDM (output discarded), then reset
+     * Pop at playback start is from the ASIO+DSD output driver, not our SDM.
+     * Confirmed by removing DSD Trellis from DSP chain — same pop occurs. */
     int num_threads = threadpool_get_thread_count(s->pool);
     int segments_per_ch = 1;
     size_t overlap = 0;

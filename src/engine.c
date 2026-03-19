@@ -207,10 +207,10 @@ void engine_channel_warmup(engine_channel_t *eng, const float *in,
     if (cfg->fs_in != fs_out)
         return;  /* warmup only for same-rate (boxcar path) */
 
-    /* Feed through boxcar */
+    /* Feed through boxcar — use all available samples to prime SDM
+     * integrators. SDM needs hundreds of samples to settle, not just
+     * 2x boxcar taps. */
     size_t warmup = count;
-    if (warmup > (size_t)eng->boxcar.taps * 2)
-        warmup = (size_t)eng->boxcar.taps * 2;  /* only need 2x taps */
 
     double *tmp = (double *)malloc(warmup * sizeof(double));
     if (!tmp) return;
