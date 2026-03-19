@@ -851,14 +851,9 @@ size_t plugin_process(plugin_state_t *s,
         overlap = (is_same_rate ? 4 : 2) * (size_t)s->config.trellis_lat;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
-        /* State-seeded parallelism: 2 segments (seg0 persistent, seg1 seeded).
-         * DSD512 stereo: 1 segment — channel parallelism only via submit_to.
-         * Two-phase seeding adds latency (2×750ms vs 1×750ms channel-parallel). */
-        int max_seg;
-        if (is_same_rate && fs_out >= DSD_RATE_512 && num_channels >= 2)
-            max_seg = 1;
-        else
-            max_seg = 2;
+        /* State-seeded parallelism: max 2 segments (seg0 persistent, seg1 seeded).
+         * Phase 2a runs seg0 for all channels, phase 2b runs seg1 after seeding. */
+        int max_seg = 2;
         if (segments_per_ch > max_seg) segments_per_ch = max_seg;
 
         /* Ensure minimum segment size (at least 4x overlap) */
@@ -877,8 +872,8 @@ size_t plugin_process(plugin_state_t *s,
 
     size_t dsd_out_count;
 
-    if (segments_per_ch >= 1 && !skip_parallel) {
-        /* === Parallel SDM path: FIR+gain, then SDM via submit_to === */
+    if (segments_per_ch > 1) {
+        /* === Parallel SDM path: FIR+gain, then state-seeded SDM === */
 
         /* Reset GPU per-chunk state (channel counters for boxcar/lowpass history) */
         if (s->gpu)
