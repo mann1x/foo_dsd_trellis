@@ -115,18 +115,26 @@ static double measure_multitone(uint32_t dsd_rate, const ntf_filter_t *f,
         sdm_context_free(&ctx); return -999.0;
     }
 
-    /* Feed clean analog multitone directly to SDM (like theoretical SINAD).
-     * DSD-quantized input gives ~6 dB (1-bit noise limit, not meaningful). */
-    /* Amplitude: 0.5/sqrt(32) per tone. Total RMS ≈ 0.5.
-     * Tones are incoherent so peak is ~3-4x single tone, not 32x. */
+    /* Bin-align each tone frequency to avoid spectral leakage.
+     * Estimate produced count, compute bin width, snap each frequency. */
+    const unsigned produced_est = n_dsd - (unsigned)lat;
+    double est_bw = (double)dsd_rate / (double)produced_est;
+    double aligned_freqs[32];
+    unsigned aligned_bins[32];
+    for (int t = 0; t < 32; t++) {
+        aligned_bins[t] = (unsigned)(g_multitone_freqs[t] / est_bw + 0.5);
+        aligned_freqs[t] = aligned_bins[t] * est_bw;
+    }
+
+    /* Generate bin-aligned multitone, feed directly to SDM */
     double amp = 0.5 / sqrt(32.0);
     for (unsigned i = 0; i < n_dsd; i++) {
         double s = 0.0;
         for (int t = 0; t < 32; t++)
-            s += amp * sin(2.0 * M_PI * g_multitone_freqs[t] * (double)i / (double)dsd_rate);
+            s += amp * sin(2.0 * M_PI * aligned_freqs[t] * (double)i / (double)dsd_rate);
         smooth[i] = s;
     }
-    (void)dsd_in;  /* not used for multitone */
+    (void)dsd_in;
 
     size_t produced = sdm_process_block(&ctx, smooth, out, n_dsd);
     sdm_context_free(&ctx);
@@ -136,16 +144,16 @@ static double measure_multitone(uint32_t dsd_rate, const ntf_filter_t *f,
         return -999.0;
     }
 
-    /* Goertzel at each of the 32 tones */
+    /* Goertzel at each bin-aligned tone */
     double actual_bw = (double)dsd_rate / (double)produced;
     unsigned max_bin = (unsigned)(20000.0 / actual_bw);
     double total_signal = 0.0;
 
-    /* Collect signal bin indices for exclusion */
+    /* Recompute bins for actual produced count */
     unsigned sig_bins[32];
     for (int t = 0; t < 32; t++) {
-        sig_bins[t] = (unsigned)(g_multitone_freqs[t] / actual_bw + 0.5);
-        total_signal += goertzel_power(out, produced, g_multitone_freqs[t], (double)dsd_rate);
+        sig_bins[t] = (unsigned)(aligned_freqs[t] / actual_bw + 0.5);
+        total_signal += goertzel_power(out, produced, aligned_freqs[t], (double)dsd_rate);
     }
 
     /* Sum noise at all non-signal bins */
@@ -171,7 +179,8 @@ static double measure_multitone(uint32_t dsd_rate, const ntf_filter_t *f,
 static double measure_noise_modulation(uint32_t dsd_rate, const ntf_filter_t *f,
                                         int depth, int cands, int lat,
                                         int use_fir_lowpass, double gain) {
-    static const double amplitudes[4] = { 0.1, 0.3, 0.5, 0.7 };
+    /* Amplitudes below SDM overload threshold (0.5 is safe for most NTFs) */
+    static const double amplitudes[4] = { 0.05, 0.15, 0.30, 0.50 };
     double noise_floors[4];
 
     unsigned rate_mult = dsd_rate / 44100;
@@ -180,7 +189,11 @@ static double measure_noise_modulation(uint32_t dsd_rate, const ntf_filter_t *f,
                            (rate_mult <= 128) ? 131072u :
                            (rate_mult <= 256) ? 262144u : 524288u;
 
-    double freq = 1000.0;
+    /* Bin-align frequency for the shorter sample count */
+    const unsigned produced_est = n_dsd - (unsigned)lat;
+    double bw = (double)dsd_rate / (double)produced_est;
+    unsigned sig_bin_est = (unsigned)(1000.0 / bw + 0.5);
+    double freq = sig_bin_est * bw;
 
     for (int a = 0; a < 4; a++) {
         sdm_context_t ctx;

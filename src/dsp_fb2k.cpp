@@ -1270,12 +1270,20 @@ private:
                                 memcpy(ets, ts_start, ts_len);
                         }
                     }
-                    if (etheo > -900.0)
+                    if (etheo > -900.0) {
+                        const char *nmr_label =
+                            (enmr <= -30.0) ? "Transparent" :
+                            (enmr <= -20.0) ? "Excellent" :
+                            (enmr <= -10.0) ? "Good" :
+                            (enmr <=   0.0) ? "Fair" : "Poor";
                         snprintf(out, out_sz,
                                  "SINAD: %.1f dB (A-wtd: %.1f)\n"
-                                 "Multitone: %.1f dB | NMod: %.1f dB | NMR: %.1f dB\n"
+                                 "Multitone: %.1f dB | NMod: %.1f dB\n"
+                                 "NMR: %.1f dB (%s)\n"
                                  "(%s)",
-                                 etheo, eawtd, emt, enmod, enmr, ets);
+                                 etheo, eawtd, emt, enmod,
+                                 enmr, nmr_label, ets);
+                    }
                     else
                         snprintf(out, out_sz, "Quality test cached (%s)", ets);
                     found = true;
