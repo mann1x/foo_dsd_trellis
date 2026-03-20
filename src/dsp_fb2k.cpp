@@ -1692,6 +1692,22 @@ public:
         if (out_rate == 0)
             return true;
 
+        /* Detect cross-family DSD→PCM: need 2-stage path
+         * (FIR decimate to same-family PCM, then polyphase to target) */
+        bool dsd_pcm_cross = false;
+        uint32_t dsd_pcm_intermediate = 0;
+        if (is_dop && out_is_pcm) {
+            bool dsd_is_48k = rate_is_48k_family(dsd_rate);
+            bool out_is_48k = rate_is_48k_family(out_rate);
+            if (dsd_is_48k != out_is_48k) {
+                dsd_pcm_cross = true;
+                uint32_t base = dsd_is_48k ? 48000u : 44100u;
+                dsd_pcm_intermediate = base;
+                while (dsd_pcm_intermediate * 2 <= out_rate && dsd_pcm_intermediate * 2 <= base * 8)
+                    dsd_pcm_intermediate *= 2;
+            }
+        }
+
         /* Apply per-rate overrides to a chunk-local copy of the config.
          * This prevents stale values (cands, lat, depth) from leaking
          * between chunks at different rates. */
@@ -1763,8 +1779,11 @@ public:
             }
         }
 
-        /* Set output rate for this chunk */
-        chunk_cfg.fs_out = out_rate;
+        /* Set output rate for this chunk.
+         * For cross-family DSD→PCM, use the intermediate same-family rate
+         * so the engine can do power-of-2 FIR decimation. The final polyphase
+         * resample to the target rate happens after engine processing. */
+        chunk_cfg.fs_out = dsd_pcm_cross ? dsd_pcm_intermediate : out_rate;
         if (!m_logged_processing) {
             trellis_log("rate_map: lookup_rate=%u map_idx=%d out_idx=%u out_rate=%u is_dop=%d gain=%.3f fs_in=%u fs_out=%u",
                         lookup_rate, map_idx, (unsigned)out_idx, out_rate, is_dop, chunk_cfg.gain, chunk_cfg.fs_in, chunk_cfg.fs_out);
@@ -1803,8 +1822,8 @@ public:
 
         size_t out_frames = 0;
 
-        if (is_dop) {
-            /* DSD input via DoP */
+        if (is_dop && !dsd_pcm_cross) {
+            /* DSD input via DoP — same-family DSD→DSD or DSD→PCM */
             if (!m_logged_processing) {
                 unsigned dsd_base = rate_is_48k_family(dsd_rate) ? 48000 : 44100;
                 unsigned dsd_mult = dsd_rate / dsd_base;
@@ -1825,6 +1844,47 @@ public:
 
             out_frames = plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
                                         pcm_frames, (int)channels, pcm_rate);
+
+        } else if (is_dop && dsd_pcm_cross) {
+            /* Cross-family DSD→PCM: 2-stage pipeline
+             * Stage 1: DSD → same-family PCM via FIR decimation (engine)
+             *           (chunk_cfg.fs_out = dsd_pcm_intermediate, set above)
+             * Stage 2: same-family PCM → target PCM via polyphase resample */
+            if (!m_logged_processing) {
+                unsigned dsd_base = rate_is_48k_family(dsd_rate) ? 48000 : 44100;
+                unsigned dsd_mult = dsd_rate / dsd_base;
+                trellis_log("DSD%u%s -> PCM %uHz (via %uHz), %uch",
+                            dsd_mult, dsd_base == 48000 ? "/48" : "",
+                            out_rate, dsd_pcm_intermediate, channels);
+            }
+
+            /* Stage 1: DSD→PCM at intermediate rate (engine configured above) */
+            size_t stage1_frames = plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
+                                                   pcm_frames, (int)channels, pcm_rate);
+
+            if (stage1_frames > 0) {
+                /* Stage 2: polyphase resample intermediate → target */
+                size_t stage2_max = (size_t)((double)stage1_frames *
+                    (double)out_rate / (double)dsd_pcm_intermediate) + 256;
+                pfc::array_staticsize_t<float> stage2_buf;
+                stage2_buf.set_size_discard(stage2_max * channels);
+
+                out_frames = plugin_process_pcm_to_pcm(m_state,
+                    (const float *)out_buf.get_ptr(), stage2_buf.get_ptr(),
+                    stage1_frames, (int)channels,
+                    dsd_pcm_intermediate, out_rate);
+
+                /* Copy stage2 output back to out_buf for the PCM output path */
+                if (out_frames > 0) {
+                    size_t total = out_frames * channels;
+                    if (total * sizeof(float) <= out_buf_bytes)
+                        memcpy(out_buf.get_ptr(), stage2_buf.get_ptr(), total * sizeof(float));
+                    else
+                        out_frames = 0;
+                }
+            } else {
+                out_frames = 0;
+            }
 
         } else if (out_is_pcm && !is_dop) {
             /* PCM→PCM rate conversion (FIR-only or polyphase) */
