@@ -245,8 +245,45 @@ static int ensure_ch_bufs(plugin_state_t *s, int num_ch, size_t dsd_samples) {
 
 plugin_state_t *plugin_create(void) {
     plugin_state_t *s = (plugin_state_t *)calloc(1, sizeof(plugin_state_t));
-    if (s)
-        dsd_config_defaults(&s->config);
+    if (!s) return NULL;
+    dsd_config_defaults(&s->config);
+
+    /* Eagerly detect topology + create threadpool at plugin load time.
+     * This avoids 150-580ms cold start on first audio chunk. */
+    cpuset_detect(&s->topology);
+    cpuset_benchmark(&s->topology);
+    for (int i = 0; i < 5; i++) {
+        cpuset_update_load(&s->topology);
+        Sleep(100);
+    }
+    s->topology_detected = true;
+
+    s->cpu_monitor = cpuset_monitor_create(&s->topology, 750, 30);
+    if (s->cpu_monitor)
+        cpuset_monitor_read(s->cpu_monitor, &s->topology);
+
+    uint32_t selected_ids[CPUSET_MAX_CPUS];
+    uint8_t  selected_lps[CPUSET_MAX_CPUS];
+    uint16_t selected_groups[CPUSET_MAX_CPUS];
+    int max_t = s->config.thread_count > 0 ? s->config.thread_count : 0;
+    int selected = cpuset_select(&s->topology,
+                                  (smt_mode_t)s->config.smt_mode,
+                                  (ccd_mode_t)s->config.ccd_mode,
+                                  (ecore_mode_t)s->config.ecore_mode,
+                                  max_t, selected_ids, selected_lps,
+                                  selected_groups, CPUSET_MAX_CPUS);
+    s->selected_core_count = selected > 0 ? selected : 0;
+    if (selected > 0) {
+        memcpy(s->selected_core_ids, selected_ids,
+               (size_t)selected * sizeof(uint32_t));
+        s->pool = threadpool_create_cpuset(selected_ids, selected_lps,
+                                            selected_groups, selected);
+    }
+    if (!s->pool)
+        s->pool = threadpool_create(
+            s->config.thread_count > 0 ? s->config.thread_count : 0,
+            s->config.affinity_mask);
+
     return s;
 }
 
