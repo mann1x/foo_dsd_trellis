@@ -23,6 +23,7 @@
 #include "../include/wav_io.h"
 #include "../include/dop.h"
 #include "../include/fir.h"
+#include "../include/sinad_measure.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1000,6 +1001,63 @@ static void handle_request(httpapi_t *api, SOCKET client) {
                     st, g_audio_capture.written, g_audio_capture.target);
                 send_json(client, 200, "OK", json, len);
             }
+        } else {
+            send_method_not_allowed(client);
+        }
+
+    } else if (strncmp(path, "/api/test_sinad", 15) == 0) {
+        if (_stricmp(method, "GET") == 0) {
+            /* GET /api/test_sinad?rate=11289600&ntf=5&nc=2&depth=4&lat=128&fir=1&gain=0.708
+             * Runs SINAD measurement and returns JSON result. */
+            uint32_t rate = DSD_RATE_128;
+            int ntf_id = -1, nc = 2, depth = 4, lat = 128, fir_mode = 1;
+            float gain = 0.708f;
+            const char *q = strchr(path, '?');
+            if (q) {
+                const char *p;
+                if ((p = strstr(q, "rate=")))    rate = (uint32_t)atoi(p + 5);
+                if ((p = strstr(q, "ntf=")))     ntf_id = atoi(p + 4);
+                if ((p = strstr(q, "nc=")))      nc = atoi(p + 3);
+                if ((p = strstr(q, "depth=")))   depth = atoi(p + 6);
+                if ((p = strstr(q, "lat=")))     lat = atoi(p + 4);
+                if ((p = strstr(q, "fir=")))     fir_mode = atoi(p + 4);
+                if ((p = strstr(q, "gain=")))    gain = (float)atof(p + 5);
+            }
+
+            /* Resolve NTF if auto — find the ID by matching the auto-selected filter */
+            if (ntf_id < 0) {
+                const ntf_filter_t *af = ntf_auto_select(rate);
+                if (af) {
+                    /* Search for matching filter to get its enum ID */
+                    for (int fi = 0; fi < ntf_get_filter_count(); fi++) {
+                        const ntf_filter_t *check = ntf_get_by_index(fi);
+                        if (check && check->freq == rate &&
+                            strcmp(check->name, af->name) == 0) {
+                            ntf_id = fi;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            sinad_result_t result;
+            sinad_measure(rate, ntf_id, nc, depth, lat, fir_mode, gain, &result);
+
+            char json[512];
+            const ntf_filter_t *nf = ntf_get_filter((ntf_filter_id_t)ntf_id, rate);
+            snprintf(json, sizeof(json),
+                "{\"rate\":%u,\"rate_name\":\"DSD%u\",\"ntf\":\"%s\","
+                "\"nc\":%d,\"depth\":%d,\"lat\":%d,\"fir\":%d,\"gain\":%.3f,"
+                "\"sinad_reencode\":%.1f,\"sinad_theoretical\":%.1f,"
+                "\"conv_fail\":%llu,\"collapse\":%llu,\"drop_pct\":%.2f,"
+                "\"ok\":%d}",
+                rate, rate / 44100, nf ? nf->name : "auto",
+                nc, depth, lat, fir_mode, gain,
+                result.sinad_db, result.sinad_theoretical,
+                (unsigned long long)result.conv_fail,
+                (unsigned long long)result.cands_collapse,
+                result.drop_pct, result.ok);
+            send_json(client, 200, "OK", json, (int)strlen(json));
         } else {
             send_method_not_allowed(client);
         }
