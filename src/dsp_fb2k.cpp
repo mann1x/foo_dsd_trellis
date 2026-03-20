@@ -494,8 +494,8 @@ private:
         m_listRate = GetDlgItem(IDC_LIST_RATEMAP);
         m_listRate.SetExtendedListViewStyle(
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 50);
-        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 54);
+        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 62);
+        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 80);
         m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 42);
         m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 50);
         m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 42);
