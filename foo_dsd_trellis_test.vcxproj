@@ -151,6 +151,7 @@
     <ClCompile Include="test\test_resample.c" />
     <ClCompile Include="test\test_validation.c" />
     <ClCompile Include="test\test_dither.c" />
+    <ClCompile Include="test\test_quality.c" />
     <!-- Library sources (linked directly, no DLL dependency) -->
     <ClCompile Include="src\config.c" />
     <ClCompile Include="src\dop.c" />
@@ -161,6 +162,7 @@
     <ClCompile Include="src\ntf.c" />
     <ClCompile Include="src\threadpool.c" />
     <ClCompile Include="src\resample.c" />
+    <ClCompile Include="src\sinad_measure.c" />
     <ClCompile Include="src\simd_detect.c" />
     <ClCompile Include="src\cpuset.c" />
     <ClCompile Include="src\precorr.c" />
