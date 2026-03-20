@@ -207,6 +207,9 @@
     <ClCompile Include="src\sinad_measure.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\resample.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\httpapi.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
@@ -253,6 +256,7 @@
     <ClInclude Include="include\httpapi.h" />
     <ClInclude Include="include\wav_io.h" />
     <ClInclude Include="include\cpuset.h" />
+    <ClInclude Include="include\resample.h" />
     <ClInclude Include="include\precorr.h" />
     <ClInclude Include="include\onnx_filter.h" />
     <ClInclude Include="include\gpu_compute.h" />

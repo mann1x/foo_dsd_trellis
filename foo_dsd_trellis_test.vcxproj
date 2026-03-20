@@ -148,6 +148,7 @@
     <ClCompile Include="test\test_gpu.c" />
     <ClCompile Include="test\test_gpu_sinad.c" />
     <ClCompile Include="test\test_offline_gpu.c" />
+    <ClCompile Include="test\test_resample.c" />
     <!-- Library sources (linked directly, no DLL dependency) -->
     <ClCompile Include="src\config.c" />
     <ClCompile Include="src\dop.c" />
@@ -157,6 +158,7 @@
     <ClCompile Include="src\trellis.c" />
     <ClCompile Include="src\ntf.c" />
     <ClCompile Include="src\threadpool.c" />
+    <ClCompile Include="src\resample.c" />
     <ClCompile Include="src\simd_detect.c" />
     <ClCompile Include="src\cpuset.c" />
     <ClCompile Include="src\precorr.c" />
