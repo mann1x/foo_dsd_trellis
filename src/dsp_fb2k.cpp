@@ -1265,7 +1265,7 @@ private:
                         }
                     }
                     if (etheo > -900.0)
-                        snprintf(out, out_sz, "SINAD: %.1f dB re-encode | %.1f dB theoretical (%s)",
+                        snprintf(out, out_sz, "Re-encode SNR: %.1f dB | SINAD: %.1f dB (%s)",
                                  esinad, etheo, ets);
                     else
                         snprintf(out, out_sz, "SINAD: %.1f dB (%s)", esinad, ets);

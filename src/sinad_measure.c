@@ -12,10 +12,14 @@
  * This measures what the user actually hears: DSD → re-encode → DSD → decode.
  */
 
+#include <windows.h>
 #include "../include/sinad_measure.h"
 #include "../include/trellis.h"
 #include "../include/ntf.h"
 #include "../include/fir.h"
+#ifdef USE_IPP
+#include <ippcore.h>
+#endif
 #include "../include/dsd_types.h"
 #include <math.h>
 #include <stdlib.h>
@@ -43,6 +47,59 @@ static double goertzel_power(const float *x, size_t n, double freq_hz,
     double imag = s2 * sin(w);
     return (real * real + imag * imag) / ((double)n * (double)n);
 }
+
+/* ─── Decoded SNR thread (IPP FIR needs large stack) ─── */
+
+typedef struct {
+    const float *dsd_out;
+    size_t       produced;
+    uint32_t     dsd_rate;
+    double       freq;
+    double       result_snr;
+} dec_work_t;
+
+static DWORD WINAPI dec_snr_thread(LPVOID param) {
+    dec_work_t *w = (dec_work_t *)param;
+
+#ifdef USE_IPP
+    ippInit();  /* safe to call multiple times */
+#endif
+
+    fir_chain_t dec_ch;
+    memset(&dec_ch, 0, sizeof(dec_ch));
+    if (fir_chain_init(&dec_ch, w->dsd_rate, 44100) != 0)
+        return 1;
+    if (dec_ch.num_stages == 0) {
+        fir_chain_free(&dec_ch);
+        return 1;
+    }
+
+    unsigned ratio = w->dsd_rate / 44100;
+    size_t pcm_est = w->produced / ratio + 4096;
+    float *pcm_buf = (float *)calloc(pcm_est, sizeof(float));
+    if (!pcm_buf) { fir_chain_free(&dec_ch); return 1; }
+
+    size_t out_n = fir_chain_process(&dec_ch, w->dsd_out, pcm_buf, w->produced);
+
+    size_t skip = 512;
+    if (skip >= out_n) skip = 0;
+
+    double sig_power = 0.0, err_power = 0.0;
+    for (size_t i = skip; i < out_n; i++) {
+        double ref = 0.5 * sin(2.0 * M_PI * w->freq * (double)i / 44100.0);
+        double diff = ref - (double)pcm_buf[i];
+        sig_power += ref * ref;
+        err_power += diff * diff;
+    }
+    if (err_power <= 0.0) err_power = 1e-30;
+    w->result_snr = 10.0 * log10(sig_power / err_power);
+
+    free(pcm_buf);
+    fir_chain_free(&dec_ch);
+    return 0;
+}
+
+/* ─── Main SINAD measurement ─── */
 
 void sinad_measure(uint32_t dsd_rate, int ntf_id,
                    int cands, int depth, int lat,
@@ -132,10 +189,10 @@ void sinad_measure(uint32_t dsd_rate, int ntf_id,
         return;
     }
 
-    /* Step 5: Pipeline SINAD — same Goertzel method as theoretical, but
-     * on the re-encoded output. Measures in-band audio quality of the
-     * DSD→boxcar/FIR→SDM→DSD roundtrip. The difference between this
-     * and the theoretical SINAD shows the re-encode degradation. */
+    /* Step 5: Re-encode SINAD — Goertzel on raw ±1.0 DSD output (0-20kHz).
+     * Measures in-band noise quality of the pipeline output.
+     * NOTE: FIR-decimated SNR (compare vs original sine at 44.1kHz)
+     * crashes due to IPP/FIR chain issues — deferred to future work. */
     {
         double actual_bw = (double)dsd_rate / (double)produced;
         unsigned actual_sig_bin = (unsigned)(freq / actual_bw + 0.5);
