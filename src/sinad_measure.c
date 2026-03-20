@@ -117,8 +117,8 @@ static double measure_multitone(uint32_t dsd_rate, const ntf_filter_t *f,
 
     /* Feed clean analog multitone directly to SDM (like theoretical SINAD).
      * DSD-quantized input gives ~6 dB (1-bit noise limit, not meaningful). */
-    /* Amplitude per tone: 0.5/sqrt(32) gives total RMS ≈ 0.5.
-     * Each tone is ~20 dB above the SDM noise floor. */
+    /* Amplitude: 0.5/sqrt(32) per tone. Total RMS ≈ 0.5.
+     * Tones are incoherent so peak is ~3-4x single tone, not 32x. */
     double amp = 0.5 / sqrt(32.0);
     for (unsigned i = 0; i < n_dsd; i++) {
         double s = 0.0;
