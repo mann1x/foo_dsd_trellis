@@ -1060,46 +1060,56 @@ size_t plugin_process(plugin_state_t *s,
             }
         }
 
-        /* GPU rate conversion FIR disabled — fir_buf is double, GPU outputs float.
-         * Falls back to CPU threadpool which widens float→double properly. */
-        if (0 && !gpu_fir_ok && s->gpu && dsd_in_count >= GPU_MIN_SAMPLES &&
+        /* GPU rate conversion FIR: GPU outputs float, fir_buf is double.
+         * Use static TLS float buffer → GPU → widen to double + apply gain.
+         * Same pattern as GPU FIR lowpass path above. */
+        if (!gpu_fir_ok && s->gpu && s->config.gpu_enabled &&
+            dsd_in_count >= GPU_MIN_SAMPLES &&
             s->channels[0].fir.num_stages > 0) {
             /* Estimate output count for buffer sizing */
             size_t est_out = dsd_in_count;
             for (int st = 0; st < s->channels[0].fir.num_stages; st++)
                 est_out = s->channels[0].fir.upsample ? est_out * 2 : est_out / 2;
 
-            for (int ch = 0; ch < num_channels; ch++) {
-                size_t gpu_out = 0;
-                if (gpu_fir_chain_process(s->gpu, s->ch_in[ch],
-                        s->channels[ch].fir_buf, dsd_in_count,
-                        &gpu_out, NULL, NULL) == 0) {
-                    fir_counts[ch] = gpu_out;
-                    fir_data[ch] = s->channels[ch].fir_buf;
-                    /* Ensure fir_buf is large enough */
-                    if (s->channels[ch].fir_buf_sz < gpu_out * sizeof(float)) {
-                        free(s->channels[ch].fir_buf);
-                        s->channels[ch].fir_buf = (float *)malloc(gpu_out * sizeof(float));
-                        s->channels[ch].fir_buf_sz = gpu_out * sizeof(float);
-                        /* Re-run on new buffer */
-                        gpu_fir_chain_process(s->gpu, s->ch_in[ch],
-                            s->channels[ch].fir_buf, dsd_in_count,
-                            &gpu_out, NULL, NULL);
-                        fir_data[ch] = s->channels[ch].fir_buf;
-                    }
-                    gpu_fir_ok = true;
-                } else {
-                    gpu_fir_ok = false;
-                    break;
-                }
+            /* TLS float buffer for GPU output (before double widening) */
+            static float *s_gpu_fir_tmp = NULL;
+            static size_t s_gpu_fir_sz = 0;
+            if (s_gpu_fir_sz < est_out) {
+                free(s_gpu_fir_tmp);
+                s_gpu_fir_tmp = (float *)malloc(est_out * sizeof(float));
+                s_gpu_fir_sz = s_gpu_fir_tmp ? est_out : 0;
             }
-            /* Apply gain on GPU */
-            if (gpu_fir_ok) {
-                float combined = s->channels[0].fir_gain * s->config.gain;
-                if (combined != 1.0f) {
-                    for (int ch = 0; ch < num_channels; ch++)
-                        gpu_gain_apply(s->gpu, fir_data[ch],
-                                       fir_counts[ch], combined);
+
+            if (s_gpu_fir_tmp) {
+                double combined_gain = (double)s->channels[0].fir_gain
+                                     * (double)s->config.gain;
+                for (int ch = 0; ch < num_channels; ch++) {
+                    size_t gpu_out = 0;
+                    if (gpu_fir_chain_process(s->gpu, s->ch_in[ch],
+                            s_gpu_fir_tmp, dsd_in_count,
+                            &gpu_out, NULL, NULL) == 0) {
+                        /* Ensure fir_buf is large enough */
+                        size_t need = gpu_out * sizeof(double);
+                        if (s->channels[ch].fir_buf_sz < need) {
+                            free(s->channels[ch].fir_buf);
+                            s->channels[ch].fir_buf = (double *)malloc(need);
+                            s->channels[ch].fir_buf_sz =
+                                s->channels[ch].fir_buf ? need : 0;
+                        }
+                        if (!s->channels[ch].fir_buf) {
+                            gpu_fir_ok = false; break;
+                        }
+                        /* Widen float→double + apply gain in one pass */
+                        for (size_t i = 0; i < gpu_out; i++)
+                            s->channels[ch].fir_buf[i] =
+                                (double)s_gpu_fir_tmp[i] * combined_gain;
+                        fir_counts[ch] = gpu_out;
+                        fir_data[ch] = s->channels[ch].fir_buf;
+                        gpu_fir_ok = true;
+                    } else {
+                        gpu_fir_ok = false;
+                        break;
+                    }
                 }
             }
         }
