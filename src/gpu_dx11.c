@@ -255,6 +255,44 @@ static const char g_hlsl_trellis[] =
 "    }\n"
 "}\n";
 
+/* FIR lowpass shader — same algorithm as CUDA fir_lowpass kernel.
+ * Quantizes DSD ±1.0 input, convolves with taps, applies gain.
+ * History buffer provides continuity across chunks. */
+static const char g_hlsl_fir_lowpass[] =
+"StructuredBuffer<float>   g_in   : register(t0);\n"
+"StructuredBuffer<float>   g_taps : register(t1);\n"
+"StructuredBuffer<float>   g_hist : register(t2);\n"
+"RWStructuredBuffer<float> g_out  : register(u0);\n"
+"cbuffer Params : register(b0) {\n"
+"    uint count;\n"
+"    uint ntaps;\n"
+"    float gain_val;\n"
+"    uint hist_valid;\n"
+"};\n"
+"\n"
+"[numthreads(256, 1, 1)]\n"
+"void main(uint3 dtid : SV_DispatchThreadID) {\n"
+"    uint i = dtid.x;\n"
+"    if (i >= count) return;\n"
+"    float acc = 0.0;\n"
+"    for (int k = 0; k < (int)ntaps; k++) {\n"
+"        int si = (int)i - k;\n"
+"        float v;\n"
+"        if (si >= 0) {\n"
+"            v = g_in[si];\n"
+"        } else if (hist_valid) {\n"
+"            v = g_hist[(int)ntaps - 1 + si];\n"
+"        } else {\n"
+"            v = 0.0;\n"
+"        }\n"
+"        v = (v >= 0.0) ? 1.0 : -1.0;\n"
+"        acc += g_taps[k] * v;\n"
+"    }\n"
+"    g_out[i] = acc * gain_val;\n"
+"}\n";
+
+#define LP_MAX_CH 8
+
 /* ─── DX11 context structure ─── */
 
 typedef struct {
@@ -267,6 +305,17 @@ typedef struct {
     ID3D11ComputeShader   *cs_gain;
     ID3D11ComputeShader   *cs_boxcar;
     ID3D11ComputeShader   *cs_trellis;
+    ID3D11ComputeShader   *cs_fir_lp;
+    /* FIR lowpass per-channel history */
+    ID3D11Buffer          *buf_lp_taps;
+    ID3D11ShaderResourceView *srv_lp_taps;
+    ID3D11Buffer          *buf_lp_hist;
+    ID3D11ShaderResourceView *srv_lp_hist;
+    float                 *h_lp_hist[LP_MAX_CH];
+    int                    lp_hist_len;
+    int                    lp_ntaps;
+    bool                   lp_hist_valid[LP_MAX_CH];
+    int                    lp_ch;
     /* Persistent Trellis SDM buffers */
     ID3D11Buffer          *buf_trellis_states;  /* UAV: [cands*8] uint2 (doubles) */
     ID3D11UnorderedAccessView *uav_trellis_states;
@@ -600,6 +649,7 @@ gpu_context_t *gpu_dx11_create(void) {
     c->cs_gain     = compile_cs(dev, g_hlsl_gain, "gain");
     c->cs_boxcar   = compile_cs(dev, g_hlsl_boxcar, "boxcar");
     c->cs_trellis  = compile_cs(dev, g_hlsl_trellis, "trellis");
+    c->cs_fir_lp   = compile_cs(dev, g_hlsl_fir_lowpass, "fir_lp");
     {
         char msg[256];
         sprintf_s(msg, sizeof(msg),
@@ -644,6 +694,12 @@ void gpu_dx11_destroy(void *ptr) {
     if (c->uav_trellis_states) ID3D11UnorderedAccessView_Release(c->uav_trellis_states);
     if (c->buf_trellis_states) ID3D11Buffer_Release(c->buf_trellis_states);
     if (c->buf_trellis_params) ID3D11Buffer_Release(c->buf_trellis_params);
+    if (c->cs_fir_lp) ID3D11ComputeShader_Release(c->cs_fir_lp);
+    if (c->srv_lp_hist) ID3D11ShaderResourceView_Release(c->srv_lp_hist);
+    if (c->buf_lp_hist) ID3D11Buffer_Release(c->buf_lp_hist);
+    if (c->srv_lp_taps) ID3D11ShaderResourceView_Release(c->srv_lp_taps);
+    if (c->buf_lp_taps) ID3D11Buffer_Release(c->buf_lp_taps);
+    for (int i = 0; i < LP_MAX_CH; i++) free(c->h_lp_hist[i]);
     if (c->cs_trellis) ID3D11ComputeShader_Release(c->cs_trellis);
     if (c->cs_boxcar) ID3D11ComputeShader_Release(c->cs_boxcar);
     if (c->cs_gain)   ID3D11ComputeShader_Release(c->cs_gain);
@@ -890,17 +946,116 @@ int gpu_dx11_boxcar(dx11_context_t *c, const float *in, float *out,
     return download_buf(c->ctx, c->buf_out, c->buf_staging, out, count);
 }
 
-/* ─── DX11 FIR Lowpass (stub — falls back to CPU) ─── */
+/* ─── DX11 Reset Chunk ─── */
+
+void gpu_dx11_reset_chunk(dx11_context_t *c) {
+    if (c) c->lp_ch = 0;
+}
+
+/* ─── DX11 FIR Lowpass ─── */
 
 int gpu_dx11_fir_lowpass_setup(dx11_context_t *c, const float *taps, int ntaps) {
-    (void)c; (void)taps; (void)ntaps;
-    return -1;  /* Not implemented — CPU fallback */
+    if (!c || !c->cs_fir_lp || !taps || ntaps < 1 || ntaps > 128)
+        return -1;
+
+    /* Create taps buffer + SRV */
+    if (c->srv_lp_taps) { ID3D11ShaderResourceView_Release(c->srv_lp_taps); c->srv_lp_taps = NULL; }
+    if (c->buf_lp_taps) { ID3D11Buffer_Release(c->buf_lp_taps); c->buf_lp_taps = NULL; }
+    if (FAILED(create_structured_buf(c->device, (UINT)ntaps,
+            D3D11_BIND_SHADER_RESOURCE, &c->buf_lp_taps)))
+        return -1;
+    if (FAILED(create_srv(c->device, c->buf_lp_taps, (UINT)ntaps, &c->srv_lp_taps)))
+        return -1;
+    upload_buf(c->ctx, c->buf_lp_taps, taps, (size_t)ntaps);
+
+    /* Create history buffer + SRV (ntaps-1 floats, shared across channels) */
+    int hist_len = ntaps - 1;
+    if (hist_len < 1) hist_len = 1;
+    if (c->srv_lp_hist) { ID3D11ShaderResourceView_Release(c->srv_lp_hist); c->srv_lp_hist = NULL; }
+    if (c->buf_lp_hist) { ID3D11Buffer_Release(c->buf_lp_hist); c->buf_lp_hist = NULL; }
+    if (FAILED(create_structured_buf(c->device, (UINT)hist_len,
+            D3D11_BIND_SHADER_RESOURCE, &c->buf_lp_hist)))
+        return -1;
+    if (FAILED(create_srv(c->device, c->buf_lp_hist, (UINT)hist_len, &c->srv_lp_hist)))
+        return -1;
+
+    /* Allocate per-channel host history, pre-fill with DSD silence */
+    c->lp_hist_len = hist_len;
+    c->lp_ntaps = ntaps;
+    c->lp_ch = 0;
+    for (int i = 0; i < LP_MAX_CH; i++) {
+        free(c->h_lp_hist[i]);
+        c->h_lp_hist[i] = (float *)malloc((size_t)hist_len * sizeof(float));
+        if (c->h_lp_hist[i]) {
+            for (int j = 0; j < hist_len; j++)
+                c->h_lp_hist[i][j] = (j & 1) ? -1.0f : 1.0f;
+            c->lp_hist_valid[i] = true;
+        } else {
+            c->lp_hist_valid[i] = false;
+        }
+    }
+
+    return 0;
 }
 
 int gpu_dx11_fir_lowpass(dx11_context_t *c, const float *in, float *out,
                           size_t count, float gain) {
-    (void)c; (void)in; (void)out; (void)count; (void)gain;
-    return -1;  /* Not implemented — CPU fallback */
+    if (!c || !c->cs_fir_lp || !c->buf_lp_taps || !in || !out || count == 0)
+        return -1;
+
+    int ch = c->lp_ch % LP_MAX_CH;
+    c->lp_ch++;
+
+    /* Ensure buffers */
+    if (ensure_buf_in(c, count) != 0) return -1;
+    if (ensure_buf_out(c, count) != 0) return -1;
+    if (ensure_staging(c, count) != 0) return -1;
+
+    /* Upload input */
+    upload_buf(c->ctx, c->buf_in, in, count);
+
+    /* Upload history for this channel */
+    uint32_t hist_valid = 0;
+    if (c->lp_hist_valid[ch] && c->h_lp_hist[ch]) {
+        upload_buf(c->ctx, c->buf_lp_hist, c->h_lp_hist[ch], (size_t)c->lp_hist_len);
+        hist_valid = 1;
+    }
+
+    /* Update constant buffer: count, ntaps, gain, hist_valid */
+    struct { uint32_t count; uint32_t ntaps; float gain; uint32_t hist_valid; } params;
+    params.count = (uint32_t)count;
+    params.ntaps = (uint32_t)c->lp_ntaps;
+    params.gain = gain;
+    params.hist_valid = hist_valid;
+    ID3D11DeviceContext_UpdateSubresource(c->ctx, (ID3D11Resource *)c->buf_params,
+                                          0, NULL, &params, 0, 0);
+
+    /* Dispatch */
+    ID3D11ShaderResourceView *srvs[3] = { c->srv_in, c->srv_lp_taps, c->srv_lp_hist };
+    ID3D11DeviceContext_CSSetShader(c->ctx, c->cs_fir_lp, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(c->ctx, 0, 3, srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(c->ctx, 0, 1, &c->uav_out, NULL);
+    ID3D11DeviceContext_CSSetConstantBuffers(c->ctx, 0, 1, &c->buf_params);
+    ID3D11DeviceContext_Dispatch(c->ctx, (UINT)((count + 255) / 256), 1, 1);
+
+    /* Clear bindings */
+    ID3D11ShaderResourceView *null_srvs[3] = { NULL, NULL, NULL };
+    ID3D11UnorderedAccessView *null_uav = NULL;
+    ID3D11DeviceContext_CSSetShaderResources(c->ctx, 0, 3, null_srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(c->ctx, 0, 1, &null_uav, NULL);
+
+    /* Download output */
+    if (download_buf(c->ctx, c->buf_out, c->buf_staging, out, count) != 0)
+        return -1;
+
+    /* Save last hist_len samples as history for next chunk */
+    if (c->h_lp_hist[ch] && count >= (size_t)c->lp_hist_len) {
+        memcpy(c->h_lp_hist[ch], in + count - (size_t)c->lp_hist_len,
+               (size_t)c->lp_hist_len * sizeof(float));
+        c->lp_hist_valid[ch] = true;
+    }
+
+    return 0;
 }
 
 /* ─── DX11 Trellis SDM ─── */

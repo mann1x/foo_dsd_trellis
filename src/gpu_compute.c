@@ -132,6 +132,10 @@ void gpu_reset_chunk(gpu_context_t *ctx) {
     case GPU_BACKEND_CUDA:
         gpu_cuda_reset_chunk(ctx);
         break;
+    case GPU_BACKEND_DIRECTX:
+        gpu_dx11_reset_chunk(ctx);
+        gpu_dx12_reset_chunk(ctx);
+        break;
     default: break;
     }
 }

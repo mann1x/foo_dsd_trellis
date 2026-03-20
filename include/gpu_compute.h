@@ -147,6 +147,8 @@ gpu_context_t *gpu_cuda_create(void);
 void gpu_dx11_destroy(void *ctx);
 void gpu_cuda_destroy(void *ctx);
 void gpu_cuda_reset_chunk(void *ctx);
+void gpu_dx11_reset_chunk(void *ctx);
+void gpu_dx12_reset_chunk(void *ctx);
 void gpu_dx12_destroy_full(void *ctx);
 
 /* DX12 full backend */

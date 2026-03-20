@@ -44,7 +44,9 @@ static char g_name[128] = "";
 static size_t g_vram = 0;
 
 /* ─── Shader IDs ─── */
-enum { PSO_FIR_UP, PSO_FIR_DOWN, PSO_GAIN, PSO_BOXCAR, PSO_TRELLIS, PSO_COUNT };
+enum { PSO_FIR_UP, PSO_FIR_DOWN, PSO_GAIN, PSO_BOXCAR, PSO_TRELLIS, PSO_FIR_LP, PSO_COUNT };
+
+#define LP_MAX_CH_DX12 8
 
 /* ─── Context ─── */
 typedef struct {
@@ -72,6 +74,16 @@ typedef struct {
     int tr_cands, tr_order, tr_lat;
     float tr_a[8], tr_g[8], tr_limit;
     bool tr_ready;
+    /* FIR lowpass */
+    ID3D12Resource       *b_lp_hist;     /* history buffer (default heap, UAV) */
+    ID3D12Resource       *b_lp_taps;     /* taps buffer (default heap, UAV) */
+    size_t                cap_lp_hist, cap_lp_taps;
+    float                *h_lp_hist[LP_MAX_CH_DX12];
+    int                   lp_hist_len;
+    int                   lp_ntaps;
+    bool                  lp_hist_valid[LP_MAX_CH_DX12];
+    int                   lp_ch;
+    float                 lp_taps_store[128];
 } dx12_t;
 
 /* ─── Helpers ─── */
@@ -261,11 +273,21 @@ static const char *g_hlsl[] = {
 "for(int mi=0;mi<ac;mi++){sc_[mi]=sc_[nc+mi]-mc;sp[mi]=sp[nc+mi];\n"
 "for(int mf=0;mf<ord;mf++)ss[mi][mf]=ss[nc+mi][mf];}}\n"
 "GroupMemoryBarrierWithGroupSync();\n"
-"if(t==0&&si>=wu)u1[ost+oi++]=so?1.0f:-1.0f;}}\n"
+"if(t==0&&si>=wu)u1[ost+oi++]=so?1.0f:-1.0f;}}\n",
+/* PSO_FIR_LP — FIR lowpass with per-channel history */
+"RWStructuredBuffer<float> u0:register(u0); RWStructuredBuffer<float> u1:register(u1);\n"
+"RWStructuredBuffer<float> u2:register(u2); RWStructuredBuffer<float> u3:register(u3);\n"
+"cbuffer P:register(b0){uint cnt;uint nt;float gv;uint hv;};\n"
+"[numthreads(256,1,1)]void main(uint3 d:SV_DispatchThreadID){\n"
+"uint i=d.x;if(i>=cnt)return;float a=0;\n"
+"for(uint k=0;k<nt;k++){int si=(int)i-(int)k;float v;\n"
+"if(si>=0)v=u0[si];else if(hv)v=u2[(int)nt-1+si];else v=0;\n"
+"v=(v>=0)?1.0:-1.0;a+=u3[k]*v;}\n"
+"u1[i]=a*gv;}\n"
 };
 
 static const char *g_shader_names[] = {
-    "fir_up", "fir_down", "gain", "boxcar", "trellis"
+    "fir_up", "fir_down", "gain", "boxcar", "trellis", "fir_lp"
 };
 
 /* ─── Probe ─── */
@@ -424,6 +446,9 @@ void gpu_dx12_destroy_full(void *p) {
     dx12_t *c = (dx12_t*)p;
     if (!c) return;
     if (c->queue) wait_gpu(c);
+    if (c->b_lp_taps) ID3D12Resource_Release(c->b_lp_taps);
+    if (c->b_lp_hist) ID3D12Resource_Release(c->b_lp_hist);
+    for (int i = 0; i < LP_MAX_CH_DX12; i++) free(c->h_lp_hist[i]);
     if (c->b_cb) ID3D12Resource_Release(c->b_cb);
     if (c->b_rb) ID3D12Resource_Release(c->b_rb);
     if (c->b_up) ID3D12Resource_Release(c->b_up);
@@ -577,17 +602,140 @@ int gpu_dx12_boxcar(dx12_t *c, const float *in, float *out,
     return download(c, c->b_out, out, bytes);
 }
 
-/* ─── FIR Lowpass (stub — falls back to CPU) ─── */
+/* ─── Reset Chunk ─── */
+
+void gpu_dx12_reset_chunk(dx12_t *c) {
+    if (c) c->lp_ch = 0;
+}
+
+/* ─── FIR Lowpass ─── */
 
 int gpu_dx12_fir_lowpass_setup(dx12_t *c, const float *taps, int ntaps) {
-    (void)c; (void)taps; (void)ntaps;
-    return -1;  /* Not implemented — CPU fallback */
+    if (!c || !taps || ntaps < 1 || ntaps > 128)
+        return -1;
+    if (!c->pso[PSO_FIR_LP])
+        return -1;
+
+    /* Store taps for upload during process */
+    memcpy(c->lp_taps_store, taps, (size_t)ntaps * sizeof(float));
+    c->lp_ntaps = ntaps;
+    c->lp_hist_len = ntaps - 1;
+    if (c->lp_hist_len < 1) c->lp_hist_len = 1;
+    c->lp_ch = 0;
+
+    /* Allocate taps buffer on GPU */
+    size_t taps_bytes = (size_t)ntaps * sizeof(float);
+    if (grow_buf(c, &c->b_lp_taps, &c->cap_lp_taps, taps_bytes,
+                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0)
+        return -1;
+
+    /* Upload taps */
+    size_t up_need = taps_bytes > c->cap_up ? taps_bytes : c->cap_up;
+    GR_UP(c, up_need);
+    begin_cmd(c);
+    upload(c, c->b_lp_taps, taps, taps_bytes);
+    exec_cmd(c);
+
+    /* Allocate history buffer */
+    size_t hist_bytes = (size_t)c->lp_hist_len * sizeof(float);
+    if (grow_buf(c, &c->b_lp_hist, &c->cap_lp_hist, hist_bytes,
+                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0)
+        return -1;
+
+    /* Allocate per-channel host history, pre-fill with DSD silence */
+    for (int i = 0; i < LP_MAX_CH_DX12; i++) {
+        free(c->h_lp_hist[i]);
+        c->h_lp_hist[i] = (float *)malloc(hist_bytes);
+        if (c->h_lp_hist[i]) {
+            for (int j = 0; j < c->lp_hist_len; j++)
+                c->h_lp_hist[i][j] = (j & 1) ? -1.0f : 1.0f;
+            c->lp_hist_valid[i] = true;
+        } else {
+            c->lp_hist_valid[i] = false;
+        }
+    }
+
+    return 0;
 }
 
 int gpu_dx12_fir_lowpass(dx12_t *c, const float *in, float *out,
                           size_t count, float gain) {
-    (void)c; (void)in; (void)out; (void)count; (void)gain;
-    return -1;  /* Not implemented — CPU fallback */
+    if (!c || !c->pso[PSO_FIR_LP] || !in || !out || count == 0)
+        return -1;
+
+    int ch = c->lp_ch % LP_MAX_CH_DX12;
+    c->lp_ch++;
+
+    size_t bytes = count * sizeof(float);
+
+    /* Grow buffers */
+    if (GR_IN(c, bytes) != 0) return -1;
+    if (GR_OUT(c, bytes) != 0) return -1;
+    size_t up_need = bytes;
+    if (up_need < (size_t)c->lp_hist_len * sizeof(float))
+        up_need = (size_t)c->lp_hist_len * sizeof(float);
+    if (GR_UP(c, up_need) != 0) return -1;
+    if (GR_RB(c, bytes) != 0) return -1;
+
+    /* Update constant buffer: count, ntaps, gain, hist_valid */
+    struct { uint32_t cnt; uint32_t nt; float gv; uint32_t hv; } params;
+    params.cnt = (uint32_t)count;
+    params.nt = (uint32_t)c->lp_ntaps;
+    params.gv = gain;
+    params.hv = (c->lp_hist_valid[ch] && c->h_lp_hist[ch]) ? 1 : 0;
+    memcpy(c->cb_map, &params, sizeof(params));
+
+    begin_cmd(c);
+
+    /* Upload input to b_in (u0) */
+    upload(c, c->b_in, in, bytes);
+
+    /* Upload history to b_lp_hist */
+    if (params.hv && c->h_lp_hist[ch])
+        upload(c, c->b_lp_hist, c->h_lp_hist[ch],
+               (size_t)c->lp_hist_len * sizeof(float));
+
+    /* Upload taps to b_aux (u3) */
+    if (GR_AUX(c, (size_t)c->lp_ntaps * sizeof(float)) != 0) return -1;
+    upload(c, c->b_aux, c->lp_taps_store, (size_t)c->lp_ntaps * sizeof(float));
+
+    /* Dispatch: u0=b_in, u1=b_out, u2=b_lp_hist, u3=b_aux(taps)
+     * Root sig has 5 params: [0]=CBV, [1-4]=UAV u0-u3 */
+    ID3D12GraphicsCommandList_SetComputeRootSignature(c->cmd, c->rs);
+    ID3D12GraphicsCommandList_SetPipelineState(c->cmd, c->pso[PSO_FIR_LP]);
+    ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(c->cmd, 0,
+        ID3D12Resource_GetGPUVirtualAddress(c->b_cb));
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(c->cmd, 1,
+        ID3D12Resource_GetGPUVirtualAddress(c->b_in));
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(c->cmd, 2,
+        ID3D12Resource_GetGPUVirtualAddress(c->b_out));
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(c->cmd, 3,
+        ID3D12Resource_GetGPUVirtualAddress(c->b_lp_hist));
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(c->cmd, 4,
+        ID3D12Resource_GetGPUVirtualAddress(c->b_aux));
+    ID3D12GraphicsCommandList_Dispatch(c->cmd,
+        (UINT)((count + 255) / 256), 1, 1);
+    {
+        D3D12_RESOURCE_BARRIER bar = {0};
+        bar.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        bar.UAV.pResource = NULL;
+        ID3D12GraphicsCommandList_ResourceBarrier(c->cmd, 1, &bar);
+    }
+
+    /* Download output */
+    if (download(c, c->b_out, out, bytes) != 0)
+        return -1;
+
+    /* Save history for next chunk */
+    if (c->h_lp_hist[ch] && count >= (size_t)c->lp_hist_len) {
+        memcpy(c->h_lp_hist[ch], in + count - (size_t)c->lp_hist_len,
+               (size_t)c->lp_hist_len * sizeof(float));
+        c->lp_hist_valid[ch] = true;
+    }
+
+    return 0;
 }
 
 /* ─── Trellis Setup ─── */
