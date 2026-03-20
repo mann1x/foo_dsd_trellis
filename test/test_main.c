@@ -49,6 +49,7 @@ static const suite_entry_t suites[] = {
     { "pipeline",  "Pipeline SINAD",    test_pipeline_sinad,   1 },
     { "diag",      "SINAD Diagnostics", test_sinad_diag_suite, 1 },
     { "resample",  "Resample",          test_resample_suite,   0 },
+    { "validation","Validation",        test_validation_suite, 0 },
 };
 
 #define SUITE_COUNT (sizeof(suites) / sizeof(suites[0]))

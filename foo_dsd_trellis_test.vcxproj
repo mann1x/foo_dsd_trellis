@@ -149,6 +149,7 @@
     <ClCompile Include="test\test_gpu_sinad.c" />
     <ClCompile Include="test\test_offline_gpu.c" />
     <ClCompile Include="test\test_resample.c" />
+    <ClCompile Include="test\test_validation.c" />
     <!-- Library sources (linked directly, no DLL dependency) -->
     <ClCompile Include="src\config.c" />
     <ClCompile Include="src\dop.c" />

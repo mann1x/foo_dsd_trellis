@@ -87,6 +87,7 @@ void test_gpu_sinad_comparison(void);
 void test_lat_sweep(void);
 void test_pipeline_sinad(void);
 void test_resample_suite(void);
+void test_validation_suite(void);
 
 /* Standalone DSD encoder tool (tools/dsd_encode.c) */
 int dsd_encode_main(int argc, char **argv);
