@@ -109,7 +109,8 @@ static size_t generate_dsd_sine(uint32_t dsd_rate, double freq_hz,
 /* ─── Measure SINAD for a rate conversion path ─── */
 
 static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
-    unsigned mult_in = fs_in / 44100;
+    unsigned base = rate_is_48k_family(fs_in) ? 48000 : 44100;
+    unsigned mult_in = fs_in / base;
     size_t n_in;
     if (mult_in <= 64)       n_in = 262144;
     else if (mult_in <= 128) n_in = 524288;
@@ -212,8 +213,10 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
 
     double sinad_db = measure_sinad(dsd_out, out_count, freq, (double)fs_out);
 
-    unsigned rate_in_mult  = fs_in  / 44100;
-    unsigned rate_out_mult = fs_out / 44100;
+    unsigned base_in  = rate_is_48k_family(fs_in)  ? 48000 : 44100;
+    unsigned base_out = rate_is_48k_family(fs_out) ? 48000 : 44100;
+    unsigned rate_in_mult  = fs_in  / base_in;
+    unsigned rate_out_mult = fs_out / base_out;
     const char *dir = (fs_out > fs_in) ? "UP" : "DN";
     printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB  [%s, gain=%.2f, lim=%s, cands=%d, depth=%d]\n",
            rate_in_mult, rate_out_mult, dir, sinad_db,
@@ -313,7 +316,8 @@ static void test_sinad_dn_512_256(void) {
 /* ─── DSD → PCM decimation tests (FIR only, no SDM) ─── */
 
 static double measure_dsd_to_pcm_sinad(uint32_t dsd_rate, uint32_t pcm_rate) {
-    unsigned mult_in = dsd_rate / 44100;
+    unsigned dsd_base = rate_is_48k_family(dsd_rate) ? 48000 : 44100;
+    unsigned mult_in = dsd_rate / dsd_base;
     size_t n_in;
     if (mult_in <= 64)       n_in = 262144;
     else if (mult_in <= 128) n_in = 524288;
@@ -377,9 +381,9 @@ static double measure_dsd_to_pcm_sinad(uint32_t dsd_rate, uint32_t pcm_rate) {
     double pcm_amp = sqrt(sig_pwr * 4.0);
     double sinad_db = measure_sinad(meas_ptr, meas_count, freq, (double)pcm_rate);
 
-    unsigned rate_mult = dsd_rate / 44100;
-    printf("    [SINAD] DSD%u->PCM%u: SINAD=%.1f dB  [%ux, n=%zu, skip=%zu, amp=%.4f, range=[%.4f,%.4f]]\n",
-           rate_mult, pcm_rate, sinad_db, ratio, meas_count, skip, pcm_amp, mn, mx);
+    unsigned rate_mult = dsd_rate / dsd_base;
+    printf("    [SINAD] DSD%u%s->PCM%u: SINAD=%.1f dB  [%ux, n=%zu, skip=%zu, amp=%.4f, range=[%.4f,%.4f]]\n",
+           rate_mult, dsd_base == 48000 ? "/48" : "", pcm_rate, sinad_db, ratio, meas_count, skip, pcm_amp, mn, mx);
 
     free(dsd_in);
     free(pcm_out);
@@ -1692,6 +1696,74 @@ static void test_weak_paths_sweep(void) {
     TEST_ASSERT_TRUE(1, "Weak paths sweep completed");
 }
 
+/* ─── DSD/48 same-rate tests ─── */
+
+static void test_sinad_dsd64_48_same(void) {
+    double sinad = measure_rate_sinad(DSD48_RATE_64, DSD48_RATE_64);
+    TEST_ASSERT_TRUE(sinad > 12.0, "DSD64/48 same-rate SINAD > 12 dB");
+}
+
+static void test_sinad_dsd128_48_same(void) {
+    double sinad = measure_rate_sinad(DSD48_RATE_128, DSD48_RATE_128);
+    TEST_ASSERT_TRUE(sinad > 12.0, "DSD128/48 same-rate SINAD > 12 dB");
+}
+
+static void test_sinad_dsd256_48_same(void) {
+    double sinad = measure_rate_sinad(DSD48_RATE_256, DSD48_RATE_256);
+    TEST_ASSERT_TRUE(sinad > 12.0, "DSD256/48 same-rate SINAD > 12 dB");
+}
+
+static void test_sinad_dsd512_48_same(void) {
+    double sinad = measure_rate_sinad(DSD48_RATE_512, DSD48_RATE_512);
+    TEST_ASSERT_TRUE(sinad > 12.0, "DSD512/48 same-rate SINAD > 12 dB");
+}
+
+/* ─── DSD/48 upsample tests ─── */
+
+static void test_sinad_up_64_48_128_48(void) {
+    double sinad = measure_rate_sinad(DSD48_RATE_64, DSD48_RATE_128);
+    TEST_ASSERT_TRUE(sinad > 12.0, "DSD64/48->DSD128/48 SINAD > 12 dB");
+}
+
+static void test_sinad_up_64_48_256_48(void) {
+    double sinad = measure_rate_sinad(DSD48_RATE_64, DSD48_RATE_256);
+    TEST_ASSERT_TRUE(sinad > 12.0, "DSD64/48->DSD256/48 SINAD > 12 dB");
+}
+
+static void test_sinad_up_128_48_256_48(void) {
+    double sinad = measure_rate_sinad(DSD48_RATE_128, DSD48_RATE_256);
+    TEST_ASSERT_TRUE(sinad > 12.0, "DSD128/48->DSD256/48 SINAD > 12 dB");
+}
+
+/* ─── DSD/48 downsample tests ─── */
+
+static void test_sinad_dn_128_48_64_48(void) {
+    double sinad = measure_rate_sinad(DSD48_RATE_128, DSD48_RATE_64);
+    TEST_ASSERT_TRUE(sinad > 12.0, "DSD128/48->DSD64/48 SINAD > 12 dB");
+}
+
+static void test_sinad_dn_256_48_128_48(void) {
+    double sinad = measure_rate_sinad(DSD48_RATE_256, DSD48_RATE_128);
+    TEST_ASSERT_TRUE(sinad > 12.0, "DSD256/48->DSD128/48 SINAD > 12 dB");
+}
+
+static void test_sinad_dn_256_48_64_48(void) {
+    double sinad = measure_rate_sinad(DSD48_RATE_256, DSD48_RATE_64);
+    TEST_ASSERT_TRUE(sinad > 12.0, "DSD256/48->DSD64/48 SINAD > 12 dB");
+}
+
+/* ─── DSD/48 → PCM tests ─── */
+
+static void test_sinad_dsd64_48_pcm48(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD48_RATE_64, 48000);
+    TEST_ASSERT_TRUE(sinad > 90.0, "DSD64/48->PCM48k SINAD > 90 dB");
+}
+
+static void test_sinad_dsd128_48_pcm96(void) {
+    double sinad = measure_dsd_to_pcm_sinad(DSD48_RATE_128, 96000);
+    TEST_ASSERT_TRUE(sinad > 90.0, "DSD128/48->PCM96k SINAD > 90 dB");
+}
+
 /* ─── Suites ─── */
 
 void test_rate_sinad_suite(void) {
@@ -1722,6 +1794,19 @@ void test_rate_sinad_suite(void) {
     TEST_RUN(test_sinad_dsd512_pcm88);
     TEST_RUN(test_sinad_dsd512_pcm176);
     TEST_RUN(test_sinad_dsd512_pcm352);
+    /* DSD/48 tests */
+    TEST_RUN(test_sinad_dsd64_48_same);
+    TEST_RUN(test_sinad_dsd128_48_same);
+    TEST_RUN(test_sinad_dsd256_48_same);
+    TEST_RUN(test_sinad_dsd512_48_same);
+    TEST_RUN(test_sinad_up_64_48_128_48);
+    TEST_RUN(test_sinad_up_64_48_256_48);
+    TEST_RUN(test_sinad_up_128_48_256_48);
+    TEST_RUN(test_sinad_dn_128_48_64_48);
+    TEST_RUN(test_sinad_dn_256_48_128_48);
+    TEST_RUN(test_sinad_dn_256_48_64_48);
+    TEST_RUN(test_sinad_dsd64_48_pcm48);
+    TEST_RUN(test_sinad_dsd128_48_pcm96);
 }
 
 void test_rate_sweep_suite(void) {
