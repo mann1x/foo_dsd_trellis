@@ -1043,17 +1043,19 @@ static void handle_request(httpapi_t *api, SOCKET client) {
             sinad_result_t result;
             sinad_measure(rate, ntf_id, nc, depth, lat, fir_mode, gain, &result);
 
-            char json[512];
+            char json[768];
             const ntf_filter_t *nf = ntf_get_filter((ntf_filter_id_t)ntf_id, rate);
             snprintf(json, sizeof(json),
                 "{\"rate\":%u,\"rate_name\":\"DSD%u\",\"ntf\":\"%s\","
                 "\"nc\":%d,\"depth\":%d,\"lat\":%d,\"fir\":%d,\"gain\":%.3f,"
-                "\"sinad_reencode\":%.1f,\"sinad_theoretical\":%.1f,"
+                "\"sinad_theoretical\":%.1f,\"sinad_awtd\":%.1f,"
+                "\"multitone_sinad\":%.1f,\"noise_mod_db\":%.1f,\"nmr_db\":%.1f,"
                 "\"conv_fail\":%llu,\"collapse\":%llu,\"drop_pct\":%.2f,"
                 "\"ok\":%d}",
                 rate, rate / 44100, nf ? nf->name : "auto",
                 nc, depth, lat, fir_mode, gain,
-                result.sinad_db, result.sinad_theoretical,
+                result.sinad_theoretical, result.sinad_awtd_theo,
+                result.multitone_sinad_db, result.noise_mod_db, result.nmr_db,
                 (unsigned long long)result.conv_fail,
                 (unsigned long long)result.cands_collapse,
                 result.drop_pct, result.ok);

@@ -1157,7 +1157,7 @@ private:
     }
 
     void SaveSinadResult(int row, int ntf_id, int cands, int depth, int lat,
-                          int fir_mode, double sinad_db, double sinad_theo) {
+                          int fir_mode, const sinad_result_t *r) {
         SYSTEMTIME st;
         GetLocalTime(&st);
         char ts[32];
@@ -1189,8 +1189,11 @@ private:
         char entry[512];
         snprintf(entry, sizeof(entry),
             "{\"row\":%d,\"ntf\":%d,\"nc\":%d,\"depth\":%d,\"lat\":%d,"
-            "\"fir\":%d,\"sinad\":%.1f,\"theo\":%.1f,\"ts\":\"%s\"}",
-            row, ntf_id, cands, depth, lat, fir_mode, sinad_db, sinad_theo, ts);
+            "\"fir\":%d,\"theo\":%.1f,\"awtd\":%.1f,"
+            "\"mt\":%.1f,\"nmod\":%.1f,\"nmr\":%.1f,\"ts\":\"%s\"}",
+            row, ntf_id, cands, depth, lat, fir_mode,
+            r->sinad_theoretical, r->sinad_awtd_theo,
+            r->multitone_sinad_db, r->noise_mod_db, r->nmr_db, ts);
 
         /* Write file: simple array of entries */
         FILE *f = fopen(path, "w");
@@ -1248,11 +1251,15 @@ private:
                        &erow, &entf, &enc, &edepth, &elat, &efir, &esinad) == 7) {
                 if (erow == row && entf == ntf_id && enc == cands &&
                     edepth == depth && elat == lat) {
-                    /* Extract theoretical SINAD */
-                    double etheo = -999.0;
-                    char *theo_start = strstr(p, "\"theo\":");
-                    if (theo_start)
-                        sscanf(theo_start, "\"theo\":%lf", &etheo);
+                    /* Extract all metric fields */
+                    double etheo = -999.0, eawtd = -999.0, emt = -999.0;
+                    double enmod = -999.0, enmr = -999.0;
+                    char *fp;
+                    if ((fp = strstr(p, "\"theo\":"))) sscanf(fp, "\"theo\":%lf", &etheo);
+                    if ((fp = strstr(p, "\"awtd\":"))) sscanf(fp, "\"awtd\":%lf", &eawtd);
+                    if ((fp = strstr(p, "\"mt\":")))   sscanf(fp, "\"mt\":%lf", &emt);
+                    if ((fp = strstr(p, "\"nmod\":"))) sscanf(fp, "\"nmod\":%lf", &enmod);
+                    if ((fp = strstr(p, "\"nmr\":")))  sscanf(fp, "\"nmr\":%lf", &enmr);
                     /* Extract timestamp */
                     char *ts_start = strstr(p, "\"ts\":\"");
                     if (ts_start) {
@@ -1265,8 +1272,11 @@ private:
                         }
                     }
                     if (etheo > -900.0)
-                        snprintf(out, out_sz, "Re-encode SNR: %.1f dB | SINAD: %.1f dB (%s)",
-                                 esinad, etheo, ets);
+                        snprintf(out, out_sz,
+                                 "SINAD: %.1f dB (A-wtd: %.1f)\n"
+                                 "Multitone: %.1f dB | NMod: %.1f dB | NMR: %.1f dB\n"
+                                 "(%s)",
+                                 etheo, eawtd, emt, enmod, enmr, ets);
                     else
                         snprintf(out, out_sz, "SINAD: %.1f dB (%s)", esinad, ets);
                     found = true;
@@ -1362,7 +1372,7 @@ private:
 
         if (result.ok) {
             SaveSinadResult(row, pi.ntf_filter, pi.cands, pi.depth, pi.lat,
-                            use_fir, result.sinad_db, result.sinad_theoretical);
+                            use_fir, &result);
         }
 
         /* Refresh Path Info (will include cached result) */

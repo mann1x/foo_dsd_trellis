@@ -20,7 +20,7 @@ BEGIN
 
     GROUPBOX        "Path Info", -1, 8, 198, 384, 104
     LTEXT           "Select a rate mapping to see path details.", IDC_STATIC_PATH_INFO, 16, 210, 308, 86
-    PUSHBUTTON      "Test SINAD", IDC_BTN_TEST_SINAD, 330, 210, 54, 14
+    PUSHBUTTON      "Test Quality", IDC_BTN_TEST_SINAD, 326, 210, 58, 14
 
     CONTROL         "Anti-pop lead-in", IDC_CHECK_ANTIPOP, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 310, 80, 10
 
