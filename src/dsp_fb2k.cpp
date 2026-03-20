@@ -520,7 +520,7 @@ private:
         m_listRate.SetExtendedListViewStyle(
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
         ensure_reverse_map();
-        int cw[] = { 58, 72, 50, 46, 38, 38, 42, 34, 32, 38 };
+        int cw[] = { 58, 72, 50, 46, 42, 42, 46, 34, 32, 38 };
         m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, cw[0]);
         m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, cw[1]);
         m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, cw[2]);
@@ -537,8 +537,10 @@ private:
             m_listRate.GetClientRect(&rc);
             int used = 0;
             for (int c = 0; c < 10; c++) used += cw[c];
-            int remain = rc.Width() - used - 4;
-            if (remain < 36) remain = 36;
+            /* Subtract vertical scrollbar width (20 rows need scrollbar) */
+            int vscroll = GetSystemMetrics(SM_CXVSCROLL);
+            int remain = rc.Width() - used - vscroll - 4;
+            if (remain < 30) remain = 30;
             m_listRate.InsertColumn(10, L"Lat", LVCFMT_LEFT, remain);
         }
 
