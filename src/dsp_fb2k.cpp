@@ -95,6 +95,31 @@ static const wchar_t *g_output_names[RATE_OUT_COUNT] = {
     L"PCM 705.6k", L"PCM 768k", L"PCM 1411.2k", L"PCM 1536k"
 };
 
+/* Display order for ListView rows: DSD rates first (paired 44/48),
+ * then PCM rates ascending. Maps display row → RATEIDX. */
+static const int g_display_order[RATE_MAP_COUNT] = {
+    RATEIDX_DSD64,     RATEIDX_DSD64_48,
+    RATEIDX_DSD128,    RATEIDX_DSD128_48,
+    RATEIDX_DSD256,    RATEIDX_DSD256_48,
+    RATEIDX_DSD512,    RATEIDX_DSD512_48,
+    RATEIDX_44100,     RATEIDX_48000,
+    RATEIDX_88200,     RATEIDX_96000,
+    RATEIDX_176400,    RATEIDX_192000,
+    RATEIDX_352800,    RATEIDX_384000,
+    RATEIDX_705600,    RATEIDX_768000,
+    RATEIDX_1411200,   RATEIDX_1536000,
+};
+
+/* Reverse mapping: RATEIDX → display row */
+static int g_rateidx_to_row[RATE_MAP_COUNT];
+static bool g_reverse_map_init = false;
+static void ensure_reverse_map(void) {
+    if (g_reverse_map_init) return;
+    for (int r = 0; r < RATE_MAP_COUNT; r++)
+        g_rateidx_to_row[g_display_order[r]] = r;
+    g_reverse_map_init = true;
+}
+
 static const wchar_t *g_ntf_names[] = {
     L"Auto", L"CLANS-4", L"SDM-4", L"CLANS-5", L"SDM-5",
     L"CLANS-6", L"SDM-6", L"CLANS-7", L"SDM-7", L"CLANS-8", L"SDM-8"
@@ -494,71 +519,75 @@ private:
         m_listRate = GetDlgItem(IDC_LIST_RATEMAP);
         m_listRate.SetExtendedListViewStyle(
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, 62);
-        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, 80);
-        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, 42);
-        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, 50);
-        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, 42);
-        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, 42);
-        m_listRate.InsertColumn(6, L"Limiter", LVCFMT_LEFT, 46);
-        m_listRate.InsertColumn(7, L"ML", LVCFMT_LEFT, 36);
-        m_listRate.InsertColumn(8, L"GPU", LVCFMT_LEFT, 34);
-        m_listRate.InsertColumn(9, L"FIR", LVCFMT_LEFT, 42);
+        ensure_reverse_map();
+        int cw[] = { 62, 80, 42, 50, 42, 42, 46, 30, 34, 36 };
+        m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, cw[0]);
+        m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, cw[1]);
+        m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, cw[2]);
+        m_listRate.InsertColumn(3, L"SDM", LVCFMT_LEFT, cw[3]);
+        m_listRate.InsertColumn(4, L"Cands", LVCFMT_LEFT, cw[4]);
+        m_listRate.InsertColumn(5, L"Depth", LVCFMT_LEFT, cw[5]);
+        m_listRate.InsertColumn(6, L"Limiter", LVCFMT_LEFT, cw[6]);
+        m_listRate.InsertColumn(7, L"ML", LVCFMT_LEFT, cw[7]);
+        m_listRate.InsertColumn(8, L"GPU", LVCFMT_LEFT, cw[8]);
+        m_listRate.InsertColumn(9, L"FIR", LVCFMT_LEFT, cw[9]);
         /* Last column: fill remaining width to avoid horizontal scrollbar */
         {
             CRect rc;
             m_listRate.GetClientRect(&rc);
-            int used = 50 + 54 + 46 + 58 + 40 + 40 + 46 + 30 + 34 + 48;
+            int used = 0;
+            for (int c = 0; c < 10; c++) used += cw[c];
             int remain = rc.Width() - used - 4;
             if (remain < 36) remain = 36;
             m_listRate.InsertColumn(10, L"Lat", LVCFMT_LEFT, remain);
         }
 
-        for (int i = 0; i < RATE_MAP_COUNT; i++) {
-            m_listRate.InsertItem(i, g_rate_names[i]);
-            m_listRate.SetItemText(i, 1, g_output_names[m_cfg.rate_map[i]]);
+        for (int row = 0; row < RATE_MAP_COUNT; row++) {
+            int i = g_display_order[row];  /* RATEIDX for this display row */
+            m_listRate.InsertItem(row, g_rate_names[i]);
+            m_listRate.SetItemText(row, 1, g_output_names[m_cfg.rate_map[i]]);
             int ntf_idx = m_cfg.rate_ntf[i] + 1; /* NTF_AUTO=-1 → 0 */
             if (ntf_idx < 0 || ntf_idx >= (int)NTF_NAME_COUNT) ntf_idx = 0;
-            m_listRate.SetItemText(i, 2, g_ntf_names[ntf_idx]);
+            m_listRate.SetItemText(row, 2, g_ntf_names[ntf_idx]);
             /* Set explicit (non-Auto) values first */
             {
                 wchar_t buf[32];
                 if (m_cfg.rate_sdm[i] >= 0) {
                     wcscpy_s(buf, m_cfg.rate_sdm[i] == SDM_MODE_PRECORR ? L"PreCorr" : L"Trellis");
-                    m_listRate.SetItemText(i, 3, buf);
+                    m_listRate.SetItemText(row, 3, buf);
                 }
                 if (m_cfg.rate_cands[i] >= 0) {
                     _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_cands[i]);
-                    m_listRate.SetItemText(i, 4, buf);
+                    m_listRate.SetItemText(row, 4, buf);
                 }
                 if (m_cfg.rate_depth[i] >= 0) {
                     _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_depth[i]);
-                    m_listRate.SetItemText(i, 5, buf);
+                    m_listRate.SetItemText(row, 5, buf);
                 }
                 if (m_cfg.rate_limiter[i] >= 0) {
                     if (m_cfg.rate_limiter[i] == 0) wcscpy_s(buf, L"Off");
                     else _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%.1f", (float)m_cfg.rate_limiter[i]);
-                    m_listRate.SetItemText(i, 6, buf);
+                    m_listRate.SetItemText(row, 6, buf);
                 }
                 if (m_cfg.rate_ml[i] >= 0) {
                     wcscpy_s(buf, m_cfg.rate_ml[i] == 0 ? L"Off" : L"On");
-                    m_listRate.SetItemText(i, 7, buf);
+                    m_listRate.SetItemText(row, 7, buf);
                 }
                 if (m_cfg.rate_gpu[i] >= 0) {
                     wcscpy_s(buf, m_cfg.rate_gpu[i] == 0 ? L"Off" : L"On");
-                    m_listRate.SetItemText(i, 8, buf);
+                    m_listRate.SetItemText(row, 8, buf);
                 }
                 if (m_cfg.rate_fir_mode[i] >= 0) {
                     wcscpy_s(buf, m_cfg.rate_fir_mode[i] == FIR_MODE_BOXCAR ? L"Boxcar" : L"FIR");
-                    m_listRate.SetItemText(i, 9, buf);
+                    m_listRate.SetItemText(row, 9, buf);
                 }
                 if (m_cfg.rate_lat[i] > 0) {
                     _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_lat[i]);
-                    m_listRate.SetItemText(i, 10, buf);
+                    m_listRate.SetItemText(row, 10, buf);
                 }
             }
             /* Resolve Auto values using path-optimal defaults */
-            RefreshAutoText(i);
+            RefreshAutoText(row);
         }
 
         /* Create in-place editor combos (children of dialog, initially hidden) */
@@ -818,19 +847,21 @@ private:
     }
 
     void ShowOutputCombo(int row) {
+        int ridx = rowToIdx(row);
+        if (ridx < 0) return;
         CRect cellRC;
         m_listRate.GetSubItemRect(row, 1, LVIR_BOUNDS, &cellRC);
         m_listRate.MapWindowPoints(m_hWnd, &cellRC);
 
         m_editCombo.ResetContent();
         for (int j = 0; j < RATE_OUT_COUNT; j++) {
-            if (rate_map_valid_output(row, (uint8_t)j)) {
-                int idx = m_editCombo.AddString(g_output_names[j]);
-                m_editCombo.SetItemData(idx, (DWORD_PTR)j);
+            if (rate_map_valid_output(ridx, (uint8_t)j)) {
+                int ci = m_editCombo.AddString(g_output_names[j]);
+                m_editCombo.SetItemData(ci, (DWORD_PTR)j);
             }
         }
 
-        uint8_t cur = m_cfg.rate_map[row];
+        uint8_t cur = m_cfg.rate_map[ridx];
         for (int j = 0; j < m_editCombo.GetCount(); j++) {
             if ((int)m_editCombo.GetItemData(j) == cur) {
                 m_editCombo.SetCurSel(j);
@@ -859,7 +890,7 @@ private:
             m_ntfCombo.SetItemData(idx, (DWORD_PTR)(j - 1)); /* 0→-1(Auto), 1→0(CLANS-4), etc */
         }
 
-        int8_t cur = m_cfg.rate_ntf[row];
+        int8_t cur = m_cfg.rate_ntf[rowToIdx(row)];
         m_ntfCombo.SetCurSel(cur + 1); /* NTF_AUTO=-1 → index 0 */
 
         m_editRow = row;
@@ -884,7 +915,7 @@ private:
             m_ntfCombo.AddString(L"Auto");
             m_ntfCombo.AddString(L"PreCorr");
             m_ntfCombo.AddString(L"Trellis");
-            int cur = m_cfg.rate_sdm[row];
+            int cur = m_cfg.rate_sdm[rowToIdx(row)];
             m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
         } else if (col == 4) {
             /* Candidates */
@@ -892,7 +923,7 @@ private:
             m_ntfCombo.AddString(L"2"); m_ntfCombo.AddString(L"4");
             m_ntfCombo.AddString(L"8"); m_ntfCombo.AddString(L"16");
             m_ntfCombo.AddString(L"32");
-            int cur = m_cfg.rate_cands[row];
+            int cur = m_cfg.rate_cands[rowToIdx(row)];
             int sel = 0;
             if (cur == 2) sel = 1; else if (cur == 4) sel = 2;
             else if (cur == 8) sel = 3; else if (cur == 16) sel = 4;
@@ -904,7 +935,7 @@ private:
             m_ntfCombo.AddString(L"4"); m_ntfCombo.AddString(L"5");
             m_ntfCombo.AddString(L"6"); m_ntfCombo.AddString(L"7");
             m_ntfCombo.AddString(L"8");
-            int cur = m_cfg.rate_depth[row];
+            int cur = m_cfg.rate_depth[rowToIdx(row)];
             int sel = 0;
             if (cur >= 4 && cur <= 8) sel = cur - 3;
             m_ntfCombo.SetCurSel(sel);
@@ -916,7 +947,7 @@ private:
             m_ntfCombo.AddString(L"8"); m_ntfCombo.AddString(L"10");
             m_ntfCombo.AddString(L"12"); m_ntfCombo.AddString(L"16");
             m_ntfCombo.AddString(L"20");
-            int cur = m_cfg.rate_limiter[row];
+            int cur = m_cfg.rate_limiter[rowToIdx(row)];
             int sel = 0;
             if (cur == 0) sel = 1;
             else if (cur == 3) sel = 2; else if (cur == 6) sel = 3;
@@ -929,21 +960,21 @@ private:
             m_ntfCombo.AddString(L"Auto");
             m_ntfCombo.AddString(L"Off");
             m_ntfCombo.AddString(L"On");
-            int cur = m_cfg.rate_ml[row];
+            int cur = m_cfg.rate_ml[rowToIdx(row)];
             m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
         } else if (col == 8) {
             /* GPU FIR */
             m_ntfCombo.AddString(L"Auto");
             m_ntfCombo.AddString(L"Off");
             m_ntfCombo.AddString(L"On");
-            int cur = m_cfg.rate_gpu[row];
+            int cur = m_cfg.rate_gpu[rowToIdx(row)];
             m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
         } else if (col == 9) {
             /* FIR mode: pre-SDM filter */
             m_ntfCombo.AddString(L"Auto");
             m_ntfCombo.AddString(L"Boxcar");
             m_ntfCombo.AddString(L"FIR");
-            int cur = m_cfg.rate_fir_mode[row];
+            int cur = m_cfg.rate_fir_mode[rowToIdx(row)];
             m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
         } else if (col == 10) {
             /* Trellis latency */
@@ -951,7 +982,7 @@ private:
             m_ntfCombo.AddString(L"16"); m_ntfCombo.AddString(L"32");
             m_ntfCombo.AddString(L"64"); m_ntfCombo.AddString(L"128");
             m_ntfCombo.AddString(L"256"); m_ntfCombo.AddString(L"512");
-            int16_t cur = m_cfg.rate_lat[row];
+            int16_t cur = m_cfg.rate_lat[rowToIdx(row)];
             int sel = 0;
             if (cur == 16) sel = 1; else if (cur == 32) sel = 2;
             else if (cur == 64) sel = 3; else if (cur == 128) sel = 4;
@@ -969,11 +1000,18 @@ private:
         m_ntfCombo.ShowDropDown(TRUE);
     }
 
+    /* Convert display row → config array index (RATEIDX) */
+    int rowToIdx(int row) const {
+        if (row < 0 || row >= RATE_MAP_COUNT) return -1;
+        return g_display_order[row];
+    }
+
     void OnRateMapEditChange(UINT, int, CWindow) {
         int sel = m_editCombo.GetCurSel();
-        if (sel >= 0 && m_editRow >= 0 && m_editRow < RATE_MAP_COUNT) {
+        int idx = rowToIdx(m_editRow);
+        if (sel >= 0 && idx >= 0) {
             uint8_t out_idx = (uint8_t)m_editCombo.GetItemData(sel);
-            m_cfg.rate_map[m_editRow] = out_idx;
+            m_cfg.rate_map[idx] = out_idx;
             m_listRate.SetItemText(m_editRow, 1, g_output_names[out_idx]);
             RefreshAutoText(m_editRow);
             UpdatePathInfo(m_editRow);
@@ -982,46 +1020,40 @@ private:
 
     void OnNtfEditChange(UINT, int, CWindow) {
         int sel = m_ntfCombo.GetCurSel();
-        if (sel < 0 || m_editRow < 0 || m_editRow >= RATE_MAP_COUNT)
+        int idx = rowToIdx(m_editRow);
+        if (sel < 0 || idx < 0)
             return;
 
         if (m_editCol == 2) {
-            /* NTF */
             int8_t ntf_val = (int8_t)(sel - 1);
-            m_cfg.rate_ntf[m_editRow] = ntf_val;
+            m_cfg.rate_ntf[idx] = ntf_val;
             m_listRate.SetItemText(m_editRow, 2, g_ntf_names[sel]);
         } else if (m_editCol == 3) {
-            /* SDM mode: 0=Auto, 1=PreCorr, 2=Trellis */
             int8_t val = (int8_t)(sel == 0 ? -1 : sel - 1);
-            m_cfg.rate_sdm[m_editRow] = val;
+            m_cfg.rate_sdm[idx] = val;
             const wchar_t *names[] = { L"Auto", L"PreCorr", L"Trellis" };
             m_listRate.SetItemText(m_editRow, 3, names[sel < 3 ? sel : 0]);
         } else if (m_editCol == 4) {
-            /* Candidates: 0=Auto, 1=2, 2=4, 3=8, 4=16, 5=32 */
             static const int8_t cvals[] = { -1, 2, 4, 8, 16, 32 };
             int8_t val = (sel >= 0 && sel < 6) ? cvals[sel] : -1;
-            m_cfg.rate_cands[m_editRow] = val;
+            m_cfg.rate_cands[idx] = val;
             if (val >= 0) {
                 wchar_t buf[16];
                 _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", val);
                 m_listRate.SetItemText(m_editRow, 4, buf);
             }
-            /* Auto text refreshed by RefreshAutoText below */
         } else if (m_editCol == 5) {
-            /* Depth: 0=Auto, 1=4, 2=5, 3=6, 4=7, 5=8 */
             int8_t val = (sel == 0) ? -1 : (int8_t)(sel + 3);
-            m_cfg.rate_depth[m_editRow] = val;
+            m_cfg.rate_depth[idx] = val;
             if (val >= 0) {
                 wchar_t buf[16];
                 _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", val);
                 m_listRate.SetItemText(m_editRow, 5, buf);
             }
-            /* Auto text refreshed by RefreshAutoText below */
         } else if (m_editCol == 6) {
-            /* Limiter: 0=Auto, 1=Off, 2=3, 3=6, 4=8, 5=10, 6=12, 7=16, 8=20 */
             static const int8_t lvals[] = { -1, 0, 3, 6, 8, 10, 12, 16, 20 };
             int8_t val = (sel >= 0 && sel < 9) ? lvals[sel] : -1;
-            m_cfg.rate_limiter[m_editRow] = val;
+            m_cfg.rate_limiter[idx] = val;
             if (val > 0) {
                 wchar_t buf[16];
                 _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%.1f", (float)val);
@@ -1030,28 +1062,24 @@ private:
                 m_listRate.SetItemText(m_editRow, 6, L"Off");
             }
         } else if (m_editCol == 7) {
-            /* ML: 0=Auto, 1=Off, 2=On */
             int8_t val = (int8_t)(sel == 0 ? -1 : sel - 1);
-            m_cfg.rate_ml[m_editRow] = val;
+            m_cfg.rate_ml[idx] = val;
             const wchar_t *names[] = { L"Auto", L"Off", L"On" };
             m_listRate.SetItemText(m_editRow, 7, names[sel < 3 ? sel : 0]);
         } else if (m_editCol == 8) {
-            /* GPU FIR: 0=Auto, 1=Off, 2=On */
             int8_t val = (int8_t)(sel == 0 ? -1 : sel - 1);
-            m_cfg.rate_gpu[m_editRow] = val;
+            m_cfg.rate_gpu[idx] = val;
             const wchar_t *names[] = { L"Auto", L"Off", L"On" };
             m_listRate.SetItemText(m_editRow, 8, names[sel < 3 ? sel : 0]);
         } else if (m_editCol == 9) {
-            /* FIR mode: 0=Auto, 1=Boxcar, 2=FIR */
             int8_t val = (int8_t)(sel == 0 ? -1 : sel - 1);
-            m_cfg.rate_fir_mode[m_editRow] = val;
+            m_cfg.rate_fir_mode[idx] = val;
             const wchar_t *names[] = { L"Auto", L"Boxcar", L"FIR" };
             m_listRate.SetItemText(m_editRow, 9, names[sel < 3 ? sel : 0]);
         } else if (m_editCol == 10) {
-            /* Trellis latency: 0=Auto, 1=16, 2=32, 3=64, 4=128, 5=256, 6=512 */
             static const int16_t lvals[] = { 0, 16, 32, 64, 128, 256, 512 };
             int16_t val = (sel >= 0 && sel < 7) ? lvals[sel] : 0;
-            m_cfg.rate_lat[m_editRow] = val;
+            m_cfg.rate_lat[idx] = val;
             if (val > 0) {
                 wchar_t buf[16];
                 _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", val);
@@ -1077,20 +1105,21 @@ private:
     /* ─── Contextual path info panel ─── */
 
     void UpdatePathInfo(int row) {
-        if (row < 0 || row >= RATE_MAP_COUNT) return;
+        int idx = rowToIdx(row);
+        if (idx < 0) return;
 
-        uint8_t out_idx = m_cfg.rate_map[row];
+        uint8_t out_idx = m_cfg.rate_map[idx];
         pfc::string_formatter info;
 
         if (out_idx == RATE_OUT_BYPASS) {
-            info << g_rate_names[row] << ": Passthrough (no processing)";
+            info << g_rate_names[idx] << ": Passthrough (no processing)";
             ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, info);
             return;
         }
 
         /* Determine input/output rates */
-        uint32_t fs_in = rate_idx_to_hz(row);
-        bool is_dsd_input = rate_idx_is_dsd(row);
+        uint32_t fs_in = rate_idx_to_hz(idx);
+        bool is_dsd_input = rate_idx_is_dsd(idx);
 
         uint32_t fs_out = rate_out_to_hz(out_idx);
         if (fs_out == 0) {
@@ -1100,8 +1129,8 @@ private:
         }
 
         /* Query path info — always query Trellis path for resolved defaults */
-        int8_t ntf_val = m_cfg.rate_ntf[row];
-        int sdm_mode = (m_cfg.rate_sdm[row] >= 0) ? (int)m_cfg.rate_sdm[row] : m_cfg.sdm_mode;
+        int8_t ntf_val = m_cfg.rate_ntf[rowToIdx(row)];
+        int sdm_mode = (m_cfg.rate_sdm[rowToIdx(row)] >= 0) ? (int)m_cfg.rate_sdm[rowToIdx(row)] : m_cfg.sdm_mode;
 
         /* Always get Trellis path info for resolved defaults */
         engine_path_info_t pi_trellis;
@@ -1115,7 +1144,7 @@ private:
             engine_get_path_info(fs_in, fs_out, (int)ntf_val, sdm_mode, &m_cfg, &pi);
 
         /* Format info text */
-        info << g_rate_names[row];
+        info << g_rate_names[idx];
         if (is_dsd_input && rate_out_is_dsd(out_idx)) {
             if (fs_in == fs_out)
                 info << " -> " << g_output_names[out_idx] << " (re-encode)";
@@ -1166,12 +1195,12 @@ private:
                 info << ", state limiter: " << pfc::format_float(pi_trellis.state_limit, 0, 1);
 
             /* ML filter status */
-            bool ml_active = (m_cfg.rate_ml[row] >= 0) ? (m_cfg.rate_ml[row] != 0) : m_cfg.ml_enabled;
+            bool ml_active = (m_cfg.rate_ml[rowToIdx(row)] >= 0) ? (m_cfg.rate_ml[rowToIdx(row)] != 0) : m_cfg.ml_enabled;
             info << "\nML filter: " << (ml_active ? "On" : "Off");
 
             /* Pre-SDM filter mode */
             {
-                int fir = m_cfg.rate_fir_mode[row];
+                int fir = m_cfg.rate_fir_mode[rowToIdx(row)];
                 const char *fir_name;
                 if (fir == FIR_MODE_BOXCAR)
                     fir_name = "Boxcar";
@@ -1185,9 +1214,9 @@ private:
             /* GPU FIR status */
             {
                 bool gpu_fir_active;
-                if (m_cfg.rate_gpu[row] == 0)
+                if (m_cfg.rate_gpu[rowToIdx(row)] == 0)
                     gpu_fir_active = false;
-                else if (m_cfg.rate_gpu[row] == 1)
+                else if (m_cfg.rate_gpu[rowToIdx(row)] == 1)
                     gpu_fir_active = true;
                 else
                     gpu_fir_active = m_cfg.gpu_enabled;
@@ -1367,7 +1396,7 @@ private:
                 "Select a rate mapping first.");
             return;
         }
-        uint8_t out_idx = m_cfg.rate_map[row];
+        uint8_t out_idx = m_cfg.rate_map[rowToIdx(row)];
         if (out_idx == RATE_OUT_BYPASS) return;
 
         uint32_t fs_in = rate_idx_to_hz(row);
@@ -1387,8 +1416,8 @@ private:
         }
 
         /* Resolve path params */
-        int8_t ntf_val = m_cfg.rate_ntf[row];
-        int sdm_mode = (m_cfg.rate_sdm[row] >= 0) ? (int)m_cfg.rate_sdm[row] : m_cfg.sdm_mode;
+        int8_t ntf_val = m_cfg.rate_ntf[rowToIdx(row)];
+        int sdm_mode = (m_cfg.rate_sdm[rowToIdx(row)] >= 0) ? (int)m_cfg.rate_sdm[rowToIdx(row)] : m_cfg.sdm_mode;
         engine_path_info_t pi;
         engine_get_path_info(fs_in, fs_out, (int)ntf_val, sdm_mode, &m_cfg, &pi);
 
@@ -1406,7 +1435,7 @@ private:
         }
 
         /* Determine FIR mode */
-        int fir_mode_raw = m_cfg.rate_fir_mode[row];
+        int fir_mode_raw = m_cfg.rate_fir_mode[rowToIdx(row)];
         int use_fir = (fir_mode_raw == FIR_MODE_FIR) ? 1 :
                       (fir_mode_raw == FIR_MODE_BOXCAR) ? 0 :
                       (sdm_mode == SDM_MODE_TRELLIS) ? 1 : 0;
@@ -1436,22 +1465,23 @@ private:
 
     /* Set Auto text (plain "Auto") for any Auto columns in a row. */
     void RefreshAutoText(int row) {
-        if (row < 0 || row >= RATE_MAP_COUNT) return;
-        if (m_cfg.rate_sdm[row] < 0)
+        int idx = rowToIdx(row);
+        if (idx < 0) return;
+        if (m_cfg.rate_sdm[idx] < 0)
             m_listRate.SetItemText(row, 3, L"Auto");
-        if (m_cfg.rate_cands[row] < 0)
+        if (m_cfg.rate_cands[idx] < 0)
             m_listRate.SetItemText(row, 4, L"Auto");
-        if (m_cfg.rate_depth[row] < 0)
+        if (m_cfg.rate_depth[idx] < 0)
             m_listRate.SetItemText(row, 5, L"Auto");
-        if (m_cfg.rate_limiter[row] < 0)
+        if (m_cfg.rate_limiter[idx] < 0)
             m_listRate.SetItemText(row, 6, L"Auto");
-        if (m_cfg.rate_ml[row] < 0)
+        if (m_cfg.rate_ml[idx] < 0)
             m_listRate.SetItemText(row, 7, L"Auto");
-        if (m_cfg.rate_gpu[row] < 0)
+        if (m_cfg.rate_gpu[idx] < 0)
             m_listRate.SetItemText(row, 8, L"Auto");
-        if (m_cfg.rate_fir_mode[row] < 0)
+        if (m_cfg.rate_fir_mode[idx] < 0)
             m_listRate.SetItemText(row, 9, L"Auto");
-        if (m_cfg.rate_lat[row] <= 0)
+        if (m_cfg.rate_lat[idx] <= 0)
             m_listRate.SetItemText(row, 10, L"Auto");
     }
 
