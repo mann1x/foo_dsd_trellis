@@ -330,10 +330,12 @@ size_t engine_process_block(engine_channel_t *eng,
     }
 
     if (eng->fir_only) {
-        /* DSD→PCM decimation: FIR + gain only, no SDM */
-        float *fir_out;
-        size_t fir_count = engine_process_fir_gain(eng, in, count, cfg, &fir_out);
-        memcpy(out, fir_out, fir_count * sizeof(float));
+        /* DSD→PCM decimation: FIR + gain only, no SDM.
+         * engine_process_fir_gain outputs double; convert to float for output. */
+        double *fir_out_d;
+        size_t fir_count = engine_process_fir_gain(eng, in, count, cfg, &fir_out_d);
+        for (size_t i = 0; i < fir_count; i++)
+            out[i] = (float)fir_out_d[i];
         return fir_count;
     }
 
