@@ -18,22 +18,29 @@
  * soxr runtime loading
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/* Minimal soxr type definitions (from soxr.h) */
+/* Minimal soxr type definitions (from soxr.h).
+ * Must match the real soxr.h struct layouts exactly. */
 typedef struct soxr *soxr_t;
 typedef char const *soxr_error_t;
 
+typedef unsigned soxr_datatype_t;
+#define SOXR_FLOAT32_I 0
+
 typedef struct {
-    double       rate;
-    unsigned     bits;
-    unsigned     channels;
+    soxr_datatype_t itype;
+    soxr_datatype_t otype;
+    double          scale;
+    void           *e;
+    unsigned long   flags;
 } soxr_io_spec_t;
 
 typedef struct {
-    unsigned long long recipe;
-    unsigned long      flags;
-    double             passband_end;
-    double             stopband_begin;
-    double             phase_response;
+    double         precision;
+    double         phase_response;
+    double         passband_end;
+    double         stopband_begin;
+    void          *e;
+    unsigned long  flags;
 } soxr_quality_spec_t;
 
 /* soxr quality recipes */
@@ -69,23 +76,27 @@ static int           g_soxr_probed = 0;  /* 0=not probed, 1=available, -1=unavai
 static void soxr_probe(void) {
     if (g_soxr_probed != 0) return;
 
-    /* Try to load from component directory (next to our DLL) */
+    /* Try to load from component directory (next to our DLL).
+     * ShiftMediaProject builds ship as "soxr.dll", official builds as "libsoxr.dll". */
+    static const char *dll_names[] = { "soxr.dll", "libsoxr.dll" };
     HMODULE self = NULL;
     char path[MAX_PATH] = {0};
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCSTR)soxr_probe, &self);
-    if (self) {
-        GetModuleFileNameA(self, path, MAX_PATH);
-        char *slash = strrchr(path, '\\');
-        if (slash) {
-            strcpy_s(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "libsoxr.dll");
-            g_soxr_dll = LoadLibraryA(path);
+    for (int d = 0; d < 2 && !g_soxr_dll; d++) {
+        if (self) {
+            GetModuleFileNameA(self, path, MAX_PATH);
+            char *slash = strrchr(path, '\\');
+            if (slash) {
+                strcpy_s(slash + 1, (size_t)(path + MAX_PATH - slash - 1), dll_names[d]);
+                g_soxr_dll = LoadLibraryA(path);
+            }
         }
+        /* Fallback: system PATH */
+        if (!g_soxr_dll)
+            g_soxr_dll = LoadLibraryA(dll_names[d]);
     }
-    /* Fallback: system PATH */
-    if (!g_soxr_dll)
-        g_soxr_dll = LoadLibraryA("libsoxr.dll");
 
     if (g_soxr_dll) {
         g_soxr_create = (fn_soxr_create)GetProcAddress(g_soxr_dll, "soxr_create");
