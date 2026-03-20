@@ -23,6 +23,14 @@
 #define IDC_COMBO_GPU_BACKEND       1031
 #define IDC_STATIC_GPU_INFO         1032
 #define IDC_BTN_TEST_SINAD          1033
+#define IDC_COMBO_PCM_BITS          1034
+#define IDC_COMBO_PCM_DITHER        1035
+#define IDC_COMBO_RESAMPLE          1036
+#define IDC_COMBO_SOXR_QUALITY      1037
+#define IDC_STATIC_PCM_BITS         1038
+#define IDC_STATIC_PCM_DITHER       1039
+#define IDC_STATIC_RESAMPLE         1040
+#define IDC_STATIC_SOXR_QUALITY     1041
 
 // Next default values for new objects
 //

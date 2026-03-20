@@ -443,6 +443,10 @@ public:
         COMMAND_HANDLER_EX(IDC_COMBO_ML_EP, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_CHECK_GPU_ENABLED, BN_CLICKED, OnGpuChange)
         COMMAND_HANDLER_EX(IDC_COMBO_GPU_BACKEND, CBN_SELCHANGE, OnChange)
+        COMMAND_HANDLER_EX(IDC_COMBO_PCM_BITS, CBN_SELCHANGE, OnChange)
+        COMMAND_HANDLER_EX(IDC_COMBO_PCM_DITHER, CBN_SELCHANGE, OnChange)
+        COMMAND_HANDLER_EX(IDC_COMBO_RESAMPLE, CBN_SELCHANGE, OnChange)
+        COMMAND_HANDLER_EX(IDC_COMBO_SOXR_QUALITY, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_BTN_TEST_SINAD, BN_CLICKED, OnTestSinad)
         COMMAND_HANDLER_EX(IDC_EDIT_THREADS, EN_CHANGE, OnEditChange)
         COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_EDIT, CBN_SELCHANGE, OnRateMapEditChange)
@@ -640,6 +644,67 @@ private:
             gpub.EnableWindow(m_cfg.gpu_enabled);
         }
         UpdateGpuStatus();
+
+        /* PCM Encoding */
+        {
+            CComboBox bits(GetDlgItem(IDC_COMBO_PCM_BITS));
+            bits.AddString(L"Auto (float)");
+            bits.AddString(L"16-bit");
+            bits.AddString(L"24-bit");
+            bits.AddString(L"32-bit");
+            bits.AddString(L"Float");
+            /* Map: Auto(-1)→0, 16→1, 24→2, 32→3, float→4 */
+            int sel = 0;
+            switch (m_cfg.pcm_bit_depth) {
+            case PCM_BIT_16: sel = 1; break;
+            case PCM_BIT_24: sel = 2; break;
+            case PCM_BIT_32: sel = 3; break;
+            case PCM_BIT_FLOAT: sel = 4; break;
+            default: sel = 0; break;
+            }
+            bits.SetCurSel(sel);
+        }
+        {
+            CComboBox dith(GetDlgItem(IDC_COMBO_PCM_DITHER));
+            dith.AddString(L"Auto");
+            dith.AddString(L"None");
+            dith.AddString(L"TPDF");
+            dith.AddString(L"Shaped");
+            int sel = 0;
+            switch (m_cfg.pcm_dither) {
+            case PCM_DITHER_NONE: sel = 1; break;
+            case PCM_DITHER_TPDF: sel = 2; break;
+            case PCM_DITHER_SHAPED: sel = 3; break;
+            default: sel = 0; break;
+            }
+            dith.SetCurSel(sel);
+        }
+        {
+            CComboBox rs(GetDlgItem(IDC_COMBO_RESAMPLE));
+            rs.AddString(L"Auto");
+            rs.AddString(L"IPP");
+            rs.AddString(L"soxr");
+            int sel = 0;
+            switch (m_cfg.resample_engine) {
+            case RESAMPLE_IPP: sel = 1; break;
+            case RESAMPLE_SOXR: sel = 2; break;
+            default: sel = 0; break;
+            }
+            rs.SetCurSel(sel);
+        }
+        {
+            CComboBox sq(GetDlgItem(IDC_COMBO_SOXR_QUALITY));
+            sq.AddString(L"Medium");
+            sq.AddString(L"High");
+            sq.AddString(L"Very High");
+            int sel = 1;  /* default HQ */
+            switch (m_cfg.soxr_quality) {
+            case SOXR_QUALITY_MQ: sel = 0; break;
+            case SOXR_QUALITY_VHQ: sel = 2; break;
+            default: sel = 1; break;
+            }
+            sq.SetCurSel(sel);
+        }
 
         /* Show initial engine info */
         const cpu_features_t *cpu = cpu_detect();
@@ -1433,6 +1498,28 @@ private:
             case 2: m_cfg.gpu_backend = 2; break;  /* GPU_BACKEND_CUDA */
             default: m_cfg.gpu_backend = 3; break;  /* GPU_BACKEND_AUTO */
             }
+        }
+
+        /* PCM encoding */
+        {
+            int sel = CComboBox(GetDlgItem(IDC_COMBO_PCM_BITS)).GetCurSel();
+            static const int8_t bits_map[] = { PCM_BIT_AUTO, PCM_BIT_16, PCM_BIT_24, PCM_BIT_32, PCM_BIT_FLOAT };
+            m_cfg.pcm_bit_depth = (sel >= 0 && sel < 5) ? bits_map[sel] : PCM_BIT_AUTO;
+        }
+        {
+            int sel = CComboBox(GetDlgItem(IDC_COMBO_PCM_DITHER)).GetCurSel();
+            static const int8_t dith_map[] = { PCM_DITHER_AUTO, PCM_DITHER_NONE, PCM_DITHER_TPDF, PCM_DITHER_SHAPED };
+            m_cfg.pcm_dither = (sel >= 0 && sel < 4) ? dith_map[sel] : PCM_DITHER_AUTO;
+        }
+        {
+            int sel = CComboBox(GetDlgItem(IDC_COMBO_RESAMPLE)).GetCurSel();
+            static const int8_t rs_map[] = { (int8_t)RESAMPLE_AUTO, (int8_t)RESAMPLE_IPP, (int8_t)RESAMPLE_SOXR };
+            m_cfg.resample_engine = (sel >= 0 && sel < 3) ? rs_map[sel] : (int8_t)RESAMPLE_AUTO;
+        }
+        {
+            int sel = CComboBox(GetDlgItem(IDC_COMBO_SOXR_QUALITY)).GetCurSel();
+            static const int8_t sq_map[] = { (int8_t)SOXR_QUALITY_MQ, (int8_t)SOXR_QUALITY_HQ, (int8_t)SOXR_QUALITY_VHQ };
+            m_cfg.soxr_quality = (sel >= 0 && sel < 3) ? sq_map[sel] : (int8_t)SOXR_QUALITY_HQ;
         }
 
         /* rate_map and rate_ntf are maintained via OnRateMapEditChange/OnNtfEditChange */
