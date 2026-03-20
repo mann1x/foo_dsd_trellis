@@ -7,9 +7,13 @@ A native foobar2000 DSP plugin that converts PCM and DSD audio to DSD using sigm
 | Feature | Description |
 |---------|-------------|
 | SDM Modes | PreCorr (default, ~0.01x RT) and Trellis (high quality, configurable depth/candidates) |
-| Rate Conversion | DSD64 / DSD128 / DSD256 / DSD512 via Intel IPP FIRSR (63-tap Kaiser half-band) |
+| Rate Conversion | DSD64-512 (44.1kHz + 48kHz families) via Intel IPP FIRSR (63-tap Kaiser half-band) |
 | PCM to DSD | Float32 PCM input upsampled via FIR then quantised to 1-bit DSD |
-| Per-Rate Config | SDM mode, candidates, depth, NTF, state limiter, and ML filter configurable per input rate |
+| PCM to PCM | Same-family (FIR chain) and cross-family (polyphase resampler: IPP or libsoxr) |
+| PCM Encoding | Output bit depth (16/24/32/float) with TPDF or noise-shaped dither, global + per-rate |
+| DSD/48 Rates | Full support for 48kHz-family DSD: DSD64/48 (3.072 MHz) through DSD512/48 (24.576 MHz) |
+| High PCM | Input/output up to 1536 kHz (44.1k and 48k families) |
+| Per-Rate Config | SDM mode, candidates, depth, NTF, state limiter, ML, PCM bits/dither configurable per input rate |
 | FIR Gain | Global FIR gain limiter (Auto = -3 dB) for uniform volume across all rate conversion paths |
 | Volume Control | DSD-Wide: boxcar smoothing + gain + SDM re-encode (no PCM decimation) |
 | Anti-Pop | Three-layer anti-pop: SDM state preservation + DoP 0x69 silence trail + rate-switch DAC mute trick |
@@ -20,7 +24,7 @@ A native foobar2000 DSP plugin that converts PCM and DSD audio to DSD using sigm
 | Intel IPP | Statically linked, automatic CPU dispatch (SSE2 -> AVX2 -> AVX-512) |
 | ONNX ML Filter | Optional causal CNN post-filter for DSD noise reduction (delay-loaded onnxruntime.dll) |
 | Property Page | Full configuration dialog with per-rate settings, path info display, dark mode support |
-| Config Versioning | Forward-compatible binary preset serialization (v12) with legacy fallback |
+| Config Versioning | Forward-compatible binary preset serialization (v16) with legacy fallback |
 | REST API | HTTP control/monitoring API on port 8881 |
 | CPU Topology | Dynamic CPUSET core selection with scheduling_class priority, SMT/CCD/E-core awareness |
 | TUSBAudio | Runtime XMOS DAC detection and status logging |
@@ -39,6 +43,7 @@ Four-layer design with clean separation of concerns:
 | Format Bridge | DoP/native detection, 1-bit <-> float32 | `dop.c`, `bitpack.c` |
 | Processing Engine | IPP FIR rate conversion + gain + parallel SDM | `engine.c`, `fir.c` |
 | SDM | Trellis (Viterbi) or PreCorr (greedy + prediction) | `trellis.c`, `precorr.c`, `ntf.c` |
+| Polyphase Resampler | Cross-family PCM rate conversion (IPP + libsoxr) | `resample.c` |
 | Infrastructure | Thread pool, CPU topology, REST API, ONNX ML, TUSBAudio | `threadpool.c`, `cpuset.c`, `httpapi.c`, `onnx_filter.c`, `tusbaudio.c` |
 
 Thread pool (`threadpool.c`) provides per-channel and per-segment parallelism with MMCSS "Pro Audio" scheduling.
@@ -90,12 +95,59 @@ On the first chunk after stop→play, inserts DoP 0x69 silence before real audio
 
 ## DSD Rates
 
+### 44.1 kHz Family
+
 | Rate | Sample Rate | Multiplier |
 |------|-------------|------------|
-| DSD64 | 2,822,400 Hz | 64 x 44.1 kHz |
-| DSD128 | 5,644,800 Hz | 128 x 44.1 kHz |
-| DSD256 | 11,289,600 Hz | 256 x 44.1 kHz |
-| DSD512 | 22,579,200 Hz | 512 x 44.1 kHz |
+| DSD64 | 2,822,400 Hz | 64 × 44.1 kHz |
+| DSD128 | 5,644,800 Hz | 128 × 44.1 kHz |
+| DSD256 | 11,289,600 Hz | 256 × 44.1 kHz |
+| DSD512 | 22,579,200 Hz | 512 × 44.1 kHz |
+
+### 48 kHz Family
+
+| Rate | Sample Rate | Multiplier |
+|------|-------------|------------|
+| DSD64/48 | 3,072,000 Hz | 64 × 48 kHz |
+| DSD128/48 | 6,144,000 Hz | 128 × 48 kHz |
+| DSD256/48 | 12,288,000 Hz | 256 × 48 kHz |
+| DSD512/48 | 24,576,000 Hz | 512 × 48 kHz |
+
+### Supported PCM Rates
+
+44.1k family: 44100, 88200, 176400, 352800, 705600, 1411200 Hz
+48k family: 48000, 96000, 192000, 384000, 768000, 1536000 Hz
+
+## Rate Conversion Paths
+
+| Path | Method | Notes |
+|------|--------|-------|
+| PCM → DSD (same family) | FIR upsample + SDM | 44.1k→DSD/44, 48k→DSD/48 |
+| PCM → PCM (same family) | FIR chain | Power-of-2 ratio, no SDM |
+| PCM → PCM (cross family) | Polyphase resampler | IPP (72 dB) or libsoxr (114 dB) |
+| DSD → DSD (same family) | Boxcar/FIR + SDM | DSD/44↔DSD/44, DSD/48↔DSD/48 |
+| DSD → PCM (same family) | FIR decimation | No SDM, multi-bit float output |
+| DSD → PCM (cross family) | FIR decimate + polyphase | 2-stage: DSD→same-family PCM→target PCM |
+
+### Polyphase Resampler
+
+For cross-family PCM conversion (e.g., 44.1k↔48k), the plugin uses a polyphase resampler:
+
+- **Default**: Intel IPP `ippsResamplePolyphase_32f` — ~72 dB SINAD at 44.1k↔48k, ~113 dB at 96k↔88.2k
+- **Optional**: libsoxr VHQ — ~114 dB SINAD at all rate pairs. Runtime-loaded from `soxr.dll` in the component folder
+
+When `Resampler = Auto`, libsoxr is used if `soxr.dll` is present, otherwise falls back to IPP.
+
+### PCM Output Encoding
+
+| Setting | Options | Notes |
+|---------|---------|-------|
+| Bit Depth | Auto (float), 16-bit, 24-bit, 32-bit, Float | Per-rate override available |
+| Dither | Auto (TPDF for integer), None, TPDF, Noise-Shaped | Per-rate override available |
+
+- **TPDF**: Triangular probability density dither, ±1 LSB. Eliminates quantization distortion. ~86 dB SNR at 16-bit.
+- **Noise-Shaped**: First-order error feedback. Pushes dither noise to high frequencies where hearing is less sensitive. ~47 dB wideband SNR but perceptually superior.
+- **Auto**: Float for float output, TPDF for integer output.
 
 ## SINAD Measurement Methodology
 
@@ -287,6 +339,8 @@ FIR-only decimation (no SDM re-encoding) for DSD-to-PCM conversion. Output is mu
 | DSD512 | PCM 88.2k | 256x | 136.9 |
 | DSD512 | PCM 176.4k | 128x | 136.4 |
 | DSD512 | PCM 352.8k | 64x | 137.1 |
+| DSD64/48 | PCM 48k | 64x | 105.0 |
+| DSD128/48 | PCM 96k | 64x | 132.4 |
 
 **Key observations:**
 - Higher input DSD rates yield better SINAD (more aggressive noise shaping, lower in-band noise)
@@ -485,6 +539,7 @@ foo_dsd_trellis/
 |   |-- threadpool.h          Thread pool API
 |   |-- simd_detect.h         CPU detection API
 |   |-- cpuset.h              CPU topology API
+|   |-- resample.h            Polyphase resampler API
 |   |-- httpapi.h             REST API
 |   |-- onnx_filter.h         ONNX ML API
 |   |-- tusbaudio.h           TUSBAudio API
@@ -503,6 +558,9 @@ foo_dsd_trellis/
 |   |-- test_hardening.c      Edge cases and robustness
 |   |-- test_threadpool.c     Thread pool tests
 |   |-- test_onnx_filter.c    ONNX ML filter tests
+|   |-- test_resample.c       Polyphase resampler tests (IPP + soxr)
+|   |-- test_validation.c     Rate map validation tests
+|   |-- test_dither.c         PCM dither and bit depth tests
 |   +-- test_sinad_diag.c     Extended SINAD diagnostics
 |-- training_pipeline/         ML model training scripts (Python/PyTorch)
 |-- tools/
@@ -516,7 +574,7 @@ foo_dsd_trellis/
 
 ## Test Results
 
-748 tests across 13 suites, all passing:
+954 tests across 17 suites, all passing:
 
 | Suite | Tag | Tests | Coverage |
 |-------|-----|-------|----------|
@@ -525,13 +583,17 @@ foo_dsd_trellis/
 | FIR | `fir` | 17 | Passband/stopband, round-trip, chain tests |
 | Trellis SDM | `trellis` | 13 | Init, reset, latency, drain, SINAD (4 rates), DC stability |
 | PreCorr SDM | `precorr` | 8 | Init, binary output, no latency, SINAD (4 rates) |
-| Rate Conversion | `rate` | 25 | SINAD for all DSD upsample/downsample pairs + DSD-to-PCM decimation |
-| Config | `config` | 99 | Serialization, versioning (v1-v12), validation, rate/NTF/limiter maps |
+| Rate Conversion | `rate` | 37 | SINAD for all DSD/44 + DSD/48 upsample/downsample + DSD-to-PCM decimation |
+| Config | `config` | 99 | Serialization, versioning (v1-v16), validation, rate/NTF/limiter maps |
 | CPU & IPP | `simd` | 5 | CPU detection, IPP kernel, FIR correctness |
 | Hardening | `hardening` | 24 | Edge cases, robustness |
 | Thread Pool | `threadpool` | 8 | Create/destroy, concurrent SDM, stress |
 | ONNX ML | `onnx` | 7 | Runtime probe, null safety, session create, live inference, SINAD |
-| Rate Conv Sweep | `sweep` | 6 | FIR-only SINAD, PCM control, limiter sweep, NTF x limiter sweep, cands x lat sweep, gain sweep (extended) |
+| GPU Compute | `gpu` | — | DX11/DX12/CUDA FIR, boxcar, SDM kernels |
+| Resample | `resample` | 14 | IPP polyphase + soxr SINAD at all cross-family rate pairs |
+| Validation | `validation` | 150 | Rate map indices, family helpers, output rules for all 20×25 combinations |
+| Dither | `dither` | 6 | Truncation, TPDF, noise-shaped, 24-bit, float passthrough |
+| Rate Conv Sweep | `sweep` | 6 | FIR-only SINAD, limiter sweep, NTF × limiter sweep (extended) |
 | SINAD Diagnostics | `diag` | 7 | NTF sweeps, warmup analysis (extended) |
 
 ## References
