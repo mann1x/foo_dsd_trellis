@@ -284,6 +284,16 @@ plugin_state_t *plugin_create(void) {
             s->config.thread_count > 0 ? s->config.thread_count : 0,
             s->config.affinity_mask);
 
+    /* Eagerly create GPU context (device + shader compilation = 400ms+).
+     * Create unconditionally — config.gpu_enabled isn't loaded yet
+     * (fb2k applies config after plugin_create via plugin_set_config).
+     * If GPU is later disabled, the context sits idle (no overhead). */
+    {
+        gpu_backend_t be = GPU_BACKEND_AUTO;
+        if (gpu_available(be))
+            s->gpu = gpu_create(be);
+    }
+
     return s;
 }
 
