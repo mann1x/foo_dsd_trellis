@@ -74,25 +74,34 @@ static DWORD WINAPI dec_snr_thread(LPVOID param) {
         return 1;
     }
 
-    unsigned ratio = w->dsd_rate / 44100;
-    size_t pcm_est = w->produced / ratio + 4096;
+    /* Output buffer must be as large as input for intermediate stages
+     * (fir_chain_process uses ping-pong between out and scratch). */
+    size_t pcm_est = w->produced;
     float *pcm_buf = (float *)calloc(pcm_est, sizeof(float));
     if (!pcm_buf) { fir_chain_free(&dec_ch); return 1; }
 
     size_t out_n = fir_chain_process(&dec_ch, w->dsd_out, pcm_buf, w->produced);
 
+    /* Use Goertzel on the decimated PCM at 44.1kHz — phase-independent.
+     * This measures the SINAD of the decoded analog signal. */
     size_t skip = 512;
     if (skip >= out_n) skip = 0;
+    float *meas = pcm_buf + skip;
+    size_t meas_n = out_n - skip;
 
-    double sig_power = 0.0, err_power = 0.0;
-    for (size_t i = skip; i < out_n; i++) {
-        double ref = 0.5 * sin(2.0 * M_PI * w->freq * (double)i / 44100.0);
-        double diff = ref - (double)pcm_buf[i];
-        sig_power += ref * ref;
-        err_power += diff * diff;
+    if (meas_n > 256) {
+        double bw = 44100.0 / (double)meas_n;
+        unsigned sig_bin = (unsigned)(w->freq / bw + 0.5);
+        double signal_power = goertzel_power(meas, meas_n, w->freq, 44100.0);
+        unsigned max_bin = (unsigned)(20000.0 / bw);
+        double noise = 0.0;
+        for (unsigned b = 1; b <= max_bin; b++) {
+            if (b >= sig_bin - 1 && b <= sig_bin + 1) continue;
+            noise += goertzel_power(meas, meas_n, b * bw, 44100.0);
+        }
+        if (noise <= 0.0) noise = 1e-30;
+        w->result_snr = 10.0 * log10(signal_power / noise);
     }
-    if (err_power <= 0.0) err_power = 1e-30;
-    w->result_snr = 10.0 * log10(sig_power / err_power);
 
     free(pcm_buf);
     fir_chain_free(&dec_ch);
@@ -189,24 +198,33 @@ void sinad_measure(uint32_t dsd_rate, int ntf_id,
         return;
     }
 
-    /* Step 5: Re-encode SINAD — Goertzel on raw ±1.0 DSD output (0-20kHz).
-     * Measures in-band noise quality of the pipeline output.
-     * NOTE: FIR-decimated SNR (compare vs original sine at 44.1kHz)
-     * crashes due to IPP/FIR chain issues — deferred to future work. */
+    /* Step 5: Re-encode SNR — decimate output DSD to 44.1kHz via IPP FIR,
+     * compare against the original analog sine.
+     * Runs on a dedicated thread (IPP needs aligned stack). */
     {
-        double actual_bw = (double)dsd_rate / (double)produced;
-        unsigned actual_sig_bin = (unsigned)(freq / actual_bw + 0.5);
-        double signal_power = goertzel_power(out, produced, freq, (double)dsd_rate);
+        /* Copy SDM output — fir_chain_process overwrites its out param
+         * via ping-pong, so in and out must be separate buffers. */
+        float *out_copy = (float *)malloc(produced * sizeof(float));
+        if (out_copy) {
+            memcpy(out_copy, out, produced * sizeof(float));
 
-        unsigned max_bin = (unsigned)(20000.0 / actual_bw);
-        double noise = 0.0;
-        for (unsigned b = 1; b <= max_bin; b++) {
-            if (b >= actual_sig_bin - 1 && b <= actual_sig_bin + 1) continue;
-            noise += goertzel_power(out, produced, b * actual_bw, (double)dsd_rate);
+            dec_work_t work;
+            work.dsd_out = out_copy;
+            work.produced = produced;
+            work.dsd_rate = dsd_rate;
+            work.freq = freq;
+            work.result_snr = -999.0;
+
+            HANDLE h = CreateThread(NULL, 4 * 1024 * 1024,
+                                     dec_snr_thread, &work, 0, NULL);
+            if (h) {
+                WaitForSingleObject(h, 30000);
+                CloseHandle(h);
+                if (work.result_snr > -900.0)
+                    result->sinad_db = work.result_snr;
+            }
+            free(out_copy);
         }
-        if (noise <= 0.0) noise = 1e-30;
-
-        result->sinad_db = 10.0 * log10(signal_power / noise);
     }
     result->conv_fail = ctx.conv_fail;
     result->cands_collapse = ctx.cands_collapse;
