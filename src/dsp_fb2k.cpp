@@ -520,7 +520,7 @@ private:
         m_listRate.SetExtendedListViewStyle(
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
         ensure_reverse_map();
-        int cw[] = { 62, 80, 42, 50, 42, 42, 46, 30, 34, 36 };
+        int cw[] = { 62, 80, 52, 50, 42, 42, 46, 30, 34, 42 };
         m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, cw[0]);
         m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, cw[1]);
         m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, cw[2]);
