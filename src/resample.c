@@ -152,8 +152,14 @@ static resample_ctx_t *ipp_create(uint32_t fs_in, uint32_t fs_out) {
     /* Use arbitrary-ratio polyphase resampler.
      * window = filter window size in input samples.
      * nStep = number of filter interpolation steps (higher = better quality). */
-    Ipp32f window = 64.0f;   /* 64 input samples window (longer = higher quality) */
-    int nStep = 256;         /* 256 interpolation steps */
+    /* IPP polyphase filter design parameters:
+     * window = filter half-length in input sample units (more = sharper cutoff)
+     * nStep = interpolation steps between pre-computed coefficients.
+     *   Linear interpolation between nStep values limits achievable SNR.
+     *   nStep=256→~72 dB, nStep=4096→~96 dB, nStep=32768→~120 dB.
+     *   Memory cost: ~8 * window * nStep bytes. */
+    Ipp32f window = 64.0f;
+    int nStep = 2048;        /* Balance quality vs memory. Interpolation floor ~90 dB. */
 
     int spec_size = 0;
     IppStatus st = ippsResamplePolyphaseGetSize_32f(
@@ -278,7 +284,7 @@ resample_ctx_t *resample_create(uint32_t fs_in, uint32_t fs_out,
     if (fs_in == fs_out || fs_in == 0 || fs_out == 0)
         return NULL;
 
-    /* Engine selection */
+    /* Engine selection: prefer soxr when available (114 dB vs IPP's 72 dB at 44.1k↔48k) */
     if (engine == RESAMPLE_SOXR || (engine == RESAMPLE_AUTO && resample_soxr_available())) {
         resample_ctx_t *ctx = soxr_backend_create(fs_in, fs_out, soxr_quality);
         if (ctx) return ctx;

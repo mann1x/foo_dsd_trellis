@@ -72,13 +72,17 @@ static double resample_sinad(uint32_t fs_in, uint32_t fs_out, int engine) {
 
     if (produced < 1000) { free(in); free(out); return -999.0; }
 
-    /* Second pass: bin-aligned tone */
+    /* Second pass: bin-aligned tone using known output count */
+    size_t expected = produced;
     double freq = bin_align(1000.0, (double)fs_out, produced);
     generate_sine(in, n_in, freq, (double)fs_in, 0.9);
     ctx = resample_create(fs_in, fs_out, engine, SOXR_QUALITY_HQ);
     if (!ctx) { free(in); free(out); return -999.0; }
     produced = resample_process(ctx, in, out, n_in);
     resample_free(ctx);
+
+    if (produced != expected)
+        printf("    WARNING: pass1=%zu pass2=%zu (mismatch!)\n", expected, produced);
 
     double meas_freq = bin_align(freq, (double)fs_out, produced);
     /* Use max 2000 bins to keep Goertzel fast */
@@ -143,9 +147,12 @@ static void test_resample_soxr_if_available(void) {
         printf("    [SKIP] libsoxr not available\n");
         return;
     }
-    double sinad = resample_sinad(44100, 48000, RESAMPLE_SOXR);
-    printf("    soxr 44.1k->48k SINAD: %.1f dB\n", sinad);
-    TEST_ASSERT_TRUE(sinad > 100.0, "soxr VHQ SINAD > 100 dB");
+    double s1 = resample_sinad(44100, 48000, RESAMPLE_SOXR);
+    double s2 = resample_sinad(48000, 44100, RESAMPLE_SOXR);
+    double s3 = resample_sinad(96000, 88200, RESAMPLE_SOXR);
+    printf("    soxr 44.1k->48k: %.1f dB | 48k->44.1k: %.1f dB | 96k->88.2k: %.1f dB\n",
+           s1, s2, s3);
+    TEST_ASSERT_TRUE(s1 > 100.0, "soxr VHQ 44->48 SINAD > 100 dB");
 }
 
 void test_resample_suite(void) {
