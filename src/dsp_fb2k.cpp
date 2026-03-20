@@ -78,12 +78,17 @@ void   config_validate(dsd_config_t *cfg);
 static const wchar_t *g_rate_names[RATE_MAP_COUNT] = {
     L"44100", L"48000", L"88200", L"96000",
     L"176400", L"192000", L"352800", L"384000",
-    L"DSD64", L"DSD128", L"DSD256", L"DSD512"
+    L"DSD64", L"DSD128", L"DSD256", L"DSD512",
+    L"705600", L"768000", L"1411200", L"1536000",
+    L"DSD64/48", L"DSD128/48", L"DSD256/48", L"DSD512/48"
 };
 
 static const wchar_t *g_output_names[RATE_OUT_COUNT] = {
     L"-", L"DSD64", L"DSD128", L"DSD256", L"DSD512",
-    L"PCM 44.1k", L"PCM 88.2k", L"PCM 176.4k", L"PCM 352.8k"
+    L"PCM 44.1k", L"PCM 88.2k", L"PCM 176.4k", L"PCM 352.8k",
+    L"DSD64/48", L"DSD128/48", L"DSD256/48", L"DSD512/48",
+    L"PCM 48k", L"PCM 96k", L"PCM 192k", L"PCM 384k",
+    L"PCM 705.6k", L"PCM 768k", L"PCM 1411.2k", L"PCM 1536k"
 };
 
 static const wchar_t *g_ntf_names[] = {
@@ -95,7 +100,9 @@ static const wchar_t *g_ntf_names[] = {
 /* Input rates by rate_map index (for path_info lookup in UI) */
 static const uint32_t g_input_rates[RATE_MAP_COUNT] = {
     44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000,
-    DSD_RATE_64, DSD_RATE_128, DSD_RATE_256, DSD_RATE_512
+    DSD_RATE_64, DSD_RATE_128, DSD_RATE_256, DSD_RATE_512,
+    705600, 768000, 1411200, 1536000,
+    DSD48_RATE_64, DSD48_RATE_128, DSD48_RATE_256, DSD48_RATE_512
 };
 
 /* ─── Gain helpers ─── */
@@ -1013,22 +1020,8 @@ private:
         }
 
         /* Determine input/output rates */
-        uint32_t fs_in = 0;
-        bool is_dsd_input = (row >= RATE_MAP_PCM_COUNT);
-        switch (row) {
-        case RATEIDX_44100:  fs_in = 44100;       break;
-        case RATEIDX_48000:  fs_in = 48000;       break;
-        case RATEIDX_88200:  fs_in = 88200;       break;
-        case RATEIDX_96000:  fs_in = 96000;       break;
-        case RATEIDX_176400: fs_in = 176400;      break;
-        case RATEIDX_192000: fs_in = 192000;      break;
-        case RATEIDX_352800: fs_in = 352800;      break;
-        case RATEIDX_384000: fs_in = 384000;      break;
-        case RATEIDX_DSD64:  fs_in = DSD_RATE_64; break;
-        case RATEIDX_DSD128: fs_in = DSD_RATE_128; break;
-        case RATEIDX_DSD256: fs_in = DSD_RATE_256; break;
-        case RATEIDX_DSD512: fs_in = DSD_RATE_512; break;
-        }
+        uint32_t fs_in = rate_idx_to_hz(row);
+        bool is_dsd_input = rate_idx_is_dsd(row);
 
         uint32_t fs_out = rate_out_to_hz(out_idx);
         if (fs_out == 0) {
@@ -1308,21 +1301,7 @@ private:
         uint8_t out_idx = m_cfg.rate_map[row];
         if (out_idx == RATE_OUT_BYPASS) return;
 
-        uint32_t fs_in = 0;
-        switch (row) {
-        case RATEIDX_44100:  fs_in = 44100;       break;
-        case RATEIDX_48000:  fs_in = 48000;       break;
-        case RATEIDX_88200:  fs_in = 88200;       break;
-        case RATEIDX_96000:  fs_in = 96000;       break;
-        case RATEIDX_176400: fs_in = 176400;      break;
-        case RATEIDX_192000: fs_in = 192000;      break;
-        case RATEIDX_352800: fs_in = 352800;      break;
-        case RATEIDX_384000: fs_in = 384000;      break;
-        case RATEIDX_DSD64:  fs_in = DSD_RATE_64; break;
-        case RATEIDX_DSD128: fs_in = DSD_RATE_128; break;
-        case RATEIDX_DSD256: fs_in = DSD_RATE_256; break;
-        case RATEIDX_DSD512: fs_in = DSD_RATE_512; break;
-        }
+        uint32_t fs_in = rate_idx_to_hz(row);
 
         uint32_t fs_out = rate_out_to_hz(out_idx);
         if (fs_out == 0 || !rate_out_is_dsd(out_idx)) {
@@ -1590,6 +1569,7 @@ public:
             uint32_t candidate_dsd = pcm_rate * 16u;
             switch (candidate_dsd) {
             case DSD_RATE_64: case DSD_RATE_128: case DSD_RATE_256: case DSD_RATE_512:
+            case DSD48_RATE_64: case DSD48_RATE_128: case DSD48_RATE_256: case DSD48_RATE_512:
                 dsd_rate = candidate_dsd;
                 break;
             }
@@ -1735,23 +1715,40 @@ public:
         if (is_dop) {
             /* DSD input via DoP */
             if (!m_logged_processing) {
-                unsigned dsd_mult = dsd_rate / 44100;
+                unsigned dsd_base = rate_is_48k_family(dsd_rate) ? 48000 : 44100;
+                unsigned dsd_mult = dsd_rate / dsd_base;
                 if (out_is_pcm)
-                    trellis_log("DSD%u -> PCM %uHz, %uch", dsd_mult, out_rate, channels);
+                    trellis_log("DSD%u%s -> PCM %uHz, %uch",
+                                dsd_mult, dsd_base == 48000 ? "/48" : "", out_rate, channels);
                 else if (dsd_rate == out_rate)
-                    trellis_log("DSD%u re-encode, %uch", dsd_mult, channels);
-                else
-                    trellis_log("DSD%u -> DSD%u, %uch", dsd_mult, out_rate / 44100, channels);
+                    trellis_log("DSD%u%s re-encode, %uch",
+                                dsd_mult, dsd_base == 48000 ? "/48" : "", channels);
+                else {
+                    unsigned out_base = rate_is_48k_family(out_rate) ? 48000 : 44100;
+                    unsigned out_mult_v = out_rate / out_base;
+                    trellis_log("DSD%u%s -> DSD%u%s, %uch",
+                                dsd_mult, dsd_base == 48000 ? "/48" : "",
+                                out_mult_v, out_base == 48000 ? "/48" : "", channels);
+                }
             }
 
             out_frames = plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
                                         pcm_frames, (int)channels, pcm_rate);
 
+        } else if (out_is_pcm) {
+            /* PCM→PCM rate conversion (FIR-only or polyphase) */
+            if (!m_logged_processing)
+                trellis_log("PCM %uHz -> PCM %uHz, %uch", pcm_rate, out_rate, channels);
+            /* TODO: implement plugin_process_pcm_to_pcm() */
+            out_frames = 0;  /* placeholder until resampler is implemented */
+
         } else {
             /* PCM input — convert to DSD */
             if (!m_logged_processing) {
-                unsigned out_mult = out_rate / 44100;
-                trellis_log("PCM %uHz -> DSD%u, %uch", pcm_rate, out_mult, channels);
+                unsigned out_base = rate_is_48k_family(out_rate) ? 48000 : 44100;
+                unsigned out_mult_v = out_rate / out_base;
+                trellis_log("PCM %uHz -> DSD%u%s, %uch",
+                            pcm_rate, out_mult_v, out_base == 48000 ? "/48" : "", channels);
             }
             out_frames = plugin_process_pcm(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
                                              pcm_frames, (int)channels, pcm_rate);

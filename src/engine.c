@@ -65,6 +65,26 @@ static const path_config_t path_table[] = {
     { DSD_RATE_512, DSD_RATE_64,  NTF_SDM_6,   0.0,  8,  0, 0, 0.708f },
     { DSD_RATE_512, DSD_RATE_128, NTF_SDM_4,  16.0, 16,  0, 0, 0.708f },
     { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 0.708f },
+    /* ─── DSD/48 paths (mirror DSD/44 NTF choices) ─── */
+    /* Same-rate re-encode */
+    { DSD48_RATE_64,  DSD48_RATE_64,  NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_128, DSD48_RATE_128, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_256, DSD48_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
+    /* DSD/48 upsample */
+    { DSD48_RATE_64,  DSD48_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_64,  DSD48_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_64,  DSD48_RATE_512, NTF_CLANS_6, 10.0, 2,  0, 4, 0.708f },
+    { DSD48_RATE_128, DSD48_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_128, DSD48_RATE_512, NTF_CLANS_8, 12.0, 2,  0, 4, 0.708f },
+    { DSD48_RATE_256, DSD48_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 0.708f },
+    /* DSD/48 downsample */
+    { DSD48_RATE_128, DSD48_RATE_64,  NTF_CLANS_4, 0.0,  32, 0, 0, 0.708f },
+    { DSD48_RATE_256, DSD48_RATE_64,  NTF_CLANS_8, 0.0,  8,  0, 0, 0.708f },
+    { DSD48_RATE_256, DSD48_RATE_128, NTF_CLANS_4, 0.0,  8,  0, 0, 0.708f },
+    { DSD48_RATE_512, DSD48_RATE_64,  NTF_SDM_6,   0.0,  8,  0, 0, 0.708f },
+    { DSD48_RATE_512, DSD48_RATE_128, NTF_SDM_4,  16.0, 16,  0, 0, 0.708f },
+    { DSD48_RATE_512, DSD48_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 0.708f },
 };
 
 #define PATH_TABLE_COUNT (sizeof(path_table) / sizeof(path_table[0]))
@@ -567,7 +587,8 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
     info->fir_stages = count_fir_stages(fs_in, fs_out);
     info->depth = cfg->trellis_depth;
 
-    /* DSD→PCM: FIR decimation only */
+    /* DSD→PCM: FIR decimation only.
+     * All PCM rates < DSD_RATE_64 (2.8MHz), all DSD rates >= DSD_RATE_64. */
     if (fs_out < DSD_RATE_64 && fs_in >= DSD_RATE_64) {
         info->fir_only = true;
         info->ntf_filter = NTF_AUTO;
@@ -608,12 +629,14 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
      *   DSD512:    lat=32  (137.6 dB, 0 collapse) — lat=16 was 124.8 dB */
     if (info->lat <= 0) {
         uint32_t rate = (fs_out > fs_in) ? fs_out : fs_in;
+        /* DSD512 or DSD512/48 */
         if (rate >= DSD_RATE_512)
             info->lat = 32;
+        /* DSD128+ or DSD128/48+ (but below DSD512) */
         else if (rate >= DSD_RATE_128)
             info->lat = 128;
         else
-            info->lat = 32;   /* DSD64 */
+            info->lat = 32;   /* DSD64 or DSD64/48 */
     }
 
     return 0;

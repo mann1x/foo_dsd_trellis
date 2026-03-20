@@ -145,6 +145,10 @@ static uint32_t dop_pcm_to_dsd_rate(uint32_t pcm_rate) {
     case DSD_RATE_128:
     case DSD_RATE_256:
     case DSD_RATE_512:
+    case DSD48_RATE_64:
+    case DSD48_RATE_128:
+    case DSD48_RATE_256:
+    case DSD48_RATE_512:
         return dsd_rate;
     default:
         return 0;  /* Not a valid DoP rate */

@@ -381,7 +381,9 @@ static void handle_render(SOCKET client, const char *body) {
 
     /* Validate output rate */
     if (output_rate != DSD_RATE_64 && output_rate != DSD_RATE_128 &&
-        output_rate != DSD_RATE_256 && output_rate != DSD_RATE_512) {
+        output_rate != DSD_RATE_256 && output_rate != DSD_RATE_512 &&
+        output_rate != DSD48_RATE_64 && output_rate != DSD48_RATE_128 &&
+        output_rate != DSD48_RATE_256 && output_rate != DSD48_RATE_512) {
         const char *e = "{\"error\":\"invalid output_rate\"}";
         send_json(client, 400, "Bad Request", e, (int)strlen(e));
         return;
@@ -1052,7 +1054,8 @@ static void handle_request(httpapi_t *api, SOCKET client) {
                 "\"multitone_sinad\":%.1f,\"noise_mod_db\":%.1f,\"nmr_db\":%.1f,"
                 "\"conv_fail\":%llu,\"collapse\":%llu,\"drop_pct\":%.2f,"
                 "\"ok\":%d}",
-                rate, rate / 44100, nf ? nf->name : "auto",
+                rate, rate / (rate_is_48k_family(rate) ? 48000u : 44100u),
+                nf ? nf->name : "auto",
                 nc, depth, lat, fir_mode, gain,
                 result.sinad_theoretical, result.sinad_awtd_theo,
                 result.multitone_sinad_db, result.noise_mod_db, result.nmr_db,

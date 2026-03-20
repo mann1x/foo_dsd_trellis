@@ -62,7 +62,7 @@ static void test_config_ml_roundtrip(void) {
     cfg.ml_enabled = true;
     cfg.ml_ep = 1;  /* ML_EP_DIRECTML */
 
-    uint8_t buf[256];
+    uint8_t buf[512];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize with ML fields");
 
@@ -95,7 +95,7 @@ static void test_config_v9_upgrade(void) {
     cfg.gain = 0.75f;
     cfg.sdm_mode = SDM_MODE_TRELLIS;
 
-    uint8_t buf[256];
+    uint8_t buf[512];
     config_serialize(&cfg, buf, sizeof(buf));
 
     /* Truncate to v9 size (78 bytes) to simulate old config */

@@ -22,7 +22,7 @@ static void test_config_roundtrip(void) {
     cfg.format = FORMAT_DOP;
     cfg.output_format = OUTPUT_PCM;
 
-    uint8_t buf[256];
+    uint8_t buf[512];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should write bytes");
 
@@ -52,7 +52,7 @@ static void test_config_sdm_mode_roundtrip(void) {
     dsd_config_defaults(&cfg);
     cfg.sdm_mode = SDM_MODE_TRELLIS;
 
-    uint8_t buf[256];
+    uint8_t buf[512];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should write bytes");
 
@@ -68,7 +68,7 @@ static void test_config_v4_compat(void) {
     dsd_config_defaults(&cfg);
     cfg.sdm_mode = SDM_MODE_PRECORR;
 
-    uint8_t buf[256];
+    uint8_t buf[512];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should work");
 
@@ -89,7 +89,7 @@ static void test_config_defaults_roundtrip(void) {
     dsd_config_t cfg;
     dsd_config_defaults(&cfg);
 
-    uint8_t buf[256];
+    uint8_t buf[512];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
 
     dsd_config_t cfg2;
@@ -163,7 +163,7 @@ static void test_config_rate_map_roundtrip(void) {
     cfg.rate_map[RATEIDX_DSD64]  = RATE_OUT_DSD256;
     cfg.rate_map[RATEIDX_DSD128] = RATE_OUT_DSD512;
 
-    uint8_t buf[256];
+    uint8_t buf[512];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should write bytes");
 
@@ -188,11 +188,16 @@ static void test_config_rate_map_validate(void) {
     TEST_ASSERT_EQ(cfg.rate_map[RATEIDX_44100], RATE_OUT_BYPASS,
                    "invalid rate_map entry clamped to bypass");
 
-    /* 48000-family can't convert to DSD — should be forced to bypass */
+    /* 48000-family can't convert to DSD/44 — should be forced to bypass */
     cfg.rate_map[RATEIDX_48000] = RATE_OUT_DSD64;
     config_validate(&cfg);
     TEST_ASSERT_EQ(cfg.rate_map[RATEIDX_48000], RATE_OUT_BYPASS,
-                   "48000 DSD output forced to bypass");
+                   "48000 DSD/44 output forced to bypass");
+    /* But 48000-family CAN convert to DSD/48 */
+    cfg.rate_map[RATEIDX_48000] = RATE_OUT_DSD64_48;
+    config_validate(&cfg);
+    TEST_ASSERT_EQ(cfg.rate_map[RATEIDX_48000], RATE_OUT_DSD64_48,
+                   "48000 DSD/48 output allowed");
 }
 
 static void test_config_v7_migration(void) {
@@ -202,7 +207,7 @@ static void test_config_v7_migration(void) {
     dsd_config_t cfg;
     dsd_config_defaults(&cfg);
 
-    uint8_t buf[256];
+    uint8_t buf[512];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should work");
 
@@ -240,7 +245,7 @@ static void test_config_rate_ntf_roundtrip(void) {
     cfg.rate_ntf[RATEIDX_DSD128] = 5;
     cfg.rate_ntf[RATEIDX_44100]  = 0;  /* first NTF */
 
-    uint8_t buf[256];
+    uint8_t buf[512];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     TEST_ASSERT_TRUE(len > 0, "serialize should write bytes");
 
@@ -272,25 +277,44 @@ static void test_config_rate_ntf_validate(void) {
 }
 
 static void test_config_v8_migration(void) {
-    /* Serialize a v9 config, truncate to v8 (remove rate_ntf).
+    /* Build a genuine v8 buffer: v7 core (58 bytes) + rate_map[12] = 70 bytes.
      * rate_ntf should default to NTF_AUTO for all entries. */
-    dsd_config_t cfg;
-    dsd_config_defaults(&cfg);
-    cfg.rate_ntf[RATEIDX_DSD64] = 3;  /* will be lost in truncation */
-
-    uint8_t buf[256];
-    size_t len = config_serialize(&cfg, buf, sizeof(buf));
-    TEST_ASSERT_TRUE(len > 0, "serialize should work");
-
-    /* Truncate to v8 size (70 bytes) */
-    size_t v8_len = 70;
-
-    /* Patch version to 8 */
-    uint32_t v8 = 8;
-    memcpy(buf, &v8, 4);
+    uint8_t buf[512];
+    memset(buf, 0, sizeof(buf));
+    size_t pos = 0;
+    uint32_t v = 8;
+    memcpy(buf + pos, &v, 4); pos += 4;       /* version */
+    pos += 4;                                   /* fs_in */
+    pos += 4;                                   /* fs_out */
+    float gain = 1.0f;
+    memcpy(buf + pos, &gain, 4); pos += 4;     /* gain */
+    buf[pos++] = 0;                             /* mute */
+    int32_t i32 = 8;
+    memcpy(buf + pos, &i32, 4); pos += 4;      /* depth */
+    i32 = 4;
+    memcpy(buf + pos, &i32, 4); pos += 4;      /* cands */
+    i32 = 32;
+    memcpy(buf + pos, &i32, 4); pos += 4;      /* lat */
+    i32 = -1;
+    memcpy(buf + pos, &i32, 4); pos += 4;      /* ntf */
+    i32 = 0;
+    memcpy(buf + pos, &i32, 4); pos += 4;      /* threads */
+    pos += 4;                                   /* affinity */
+    pos += 4;                                   /* format */
+    pos += 4;                                   /* output_format */
+    buf[pos++] = 0;                             /* debug_log (v2) */
+    buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 0; /* smt/ccd/ecore (v3) */
+    uint16_t port = 8881;
+    memcpy(buf + pos, &port, 2); pos += 2;     /* api_port (v4) */
+    buf[pos++] = 0;                             /* sdm_mode (v5) */
+    buf[pos++] = 0;                             /* fir_mode placeholder (v6) */
+    buf[pos++] = 0;                             /* proc_mode placeholder (v7) */
+    /* v8: rate_map[12] — all bypass */
+    memset(buf + pos, RATE_OUT_BYPASS, 12);
+    pos += 12;
 
     dsd_config_t cfg2;
-    int ret = config_deserialize(&cfg2, buf, v8_len);
+    int ret = config_deserialize(&cfg2, buf, pos);
     TEST_ASSERT_EQ(ret, 0, "v8 deserialize should succeed");
     /* All rate_ntf should be NTF_AUTO (not preserved from v8) */
     for (int i = 0; i < RATE_MAP_COUNT; i++)

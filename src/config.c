@@ -65,55 +65,8 @@ static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
 }
 
 /* ─── Version field layout ─── */
-/* 4  version
- * 4  fs_in
- * 4  fs_out
- * 4  gain (float)
- * 1  mute (bool)
- * 4  trellis_depth
- * 4  trellis_cands
- * 4  trellis_lat
- * 4  ntf_filter
- * 4  thread_count
- * 4  affinity_mask
- * 4  format
- * 4  output_format
- * Total v1: 49 bytes
- *
- * Version 2 adds:
- * 1  debug_log (bool)
- * Total: 50 bytes
- *
- * Version 3 adds:
- * 1  smt_mode
- * 1  ccd_mode
- * 1  ecore_mode
- * Total: 53 bytes
- *
- * Version 4 adds:
- * 2  api_port (uint16_t)
- * Total: 55 bytes
- *
- * Version 5 adds:
- * 1  sdm_mode
- * Total: 56 bytes
- *
- * Version 6 added fir_mode (1 byte, now removed — read and discard)
- * Total: 57 bytes
- *
- * Version 7 added proc_mode (1 byte, now superseded by rate_map)
- * Total: 58 bytes
- *
- * Version 8 adds:
- * 12  rate_map[12] (per-input-rate output config)
- * Total: 70 bytes
- *
- * Version 9 adds:
- * 12  rate_ntf[12] (per-input-rate NTF override, int8_t, -1=auto)
- * Total: 82 bytes */
-/* Correct byte counts: 4(ver)+4(fs_in)+4(fs_out)+4(gain)+1(mute)
- * +4(depth)+4(cands)+4(lat)+4(ntf)+4(threads)+4(affinity)
- * +4(format)+4(output_format) = 49 for v1 */
+/* All size constants for v8-v15 use RATE_MAP_COUNT_V15 (12) — the array size
+ * that was used when those versions were written. v16+ uses RATE_MAP_COUNT (20). */
 #define CONFIG_V1_SIZE 49
 #define CONFIG_V2_SIZE 50
 #define CONFIG_V3_SIZE 53
@@ -121,23 +74,50 @@ static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
 #define CONFIG_V5_SIZE 56
 #define CONFIG_V6_SIZE 57
 #define CONFIG_V7_SIZE 58
-#define CONFIG_V8_SIZE 70
-#define CONFIG_V9_SIZE 82
-#define CONFIG_V10_SIZE 84
-/* v11: antipop(1) + 4 × RATE_MAP_COUNT(12) for rate_sdm/cands/depth/ml */
-#define CONFIG_V11_SIZE (CONFIG_V10_SIZE + 1 + 4 * RATE_MAP_COUNT)
+#define CONFIG_V8_SIZE  (CONFIG_V7_SIZE + RATE_MAP_COUNT_V15)            /* 70 */
+#define CONFIG_V9_SIZE  (CONFIG_V8_SIZE + RATE_MAP_COUNT_V15)            /* 82 */
+#define CONFIG_V10_SIZE (CONFIG_V9_SIZE + 2)                             /* 84 */
+/* v11: antipop(1) + 4 × 12 for rate_sdm/cands/depth/ml */
+#define CONFIG_V11_SIZE (CONFIG_V10_SIZE + 1 + 4 * RATE_MAP_COUNT_V15)   /* 133 */
 /* v12: rate_limiter(12) + fir_gain_db(1) */
-#define CONFIG_V12_SIZE (CONFIG_V11_SIZE + RATE_MAP_COUNT + 1)
+#define CONFIG_V12_SIZE (CONFIG_V11_SIZE + RATE_MAP_COUNT_V15 + 1)       /* 146 */
 /* v13: gpu_enabled(1) + gpu_backend(1) + rate_gpu(12) */
-#define CONFIG_V13_SIZE (CONFIG_V12_SIZE + 1 + 1 + RATE_MAP_COUNT)
+#define CONFIG_V13_SIZE (CONFIG_V12_SIZE + 1 + 1 + RATE_MAP_COUNT_V15)   /* 160 */
 /* v14: rate_gpu_sdm(12) — legacy, read and discard */
-#define CONFIG_V14_SIZE (CONFIG_V13_SIZE + RATE_MAP_COUNT)
+#define CONFIG_V14_SIZE (CONFIG_V13_SIZE + RATE_MAP_COUNT_V15)           /* 172 */
 /* v15: rate_fir_mode(12) + rate_lat(24 = 12 × int16_t) */
-#define CONFIG_V15_SIZE (CONFIG_V14_SIZE + RATE_MAP_COUNT + RATE_MAP_COUNT * 2)
+#define CONFIG_V15_SIZE (CONFIG_V14_SIZE + RATE_MAP_COUNT_V15 + RATE_MAP_COUNT_V15 * 2) /* 208 */
+
+/* v16: All per-rate arrays expanded to RATE_MAP_COUNT (20).
+ * Written as: v15 core fields (using 20-element arrays) + PCM encoding fields.
+ * v16 core = v7(58) + rate_map(20) + rate_ntf(20) + ml(2) + antipop(1)
+ *   + rate_sdm(20) + rate_cands(20) + rate_depth(20) + rate_ml(20)
+ *   + rate_limiter(20) + fir_gain_db(1)
+ *   + gpu_enabled(1) + gpu_backend(1) + rate_gpu(20)
+ *   + rate_gpu_sdm_legacy(20)
+ *   + rate_fir_mode(20) + rate_lat(40)
+ *   + pcm_bit_depth(1) + pcm_dither(1) + resample_engine(1) + soxr_quality(1)
+ *   + rate_pcm_bits(20) + rate_pcm_dither(20) */
+#define CONFIG_V16_SIZE (CONFIG_V7_SIZE \
+    + RATE_MAP_COUNT             /* rate_map */ \
+    + RATE_MAP_COUNT             /* rate_ntf */ \
+    + 2                          /* ml_enabled + ml_ep */ \
+    + 1                          /* antipop */ \
+    + 4 * RATE_MAP_COUNT         /* rate_sdm/cands/depth/ml */ \
+    + RATE_MAP_COUNT             /* rate_limiter */ \
+    + 1                          /* fir_gain_db */ \
+    + 1 + 1                      /* gpu_enabled + gpu_backend */ \
+    + RATE_MAP_COUNT             /* rate_gpu */ \
+    + RATE_MAP_COUNT             /* rate_gpu_sdm legacy */ \
+    + RATE_MAP_COUNT             /* rate_fir_mode */ \
+    + RATE_MAP_COUNT * 2         /* rate_lat (int16_t) */ \
+    + 4                          /* pcm_bit_depth + pcm_dither + resample_engine + soxr_quality */ \
+    + 2 * RATE_MAP_COUNT         /* rate_pcm_bits + rate_pcm_dither */ \
+    )
 
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
-    if (buf_size < CONFIG_V15_SIZE)
+    if (buf_size < CONFIG_V16_SIZE)
         return 0;
 
     size_t pos = 0;
@@ -162,7 +142,7 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     pos = write_u8(buf, pos, (uint8_t)cfg->sdm_mode);
     pos = write_u8(buf, pos, 0);  /* fir_mode placeholder (v6 compat) */
     pos = write_u8(buf, pos, 0);  /* proc_mode placeholder (v7 compat) */
-    /* v8: rate_map */
+    /* v8: rate_map (20 elements in v16) */
     memcpy(buf + pos, cfg->rate_map, RATE_MAP_COUNT);
     pos += RATE_MAP_COUNT;
     /* v9: rate_ntf */
@@ -191,7 +171,7 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     memcpy(buf + pos, cfg->rate_gpu, RATE_MAP_COUNT);
     pos += RATE_MAP_COUNT;
 
-    /* v14: legacy rate_gpu_sdm — write zeros for forward compat */
+    /* v14: legacy rate_gpu_sdm — write defaults for forward compat */
     memset(buf + pos, 0xFF, RATE_MAP_COUNT);
     pos += RATE_MAP_COUNT;
 
@@ -200,6 +180,16 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     pos += RATE_MAP_COUNT;
     memcpy(buf + pos, cfg->rate_lat, RATE_MAP_COUNT * sizeof(int16_t));
     pos += RATE_MAP_COUNT * sizeof(int16_t);
+
+    /* v16: PCM encoding + resampler */
+    pos = write_u8(buf, pos, (uint8_t)(int8_t)cfg->pcm_bit_depth);
+    pos = write_u8(buf, pos, (uint8_t)(int8_t)cfg->pcm_dither);
+    pos = write_u8(buf, pos, (uint8_t)(int8_t)cfg->resample_engine);
+    pos = write_u8(buf, pos, (uint8_t)(int8_t)cfg->soxr_quality);
+    memcpy(buf + pos, cfg->rate_pcm_bits, RATE_MAP_COUNT);
+    pos += RATE_MAP_COUNT;
+    memcpy(buf + pos, cfg->rate_pcm_dither, RATE_MAP_COUNT);
+    pos += RATE_MAP_COUNT;
 
     return pos;
 }
@@ -214,6 +204,10 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
     /* Read version */
     uint32_t version;
     read_u32(buf, 0, &version);
+
+    /* Determine the per-rate array size for this version.
+     * v8-v15 stored 12-element arrays; v16+ stores 20-element arrays. */
+    int rate_count = (version >= 16) ? RATE_MAP_COUNT : RATE_MAP_COUNT_V15;
 
     if ((version >= 1 && version <= DSD_CONFIG_VERSION) && buf_size >= CONFIG_V1_SIZE) {
         /* Version 1+: field-by-field */
@@ -274,62 +268,75 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
             pos = read_u8(buf, pos, &u8);
             proc_mode_raw = u8;
         }
-        /* Version 8 adds rate_map */
+        /* Version 8+ adds per-rate arrays */
         if (version >= 8 && buf_size >= CONFIG_V8_SIZE) {
-            memcpy(cfg->rate_map, buf + pos, RATE_MAP_COUNT);
-            pos += RATE_MAP_COUNT;
+            /* Read rate_map: rate_count elements into first rate_count positions */
+            memcpy(cfg->rate_map, buf + pos, rate_count);
+            pos += rate_count;
             /* Version 9 adds rate_ntf */
-            if (version >= 9 && buf_size >= CONFIG_V9_SIZE) {
-                memcpy(cfg->rate_ntf, buf + pos, RATE_MAP_COUNT);
-                pos += RATE_MAP_COUNT;
+            if (version >= 9) {
+                memcpy(cfg->rate_ntf, buf + pos, rate_count);
+                pos += rate_count;
             }
             /* Version 10 adds ml_enabled, ml_ep, antipop */
-            if (version >= 10 && buf_size >= CONFIG_V10_SIZE) {
+            if (version >= 10) {
                 uint8_t u8;
                 pos = read_u8(buf, pos, &u8); cfg->ml_enabled = (u8 != 0);
                 pos = read_u8(buf, pos, &u8); cfg->ml_ep = (int)u8;
-                /* antipop: read if available (85+ bytes), else keep default */
+                /* antipop: read if available */
                 if (pos < buf_size) {
                     pos = read_u8(buf, pos, &u8); cfg->antipop = (u8 != 0);
                 }
             }
             /* Version 11 adds per-rate SDM, cands, depth, ML */
-            if (version >= 11 && buf_size >= CONFIG_V11_SIZE) {
-                memcpy(cfg->rate_sdm, buf + pos, RATE_MAP_COUNT);
-                pos += RATE_MAP_COUNT;
-                memcpy(cfg->rate_cands, buf + pos, RATE_MAP_COUNT);
-                pos += RATE_MAP_COUNT;
-                memcpy(cfg->rate_depth, buf + pos, RATE_MAP_COUNT);
-                pos += RATE_MAP_COUNT;
-                memcpy(cfg->rate_ml, buf + pos, RATE_MAP_COUNT);
-                pos += RATE_MAP_COUNT;
+            if (version >= 11) {
+                memcpy(cfg->rate_sdm, buf + pos, rate_count);
+                pos += rate_count;
+                memcpy(cfg->rate_cands, buf + pos, rate_count);
+                pos += rate_count;
+                memcpy(cfg->rate_depth, buf + pos, rate_count);
+                pos += rate_count;
+                memcpy(cfg->rate_ml, buf + pos, rate_count);
+                pos += rate_count;
             }
             /* Version 12 adds per-rate state limiter + global FIR gain */
-            if (version >= 12 && buf_size >= CONFIG_V12_SIZE) {
-                memcpy(cfg->rate_limiter, buf + pos, RATE_MAP_COUNT);
-                pos += RATE_MAP_COUNT;
+            if (version >= 12) {
+                memcpy(cfg->rate_limiter, buf + pos, rate_count);
+                pos += rate_count;
                 uint8_t u8;
                 pos = read_u8(buf, pos, &u8);
                 cfg->fir_gain_db = (int8_t)u8;
             }
             /* Version 13 adds GPU compute settings */
-            if (version >= 13 && buf_size >= CONFIG_V13_SIZE) {
+            if (version >= 13) {
                 uint8_t u8;
                 pos = read_u8(buf, pos, &u8); cfg->gpu_enabled = (u8 != 0);
                 pos = read_u8(buf, pos, &u8); cfg->gpu_backend = (int)u8;
-                memcpy(cfg->rate_gpu, buf + pos, RATE_MAP_COUNT);
-                pos += RATE_MAP_COUNT;
+                memcpy(cfg->rate_gpu, buf + pos, rate_count);
+                pos += rate_count;
             }
             /* Version 14 had per-rate GPU SDM toggle — read and discard */
-            if (version >= 14 && buf_size >= CONFIG_V14_SIZE) {
-                pos += RATE_MAP_COUNT; /* skip legacy rate_gpu_sdm */
+            if (version >= 14) {
+                pos += rate_count; /* skip legacy rate_gpu_sdm */
             }
             /* Version 15 adds per-rate FIR mode + trellis latency */
-            if (version >= 15 && buf_size >= CONFIG_V15_SIZE) {
-                memcpy(cfg->rate_fir_mode, buf + pos, RATE_MAP_COUNT);
+            if (version >= 15) {
+                memcpy(cfg->rate_fir_mode, buf + pos, rate_count);
+                pos += rate_count;
+                memcpy(cfg->rate_lat, buf + pos, rate_count * sizeof(int16_t));
+                pos += rate_count * sizeof(int16_t);
+            }
+            /* Version 16 adds PCM encoding + resampler */
+            if (version >= 16) {
+                uint8_t u8;
+                pos = read_u8(buf, pos, &u8); cfg->pcm_bit_depth = (int8_t)u8;
+                pos = read_u8(buf, pos, &u8); cfg->pcm_dither = (int8_t)u8;
+                pos = read_u8(buf, pos, &u8); cfg->resample_engine = (int8_t)u8;
+                pos = read_u8(buf, pos, &u8); cfg->soxr_quality = (int8_t)u8;
+                memcpy(cfg->rate_pcm_bits, buf + pos, RATE_MAP_COUNT);
                 pos += RATE_MAP_COUNT;
-                memcpy(cfg->rate_lat, buf + pos, RATE_MAP_COUNT * sizeof(int16_t));
-                pos += RATE_MAP_COUNT * sizeof(int16_t);
+                memcpy(cfg->rate_pcm_dither, buf + pos, RATE_MAP_COUNT);
+                pos += RATE_MAP_COUNT;
             }
         } else {
             /* Migrate from v1-v7: use fs_out + proc_mode to populate rate_map */
@@ -337,8 +344,8 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
             if (proc_mode_raw == 2 || version < 7) {
                 /* DSD recode mode or pre-v7: apply to DSD inputs */
                 if (out_idx != RATE_OUT_BYPASS) {
-                    /* All DSD inputs → specified output rate */
-                    for (int i = RATE_MAP_PCM_COUNT; i < RATE_MAP_COUNT; i++)
+                    /* All DSD/44 inputs → specified output rate */
+                    for (int i = RATEIDX_DSD64; i <= RATEIDX_DSD512; i++)
                         cfg->rate_map[i] = out_idx;
                 } else {
                     /* fs_out=0 means "same as input" = re-encode at same rate */
@@ -362,16 +369,6 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
         (void)pos;
         (void)sdm_mode_raw;
         cfg->fs_out = 0; /* runtime field, set from rate_map */
-        config_validate(cfg);
-        return 0;
-    }
-
-    /* Version 0 (legacy): raw memcpy of old dsd_config_t. */
-    size_t old_size = sizeof(dsd_config_t) - sizeof(int) - RATE_MAP_COUNT;
-    if (buf_size == old_size || buf_size == sizeof(dsd_config_t)) {
-        memcpy(cfg, buf, buf_size < sizeof(dsd_config_t) ? buf_size : sizeof(dsd_config_t));
-        if (buf_size == old_size)
-            cfg->output_format = OUTPUT_DOP;
         config_validate(cfg);
         return 0;
     }
@@ -441,4 +438,14 @@ void config_validate(dsd_config_t *cfg) {
     /* Validate GPU settings */
     if (cfg->gpu_backend < 0 || cfg->gpu_backend > 3)
         cfg->gpu_backend = 3;  /* GPU_BACKEND_AUTO */
+
+    /* Validate PCM encoding */
+    if (cfg->pcm_bit_depth < PCM_BIT_AUTO || cfg->pcm_bit_depth > PCM_BIT_FLOAT)
+        cfg->pcm_bit_depth = PCM_BIT_AUTO;
+    if (cfg->pcm_dither < PCM_DITHER_AUTO || cfg->pcm_dither > PCM_DITHER_SHAPED)
+        cfg->pcm_dither = PCM_DITHER_AUTO;
+    if (cfg->resample_engine < RESAMPLE_AUTO || cfg->resample_engine > RESAMPLE_SOXR)
+        cfg->resample_engine = RESAMPLE_AUTO;
+    if (cfg->soxr_quality < SOXR_QUALITY_MQ || cfg->soxr_quality > SOXR_QUALITY_VHQ)
+        cfg->soxr_quality = SOXR_QUALITY_HQ;
 }
