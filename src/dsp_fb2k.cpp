@@ -1244,11 +1244,10 @@ private:
         char *p = buf;
         while ((p = strstr(p, "{\"row\":")) != NULL) {
             int erow, entf, enc, edepth, elat, efir;
-            double esinad;
             char ets[32] = "";
             if (sscanf(p, "{\"row\":%d,\"ntf\":%d,\"nc\":%d,\"depth\":%d,"
-                       "\"lat\":%d,\"fir\":%d,\"sinad\":%lf",
-                       &erow, &entf, &enc, &edepth, &elat, &efir, &esinad) == 7) {
+                       "\"lat\":%d,\"fir\":%d",
+                       &erow, &entf, &enc, &edepth, &elat, &efir) == 6) {
                 if (erow == row && entf == ntf_id && enc == cands &&
                     edepth == depth && elat == lat) {
                     /* Extract all metric fields */
@@ -1278,7 +1277,7 @@ private:
                                  "(%s)",
                                  etheo, eawtd, emt, enmod, enmr, ets);
                     else
-                        snprintf(out, out_sz, "SINAD: %.1f dB (%s)", esinad, ets);
+                        snprintf(out, out_sz, "Quality test cached (%s)", ets);
                     found = true;
                 }
             }
@@ -1358,7 +1357,7 @@ private:
         float fir_gain = fir_gain_db_to_linear(m_cfg.fir_gain_db);
 
         /* Show measuring... */
-        ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, "Measuring SINAD...");
+        ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, "Measuring quality...");
         ::EnableWindow(GetDlgItem(IDC_BTN_TEST_SINAD), FALSE);
         /* Force repaint so user sees "Measuring..." */
         UpdateWindow();
