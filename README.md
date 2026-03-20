@@ -109,6 +109,109 @@ On the first chunk after stop→play, inserts DoP 0x69 silence before real audio
 
 **Sample counts**: 262,144 samples (DSD64), 524,288 (DSD128), 1,048,576 (DSD256), 2,097,152 (DSD512) — approximately 93 ms of audio at each rate.
 
+## Audio Quality Measurement
+
+The **Test Quality** button in the settings dialog and the `/api/test_sinad` REST endpoint run a comprehensive quality assessment of the SDM configuration for the selected DSD rate. Four complementary metrics evaluate different aspects of audio quality.
+
+### How It Works
+
+1. **Test signal generation**: A bin-aligned ~1 kHz sine wave at 50% amplitude, encoded as clean analog (for SINAD/NMR) or as a 32-tone composite (for multitone)
+2. **SDM processing**: Signal is fed through the Trellis SDM with the selected NTF, candidates, depth, and latency settings
+3. **Analysis**: Goertzel algorithm measures signal and noise power across 0–20 kHz (the audible band)
+4. **Multiple amplitudes**: Noise modulation runs 4 passes at different signal levels to detect signal-dependent noise
+
+### Metrics
+
+#### SINAD (Signal-to-Noise-and-Distortion Ratio)
+
+Measures the SDM's theoretical noise-shaping quality. A clean analog sine is fed directly to the SDM — no DSD quantization, no pipeline pre-filter. This isolates the SDM's performance from input limitations.
+
+| Rating | SINAD (dB) | Interpretation |
+|--------|-----------|----------------|
+| Excellent | > 120 | Exceeds 20-bit PCM quality |
+| Very Good | 100–120 | 16–20 bit equivalent dynamic range |
+| Good | 80–100 | Solid DSD quality, typical for DSD64 |
+| Fair | 60–80 | Audible noise floor, acceptable for background |
+| Poor | < 60 | Significant noise, check NTF/settings |
+
+#### A-weighted SINAD
+
+Same as SINAD but with IEC 61672 A-weighting applied to the noise measurement. Human hearing is less sensitive to low frequencies (< 200 Hz) and very high frequencies (> 10 kHz). A-weighted SINAD is typically 3–6 dB higher than flat SINAD because noise at frequency extremes is downweighted.
+
+**What to expect**: A-weighted should always be ≥ flat SINAD. A large difference (> 8 dB) indicates the noise is concentrated at frequencies where hearing is less sensitive — good news perceptually.
+
+#### Multitone SINAD (32-tone)
+
+Measures SDM quality with a complex signal resembling music. 32 tones at 1/10-decade spacing from 17 Hz to 21.2 kHz (matching Archimago's measurement methodology) are fed simultaneously through the SDM. Each tone is bin-aligned to prevent spectral leakage.
+
+| Rating | Multitone (dB) | Interpretation |
+|--------|---------------|----------------|
+| Excellent | > 120 | Handles complex music with negligible distortion |
+| Very Good | 90–120 | High-quality DSD encoding |
+| Good | 70–90 | Normal DSD quality |
+| Fair | 50–70 | Some intermodulation products present |
+| Poor | < 50 | Significant intermodulation, check settings |
+
+**What to expect**: Multitone SINAD is typically close to single-tone SINAD for well-designed NTFs. A large gap (> 20 dB) may indicate the SDM overloads with complex signals — try increasing the state limiter or reducing FIR gain.
+
+#### Noise Modulation Index (NMod)
+
+Measures how much the noise floor varies with signal level. An ideal SDM has a constant noise floor regardless of signal amplitude. Signal-dependent noise (noise modulation) is perceptually more noticeable than constant noise at the same level.
+
+The test runs 4 SDM passes at amplitudes 0.05, 0.15, 0.30, and 0.50, measuring the noise floor at each level. NMod = max(noise floor) − min(noise floor) in dB.
+
+| Rating | NMod (dB) | Interpretation |
+|--------|----------|----------------|
+| Excellent | < 3 | Constant noise floor, inaudible modulation |
+| Good | 3–6 | Minor variation, unlikely to be audible |
+| Fair | 6–10 | Moderate variation, may be noticeable in quiet passages |
+| Poor | > 10 | Significant noise modulation, check NTF order/settings |
+
+#### NMR (Noise-to-Mask Ratio)
+
+Simplified perceptual metric inspired by PEAQ (ITU-R BS.1387). Measures whether the SDM's noise is below the psychoacoustic masking threshold — i.e., whether the noise is actually *audible* given the signal content.
+
+The output is analyzed per Bark critical band (25 bands from 0–20 kHz). For each band, the noise energy is compared against a simplified masking threshold derived from the signal energy in that band.
+
+| Rating | NMR (dB) | Label | Interpretation |
+|--------|---------|-------|----------------|
+| Excellent | ≤ −30 | Transparent | Noise completely masked — indistinguishable from perfect |
+| Very Good | −30 to −20 | Excellent | Noise well below masking, inaudible |
+| Good | −20 to −10 | Good | Noise mostly masked, minimal audibility |
+| Fair | −10 to 0 | Fair | Noise approaching masking threshold |
+| Poor | > 0 | Poor | Noise above masking — audible artifacts |
+
+### REST API
+
+```bash
+# Measure DSD128 quality with default settings
+curl "http://localhost:8881/api/test_sinad?rate=5644800&nc=2&depth=4&lat=128&fir=1&gain=0.708"
+
+# Response:
+{
+  "sinad_theoretical": 129.4,
+  "sinad_awtd": 134.6,
+  "multitone_sinad": 101.2,
+  "noise_mod_db": 9.8,
+  "nmr_db": -117.2,
+  "conv_fail": 0,
+  "collapse": 0,
+  "drop_pct": 0.0
+}
+```
+
+Parameters: `rate` (DSD rate in Hz), `nc` (candidates), `depth`, `lat` (latency), `fir` (0=boxcar, 1=FIR lowpass), `gain` (linear, e.g., 0.708 for −3 dB), `ntf` (NTF filter ID, −1=auto).
+
+### Reference Results
+
+Measured with default auto settings (nc=2, depth=4):
+
+| Rate | SINAD | A-wtd | Multitone | NMod | NMR |
+|------|-------|-------|-----------|------|-----|
+| DSD64 | 96.8 | 101.1 | 99.7 | 8.4 | −85.1 |
+| DSD128 | 129.4 | 134.6 | 101.2 | 9.8 | −117.2 |
+| DSD256 | 115.6 | 120.7 | 132.3 | 6.8 | −106.6 |
+
 ## SINAD Results
 
 ### Trellis SDM (depth=8, candidates=8, latency=512)
@@ -413,7 +516,7 @@ foo_dsd_trellis/
 
 ## Test Results
 
-723 tests across 13 suites, all passing:
+748 tests across 13 suites, all passing:
 
 | Suite | Tag | Tests | Coverage |
 |-------|-----|-------|----------|
