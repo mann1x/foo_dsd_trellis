@@ -17,6 +17,7 @@
 #pragma comment(lib, "ws2_32.lib")
 
 #include "../include/httpapi.h"
+#include "../include/resample.h"
 #include "../include/trellis.h"
 #include "../include/precorr.h"
 #include "../include/ntf.h"
@@ -174,7 +175,22 @@ static int config_to_json(const dsd_config_t *cfg, char *buf, int max) {
                     cfg->gpu_backend == 1 ? "DirectCompute" :
                     cfg->gpu_backend == 2 ? "CUDA" :
                     cfg->gpu_backend == 3 ? "Auto" : "None");
-    p = json_append(buf, p, max, "  \"fir_engine\": \"%s\"\n", fir_ipp_kernel_name());
+    p = json_append(buf, p, max, "  \"fir_engine\": \"%s\",\n", fir_ipp_kernel_name());
+    /* PCM encoding */
+    static const char *bits_names[] = { "auto", "16", "24", "32", "float" };
+    static const char *dith_names[] = { "auto", "none", "tpdf", "shaped" };
+    static const char *rs_names[] = { "auto", "ipp", "soxr" };
+    static const char *sq_names[] = { "medium", "high", "very_high" };
+    int bi = cfg->pcm_bit_depth + 1; if (bi < 0 || bi > 4) bi = 0;
+    int di = cfg->pcm_dither + 1;    if (di < 0 || di > 3) di = 0;
+    int ri = cfg->resample_engine + 1; if (ri < 0 || ri > 2) ri = 0;
+    int qi = cfg->soxr_quality;      if (qi < 0 || qi > 2) qi = 1;
+    p = json_append(buf, p, max, "  \"pcm_bit_depth\": \"%s\",\n", bits_names[bi]);
+    p = json_append(buf, p, max, "  \"pcm_dither\": \"%s\",\n", dith_names[di]);
+    p = json_append(buf, p, max, "  \"resample_engine\": \"%s\",\n", rs_names[ri]);
+    p = json_append(buf, p, max, "  \"soxr_quality\": \"%s\",\n", sq_names[qi]);
+    p = json_append(buf, p, max, "  \"soxr_available\": %s\n",
+                    resample_soxr_available() ? "true" : "false");
     p = json_append(buf, p, max, "}");
     return p;
 }
