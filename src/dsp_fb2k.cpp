@@ -35,6 +35,7 @@ extern "C" {
 /* Per-instance plugin state (opaque, defined in dsp_plugin.c) */
 typedef struct plugin_state plugin_state_t;
 
+#include "../include/resample.h"
 plugin_state_t *plugin_create(void);
 void            plugin_destroy(plugin_state_t *s);
 void            plugin_set_config(plugin_state_t *s, const dsd_config_t *cfg);
@@ -1155,15 +1156,59 @@ private:
             else
                 info << " -> " << g_output_names[out_idx] << " (1/" << (fs_in/fs_out) << " downsample)";
         } else if (is_dsd_input && rate_out_is_pcm(out_idx)) {
-            info << " -> " << g_output_names[out_idx] << " (1/" << (fs_in/fs_out) << " decimation)";
+            uint32_t ratio = fs_in / fs_out;
+            info << " -> " << g_output_names[out_idx] << " (1/" << ratio << " decimation)";
+        } else if (!is_dsd_input && rate_out_is_dsd(out_idx)) {
+            uint32_t ratio = fs_out / fs_in;
+            info << " -> " << g_output_names[out_idx] << " (" << ratio << "x upsample to DSD)";
+        } else if (!is_dsd_input && rate_out_is_pcm(out_idx)) {
+            if (fs_out > fs_in)
+                info << " -> " << g_output_names[out_idx] << " (" << (fs_out/fs_in) << "x upsample)";
+            else if (fs_out < fs_in)
+                info << " -> " << g_output_names[out_idx] << " (1/" << (fs_in/fs_out) << " downsample)";
+            else
+                info << " -> " << g_output_names[out_idx] << " (passthrough)";
         } else {
-            info << " -> " << g_output_names[out_idx] << " (" << (fs_out/fs_in) << "x upsample)";
+            info << " -> " << g_output_names[out_idx];
         }
 
         info << "\nFIR: " << pi.fir_stages << " stages, " << fir_ipp_kernel_name();
 
         if (pi.fir_only) {
             info << "\nFIR decimation only (no SDM)";
+            /* Show resampler for cross-family DSD→PCM */
+            bool dsd_in = is_dsd_input;
+            bool pcm_out_v = rate_out_is_pcm(out_idx);
+            if (dsd_in && pcm_out_v) {
+                bool in_48k = rate_idx_is_48k_family(idx);
+                bool out_48k = rate_is_48k_family(fs_out);
+                if (in_48k != out_48k) {
+                    uint32_t inter = in_48k ? 48000u : 44100u;
+                    while (inter * 2 <= fs_out && inter * 2 <= (in_48k ? 384000u : 352800u))
+                        inter *= 2;
+                    const char *rs = resample_soxr_available() ? "soxr" : "IPP";
+                    if (m_cfg.resample_engine == RESAMPLE_IPP) rs = "IPP";
+                    else if (m_cfg.resample_engine == RESAMPLE_SOXR) rs = "soxr";
+                    info << "\nCross-family: FIR→" << inter << "Hz → " << rs << " polyphase → " << fs_out << "Hz";
+                }
+            }
+        } else if (!is_dsd_input && rate_out_is_pcm(out_idx)) {
+            /* PCM→PCM path */
+            bool needs_poly = resample_needed(fs_in, fs_out);
+            if (needs_poly) {
+                const char *rs = resample_soxr_available() ? "soxr" : "IPP";
+                if (m_cfg.resample_engine == RESAMPLE_IPP) rs = "IPP";
+                else if (m_cfg.resample_engine == RESAMPLE_SOXR) rs = "soxr";
+                info << "\nPolyphase resampler: " << rs;
+                if (m_cfg.resample_engine != RESAMPLE_IPP && resample_soxr_available()) {
+                    static const char *sq[] = { "Medium", "High", "Very High" };
+                    int qi = m_cfg.soxr_quality;
+                    if (qi < 0 || qi > 2) qi = 1;
+                    info << " (" << sq[qi] << ")";
+                }
+            } else {
+                info << "\nFIR chain (power-of-2 ratio, no SDM)";
+            }
         } else {
             const char *sdm_name = (sdm_mode == SDM_MODE_TRELLIS) ? "Trellis" : "PreCorr";
             info << "\nSDM: " << sdm_name;
@@ -1441,9 +1486,8 @@ private:
                                 use_fir, &result);
             }
         } else {
-            /* PCM output: measure FIR decimation or resample SINAD.
-             * For now, show path info without full quality metrics. */
-            /* TODO: implement PCM output quality measurement */
+            /* PCM output: no SDM quality to measure.
+             * Show path info with FIR/resampler details instead. */
         }
 
         ::EnableWindow(GetDlgItem(IDC_BTN_TEST_SINAD), TRUE);
