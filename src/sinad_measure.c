@@ -117,7 +117,9 @@ static double measure_multitone(uint32_t dsd_rate, const ntf_filter_t *f,
 
     /* Feed clean analog multitone directly to SDM (like theoretical SINAD).
      * DSD-quantized input gives ~6 dB (1-bit noise limit, not meaningful). */
-    double amp = 0.5 / 32.0;
+    /* Amplitude per tone: 0.5/sqrt(32) gives total RMS ≈ 0.5.
+     * Each tone is ~20 dB above the SDM noise floor. */
+    double amp = 0.5 / sqrt(32.0);
     for (unsigned i = 0; i < n_dsd; i++) {
         double s = 0.0;
         for (int t = 0; t < 32; t++)
@@ -230,41 +232,6 @@ static double measure_noise_modulation(uint32_t dsd_rate, const ntf_filter_t *f,
     return max_nf - min_nf;
 }
 
-/* ─── Simple radix-2 FFT ─── */
-
-static void fft_radix2(double *re, double *im, int n) {
-    /* Bit-reversal permutation */
-    for (int i = 1, j = 0; i < n; i++) {
-        int bit = n >> 1;
-        while (j & bit) { j ^= bit; bit >>= 1; }
-        j ^= bit;
-        if (i < j) {
-            double t;
-            t = re[i]; re[i] = re[j]; re[j] = t;
-            t = im[i]; im[i] = im[j]; im[j] = t;
-        }
-    }
-    /* Cooley-Tukey */
-    for (int len = 2; len <= n; len <<= 1) {
-        double ang = -2.0 * M_PI / len;
-        double wre = cos(ang), wim = sin(ang);
-        for (int i = 0; i < n; i += len) {
-            double ure = 1.0, uim = 0.0;
-            for (int j = 0; j < len / 2; j++) {
-                double tre = re[i+j+len/2]*ure - im[i+j+len/2]*uim;
-                double tim = re[i+j+len/2]*uim + im[i+j+len/2]*ure;
-                re[i+j+len/2] = re[i+j] - tre;
-                im[i+j+len/2] = im[i+j] - tim;
-                re[i+j] += tre;
-                im[i+j] += tim;
-                double t = ure*wre - uim*wim;
-                uim = ure*wim + uim*wre;
-                ure = t;
-            }
-        }
-    }
-}
-
 /* ─── NMR (Noise-to-Mask Ratio) ─── */
 
 /* Bark critical band edge frequencies (25 bands) */
@@ -274,90 +241,50 @@ static const double g_bark_edges[26] = {
     9500, 12000, 15500, 20000
 };
 
-/* NMR thread work structure */
-typedef struct {
-    const float *dsd_out;
-    size_t       produced;
-    uint32_t     dsd_rate;
-    double       freq;
-    double       result_nmr;
-} nmr_work_t;
-
-static DWORD WINAPI nmr_thread(LPVOID param) {
-    nmr_work_t *w = (nmr_work_t *)param;
-    w->result_nmr = -999.0;
-
-    /* Decimate output DSD to ~48kHz via FIR chain */
-    /* Use closest integer ratio to 48kHz: DSD64→44.1k (64x) */
-    uint32_t target = 44100;
-    fir_chain_t dec_ch;
-    memset(&dec_ch, 0, sizeof(dec_ch));
-    if (fir_chain_init(&dec_ch, w->dsd_rate, target) != 0)
-        return 1;
-
-    size_t pcm_sz = w->produced;  /* large enough for intermediates */
-    float *pcm = (float *)calloc(pcm_sz, sizeof(float));
-    if (!pcm) { fir_chain_free(&dec_ch); return 1; }
-
-    size_t pcm_n = fir_chain_process(&dec_ch, w->dsd_out, pcm, w->produced);
-    fir_chain_free(&dec_ch);
-
-    if (pcm_n < 4096) { free(pcm); return 1; }
-
-    /* Take 4096 samples for FFT (skip warmup) */
-    size_t fft_n = 4096;
-    size_t skip = 512;
-    if (skip + fft_n > pcm_n) skip = 0;
-    if (fft_n > pcm_n - skip) { free(pcm); return 1; }
-
-    /* Generate reference sine at target rate */
-    double *ref_re = (double *)calloc(fft_n, sizeof(double));
-    double *ref_im = (double *)calloc(fft_n, sizeof(double));
-    double *tst_re = (double *)calloc(fft_n, sizeof(double));
-    double *tst_im = (double *)calloc(fft_n, sizeof(double));
-    if (!ref_re || !ref_im || !tst_re || !tst_im) {
-        free(ref_re); free(ref_im); free(tst_re); free(tst_im);
-        free(pcm); return 1;
-    }
-
-    for (size_t i = 0; i < fft_n; i++) {
-        ref_re[i] = 0.5 * sin(2.0 * M_PI * w->freq * (double)i / (double)target);
-        tst_re[i] = (double)pcm[skip + i];
-    }
-
-    /* FFT both */
-    fft_radix2(ref_re, ref_im, (int)fft_n);
-    fft_radix2(tst_re, tst_im, (int)fft_n);
-
-    /* Compute NMR per Bark band */
-    double bw = (double)target / (double)fft_n;
+/* NMR: Noise-to-Mask Ratio using Goertzel on raw DSD (no FIR decimation).
+ * Computes signal and noise energy per Bark band using Goertzel,
+ * then compares noise against a simplified masking threshold. */
+static double measure_nmr(const float *out, size_t produced, double freq,
+                           uint32_t dsd_rate) {
+    double actual_bw = (double)dsd_rate / (double)produced;
     double total_nmr = 0.0;
     int band_count = 0;
 
     for (int band = 0; band < 25; band++) {
         double f_lo = g_bark_edges[band];
         double f_hi = g_bark_edges[band + 1];
-        unsigned bin_lo = (unsigned)(f_lo / bw + 0.5);
-        unsigned bin_hi = (unsigned)(f_hi / bw + 0.5);
-        if (bin_hi > fft_n / 2) bin_hi = (unsigned)(fft_n / 2);
+        if (f_hi > 20000.0) f_hi = 20000.0;
+        unsigned bin_lo = (unsigned)(f_lo / actual_bw + 0.5);
+        unsigned bin_hi = (unsigned)(f_hi / actual_bw + 0.5);
+        if (bin_lo < 1) bin_lo = 1;
         if (bin_lo >= bin_hi) continue;
 
-        /* Reference energy in this band */
-        double ref_energy = 0.0;
-        for (unsigned b = bin_lo; b < bin_hi; b++) {
-            ref_energy += ref_re[b]*ref_re[b] + ref_im[b]*ref_im[b];
-        }
+        /* Signal bin in this band? */
+        unsigned sig_bin = (unsigned)(freq / actual_bw + 0.5);
+        int has_signal = (sig_bin >= bin_lo && sig_bin < bin_hi);
 
-        /* Noise energy = |ref - test|² per bin */
+        /* Sum energy in this band */
+        double band_energy = 0.0;
         double noise_energy = 0.0;
         for (unsigned b = bin_lo; b < bin_hi; b++) {
-            double dr = ref_re[b] - tst_re[b];
-            double di = ref_im[b] - tst_im[b];
-            noise_energy += dr*dr + di*di;
+            double pwr = goertzel_power(out, produced, b * actual_bw, (double)dsd_rate);
+            band_energy += pwr;
+            /* Exclude signal bin from noise */
+            if (!(b >= sig_bin - 1 && b <= sig_bin + 1))
+                noise_energy += pwr;
         }
 
-        /* Masking threshold: simplified — reference energy / 100 (-20 dB below) */
-        double mask = ref_energy * 0.01;
+        /* Masking threshold: simplified spreading function.
+         * Signal energy in this band masks noise up to -20 dB below. */
+        double mask;
+        if (has_signal) {
+            double sig_pwr = goertzel_power(out, produced, freq, (double)dsd_rate);
+            mask = sig_pwr * 0.01;  /* -20 dB below signal */
+        } else {
+            /* Non-signal bands: use absolute hearing threshold
+             * (simplified: -60 dB relative to full scale) */
+            mask = 1e-6;
+        }
         if (mask <= 0.0) mask = 1e-30;
 
         if (noise_energy > 0.0) {
@@ -366,12 +293,7 @@ static DWORD WINAPI nmr_thread(LPVOID param) {
         }
     }
 
-    if (band_count > 0)
-        w->result_nmr = total_nmr / (double)band_count;
-
-    free(ref_re); free(ref_im); free(tst_re); free(tst_im);
-    free(pcm);
-    return 0;
+    return (band_count > 0) ? total_nmr / (double)band_count : -999.0;
 }
 
 /* ─── Main measurement function ─── */
@@ -433,22 +355,7 @@ void sinad_measure(uint32_t dsd_rate, int ntf_id,
                 out, produced, freq, dsd_rate, &result->sinad_awtd_theo);
 
             /* ── Metric 4: NMR on theoretical output ── */
-            {
-                nmr_work_t work;
-                work.dsd_out = out;
-                work.produced = produced;
-                work.dsd_rate = dsd_rate;
-                work.freq = freq;
-                work.result_nmr = -999.0;
-
-                HANDLE h = CreateThread(NULL, 4 * 1024 * 1024,
-                                         nmr_thread, &work, 0, NULL);
-                if (h) {
-                    WaitForSingleObject(h, 30000);
-                    CloseHandle(h);
-                    result->nmr_db = work.result_nmr;
-                }
-            }
+            result->nmr_db = measure_nmr(out, produced, freq, dsd_rate);
         }
 
         result->ok = 1;
