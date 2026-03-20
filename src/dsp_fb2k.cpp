@@ -404,7 +404,7 @@ static const GUID g_dsp_guid =
 /* ─── Preset serialization using dsp_preset_builder/parser ─── */
 
 static void make_preset(const dsd_config_t &cfg, dsp_preset &out) {
-    uint8_t buf[256];
+    uint8_t buf[512];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     out.set_owner(g_dsp_guid);
     out.set_data(buf, len);
@@ -1388,46 +1388,24 @@ private:
         return found;
     }
 
-    /* ─── Test SINAD button ─── */
+    /* ─── Test Quality button ─── */
 
     void OnTestSinad(UINT, int, CWindow) {
-        /* Use ListView selection, not m_editRow (which requires dropdown interaction) */
         int row = m_listRate.GetNextItem(-1, LVNI_SELECTED);
         if (row < 0 || row >= RATE_MAP_COUNT) {
             ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO,
                 "Select a rate mapping first.");
             return;
         }
-        uint8_t out_idx = m_cfg.rate_map[rowToIdx(row)];
+        int idx = rowToIdx(row);
+        uint8_t out_idx = m_cfg.rate_map[idx];
         if (out_idx == RATE_OUT_BYPASS) return;
 
-        uint32_t fs_in = rate_idx_to_hz(row);
-
+        uint32_t fs_in = rate_idx_to_hz(idx);
         uint32_t fs_out = rate_out_to_hz(out_idx);
-        if (fs_out == 0 || !rate_out_is_dsd(out_idx)) {
-            ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO,
-                "SINAD test only for DSD same-rate re-encode paths.");
-            return;
-        }
+        if (fs_out == 0) return;
 
-        /* Only same-rate for now */
-        if (fs_in != fs_out) {
-            ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO,
-                "SINAD test currently supports same-rate re-encode only.");
-            return;
-        }
-
-        /* Resolve path params */
-        int8_t ntf_val = m_cfg.rate_ntf[rowToIdx(row)];
-        int sdm_mode = (m_cfg.rate_sdm[rowToIdx(row)] >= 0) ? (int)m_cfg.rate_sdm[rowToIdx(row)] : m_cfg.sdm_mode;
-        engine_path_info_t pi;
-        engine_get_path_info(fs_in, fs_out, (int)ntf_val, sdm_mode, &m_cfg, &pi);
-
-        if (pi.fir_only) {
-            ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO,
-                "SINAD test not applicable for FIR-only paths.");
-            return;
-        }
+        bool out_is_dsd_val = rate_out_is_dsd(out_idx);
 
         /* Pause playback */
         {
@@ -1436,32 +1414,41 @@ private:
                 pc->pause(true);
         }
 
-        /* Determine FIR mode */
-        int fir_mode_raw = m_cfg.rate_fir_mode[rowToIdx(row)];
-        int use_fir = (fir_mode_raw == FIR_MODE_FIR) ? 1 :
-                      (fir_mode_raw == FIR_MODE_BOXCAR) ? 0 :
-                      (sdm_mode == SDM_MODE_TRELLIS) ? 1 : 0;
-        float fir_gain = fir_gain_db_to_linear(m_cfg.fir_gain_db);
-
         /* Show measuring... */
         ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, "Measuring quality...");
         ::EnableWindow(GetDlgItem(IDC_BTN_TEST_SINAD), FALSE);
-        /* Force repaint so user sees "Measuring..." */
         UpdateWindow();
 
-        /* Run measurement */
-        sinad_result_t result;
-        sinad_measure(fs_out, pi.ntf_filter, pi.cands, pi.depth, pi.lat,
-                      use_fir, fir_gain, &result);
+        if (out_is_dsd_val) {
+            /* DSD output: full quality measurement (SINAD, A-wtd, multitone, NMod, NMR) */
+            int8_t ntf_val = m_cfg.rate_ntf[idx];
+            int sdm_mode = (m_cfg.rate_sdm[idx] >= 0) ? (int)m_cfg.rate_sdm[idx] : m_cfg.sdm_mode;
+            engine_path_info_t pi;
+            engine_get_path_info(fs_in, fs_out, (int)ntf_val, sdm_mode, &m_cfg, &pi);
+
+            int fir_mode_raw = m_cfg.rate_fir_mode[idx];
+            int use_fir = (fir_mode_raw == FIR_MODE_FIR) ? 1 :
+                          (fir_mode_raw == FIR_MODE_BOXCAR) ? 0 :
+                          (sdm_mode == SDM_MODE_TRELLIS) ? 1 : 0;
+            float fir_gain = fir_gain_db_to_linear(m_cfg.fir_gain_db);
+
+            sinad_result_t result;
+            sinad_measure(fs_out, pi.ntf_filter, pi.cands, pi.depth, pi.lat,
+                          use_fir, fir_gain, &result);
+
+            if (result.ok) {
+                SaveSinadResult(row, pi.ntf_filter, pi.cands, pi.depth, pi.lat,
+                                use_fir, &result);
+            }
+        } else {
+            /* PCM output: measure FIR decimation or resample SINAD.
+             * For now, show path info without full quality metrics. */
+            /* TODO: implement PCM output quality measurement */
+        }
 
         ::EnableWindow(GetDlgItem(IDC_BTN_TEST_SINAD), TRUE);
 
-        if (result.ok) {
-            SaveSinadResult(row, pi.ntf_filter, pi.cands, pi.depth, pi.lat,
-                            use_fir, &result);
-        }
-
-        /* Refresh Path Info (will include cached result) */
+        /* Refresh Path Info (will include cached result for DSD paths) */
         UpdatePathInfo(row);
     }
 
