@@ -29,6 +29,7 @@ extern "C" {
 #include "../include/engine.h"
 #include "../include/ntf.h"
 #include "../include/tusbaudio.h"
+#include "../include/sinad_measure.h"
 #include "build_version.h"
 
 /* Per-instance plugin state (opaque, defined in dsp_plugin.c) */
@@ -431,6 +432,7 @@ public:
         COMMAND_HANDLER_EX(IDC_COMBO_ML_EP, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_CHECK_GPU_ENABLED, BN_CLICKED, OnGpuChange)
         COMMAND_HANDLER_EX(IDC_COMBO_GPU_BACKEND, CBN_SELCHANGE, OnChange)
+        COMMAND_HANDLER_EX(IDC_BTN_TEST_SINAD, BN_CLICKED, OnTestSinad)
         COMMAND_HANDLER_EX(IDC_EDIT_THREADS, EN_CHANGE, OnEditChange)
         COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_EDIT, CBN_SELCHANGE, OnRateMapEditChange)
         COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_EDIT, CBN_KILLFOCUS, OnComboKillFocus)
@@ -1132,7 +1134,239 @@ private:
             }
         }
 
+        /* Append cached SINAD result if available */
+        {
+            char cached[128];
+            if (LoadCachedSinad(row, pi.ntf_filter, pi.cands, pi.depth, pi.lat,
+                                cached, sizeof(cached)))
+                info << "\n" << cached;
+        }
+
         ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, info);
+    }
+
+    /* ─── SINAD JSON cache ─── */
+
+    void GetSinadJsonPath(char *path, size_t sz) {
+        /* Same directory as the DLL */
+        char dll_path[MAX_PATH];
+        GetModuleFileNameA(core_api::get_my_instance(), dll_path, MAX_PATH);
+        char *last_sep = strrchr(dll_path, '\\');
+        if (last_sep) *(last_sep + 1) = '\0';
+        snprintf(path, sz, "%sfoo_dsd_trellis_sinad.json", dll_path);
+    }
+
+    void SaveSinadResult(int row, int ntf_id, int cands, int depth, int lat,
+                          int fir_mode, double sinad_db, double sinad_theo) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char ts[32];
+        snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d",
+                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+        char path[MAX_PATH];
+        GetSinadJsonPath(path, sizeof(path));
+
+        /* Read existing file */
+        char *existing = NULL;
+        size_t existing_len = 0;
+        {
+            FILE *f = fopen(path, "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                existing_len = (size_t)ftell(f);
+                fseek(f, 0, SEEK_SET);
+                existing = (char *)malloc(existing_len + 1);
+                if (existing) {
+                    fread(existing, 1, existing_len, f);
+                    existing[existing_len] = '\0';
+                }
+                fclose(f);
+            }
+        }
+
+        /* Build new entry */
+        char entry[512];
+        snprintf(entry, sizeof(entry),
+            "{\"row\":%d,\"ntf\":%d,\"nc\":%d,\"depth\":%d,\"lat\":%d,"
+            "\"fir\":%d,\"sinad\":%.1f,\"theo\":%.1f,\"ts\":\"%s\"}",
+            row, ntf_id, cands, depth, lat, fir_mode, sinad_db, sinad_theo, ts);
+
+        /* Write file: simple array of entries */
+        FILE *f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "[\n");
+            /* Copy existing entries (skip matching row+params) */
+            if (existing) {
+                char *p = existing;
+                while ((p = strstr(p, "{\"row\":")) != NULL) {
+                    char *end = strchr(p, '}');
+                    if (!end) break;
+                    end++;
+                    /* Check if this entry matches our row */
+                    int erow = -1;
+                    sscanf(p, "{\"row\":%d", &erow);
+                    if (erow != row) {
+                        fprintf(f, "  %.*s,\n", (int)(end - p), p);
+                    }
+                    p = end;
+                }
+            }
+            fprintf(f, "  %s\n", entry);
+            fprintf(f, "]\n");
+            fclose(f);
+        }
+        free(existing);
+    }
+
+    bool LoadCachedSinad(int row, int ntf_id, int cands, int depth, int lat,
+                          char *out, size_t out_sz) {
+        char path[MAX_PATH];
+        GetSinadJsonPath(path, sizeof(path));
+
+        FILE *f = fopen(path, "rb");
+        if (!f) return false;
+
+        fseek(f, 0, SEEK_END);
+        size_t len = (size_t)ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char *buf = (char *)malloc(len + 1);
+        if (!buf) { fclose(f); return false; }
+        fread(buf, 1, len, f);
+        buf[len] = '\0';
+        fclose(f);
+
+        /* Scan for matching entry */
+        bool found = false;
+        char *p = buf;
+        while ((p = strstr(p, "{\"row\":")) != NULL) {
+            int erow, entf, enc, edepth, elat, efir;
+            double esinad;
+            char ets[32] = "";
+            if (sscanf(p, "{\"row\":%d,\"ntf\":%d,\"nc\":%d,\"depth\":%d,"
+                       "\"lat\":%d,\"fir\":%d,\"sinad\":%lf",
+                       &erow, &entf, &enc, &edepth, &elat, &efir, &esinad) == 7) {
+                if (erow == row && entf == ntf_id && enc == cands &&
+                    edepth == depth && elat == lat) {
+                    /* Extract theoretical SINAD */
+                    double etheo = -999.0;
+                    char *theo_start = strstr(p, "\"theo\":");
+                    if (theo_start)
+                        sscanf(theo_start, "\"theo\":%lf", &etheo);
+                    /* Extract timestamp */
+                    char *ts_start = strstr(p, "\"ts\":\"");
+                    if (ts_start) {
+                        ts_start += 6;
+                        char *ts_end = strchr(ts_start, '"');
+                        if (ts_end) {
+                            size_t ts_len = (size_t)(ts_end - ts_start);
+                            if (ts_len < sizeof(ets))
+                                memcpy(ets, ts_start, ts_len);
+                        }
+                    }
+                    if (etheo > -900.0)
+                        snprintf(out, out_sz, "SINAD: %.1f dB re-encode | %.1f dB theoretical (%s)",
+                                 esinad, etheo, ets);
+                    else
+                        snprintf(out, out_sz, "SINAD: %.1f dB (%s)", esinad, ets);
+                    found = true;
+                }
+            }
+            p++;
+        }
+        free(buf);
+        return found;
+    }
+
+    /* ─── Test SINAD button ─── */
+
+    void OnTestSinad(UINT, int, CWindow) {
+        /* Use ListView selection, not m_editRow (which requires dropdown interaction) */
+        int row = m_listRate.GetNextItem(-1, LVNI_SELECTED);
+        if (row < 0 || row >= RATE_MAP_COUNT) {
+            ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO,
+                "Select a rate mapping first.");
+            return;
+        }
+        uint8_t out_idx = m_cfg.rate_map[row];
+        if (out_idx == RATE_OUT_BYPASS) return;
+
+        uint32_t fs_in = 0;
+        switch (row) {
+        case RATEIDX_44100:  fs_in = 44100;       break;
+        case RATEIDX_48000:  fs_in = 48000;       break;
+        case RATEIDX_88200:  fs_in = 88200;       break;
+        case RATEIDX_96000:  fs_in = 96000;       break;
+        case RATEIDX_176400: fs_in = 176400;      break;
+        case RATEIDX_192000: fs_in = 192000;      break;
+        case RATEIDX_352800: fs_in = 352800;      break;
+        case RATEIDX_384000: fs_in = 384000;      break;
+        case RATEIDX_DSD64:  fs_in = DSD_RATE_64; break;
+        case RATEIDX_DSD128: fs_in = DSD_RATE_128; break;
+        case RATEIDX_DSD256: fs_in = DSD_RATE_256; break;
+        case RATEIDX_DSD512: fs_in = DSD_RATE_512; break;
+        }
+
+        uint32_t fs_out = rate_out_to_hz(out_idx);
+        if (fs_out == 0 || !rate_out_is_dsd(out_idx)) {
+            ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO,
+                "SINAD test only for DSD same-rate re-encode paths.");
+            return;
+        }
+
+        /* Only same-rate for now */
+        if (fs_in != fs_out) {
+            ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO,
+                "SINAD test currently supports same-rate re-encode only.");
+            return;
+        }
+
+        /* Resolve path params */
+        int8_t ntf_val = m_cfg.rate_ntf[row];
+        int sdm_mode = (m_cfg.rate_sdm[row] >= 0) ? (int)m_cfg.rate_sdm[row] : m_cfg.sdm_mode;
+        engine_path_info_t pi;
+        engine_get_path_info(fs_in, fs_out, (int)ntf_val, sdm_mode, &m_cfg, &pi);
+
+        if (pi.fir_only) {
+            ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO,
+                "SINAD test not applicable for FIR-only paths.");
+            return;
+        }
+
+        /* Pause playback */
+        {
+            static_api_ptr_t<playback_control> pc;
+            if (pc->is_playing() && !pc->is_paused())
+                pc->pause(true);
+        }
+
+        /* Determine FIR mode */
+        int fir_mode_raw = m_cfg.rate_fir_mode[row];
+        int use_fir = (fir_mode_raw == FIR_MODE_FIR) ? 1 :
+                      (fir_mode_raw == FIR_MODE_BOXCAR) ? 0 :
+                      (sdm_mode == SDM_MODE_TRELLIS) ? 1 : 0;
+        float fir_gain = fir_gain_db_to_linear(m_cfg.fir_gain_db);
+
+        /* Show measuring... */
+        ::uSetDlgItemText(*this, IDC_STATIC_PATH_INFO, "Measuring SINAD...");
+        ::EnableWindow(GetDlgItem(IDC_BTN_TEST_SINAD), FALSE);
+        /* Force repaint so user sees "Measuring..." */
+        UpdateWindow();
+
+        /* Run measurement */
+        sinad_result_t result;
+        sinad_measure(fs_out, pi.ntf_filter, pi.cands, pi.depth, pi.lat,
+                      use_fir, fir_gain, &result);
+
+        ::EnableWindow(GetDlgItem(IDC_BTN_TEST_SINAD), TRUE);
+
+        if (result.ok) {
+            SaveSinadResult(row, pi.ntf_filter, pi.cands, pi.depth, pi.lat,
+                            use_fir, result.sinad_db, result.sinad_theoretical);
+        }
+
+        /* Refresh Path Info (will include cached result) */
+        UpdatePathInfo(row);
     }
 
     /* Set Auto text (plain "Auto") for any Auto columns in a row. */

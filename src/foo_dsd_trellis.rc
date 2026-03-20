@@ -19,7 +19,8 @@ BEGIN
     CONTROL         "Debug log (foo_dsd_trellis.log)", IDC_CHECK_DEBUG_LOG, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 270, 180, 130, 10
 
     GROUPBOX        "Path Info", -1, 8, 198, 384, 104
-    LTEXT           "Select a rate mapping to see path details.", IDC_STATIC_PATH_INFO, 16, 210, 368, 86
+    LTEXT           "Select a rate mapping to see path details.", IDC_STATIC_PATH_INFO, 16, 210, 308, 86
+    PUSHBUTTON      "Test SINAD", IDC_BTN_TEST_SINAD, 330, 210, 54, 14
 
     CONTROL         "Anti-pop lead-in", IDC_CHECK_ANTIPOP, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 310, 80, 10
 

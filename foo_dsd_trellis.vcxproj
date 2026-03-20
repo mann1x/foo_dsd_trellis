@@ -204,6 +204,9 @@
     <ClCompile Include="src\cpuset.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\sinad_measure.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\httpapi.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>

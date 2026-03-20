@@ -22,6 +22,7 @@
 #define IDC_CHECK_GPU_ENABLED       1030
 #define IDC_COMBO_GPU_BACKEND       1031
 #define IDC_STATIC_GPU_INFO         1032
+#define IDC_BTN_TEST_SINAD          1033
 
 // Next default values for new objects
 //
