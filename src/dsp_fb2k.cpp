@@ -48,6 +48,10 @@ size_t          plugin_process_pcm(plugin_state_t *s,
                                     const float *in_pcm, uint8_t *out_i24,
                                     size_t pcm_frames, int num_channels,
                                     uint32_t pcm_rate);
+size_t          plugin_process_pcm_to_pcm(plugin_state_t *s,
+                                          const float *in_pcm, float *out_pcm,
+                                          size_t pcm_frames, int num_channels,
+                                          uint32_t pcm_rate_in, uint32_t pcm_rate_out);
 size_t          plugin_drain(plugin_state_t *s, uint8_t *out_i24,
                              int num_channels);
 size_t          plugin_generate_tail(plugin_state_t *s, uint8_t *out_i24,
@@ -1735,12 +1739,19 @@ public:
             out_frames = plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
                                         pcm_frames, (int)channels, pcm_rate);
 
-        } else if (out_is_pcm) {
+        } else if (out_is_pcm && !is_dop) {
             /* PCM→PCM rate conversion (FIR-only or polyphase) */
             if (!m_logged_processing)
                 trellis_log("PCM %uHz -> PCM %uHz, %uch", pcm_rate, out_rate, channels);
-            /* TODO: implement plugin_process_pcm_to_pcm() */
-            out_frames = 0;  /* placeholder until resampler is implemented */
+
+            /* PCM→PCM output is float, not DoP i24. Reuse out_buf as float. */
+            float *pcm_out = (float *)(void *)out_buf.get_ptr();
+            out_frames = plugin_process_pcm_to_pcm(m_state, in_f32.get_ptr(), pcm_out,
+                                                    pcm_frames, (int)channels,
+                                                    pcm_rate, out_rate);
+            if (!m_logged_processing && out_frames > 0)
+                trellis_log("PCM->PCM: in=%u @ %uHz, out=%u @ %uHz",
+                            (unsigned)pcm_frames, pcm_rate, (unsigned)out_frames, out_rate);
 
         } else {
             /* PCM input — convert to DSD */
@@ -1965,13 +1976,65 @@ public:
         }
 
         if (out_is_pcm) {
-            /* PCM output: data is float, convert to audio_sample */
+            /* PCM output: apply bit depth conversion and optional dither.
+             * Resolve per-rate override or global setting. */
+            int8_t bits_cfg = chunk_cfg.rate_pcm_bits[map_idx];
+            if (bits_cfg == PCM_BIT_AUTO) bits_cfg = chunk_cfg.pcm_bit_depth;
+            int8_t dith_cfg = chunk_cfg.rate_pcm_dither[map_idx];
+            if (dith_cfg == PCM_DITHER_AUTO) dith_cfg = chunk_cfg.pcm_dither;
+
             const float *pcm_f = (const float *)out_buf.get_ptr();
-            pfc::array_staticsize_t<audio_sample> pcm_as;
-            pcm_as.set_size_discard(total_out);
-            for (size_t i = 0; i < total_out; i++)
-                pcm_as[i] = (audio_sample)pcm_f[i];
-            chunk->set_data(pcm_as.get_ptr(), out_frames, channels, out_pcm_rate);
+
+            if (bits_cfg == PCM_BIT_16 || bits_cfg == PCM_BIT_24 || bits_cfg == PCM_BIT_32) {
+                int bit_depth = (bits_cfg == PCM_BIT_16) ? 16 :
+                                (bits_cfg == PCM_BIT_32) ? 32 : 24;
+                /* Quantize float to fixed-point with optional dither */
+                double scale = (double)((1 << (bit_depth - 1)) - 1);
+                double inv_scale = 1.0 / scale;
+                pfc::array_staticsize_t<audio_sample> pcm_as;
+                pcm_as.set_size_discard(total_out);
+
+                static unsigned dither_seed = 12345;
+                double dither_err = 0.0;  /* for noise-shaped dither */
+
+                for (size_t i = 0; i < total_out; i++) {
+                    double v = (double)pcm_f[i];
+                    double dither_val = 0.0;
+
+                    if (dith_cfg == PCM_DITHER_TPDF || dith_cfg == PCM_DITHER_AUTO) {
+                        /* TPDF dither: ±1 LSB triangular noise */
+                        dither_seed = dither_seed * 1664525u + 1013904223u;
+                        double r1 = ((double)(dither_seed >> 16) / 32768.0) - 1.0;
+                        dither_seed = dither_seed * 1664525u + 1013904223u;
+                        double r2 = ((double)(dither_seed >> 16) / 32768.0) - 1.0;
+                        dither_val = (r1 + r2) * inv_scale;
+                    } else if (dith_cfg == PCM_DITHER_SHAPED) {
+                        /* Noise-shaped: TPDF + first-order error feedback */
+                        dither_seed = dither_seed * 1664525u + 1013904223u;
+                        double r1 = ((double)(dither_seed >> 16) / 32768.0) - 1.0;
+                        dither_seed = dither_seed * 1664525u + 1013904223u;
+                        double r2 = ((double)(dither_seed >> 16) / 32768.0) - 1.0;
+                        dither_val = (r1 + r2) * inv_scale - dither_err;
+                    }
+
+                    double quantized = floor((v + dither_val) * scale + 0.5) * inv_scale;
+                    if (dith_cfg == PCM_DITHER_SHAPED)
+                        dither_err = quantized - v;
+
+                    /* Clamp to ±1.0 */
+                    if (quantized > 1.0) quantized = 1.0;
+                    if (quantized < -1.0) quantized = -1.0;
+                    pcm_as[i] = (audio_sample)quantized;
+                }
+                chunk->set_data(pcm_as.get_ptr(), out_frames, channels, out_pcm_rate);
+            } else {
+                /* Float output (default / Auto) — no quantization */
+                pfc::array_staticsize_t<audio_sample> pcm_as;
+                pcm_as.set_size_discard(total_out);
+                for (size_t i = 0; i < total_out; i++)
+                    pcm_as[i] = (audio_sample)pcm_f[i];
+                chunk->set_data(pcm_as.get_ptr(), out_frames, channels, out_pcm_rate);
+            }
         } else {
             /* DoP output: data is 24-bit signed LE, pass directly */
             chunk->set_data_fixedpoint_ex(

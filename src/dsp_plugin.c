@@ -26,6 +26,8 @@
 #include "../include/cpuset.h"
 #include "../include/onnx_filter.h"
 #include "../include/httpapi.h"
+#include "../include/fir.h"
+#include "../include/resample.h"
 
 /*
  * Plugin identity
@@ -1655,6 +1657,83 @@ size_t plugin_process_pcm(plugin_state_t *s,
     s->time_pack_ms = perf_ms(t_pack_start, t_pack_end);
 
     return out_pcm_frames;
+}
+
+/*
+ * Process an interleaved PCM chunk and convert to a different PCM sample rate.
+ * Same-family: uses FIR chain (power-of-2 ratio).
+ * Cross-family: uses IPP polyphase or libsoxr.
+ *
+ * in_pcm:      interleaved float32 PCM input
+ * out_pcm:     output float32 buffer (caller-allocated)
+ * pcm_frames:  number of PCM frames (per channel) in input
+ * num_channels: channel count
+ * pcm_rate_in: input PCM sample rate
+ * pcm_rate_out: output PCM sample rate
+ *
+ * Returns: number of output PCM frames per channel, or 0 on error.
+ */
+size_t plugin_process_pcm_to_pcm(plugin_state_t *s,
+                                  const float *in_pcm, float *out_pcm,
+                                  size_t pcm_frames, int num_channels,
+                                  uint32_t pcm_rate_in, uint32_t pcm_rate_out) {
+    if (!s || pcm_rate_in == 0 || pcm_rate_out == 0 || num_channels == 0)
+        return 0;
+
+    if (pcm_rate_in == pcm_rate_out) {
+        /* Passthrough — shouldn't reach here, but handle gracefully */
+        memcpy(out_pcm, in_pcm, pcm_frames * (size_t)num_channels * sizeof(float));
+        return pcm_frames;
+    }
+
+    bool needs_polyphase = resample_needed(pcm_rate_in, pcm_rate_out);
+
+    /* Estimate max output frames */
+    size_t max_out = (size_t)((double)pcm_frames * (double)pcm_rate_out / (double)pcm_rate_in) + 256;
+
+    /* Per-channel processing */
+    float *ch_in  = (float *)malloc(pcm_frames * sizeof(float));
+    float *ch_out = (float *)malloc(max_out * sizeof(float));
+    if (!ch_in || !ch_out) { free(ch_in); free(ch_out); return 0; }
+
+    size_t out_frames = 0;
+
+    for (int ch = 0; ch < num_channels; ch++) {
+        /* De-interleave */
+        for (size_t f = 0; f < pcm_frames; f++)
+            ch_in[f] = in_pcm[f * (size_t)num_channels + (size_t)ch];
+
+        size_t produced = 0;
+
+        if (needs_polyphase) {
+            /* Cross-family: polyphase resampler */
+            resample_ctx_t *rs = resample_create(pcm_rate_in, pcm_rate_out,
+                                                  s->config.resample_engine,
+                                                  s->config.soxr_quality);
+            if (!rs) { free(ch_in); free(ch_out); return 0; }
+            produced = resample_process(rs, ch_in, ch_out, pcm_frames);
+            resample_free(rs);
+        } else {
+            /* Same-family: FIR chain (power-of-2 ratio) */
+            fir_chain_t fir;
+            if (fir_chain_init(&fir, pcm_rate_in, pcm_rate_out) != 0) {
+                free(ch_in); free(ch_out);
+                return 0;
+            }
+            produced = fir_chain_process(&fir, ch_in, ch_out, pcm_frames);
+            fir_chain_free(&fir);
+        }
+
+        if (ch == 0) out_frames = produced;
+
+        /* Re-interleave */
+        for (size_t f = 0; f < produced; f++)
+            out_pcm[f * (size_t)num_channels + (size_t)ch] = ch_out[f];
+    }
+
+    free(ch_in);
+    free(ch_out);
+    return out_frames;
 }
 
 /*
