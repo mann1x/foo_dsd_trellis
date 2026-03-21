@@ -163,14 +163,14 @@ When `Resampler = Auto`, libsoxr is used if `soxr.dll` is present, otherwise fal
 
 ## Audio Quality Measurement
 
-The **Test Quality** button in the settings dialog and the `/api/test_sinad` REST endpoint run a comprehensive quality assessment of the SDM configuration for the selected DSD rate. Four complementary metrics evaluate different aspects of audio quality.
+The **Test Quality** button in the settings dialog runs a comprehensive quality assessment for any configured rate conversion path — DSD→DSD, DSD→PCM, PCM→PCM, and PCM→DSD. The `/api/test_sinad` REST endpoint provides the same measurement for DSD paths.
 
 ### How It Works
 
-1. **Test signal generation**: A bin-aligned ~1 kHz sine wave at 50% amplitude, encoded as clean analog (for SINAD/NMR) or as a 32-tone composite (for multitone)
-2. **SDM processing**: Signal is fed through the Trellis SDM with the selected NTF, candidates, depth, and latency settings
-3. **Analysis**: Goertzel algorithm measures signal and noise power across 0–20 kHz (the audible band)
-4. **Multiple amplitudes**: Noise modulation runs 4 passes at different signal levels to detect signal-dependent noise
+1. **Test signal generation**: A bin-aligned ~1 kHz sine wave at 50% amplitude. For DSD paths, encoded through a Trellis SDM; for PCM paths, generated directly as float32.
+2. **Processing**: Signal passes through the full conversion pipeline (FIR + SDM for DSD, FIR decimation for DSD→PCM, polyphase resampler for cross-family PCM)
+3. **Analysis**: Goertzel algorithm measures signal and noise power across 0–20 kHz. FIR startup transient skipped for accurate measurement.
+4. **Multiple signals**: Multitone uses 32 bin-aligned tones; noise modulation runs 4 passes at different amplitudes
 
 ### Metrics
 
@@ -256,13 +256,32 @@ Parameters: `rate` (DSD rate in Hz), `nc` (candidates), `depth`, `lat` (latency)
 
 ### Reference Results
 
-Measured with default auto settings (nc=2, depth=4):
+#### DSD Same-Rate Re-encode (nc=2, depth=4, auto NTF)
 
 | Rate | SINAD | A-wtd | Multitone | NMod | NMR |
 |------|-------|-------|-----------|------|-----|
-| DSD64 | 96.8 | 101.1 | 99.7 | 8.4 | −85.1 |
-| DSD128 | 129.4 | 134.6 | 101.2 | 9.8 | −117.2 |
-| DSD256 | 115.6 | 120.7 | 132.3 | 6.8 | −106.6 |
+| DSD64 | 102.5 | 105.2 | 89.1 | 4.3 | −87.7 |
+| DSD128 | 121.5 | 126.8 | 120.3 | 10.3 | −110.9 |
+| DSD256 | 112.0 | 117.1 | 132.5 | 15.7 | −103.5 |
+| DSD64/48 | 101.6 | 104.7 | 102.4 | 11.7 | −87.6 |
+
+#### DSD → PCM Decimation (FIR only, no SDM)
+
+| Path | SINAD | A-wtd | Multitone | NMod |
+|------|-------|-------|-----------|------|
+| DSD64 → PCM 44.1k | 104.7 | 106.9 | 93.6 | 3.7 |
+| DSD128 → PCM 88.2k | 132.6 | 134.2 | 114.0 | 4.6 |
+| DSD256 → PCM 176.4k | 133.9 | 135.7 | 117.4 | 3.5 |
+| DSD64/48 → PCM 48k | 105.4 | 107.6 | 93.9 | 2.8 |
+
+#### PCM → PCM Rate Conversion
+
+| Path | Method | SINAD | A-wtd | Multitone |
+|------|--------|-------|-------|-----------|
+| 44.1k → 88.2k | FIR (2×) | 146.4 | 148.5 | 138.9 |
+| 96k → 48k | FIR (÷2) | 146.1 | 148.2 | 141.1 |
+| 44.1k → 48k | soxr polyphase | 95.3 | 102.2 | 62.7 |
+| 96k → 88.2k | soxr polyphase | 104.4 | 106.5 | 78.7 |
 
 ## SINAD Results
 
@@ -322,30 +341,51 @@ Rate conversion uses production path_config values: per-path optimal NTF filter,
 
 ### DSD to PCM Decimation
 
-FIR-only decimation (no SDM re-encoding) for DSD-to-PCM conversion. Output is multi-bit float32 PCM. Measured with Goertzel SINAD on the steady-state portion (startup transient skipped).
+FIR-only decimation (no SDM re-encoding) for DSD-to-PCM conversion. Output is multi-bit float32 PCM. FIR startup transient skipped before measurement.
 
-| Input | Output | Ratio | SINAD (dB) |
-|-------|--------|-------|------------|
-| DSD64 | PCM 44.1k | 64x | 103.7 |
-| DSD64 | PCM 88.2k | 32x | 103.1 |
-| DSD64 | PCM 176.4k | 16x | 93.8 |
-| DSD128 | PCM 44.1k | 128x | 131.8 |
-| DSD128 | PCM 88.2k | 64x | 128.1 |
-| DSD128 | PCM 176.4k | 32x | 103.5 |
-| DSD256 | PCM 44.1k | 256x | 133.9 |
-| DSD256 | PCM 88.2k | 128x | 133.5 |
-| DSD256 | PCM 176.4k | 64x | 133.4 |
-| DSD512 | PCM 44.1k | 512x | 135.6 |
-| DSD512 | PCM 88.2k | 256x | 136.9 |
-| DSD512 | PCM 176.4k | 128x | 136.4 |
-| DSD512 | PCM 352.8k | 64x | 137.1 |
-| DSD64/48 | PCM 48k | 64x | 105.0 |
-| DSD128/48 | PCM 96k | 64x | 132.4 |
+| Input | Output | Ratio | SINAD (dB) | A-wtd (dB) |
+|-------|--------|-------|------------|------------|
+| DSD64 | PCM 44.1k | 64x | 104.7 | 106.9 |
+| DSD64 | PCM 88.2k | 32x | 103.0 | 104.8 |
+| DSD64 | PCM 176.4k | 16x | 85.7 | 87.5 |
+| DSD128 | PCM 44.1k | 128x | 131.9 | 133.5 |
+| DSD128 | PCM 88.2k | 64x | 132.3 | 134.0 |
+| DSD128 | PCM 176.4k | 32x | 121.1 | 123.0 |
+| DSD256 | PCM 44.1k | 256x | 134.0 | 135.6 |
+| DSD256 | PCM 88.2k | 128x | 133.6 | 135.2 |
+| DSD256 | PCM 176.4k | 64x | 133.5 | 135.1 |
+| DSD512 | PCM 44.1k | 512x | 135.8 | 137.4 |
+| DSD512 | PCM 88.2k | 256x | 136.8 | 138.4 |
+| DSD512 | PCM 176.4k | 128x | 136.3 | 137.9 |
+| DSD512 | PCM 352.8k | 64x | 136.6 | 138.2 |
+| DSD64/48 | PCM 48k | 64x | 105.0 | 107.2 |
+| DSD128/48 | PCM 96k | 64x | 132.4 | 134.0 |
 
 **Key observations:**
 - Higher input DSD rates yield better SINAD (more aggressive noise shaping, lower in-band noise)
-- DSD64->PCM176.4k shows lower SINAD (93.8 dB) because 176.4k's Nyquist (88.2 kHz) reaches into the noise shaping transition region
-- DSD128+ to PCM44.1k/88.2k all exceed 100 dB — well beyond CD quality
+- DSD64→PCM176.4k shows lower SINAD (85.7 dB) because 176.4k's Nyquist (88.2 kHz) reaches into the noise shaping transition region
+- DSD128+ to PCM44.1k/88.2k all exceed 120 dB — well beyond CD quality
+- A-weighted SINAD is 1.5–2 dB higher than flat (DSD noise concentrated at high frequencies)
+
+### PCM to PCM Rate Conversion
+
+Same-family conversions use the FIR half-band chain (power-of-2 ratio). Cross-family conversions use polyphase resampling (soxr preferred, IPP fallback).
+
+| Input | Output | Method | SINAD (dB) | A-wtd (dB) | Multitone (dB) |
+|-------|--------|--------|------------|------------|----------------|
+| 44.1k | 88.2k | FIR 2× | 146.4 | 148.5 | 138.9 |
+| 96k | 48k | FIR ÷2 | 146.1 | 148.2 | 141.1 |
+| 44.1k | 176.4k | FIR 4× | 130.1 | 132.0 | — |
+| 44.1k | 48k | soxr VHQ | 95.3 | 102.2 | 62.7 |
+| 48k | 44.1k | soxr VHQ | 102.4 | 108.8 | — |
+| 96k | 88.2k | soxr VHQ | 104.4 | 106.5 | 78.7 |
+| 44.1k | 48k | IPP polyphase | 72.1 | 74.0 | — |
+
+**Key observations:**
+- FIR same-family: ~146 dB SINAD — near float32 precision limit (24-bit mantissa)
+- soxr cross-family: 95–104 dB — excellent for arbitrary-ratio resampling
+- IPP cross-family: ~72 dB — adequate fallback when soxr.dll not available
+- With `Resampler = Auto` (default), soxr is used whenever soxr.dll is present
 
 ## Module Details
 
@@ -456,7 +496,7 @@ Per-channel orchestrator:
 
 ### Configuration (`config.c`)
 
-Runtime parameters serialized to foobar2000 config store (version 12):
+Runtime parameters serialized to foobar2000 config store (version 16):
 
 | Parameter | Type | Range | Default |
 |-----------|------|-------|---------|
@@ -470,6 +510,13 @@ Runtime parameters serialized to foobar2000 config store (version 12):
 | State limiter | per-rate | Auto / Off / 3-20 | Auto |
 | ML noise filter | per-rate | Auto / Off / On | Auto |
 | FIR gain | global | Auto (-3 dB) / 0 to -12 dB | Auto |
+| FIR mode | per-rate | Auto / Boxcar / FIR | Auto |
+| Trellis latency | per-rate | Auto / 16-512 | Auto |
+| GPU FIR | per-rate | Auto / Off / On | Auto |
+| PCM bit depth | global + per-rate | Auto (float) / 16 / 24 / 32 / Float | Auto |
+| PCM dither | global + per-rate | Auto / None / TPDF / Shaped | Auto |
+| Resampler | global | Auto / IPP / soxr | Auto |
+| soxr quality | global | Medium / High / Very High | High |
 | Anti-pop lead-in | bool | on/off | on |
 | Thread count | int | 0 (auto) - cores | 0 |
 | Input format | enum | Auto / DoP / Native | Auto |
@@ -513,7 +560,7 @@ foo_dsd_trellis/
 |-- src/
 |   |-- dsp_fb2k.cpp          fb2k DSP v2 C++ wrapper
 |   |-- dsp_plugin.c          Plugin state management
-|   |-- config.c              Configuration serialization (v12)
+|   |-- config.c              Configuration serialization (v16)
 |   |-- dop.c                 DoP detection, pack/unpack
 |   |-- bitpack.c             Native ASIO bitstream pack/unpack
 |   |-- engine.c              Per-channel processing orchestrator
@@ -525,6 +572,8 @@ foo_dsd_trellis/
 |   |-- simd_detect.c         CPU feature detection
 |   |-- cpuset.c              CPU topology and dynamic CPUSET
 |   |-- httpapi.c             REST API server
+|   |-- resample.c            Polyphase resampler (IPP + soxr runtime)
+|   |-- sinad_measure.c       Audio quality measurement engine
 |   |-- onnx_filter.c         ONNX ML post-filter (delay-loaded)
 |   |-- tusbaudio.c           TUSBAudio XMOS DAC integration
 |   +-- wav_io.c              WAV file read/write
@@ -540,6 +589,7 @@ foo_dsd_trellis/
 |   |-- simd_detect.h         CPU detection API
 |   |-- cpuset.h              CPU topology API
 |   |-- resample.h            Polyphase resampler API
+|   |-- sinad_measure.h       Quality measurement API
 |   |-- httpapi.h             REST API
 |   |-- onnx_filter.h         ONNX ML API
 |   |-- tusbaudio.h           TUSBAudio API
@@ -561,6 +611,7 @@ foo_dsd_trellis/
 |   |-- test_resample.c       Polyphase resampler tests (IPP + soxr)
 |   |-- test_validation.c     Rate map validation tests
 |   |-- test_dither.c         PCM dither and bit depth tests
+|   |-- test_quality.c        Quality metrics tests (all path types)
 |   +-- test_sinad_diag.c     Extended SINAD diagnostics
 |-- training_pipeline/         ML model training scripts (Python/PyTorch)
 |-- tools/
@@ -574,7 +625,7 @@ foo_dsd_trellis/
 
 ## Test Results
 
-954 tests across 17 suites, all passing:
+1016 tests across 18 suites, all passing:
 
 | Suite | Tag | Tests | Coverage |
 |-------|-----|-------|----------|
@@ -592,7 +643,8 @@ foo_dsd_trellis/
 | GPU Compute | `gpu` | — | DX11/DX12/CUDA FIR, boxcar, SDM kernels |
 | Resample | `resample` | 14 | IPP polyphase + soxr SINAD at all cross-family rate pairs |
 | Validation | `validation` | 150 | Rate map indices, family helpers, output rules for all 20×25 combinations |
-| Dither | `dither` | 6 | Truncation, TPDF, noise-shaped, 24-bit, float passthrough |
+| Dither | `dither` | 6 | Truncation (94 dB), TPDF (86 dB), noise-shaped, float passthrough |
+| Quality Metrics | `quality` | 62 | A-weight curve, DSD/DSD→PCM/PCM→PCM quality matrix (10 paths) |
 | Rate Conv Sweep | `sweep` | 6 | FIR-only SINAD, limiter sweep, NTF × limiter sweep (extended) |
 | SINAD Diagnostics | `diag` | 7 | NTF sweeps, warmup analysis (extended) |
 
