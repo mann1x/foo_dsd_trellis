@@ -134,15 +134,31 @@ __global__ void das_density_scan(
 }
 
 
-/* ─── Kernel 2: Gather-Assemble Stitched Output ─── */
+/* ─── Kernel 2: Gather-Assemble with Dithered Crossfade ─── */
 
 /* Grid:  (ceil(final_count / 256), num_channels, 1)
  * Block: (256, 1, 1)
  *
- * Each thread computes which segment its output sample comes from
- * using the stitch_positions array (computed from ch0, applied to all).
- * Reads from the correct segment output and writes to the final buffer.
+ * Assembles output from segments using stitch positions from ch0.
+ * At each stitch boundary, applies a dithered crossfade over a window
+ * of 'fade_width' samples to smooth the noise texture transition.
+ * Crossfade uses probability-weighted random bit selection:
+ *   p = position_in_fade / fade_width  (0→1)
+ *   output = (hash < p) ? seg_next : seg_prev
+ * This keeps output in ±1.0 DSD domain while smoothing transitions.
  */
+
+/* Fast deterministic hash for dithered crossfade.
+ * Produces uniform [0,1) from sample position + channel. */
+__device__ float das_hash(int pos, int ch, int boundary) {
+    unsigned h = (unsigned)pos * 2654435761u ^ (unsigned)ch * 2246822519u
+               ^ (unsigned)boundary * 3266489917u;
+    h ^= h >> 16;
+    h *= 0x45d9f3bu;
+    h ^= h >> 16;
+    return (float)(h & 0x7FFFFF) / 8388608.0f;  /* 23-bit mantissa → [0,1) */
+}
+
 __global__ void das_assemble(
     const float *seg_out,          /* all segment outputs [num_ch × total_cap] */
     float *final_out,              /* assembled output [num_ch × final_count] */
@@ -153,77 +169,114 @@ __global__ void das_assemble(
     int overlap_samples,
     int final_count,               /* output samples per channel */
     int ch_stride_seg,             /* per-channel stride in seg_out */
-    int ch_stride_final)           /* per-channel stride in final_out */
+    int ch_stride_final,           /* per-channel stride in final_out */
+    int fade_half_width)           /* half-width of crossfade window */
 {
     int gidx = blockIdx.x * blockDim.x + threadIdx.x;
     int ch   = blockIdx.y;
 
     if (gidx >= final_count) return;
 
-    /* Build cumulative boundary table in shared memory.
-     * cum_end[s] = number of final output samples from segments 0..s.
-     * Seg 0: takes D + stitch_positions[0] samples.
-     * Seg s (1..N-2): takes from stitch_pos[s-1] to D + stitch_pos[s] samples.
-     * Seg N-1 (last): takes from stitch_pos[N-2] to end. */
-    __shared__ int s_cum_end[512];  /* max 512 segments */
-    __shared__ int s_stitch[512];   /* cached stitch positions */
+    __shared__ int s_cum_end[512];
+    __shared__ int s_stitch[512];
 
     /* Cooperatively load stitch positions */
     for (int i = threadIdx.x; i < num_segs - 1; i += blockDim.x)
         s_stitch[i] = stitch_positions[i];
     __syncthreads();
 
-    /* Cooperatively build cumulative table */
+    /* Build cumulative boundary table */
     if (threadIdx.x == 0) {
         int cum = 0;
         for (int s = 0; s < num_segs; s++) {
             int seg_take;
-            if (s == 0) {
-                /* Seg 0: output samples [0 .. D + stitch_pos[0]) */
+            if (s == 0)
                 seg_take = D_output + (num_segs > 1 ? s_stitch[0] : 0);
-            } else if (s < num_segs - 1) {
-                /* Middle seg: output from stitch_pos[s-1] to D + stitch_pos[s] */
+            else if (s < num_segs - 1)
                 seg_take = D_output + s_stitch[s] - s_stitch[s - 1];
-            } else {
-                /* Last seg: output from stitch_pos[s-1] to end */
+            else
                 seg_take = final_count - cum;
-            }
             cum += seg_take;
             s_cum_end[s] = cum;
         }
     }
     __syncthreads();
 
-    /* Binary search to find which segment this output belongs to */
+    /* Binary search for source segment */
     int src_seg = 0;
     {
         int lo = 0, hi = num_segs - 1;
         while (lo < hi) {
             int mid = (lo + hi) / 2;
-            if (s_cum_end[mid] <= gidx)
-                lo = mid + 1;
-            else
-                hi = mid;
+            if (s_cum_end[mid] <= gidx) lo = mid + 1;
+            else hi = mid;
         }
         src_seg = lo;
     }
 
-    /* Compute offset within the source segment's output */
     int seg_start_in_final = (src_seg > 0) ? s_cum_end[src_seg - 1] : 0;
     int local_idx = gidx - seg_start_in_final;
+    int seg_take = s_cum_end[src_seg] - seg_start_in_final;
 
-    /* Compute read offset within the segment's output buffer.
-     * Seg 0: read from [0 + local_idx].
-     * Seg s (1+): read from [stitch_pos[s-1] + local_idx]. */
+    /* Read offset within source segment */
     int seg_read_offset;
-    if (src_seg == 0) {
+    if (src_seg == 0)
         seg_read_offset = local_idx;
-    } else {
+    else
         seg_read_offset = s_stitch[src_seg - 1] + local_idx;
+
+    int seg_base = ch * ch_stride_seg;
+    float val = seg_out[seg_base + seg_out_starts[src_seg] + seg_read_offset];
+
+    /* Dithered crossfade at stitch boundaries.
+     * For samples within fade_half_width of a boundary, blend between
+     * the previous and next segment's output using probabilistic selection. */
+    if (fade_half_width > 0) {
+        /* Check if we're near the END of this segment (transition to next) */
+        int dist_to_end = seg_take - 1 - local_idx;
+        if (src_seg < num_segs - 1 && dist_to_end < fade_half_width) {
+            /* Crossfade zone: transition from this segment to next.
+             * p = 0 at fade start (fully this seg), 1 at boundary (fully next). */
+            float p = 1.0f - (float)dist_to_end / (float)fade_half_width;
+            float rnd = das_hash(gidx, ch, src_seg);
+            if (rnd < p) {
+                /* Use next segment's sample instead */
+                int next_seg = src_seg + 1;
+                /* At the boundary, next seg starts at stitch[src_seg].
+                 * The sample we want from next seg is at the corresponding position. */
+                int boundary_pos = s_cum_end[src_seg];  /* absolute pos of boundary */
+                int abs_pos = seg_start_in_final + local_idx;
+                int into_next = abs_pos - (boundary_pos - fade_half_width);
+                int next_read = s_stitch[src_seg] - fade_half_width + into_next;
+                if (next_read >= 0 && next_read < D_output + overlap_samples)
+                    val = seg_out[seg_base + seg_out_starts[next_seg] + next_read];
+            }
+        }
+
+        /* Check if we're near the START of this segment (transition from prev) */
+        if (src_seg > 0 && local_idx < fade_half_width) {
+            /* Crossfade zone: transition from previous segment to this.
+             * p = 0 at boundary (fully prev seg), 1 at fade end (fully this seg). */
+            float p = (float)local_idx / (float)fade_half_width;
+            float rnd = das_hash(gidx, ch, src_seg - 1);
+            if (rnd > p) {
+                /* Use previous segment's sample instead */
+                int prev_seg = src_seg - 1;
+                /* Previous seg's output at this position */
+                int prev_read_base;
+                if (prev_seg == 0)
+                    prev_read_base = 0;
+                else
+                    prev_read_base = s_stitch[prev_seg - 1];
+                int prev_local = (seg_start_in_final + local_idx) -
+                                 (prev_seg > 0 ? s_cum_end[prev_seg - 1] : 0);
+                int prev_read = prev_read_base + prev_local;
+                if (prev_read >= 0 && prev_read < D_output + overlap_samples)
+                    val = seg_out[seg_base + seg_out_starts[prev_seg] + prev_read];
+            }
+        }
     }
 
-    /* Read from segment output, write to final output */
-    float val = seg_out[ch * ch_stride_seg + seg_out_starts[src_seg] + seg_read_offset];
     final_out[ch * ch_stride_final + gidx] = val;
 }
 

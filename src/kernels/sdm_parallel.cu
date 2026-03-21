@@ -63,7 +63,10 @@ __global__ void trellis_parallel_segments(
     const double *all_init_costs,  /* [num_segs * nc] replicated seed */
     double *all_final_states,      /* [num_segs * nc * 8] */
     double *all_final_costs,       /* [num_segs * nc] */
-    int *seg_actual_counts)        /* [num_ch * num_segs] actual output */
+    int *seg_actual_counts,        /* [num_ch * num_segs] actual output */
+    int D_nominal,                 /* snapshot trigger: save state at this output count */
+    double *all_mid_states,        /* [num_segs * nc * 8] state at output[D] (NULL=skip) */
+    double *all_mid_costs)         /* [num_segs * nc] cost at output[D] (NULL=skip) */
 {
     int seg = blockIdx.x;
     int ch  = blockIdx.y;
@@ -272,6 +275,14 @@ __global__ void trellis_parallel_segments(
         if (tid == 0 && hist_ready && s >= eff_M && out_idx < out_cap) {
             /* bit=1 → y=+1.0, bit=0 → y=-1.0 (matches CPU convention) */
             seg_out[out_idx++] = s_output_bit ? 1.0f : -1.0f;
+        }
+        /* Save state snapshot when output reaches D_nominal (overlap start).
+         * Best candidate (idx 0) state used for Viterbi re-encoding. */
+        if (tid == 0 && out_idx == D_nominal && all_mid_states && ch == 0) {
+            for (int k = 0; k < order; k++)
+                all_mid_states[seg * nc * 8 + k] = p_state[0][k];
+            if (all_mid_costs)
+                all_mid_costs[seg * nc] = p_cost[0];
         }
     }
 

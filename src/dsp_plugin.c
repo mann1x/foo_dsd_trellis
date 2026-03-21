@@ -1322,6 +1322,15 @@ size_t plugin_process(plugin_state_t *s,
             }
 
             if (s->gpu_das_in && s->gpu_das_out) {
+                /* Ensure GPU SDM is set up for current rate's NTF/lat/cands */
+                {
+                    const ntf_filter_t *f = s->channels[0].sdm.filter;
+                    int cur_cands = (int)s->channels[0].sdm.trellis_num;
+                    int cur_lat   = (int)s->channels[0].sdm.trellis_lat;
+                    if (f)
+                        gpu_cuda_trellis_setup(s->gpu, cur_cands, f->order,
+                            cur_lat, f->a, f->g, s->channels[0].sdm.state_limit);
+                }
                 /* Convert fp64 FIR output → fp32 for GPU */
                 for (int ch = 0; ch < num_channels; ch++)
                     for (size_t i = 0; i < fir_counts[ch]; i++)
@@ -1335,6 +1344,67 @@ size_t plugin_process(plugin_state_t *s,
                         memcpy(s->ch_out[ch], s->gpu_das_out + ch * fir_n,
                                fir_n * sizeof(float));
                     dsd_out_count = fir_n;
+
+                    /* Debug: dump GPU DAS output for offline analysis.
+                     * Writes first 3 chunks to binary files for comparison. */
+                    if (s->config.debug_log) {
+                        extern void trellis_log_c(const char *);
+                        static int das_dump_count = 0;
+                        if (das_dump_count < 3) {
+                            char fname[256];
+                            HANDLE hf; DWORD bw;
+                            /* Dump GPU output (ch0, first 500K samples) */
+                            size_t dump_n = fir_n < 500000 ? fir_n : 500000;
+                            snprintf(fname, sizeof(fname),
+                                "C:\\Users\\manni\\source\\repos\\foo_dsd_trellis\\foobar2000-test\\profile\\user-components-x64\\"
+                                "foo_dsd_trellis\\gpu_das_out_%d.raw", das_dump_count);
+                            hf = CreateFileA(fname, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+                            if (hf != INVALID_HANDLE_VALUE) {
+                                WriteFile(hf, s->gpu_das_out, (DWORD)(dump_n * sizeof(float)), &bw, NULL);
+                                CloseHandle(hf);
+                            }
+                            /* Dump input (ch0) */
+                            snprintf(fname, sizeof(fname),
+                                "C:\\Users\\manni\\source\\repos\\foo_dsd_trellis\\foobar2000-test\\profile\\user-components-x64\\"
+                                "foo_dsd_trellis\\gpu_das_in_%d.raw", das_dump_count);
+                            hf = CreateFileA(fname, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+                            if (hf != INVALID_HANDLE_VALUE) {
+                                WriteFile(hf, s->gpu_das_in, (DWORD)(dump_n * sizeof(float)), &bw, NULL);
+                                CloseHandle(hf);
+                            }
+                            /* CPU SDM on same input for comparison */
+                            {
+                                const ntf_filter_t *pf = s->channels[0].sdm.filter;
+                                if (pf) {
+                                    sdm_context_t probe;
+                                    sdm_context_init(&probe, pf, pf->order,
+                                        s->config.trellis_cands, s->config.trellis_lat);
+                                    double *din = (double *)malloc(dump_n * sizeof(double));
+                                    float *cout = (float *)calloc(dump_n, sizeof(float));
+                                    if (din && cout) {
+                                        for (size_t i = 0; i < dump_n; i++)
+                                            din[i] = (double)s->gpu_das_in[i];
+                                        sdm_process_block(&probe, din, cout, dump_n);
+                                        snprintf(fname, sizeof(fname),
+                                            "C:\\Users\\manni\\source\\repos\\foo_dsd_trellis\\foobar2000-test\\profile\\user-components-x64\\"
+                                            "foo_dsd_trellis\\cpu_sdm_out_%d.raw", das_dump_count);
+                                        hf = CreateFileA(fname, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+                                        if (hf != INVALID_HANDLE_VALUE) {
+                                            WriteFile(hf, cout, (DWORD)(dump_n * sizeof(float)), &bw, NULL);
+                                            CloseHandle(hf);
+                                        }
+                                    }
+                                    free(din); free(cout);
+                                    sdm_context_free(&probe);
+                                }
+                            }
+                            das_dump_count++;
+                            char msg[128];
+                            snprintf(msg, sizeof(msg), "GPU DAS dump %d: %zu samples written",
+                                     das_dump_count - 1, dump_n);
+                            trellis_log_c(msg);
+                        }
+                    }
 
                     QueryPerformanceCounter(&t_sdm_end);
                     s->time_sdm_ms = perf_ms(t_sdm_start, t_sdm_end);

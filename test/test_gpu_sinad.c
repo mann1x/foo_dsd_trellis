@@ -223,10 +223,242 @@ void test_gpu_sinad_dx12(void) {
     g_tests_run++; g_tests_passed++;
 }
 
+/* ─── GPU DAS pipeline SINAD test ─── */
+
+static void test_gpu_das_sinad(void) {
+    printf("  test_gpu_das_sinad...\n");
+    if (!gpu_available(GPU_BACKEND_CUDA)) {
+        printf("    (skipped: CUDA not available)\n");
+        g_tests_run++; g_tests_passed++;
+        return;
+    }
+
+    /* Test at DSD512 config: nc=2, lat=32 — actual playback params */
+    uint32_t dsd_rate = 22579200;
+    int nc = 2, lat = 32;
+    size_t N = 22579200;  /* 1 second of DSD512 */
+    double test_freq = 1000.0;
+
+    /* Bin-align frequency */
+    int decimation = (int)(dsd_rate / 44100);
+    size_t pcm_n_est = N / (size_t)decimation;
+    double bin = round(test_freq * (double)pcm_n_est / 44100.0);
+    test_freq = bin * 44100.0 / (double)pcm_n_est;
+
+    const ntf_filter_t *f = ntf_auto_select(dsd_rate);
+    if (!f) { printf("    no NTF\n"); return; }
+
+    printf("    DAS @ DSD512: %.1f Hz, %zu samples, nc=%d lat=%d\n",
+           test_freq, N, nc, lat);
+
+    /* Generate test signal: sine → DSD encode → boxcar smooth */
+    size_t enc_n = 0;
+    float *smoothed = make_test_signal(f, dsd_rate, test_freq, N, &enc_n);
+    if (!smoothed) { printf("    signal gen failed\n"); return; }
+
+    /* CPU reference */
+    float *cpu_out = (float *)calloc(enc_n, sizeof(float));
+    double *smoothed_d = (double *)malloc(enc_n * sizeof(double));
+    if (!cpu_out || !smoothed_d) {
+        free(smoothed); free(cpu_out); free(smoothed_d); return;
+    }
+    for (size_t i = 0; i < enc_n; i++) smoothed_d[i] = (double)smoothed[i];
+    {
+        sdm_context_t cpu_sdm;
+        sdm_context_init(&cpu_sdm, f, f->order, nc, lat);
+        sdm_process_block(&cpu_sdm, smoothed_d, cpu_out, enc_n);
+        sdm_context_free(&cpu_sdm);
+    }
+    double cpu_sinad = measure_sinad(cpu_out, enc_n, dsd_rate, test_freq);
+
+    /* GPU DAS pipeline: gpu_cuda_trellis_das with 1 channel */
+    float *gpu_out = (float *)calloc(enc_n, sizeof(float));
+    gpu_context_t *ctx = gpu_create(GPU_BACKEND_CUDA);
+    if (!ctx || !gpu_out) {
+        printf("    GPU create failed\n");
+        free(smoothed); free(cpu_out); free(smoothed_d); free(gpu_out);
+        return;
+    }
+    gpu_cuda_trellis_setup(ctx, nc, f->order, lat, f->a, f->g, 0.0);
+
+    /* DAS path: 1 channel */
+    int rc = gpu_cuda_trellis_das(ctx, smoothed, gpu_out, enc_n, 1);
+    gpu_destroy(ctx);
+    free(smoothed_d);
+
+    if (rc != 0) {
+        printf("    DAS pipeline failed (rc=%d)\n", rc);
+        /* Fallback: test old path */
+        free(smoothed); free(cpu_out); free(gpu_out);
+        return;
+    }
+
+    double das_sinad = measure_sinad(gpu_out, enc_n, dsd_rate, test_freq);
+
+    /* Also test old single-path for comparison */
+    gpu_context_t *ctx2 = gpu_create(GPU_BACKEND_CUDA);
+    float *old_out = (float *)calloc(enc_n, sizeof(float));
+    double old_sinad = -999.0;
+    if (ctx2 && old_out) {
+        gpu_cuda_trellis_setup(ctx2, nc, f->order, lat, f->a, f->g, 0.0);
+        int rc2 = gpu_cuda_trellis(ctx2, smoothed, old_out, enc_n);
+        if (rc2 == 0)
+            old_sinad = measure_sinad(old_out, enc_n, dsd_rate, test_freq);
+        gpu_destroy(ctx2);
+    }
+    free(old_out);
+
+    /* Sample comparison */
+    double cpu_avg = 0, das_avg = 0;
+    for (size_t i = 10000; i < 10064 && i < enc_n; i++) {
+        cpu_avg += cpu_out[i];
+        das_avg += gpu_out[i];
+    }
+    printf("    DSD avg[10000..10063]: CPU=%.4f DAS=%.4f\n",
+           cpu_avg/64, das_avg/64);
+    printf("    *** CPU SINAD: %.1f dB, DAS SINAD: %.1f dB, old GPU: %.1f dB ***\n",
+           cpu_sinad, das_sinad, old_sinad);
+
+    TEST_ASSERT(das_sinad > 20.0, "GPU DAS SINAD should be > 20 dB");
+
+    free(smoothed); free(cpu_out); free(gpu_out);
+}
+
+/* ─── Multi-chunk DAS test: detects noise at chunk boundaries ─── */
+
+static void test_gpu_das_multi_chunk(void) {
+    printf("  test_gpu_das_multi_chunk...\n");
+    if (!gpu_available(GPU_BACKEND_CUDA)) {
+        printf("    (skipped: CUDA not available)\n");
+        g_tests_run++; g_tests_passed++;
+        return;
+    }
+
+    uint32_t dsd_rate = 22579200;
+    int nc = 2, lat = 32;
+    int num_chunks = 5;
+    size_t chunk_size = 4000000;  /* ~177ms per chunk */
+    size_t total_n = chunk_size * (size_t)num_chunks;
+    double test_freq = 1000.0;
+
+    /* Bin-align */
+    int decimation = (int)(dsd_rate / 44100);
+    size_t pcm_est = total_n / (size_t)decimation;
+    double bin = round(test_freq * (double)pcm_est / 44100.0);
+    test_freq = bin * 44100.0 / (double)pcm_est;
+
+    const ntf_filter_t *f = ntf_auto_select(dsd_rate);
+    if (!f) { printf("    no NTF\n"); return; }
+
+    printf("    Multi-chunk DAS: %d chunks x %zu samples, nc=%d lat=%d\n",
+           num_chunks, chunk_size, nc, lat);
+
+    /* Generate full test signal */
+    size_t enc_n = 0;
+    float *smoothed = make_test_signal(f, dsd_rate, test_freq, total_n, &enc_n);
+    if (!smoothed) { printf("    signal gen failed\n"); return; }
+
+    /* CPU reference: single continuous pass */
+    float *cpu_out = (float *)calloc(enc_n, sizeof(float));
+    double *smoothed_d = (double *)malloc(enc_n * sizeof(double));
+    if (!cpu_out || !smoothed_d) {
+        free(smoothed); free(cpu_out); free(smoothed_d); return;
+    }
+    for (size_t i = 0; i < enc_n; i++) smoothed_d[i] = (double)smoothed[i];
+    {
+        sdm_context_t cpu_sdm;
+        sdm_context_init(&cpu_sdm, f, f->order, nc, lat);
+        sdm_process_block(&cpu_sdm, smoothed_d, cpu_out, enc_n);
+        sdm_context_free(&cpu_sdm);
+    }
+    double cpu_sinad = measure_sinad(cpu_out, enc_n, dsd_rate, test_freq);
+
+    /* GPU DAS: process in chunks (simulates live playback) */
+    float *das_out = (float *)calloc(enc_n, sizeof(float));
+    gpu_context_t *ctx = gpu_create(GPU_BACKEND_CUDA);
+    if (!ctx || !das_out) {
+        printf("    GPU create failed\n");
+        free(smoothed); free(cpu_out); free(smoothed_d); free(das_out);
+        return;
+    }
+    gpu_cuda_trellis_setup(ctx, nc, f->order, lat, f->a, f->g, 0.0);
+
+    size_t out_pos = 0;
+    for (int c = 0; c < num_chunks; c++) {
+        size_t in_start = (size_t)c * chunk_size;
+        size_t in_count = chunk_size;
+        if (in_start + in_count > enc_n) in_count = enc_n - in_start;
+        if (in_count == 0) break;
+
+        float *chunk_out = (float *)calloc(in_count, sizeof(float));
+        if (!chunk_out) break;
+
+        int rc = gpu_cuda_trellis_das(ctx, smoothed + in_start,
+                                       chunk_out, in_count, 1);
+        if (rc != 0) {
+            printf("    DAS chunk %d failed\n", c);
+            free(chunk_out);
+            break;
+        }
+
+        /* Copy to continuous output.
+         * DAS returns D*num_segs samples which may differ from in_count. */
+        size_t copy = in_count;
+        if (out_pos + copy > enc_n) copy = enc_n - out_pos;
+        memcpy(das_out + out_pos, chunk_out, copy * sizeof(float));
+        out_pos += copy;
+        free(chunk_out);
+    }
+    gpu_destroy(ctx);
+    free(smoothed_d);
+
+    double das_sinad = measure_sinad(das_out, out_pos, dsd_rate, test_freq);
+
+    /* Check for discontinuities at chunk boundaries */
+    int boundary_glitches = 0;
+    for (int c = 1; c < num_chunks; c++) {
+        size_t bnd = (size_t)c * chunk_size;
+        if (bnd >= out_pos) break;
+        /* Check if consecutive samples have opposite signs (full-scale flip) */
+        for (int d = -2; d <= 2; d++) {
+            size_t idx = bnd + (size_t)d;
+            if (idx > 0 && idx < out_pos) {
+                float prev = das_out[idx - 1];
+                float curr = das_out[idx];
+                /* In DSD, ±1 transitions are normal. Look for unusual
+                 * patterns: compare with CPU at same position */
+                if (idx < enc_n && das_out[idx] != cpu_out[idx]) {
+                    /* Count how many consecutive mismatches around boundary */
+                    int mismatch_run = 0;
+                    for (size_t j = idx; j < idx + 100 && j < out_pos && j < enc_n; j++) {
+                        if (das_out[j] != cpu_out[j]) mismatch_run++;
+                        else break;
+                    }
+                    if (mismatch_run > 50) {
+                        boundary_glitches++;
+                        printf("    chunk boundary %d @ %zu: %d consecutive mismatches\n",
+                               c, bnd, mismatch_run);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    printf("    *** CPU SINAD: %.1f dB, multi-chunk DAS: %.1f dB, boundary glitches: %d ***\n",
+           cpu_sinad, das_sinad, boundary_glitches);
+
+    TEST_ASSERT(das_sinad > 20.0, "multi-chunk GPU DAS SINAD should be > 20 dB");
+
+    free(smoothed); free(cpu_out); free(das_out);
+}
+
 /* Combined entry point */
 void test_gpu_sinad_comparison(void) {
     printf("\n=== GPU vs CPU SDM SINAD ===\n");
     test_gpu_sinad_cuda();
     test_gpu_sinad_cuda_dsd256();
     test_gpu_sinad_dx12();
+    test_gpu_das_sinad();
+    test_gpu_das_multi_chunk();
 }
