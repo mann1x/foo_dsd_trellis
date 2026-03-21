@@ -1293,6 +1293,14 @@ size_t plugin_process(plugin_state_t *s,
         LARGE_INTEGER t_sdm_start, t_sdm_end;
         QueryPerformanceCounter(&t_sdm_start);
 
+        /* TODO: GPU SDM SBVD path — requires kernel modification to output
+         * per-segment overlap data for CPU-side stitch scanning.
+         * When gpu_sdm_enabled is set, the CUDA kernel needs to:
+         * 1. Output overlap samples between segments (not discard)
+         * 2. Return segment boundary positions for stitch scanning
+         * 3. Use double precision input (currently float)
+         * Parked until kernel is properly updated. */
+
         /* Phase 2: Launch ALL segments in parallel — no sequential dependency.
          * All segments (including seg0) are seeded from the persistent SDM's
          * current state and run simultaneously. Overlap stitching handles

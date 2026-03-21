@@ -31,6 +31,7 @@
 #define IDC_STATIC_PCM_DITHER       1039
 #define IDC_STATIC_RESAMPLE         1040
 #define IDC_STATIC_SOXR_QUALITY     1041
+#define IDC_CHECK_GPU_SDM           1042
 
 // Next default values for new objects
 //

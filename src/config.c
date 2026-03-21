@@ -192,6 +192,7 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     pos += RATE_MAP_COUNT;
     memcpy(buf + pos, cfg->rate_parallel, RATE_MAP_COUNT);
     pos += RATE_MAP_COUNT;
+    pos = write_u8(buf, pos, cfg->gpu_sdm_enabled ? 1 : 0);
 
     return pos;
 }
@@ -343,6 +344,11 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
                 if (pos + RATE_MAP_COUNT <= buf_size) {
                     memcpy(cfg->rate_parallel, buf + pos, RATE_MAP_COUNT);
                     pos += RATE_MAP_COUNT;
+                }
+                if (pos + 1 <= buf_size) {
+                    uint8_t u8;
+                    pos = read_u8(buf, pos, &u8);
+                    cfg->gpu_sdm_enabled = (u8 != 0);
                 }
             }
         } else {

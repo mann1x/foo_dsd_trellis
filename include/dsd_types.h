@@ -386,6 +386,7 @@ typedef struct {
     int8_t    rate_pcm_bits[RATE_MAP_COUNT];   /* Per-rate PCM bit depth override */
     int8_t    rate_pcm_dither[RATE_MAP_COUNT]; /* Per-rate PCM dither override */
     int8_t    rate_parallel[RATE_MAP_COUNT];   /* Per-rate Trellis parallel: -1=Auto, 0=Sequential, 1=Parallel */
+    bool      gpu_sdm_enabled;    /* Enable GPU Trellis SDM SBVD (experimental, default disabled) */
 } dsd_config_t;
 
 /* Trellis parallel mode */
@@ -483,6 +484,7 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     memset(cfg->rate_pcm_bits, 0xFF, sizeof(cfg->rate_pcm_bits));     /* -1 = Auto */
     memset(cfg->rate_pcm_dither, 0xFF, sizeof(cfg->rate_pcm_dither)); /* -1 = Auto */
     memset(cfg->rate_parallel, 0xFF, sizeof(cfg->rate_parallel));     /* -1 = Auto */
+    cfg->gpu_sdm_enabled = false;  /* GPU Trellis SDM disabled by default */
 }
 
 #endif /* DSD_TYPES_H */

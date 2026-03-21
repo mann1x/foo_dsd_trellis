@@ -468,6 +468,7 @@ public:
         COMMAND_HANDLER_EX(IDC_CHECK_ML_ENABLED, BN_CLICKED, OnMlChange)
         COMMAND_HANDLER_EX(IDC_COMBO_ML_EP, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_CHECK_GPU_ENABLED, BN_CLICKED, OnGpuChange)
+        COMMAND_HANDLER_EX(IDC_CHECK_GPU_SDM, BN_CLICKED, OnChange)
         COMMAND_HANDLER_EX(IDC_COMBO_GPU_BACKEND, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_COMBO_PCM_BITS, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_COMBO_PCM_DITHER, CBN_SELCHANGE, OnChange)
@@ -679,6 +680,8 @@ private:
             gpub.SetCurSel(sel);
             gpub.EnableWindow(m_cfg.gpu_enabled);
         }
+        CheckDlgButton(IDC_CHECK_GPU_SDM, m_cfg.gpu_sdm_enabled ? BST_CHECKED : BST_UNCHECKED);
+        ::EnableWindow(GetDlgItem(IDC_CHECK_GPU_SDM), m_cfg.gpu_enabled);
         UpdateGpuStatus();
 
         /* PCM Encoding */
@@ -805,6 +808,7 @@ private:
         if (m_updating) return;
         bool enabled = IsDlgButtonChecked(IDC_CHECK_GPU_ENABLED) == BST_CHECKED;
         CComboBox(GetDlgItem(IDC_COMBO_GPU_BACKEND)).EnableWindow(enabled);
+        ::EnableWindow(GetDlgItem(IDC_CHECK_GPU_SDM), enabled);
         UpdateGpuStatus();
     }
 
@@ -1605,6 +1609,8 @@ private:
             default: m_cfg.gpu_backend = 3; break;  /* GPU_BACKEND_AUTO */
             }
         }
+
+        m_cfg.gpu_sdm_enabled = IsDlgButtonChecked(IDC_CHECK_GPU_SDM) == BST_CHECKED;
 
         /* PCM encoding */
         {
