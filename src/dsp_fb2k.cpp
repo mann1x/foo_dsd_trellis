@@ -1386,8 +1386,7 @@ private:
             if (sscanf(p, "{\"row\":%d,\"ntf\":%d,\"nc\":%d,\"depth\":%d,"
                        "\"lat\":%d,\"fir\":%d",
                        &erow, &entf, &enc, &edepth, &elat, &efir) == 6) {
-                if (erow == row && entf == ntf_id && enc == cands &&
-                    edepth == depth && elat == lat) {
+                if (erow == row) {
                     /* Extract all metric fields */
                     double etheo = -999.0, eawtd = -999.0, emt = -999.0;
                     double enmod = -999.0, enmr = -999.0;
