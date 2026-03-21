@@ -90,6 +90,7 @@ void test_resample_suite(void);
 void test_validation_suite(void);
 void test_dither_suite(void);
 void test_quality_suite(void);
+void test_stitch_suite(void);
 
 /* Standalone DSD encoder tool (tools/dsd_encode.c) */
 int dsd_encode_main(int argc, char **argv);

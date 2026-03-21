@@ -1053,8 +1053,9 @@ size_t plugin_process(plugin_state_t *s,
         if (fs_out > s->config.fs_in)
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);
 
-        /* Boxcar needs 4x overlap for SDM convergence; FIR needs 2x */
-        overlap = (is_same_rate ? 4 : 2) * (size_t)s->config.trellis_lat;
+        /* Overlap for SDM convergence: higher multiplier = better state
+         * convergence (measured via stitch diagnostic suite). */
+        overlap = 32 * (size_t)s->config.trellis_lat;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
         /* State-seeded parallelism with overlap stitching.
@@ -1364,18 +1365,23 @@ size_t plugin_process(plugin_state_t *s,
                 size_t nom_start = seg_nominal_start[ch][seg];
                 size_t nom_size = seg_nominal_size[ch][seg];
 
-                /* Seg0: extend by overlap into seg1's territory.
-                 * Segs 1+: start overlap earlier for warmup. */
+                /* All non-last segments extend by overlap into the next segment's
+                 * territory.  Segs 1+ also start overlap earlier for warmup.
+                 * This ensures every boundary has a full overlap region in
+                 * BOTH segments' output for proper stitch scanning. */
                 size_t input_start, input_count, warmup_discard;
+                bool extend_fwd = (seg < segments_per_ch - 1);
                 if (seg == 0) {
                     input_start = 0;
                     input_count = nom_size;
-                    if (segments_per_ch > 1 && nom_size + overlap <= fir_count)
-                        input_count += overlap;  /* extend for overlap */
+                    if (extend_fwd && nom_size + overlap <= fir_count)
+                        input_count += overlap;
                     warmup_discard = 0;
                 } else {
                     input_start = (nom_start >= overlap) ? nom_start - overlap : 0;
                     input_count = nom_start + nom_size - input_start;
+                    if (extend_fwd && nom_start + nom_size + overlap <= fir_count)
+                        input_count += overlap;
                     warmup_discard = (nom_start >= overlap) ?
                         overlap - (size_t)s->config.trellis_lat : 0;
                 }
@@ -1413,10 +1419,11 @@ size_t plugin_process(plugin_state_t *s,
         for (int i = 0; i < all_block_count; i++)
             seg_out_counts[i] = all_blocks[i].out_count;
 
-        /* Phase 2c: Assemble output with pairwise overlap stitching.
-         * Compute stitch positions on channel 0, apply SAME positions
-         * to all channels to guarantee identical output counts. */
-        int stitch_positions[8];  /* best_pos per segment boundary */
+        /* Phase 2c: Assemble output with hybrid overlap stitching.
+         * Uses windowed match density to find the region of best SDM
+         * convergence, then picks the nearest exact bit-match for a
+         * clean transition.  Computed on ch0, applied to all channels. */
+        int stitch_positions[8];
         memset(stitch_positions, 0, sizeof(stitch_positions));
 
         /* Pass 1: find stitch positions on channel 0 */
@@ -1439,16 +1446,51 @@ size_t plugin_process(plugin_state_t *s,
                 if (ovl_len > seg_out) ovl_len = seg_out;
                 if (ovl_len > overlap) ovl_len = overlap;
 
-                int best_pos = 0, best_run = 0;
+                /* Step 1: Windowed match density — find region of best
+                 * convergence.  Window size = 2 × trellis_lat. */
+                int half_w = s->config.trellis_lat;
+                if (half_w > (int)ovl_len / 2) half_w = (int)ovl_len / 2;
+                if (half_w < 4) half_w = 4;
+
+                int best_density = 0, best_density_pos = 0;
                 for (size_t p = 0; p < ovl_len; p++) {
-                    if (prev_ovl[p] == this_ovl[p]) {
-                        int run = 1;
-                        while (p + (size_t)run < ovl_len &&
-                               prev_ovl[p + run] == this_ovl[p + run])
-                            run++;
-                        if (run > best_run) { best_run = run; best_pos = (int)p; }
+                    int start = (int)p - half_w;
+                    int end   = (int)p + half_w;
+                    if (start < 0) start = 0;
+                    if (end > (int)ovl_len) end = (int)ovl_len;
+                    int matches = 0;
+                    for (int w = start; w < end; w++) {
+                        if (prev_ovl[w] == this_ovl[w])
+                            matches++;
+                    }
+                    if (matches > best_density) {
+                        best_density = matches;
+                        best_density_pos = (int)p;
                     }
                 }
+
+                /* Step 2: Within the best-density region, find nearest
+                 * exact bit-match for a clean stitch transition. */
+                int best_pos = best_density_pos;  /* fallback: density peak */
+                int search_r = half_w;
+                int found_match = 0;
+                for (int r = 0; r <= search_r; r++) {
+                    int lo = best_density_pos - r;
+                    int hi = best_density_pos + r;
+                    if (lo >= 0 && lo < (int)ovl_len &&
+                        prev_ovl[lo] == this_ovl[lo]) {
+                        best_pos = lo;
+                        found_match = 1;
+                        break;
+                    }
+                    if (hi != lo && hi >= 0 && hi < (int)ovl_len &&
+                        prev_ovl[hi] == this_ovl[hi]) {
+                        best_pos = hi;
+                        found_match = 1;
+                        break;
+                    }
+                }
+
                 stitch_positions[seg] = best_pos;
 
                 size_t stitch_at = prev_ovl_start + (size_t)best_pos;
@@ -1459,10 +1501,11 @@ size_t plugin_process(plugin_state_t *s,
                 write_pos = stitch_at + copy_count;
 
                 if (s->config.debug_log) {
-                    char msg[128];
+                    char msg[160];
                     snprintf(msg, sizeof(msg),
-                             "stitch seg%d: ovl=%zu best_pos=%d best_run=%d",
-                             seg, ovl_len, best_pos, best_run);
+                             "stitch seg%d: ovl=%zu density=%d/%d pos=%d match=%s",
+                             seg, ovl_len, best_density, half_w * 2,
+                             best_pos, found_match ? "yes" : "no");
                     extern void trellis_log_c(const char *);
                     trellis_log_c(msg);
                 }
