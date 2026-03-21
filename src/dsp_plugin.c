@@ -1059,9 +1059,11 @@ size_t plugin_process(plugin_state_t *s,
         if (fs_out > s->config.fs_in)
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);
 
-        /* Overlap for SDM convergence: higher multiplier = better state
-         * convergence (measured via stitch diagnostic suite). */
+        /* Overlap for SDM convergence: 32x lat, capped at 1024 samples.
+         * 32x optimal at lat=32 (DSD512). Cap prevents excessive overlap
+         * at higher latencies (lat=128 → would be 4096 uncapped). */
         overlap = 32 * (size_t)s->config.trellis_lat;
+        if (overlap > 1024) overlap = 1024;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
         /* State-seeded parallelism with overlap stitching.
