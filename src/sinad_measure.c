@@ -629,14 +629,18 @@ void sinad_measure_pcm_to_pcm(uint32_t fs_in, uint32_t fs_out,
     if (!in || !out) { free(in); free(out); return; }
 
     /* Pass 1: discover output count */
+    bool is_fir = !resample_needed(fs_in, fs_out);
+    size_t skip = is_fir ? 128 : 0;  /* FIR startup transient */
+
     for (size_t i = 0; i < n_in; i++)
         in[i] = (float)(0.5 * sin(2.0 * M_PI * 1000.0 * (double)i / (double)fs_in));
     size_t produced = pcm_convert(in, out, n_in, fs_in, fs_out,
                                    resample_engine, soxr_quality);
-    if (produced < 1000) { free(in); free(out); return; }
+    if (produced < skip + 1000) { free(in); free(out); return; }
 
-    /* Pass 2: bin-aligned SINAD */
-    double bw = (double)fs_out / (double)produced;
+    /* Pass 2: bin-aligned to measurement window (after skip) */
+    size_t meas_n = produced - skip;
+    double bw = (double)fs_out / (double)meas_n;
     double freq = (unsigned)(1000.0 / bw + 0.5) * bw;
 
     for (size_t i = 0; i < n_in; i++)
@@ -645,13 +649,14 @@ void sinad_measure_pcm_to_pcm(uint32_t fs_in, uint32_t fs_out,
                             resample_engine, soxr_quality);
     if (produced < 1000) { free(in); free(out); return; }
 
+    meas_n = produced - skip;
     result->sinad_theoretical = measure_pcm_sinad(
-        out, produced, freq, fs_out, &result->sinad_awtd_theo);
+        out + skip, meas_n, freq, fs_out, &result->sinad_awtd_theo);
 
     /* Multitone: 32 tones through PCM→PCM conversion.
      * Bin-align each tone to the actual output count from pass 2. */
     {
-        double abw_mt = (double)fs_out / (double)produced;
+        double abw_mt = (double)fs_out / (double)(produced - skip);
         for (size_t i = 0; i < n_in; i++) in[i] = 0.0f;
         int tone_count = 0;
         for (int t = 0; t < 32; t++) {
@@ -666,14 +671,16 @@ void sinad_measure_pcm_to_pcm(uint32_t fs_in, uint32_t fs_out,
         if (tone_count > 0) {
             size_t mt_out = pcm_convert(in, out, n_in, fs_in, fs_out,
                                          resample_engine, soxr_quality);
-            if (mt_out > 1000) {
-                double abw = (double)fs_out / (double)mt_out;
+            if (mt_out > skip + 1000) {
+                float *mt_meas = out + skip;
+                size_t mt_n = mt_out - skip;
+                double abw = (double)fs_out / (double)mt_n;
                 double sig_sum = 0.0, noise_sum = 0.0;
                 for (int t = 0; t < 32; t++) {
                     double tf = g_multitone_freqs[t];
                     if (tf > (double)fs_out / 2.0) continue;
                     double af = (unsigned)(tf / abw + 0.5) * abw;
-                    sig_sum += goertzel_power(out, mt_out, af, (double)fs_out);
+                    sig_sum += goertzel_power(mt_meas, mt_n, af, (double)fs_out);
                 }
                 unsigned max_bin = (unsigned)(20000.0 / abw);
                 for (unsigned b = 1; b <= max_bin; b++) {
@@ -684,7 +691,7 @@ void sinad_measure_pcm_to_pcm(uint32_t fs_in, uint32_t fs_out,
                         if (fabs(bf - af) < abw * 1.5) { is_sig = 1; break; }
                     }
                     if (!is_sig)
-                        noise_sum += goertzel_power(out, mt_out, bf, (double)fs_out);
+                        noise_sum += goertzel_power(mt_meas, mt_n, bf, (double)fs_out);
                 }
                 if (noise_sum > 0.0)
                     result->multitone_sinad_db = 10.0 * log10(sig_sum / noise_sum);

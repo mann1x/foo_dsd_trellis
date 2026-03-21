@@ -8,7 +8,9 @@
 #include "test.h"
 #include "../include/sinad_measure.h"
 #include "../include/dsd_types.h"
+#include "../include/fir.h"
 #include <math.h>
+#include <stdlib.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -191,6 +193,91 @@ static void test_quality_matrix(void) {
     TEST_ASSERT_EQ(ok, n, "all matrix paths should succeed");
 }
 
+/* Goertzel for FIR diagnostic */
+static double goertzel_power_q(const float *x, size_t n, double freq_hz,
+                                double sample_rate) {
+    double k = freq_hz * (double)n / sample_rate;
+    double w = 2.0 * M_PI * k / (double)n;
+    double coeff = 2.0 * cos(w);
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        s0 = (double)x[i] + coeff * s1 - s2;
+        s2 = s1; s1 = s0;
+    }
+    double real = s1 - s2 * cos(w);
+    double imag = s2 * sin(w);
+    return (real * real + imag * imag) / ((double)n * (double)n);
+}
+
+/* Direct FIR PCM→PCM quality test (bypasses sinad_measure_pcm_to_pcm) */
+static void test_fir_pcm_direct(void) {
+    uint32_t pairs[][2] = { {44100,88200}, {96000,48000}, {44100,176400} };
+    int n_pairs = 3;
+    for (int p = 0; p < n_pairs; p++) {
+        uint32_t fs_in = pairs[p][0], fs_out = pairs[p][1];
+        size_t n_in = fs_in;
+        size_t n_out_buf = (fs_out > fs_in ? fs_out * 2 : fs_in) + 4096;
+        float *in  = (float *)malloc(n_in * sizeof(float));
+        float *out = (float *)malloc(n_out_buf * sizeof(float));
+
+        /* Pass 1: discover output count */
+        for (size_t i = 0; i < n_in; i++)
+            in[i] = (float)(0.5 * sin(2.0 * M_PI * 1000.0 * (double)i / (double)fs_in));
+        fir_chain_t fir;
+        int rc = fir_chain_init(&fir, fs_in, fs_out);
+        if (rc != 0) { printf("    %u->%u: init failed\n", fs_in, fs_out); free(in); free(out); continue; }
+        size_t produced = fir_chain_process(&fir, in, out, n_in);
+        fir_chain_free(&fir);
+
+        /* Pass 2: bin-aligned frequency for actual output N (skip transient) */
+        size_t skip = 128;
+        size_t meas_n = produced - skip;
+        double bw = (double)fs_out / (double)meas_n;
+        double gen_freq = (unsigned)(1000.0 / bw + 0.5) * bw;
+
+        for (size_t i = 0; i < n_in; i++)
+            in[i] = (float)(0.5 * sin(2.0 * M_PI * gen_freq * (double)i / (double)fs_in));
+        rc = fir_chain_init(&fir, fs_in, fs_out);
+        if (rc != 0) { free(in); free(out); continue; }
+        produced = fir_chain_process(&fir, in, out, n_in);
+        fir_chain_free(&fir);
+
+        float *meas = out + skip;
+        meas_n = produced - skip;
+
+        float peak = 0;
+        for (size_t i = 0; i < meas_n; i++) {
+            float a = meas[i] > 0 ? meas[i] : -meas[i];
+            if (a > peak) peak = a;
+        }
+
+        bw = (double)fs_out / (double)meas_n;
+        unsigned sig_bin = (unsigned)(1000.0 / bw + 0.5);
+        double freq = sig_bin * bw;
+        double sig_pwr = goertzel_power_q(meas, meas_n, freq, (double)fs_out);
+        unsigned max_bin = (unsigned)(20000.0 / bw);
+        double noise = 0;
+        for (unsigned b = 1; b <= max_bin; b++) {
+            if (b >= sig_bin - 1 && b <= sig_bin + 1) continue;
+            noise += goertzel_power_q(meas, meas_n, b * bw, (double)fs_out);
+        }
+        double sinad = 10.0 * log10(sig_pwr / (noise > 0 ? noise : 1e-30));
+        /* Find top 3 noise bins */
+        double top1 = 0; unsigned top1b = 0;
+        for (unsigned b = 1; b <= max_bin; b++) {
+            if (b >= sig_bin - 1 && b <= sig_bin + 1) continue;
+            double np = goertzel_power_q(meas, meas_n, b * bw, (double)fs_out);
+            if (np > top1) { top1 = np; top1b = b; }
+        }
+        printf("    FIR %u->%u: %zu samples, peak=%.4f, SINAD=%.1f dB, top noise: bin %u (%.0f Hz) = %.1f dB\n",
+               fs_in, fs_out, produced, peak, sinad,
+               top1b, top1b * bw, 10.0 * log10(top1 > 0 ? top1 / sig_pwr : 1e-30));
+        TEST_ASSERT_TRUE(sinad > 30.0, "FIR PCM SINAD (investigating)");
+
+        free(in); free(out);
+    }
+}
+
 void test_quality_suite(void) {
     TEST_SUITE("Quality Metrics");
     TEST_RUN(test_a_weight_1khz);
@@ -205,4 +292,5 @@ void test_quality_suite(void) {
     TEST_RUN(test_quality_dsd64_to_pcm44);
     TEST_RUN(test_quality_pcm_44_to_48);
     TEST_RUN(test_quality_matrix);
+    TEST_RUN(test_fir_pcm_direct);
 }
