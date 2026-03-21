@@ -240,21 +240,31 @@ static const char *g_hlsl[] = {
 "uint i=d.x;if(i>=cnt)return;float s=0;int b=(int)bt;\n"
 "for(int k=0;k<b;k++){int si=(int)i-k;float v=(si>=0)?u0[si]:0;s+=(v>=0?1.0:-1.0);}\n"
 "u1[i]=s/(float)bt*gv;}\n",
-/* PSO_TRELLIS parallel segments */
+/* PSO_TRELLIS parallel segments — proper Viterbi traceback + path dedup.
+ * Matches CUDA sdm_parallel.cu quality. History buffer for traceback,
+ * path dedup to prevent candidate collapse. */
 "RWStructuredBuffer<float> u0:register(u0);RWStructuredBuffer<float> u1:register(u1);\n"
 "RWStructuredBuffer<int> u2:register(u2);RWStructuredBuffer<int> u3:register(u3);\n"
 "cbuffer P:register(b0){int st;int wu;int nc;int ord;\n"
-"float a0,a1,a2,a3,a4,a5,a6,a7,g0,g1,g2,g3,g4,g5,g6,g7;float sl;float p0,p1,p2;};\n"
+"float a0,a1,a2,a3,a4,a5,a6,a7,g0,g1,g2,g3,g4,g5,g6,g7;float sl;int lat;float p1,p2;};\n"
 "groupshared float sa[8],sg_[8],ss[64][8],sc_[64];groupshared uint sp[64];\n"
-"groupshared int sac;groupshared uint so;\n"
+"groupshared uint sh[64][16];groupshared uint sn[64];\n"  /* history + traceback */
+"groupshared int sac,shp,spn;groupshared uint so;\n"
 "[numthreads(64,1,1)]void main(uint3 gid:SV_GroupID,uint3 tid:SV_GroupThreadID){\n"
 "int se=gid.x;int t=tid.x;\n"
 "if(t==0){sa[0]=a0;sa[1]=a1;sa[2]=a2;sa[3]=a3;sa[4]=a4;sa[5]=a5;sa[6]=a6;sa[7]=a7;\n"
-"sg_[0]=g0;sg_[1]=g1;sg_[2]=g2;sg_[3]=g3;sg_[4]=g4;sg_[5]=g5;sg_[6]=g6;sg_[7]=g7;sac=nc;}\n"
-"if(t<nc){for(int i=0;i<ord;i++)ss[t][i]=0;sc_[t]=0;sp[t]=0;}\n"
+"sg_[0]=g0;sg_[1]=g1;sg_[2]=g2;sg_[3]=g3;sg_[4]=g4;sg_[5]=g5;sg_[6]=g6;sg_[7]=g7;\n"
+"sac=nc;shp=0;spn=0;}\n"
+"if(t<nc){for(int i=0;i<ord;i++)ss[t][i]=0;sc_[t]=0;sp[t]=0;\n"
+"for(int i=0;i<16;i++)sh[t][i]=0;}\n"
 "GroupMemoryBarrierWithGroupSync();\n"
 "int sst=u2[se];int ost=u3[se];int oi=0;\n"
 "for(int si=0;si<st;si++){float x=u0[sst+si]*0.5f;int ac=sac;\n"
+/* Phase 0: read traceback bits from history */
+"if(t<ac){if(spn>=lat){int np=(shp+1)%lat;int nb=np/32;int ni=np%32;\n"
+"sn[t]=(sh[t][nb]>>ni)&1;}else{sn[t]=0;}}\n"
+"GroupMemoryBarrierWithGroupSync();\n"
+/* Phase 1: parallel candidate expansion */
 "if(t<2*ac){int pi=(int)((uint)t>>1);float yb=(t&1)?1.0f:-1.0f;float d[8];\n"
 "d[0]=ss[pi][0]-sg_[0]*ss[pi][1]+x;\n"
 "for(int ka=1;ka<ord-1;ka++)d[ka]=ss[pi][ka]+ss[pi][ka-1]-sg_[ka]*ss[pi][ka+1];\n"
@@ -262,18 +272,41 @@ static const char *g_hlsl[] = {
 "float v=x;for(int kb=0;kb<ord;kb++)v+=sa[kb]*d[kb];d[0]+=yb;\n"
 "if(sl>0){for(int kc=0;kc<ord;kc++)d[kc]=clamp(d[kc],-sl,sl);}\n"
 "int ci=nc+t;for(int kd=0;kd<ord;kd++)ss[ci][kd]=d[kd];\n"
-"sc_[ci]=sc_[pi]+(v+sa[0]*yb)*(v+sa[0]*yb);sp[ci]=(sp[pi]<<1|(uint)(t&1))&0xFF;}\n"
+"sc_[ci]=sc_[pi]+(v+sa[0]*yb)*(v+sa[0]*yb);\n"
+"uint cb=(t&1)?0u:1u;sp[ci]=(sp[pi]<<1|cb)&0xFF;sn[ci]=sn[pi];\n"
+"for(int i=0;i<16;i++)sh[ci][i]=sh[pi][i];}\n"
 "GroupMemoryBarrierWithGroupSync();\n"
-"if(t==0){int tc=2*ac;for(int ri=0;ri<ac;ri++){int b=nc+ri;\n"
+/* Phase 2: thread 0 — sort, dedup, record history, output */
+"if(t==0){int tc=2*ac;\n"
+/* Selection sort by cost */
+"for(int ri=0;ri<ac&&ri<tc;ri++){int b=nc+ri;\n"
 "for(int rj=nc+ri+1;rj<nc+tc;rj++)if(sc_[rj]<sc_[b])b=rj;\n"
 "if(b!=nc+ri){float c2=sc_[nc+ri];sc_[nc+ri]=sc_[b];sc_[b]=c2;\n"
 "uint p2=sp[nc+ri];sp[nc+ri]=sp[b];sp[b]=p2;\n"
-"for(int re=0;re<ord;re++){float s2=ss[nc+ri][re];ss[nc+ri][re]=ss[b][re];ss[b][re]=s2;}}}\n"
-"so=sp[nc]&1;float mc=sc_[nc];\n"
+"uint n2=sn[nc+ri];sn[nc+ri]=sn[b];sn[b]=n2;\n"
+"for(int re=0;re<ord;re++){float s2=ss[nc+ri][re];ss[nc+ri][re]=ss[b][re];ss[b][re]=s2;}\n"
+"for(int rh=0;rh<16;rh++){uint h2=sh[nc+ri][rh];sh[nc+ri][rh]=sh[b][rh];sh[b][rh]=h2;}}}\n"
+/* Path dedup */
+"{int dd=1;for(int i=1;i<ac;i++){int dup=0;\n"
+"for(int j=0;j<dd;j++){if(sp[nc+i]==sp[nc+j]){dup=1;break;}}\n"
+"if(!dup){if(dd!=i){sc_[nc+dd]=sc_[nc+i];sp[nc+dd]=sp[nc+i];sn[nc+dd]=sn[nc+i];\n"
+"for(int k=0;k<ord;k++)ss[nc+dd][k]=ss[nc+i][k];\n"
+"for(int k=0;k<16;k++)sh[nc+dd][k]=sh[nc+i][k];}dd++;}}ac=dd;}\n"
+/* Output: traceback bit from best candidate */
+"so=sn[nc];\n"
+/* Record bit in history */
+"{int bp=shp/32;int bi=shp%32;uint cb2=sp[nc]&1;\n"
+"for(int i=0;i<ac;i++){uint cb3=(sp[nc+i])&1;\n"
+"if(cb3)sh[nc+i][bp]|=(1u<<bi);else sh[nc+i][bp]&=~(1u<<bi);}}\n"
+"shp=(shp+1)%lat;if(spn<lat)spn++;\n"
+/* Promote children to parents */
+"sac=ac;float mc=sc_[nc];\n"
 "for(int mi=0;mi<ac;mi++){sc_[mi]=sc_[nc+mi]-mc;sp[mi]=sp[nc+mi];\n"
-"for(int mf=0;mf<ord;mf++)ss[mi][mf]=ss[nc+mi][mf];}}\n"
+"for(int mf=0;mf<ord;mf++)ss[mi][mf]=ss[nc+mi][mf];\n"
+"for(int mh=0;mh<16;mh++)sh[mi][mh]=sh[nc+mi][mh];}}\n"
 "GroupMemoryBarrierWithGroupSync();\n"
-"if(t==0&&si>=wu)u1[ost+oi++]=so?1.0f:-1.0f;}}\n",
+/* Output after warmup with valid history */
+"if(t==0&&spn>=(uint)lat&&si>=wu)u1[ost+oi++]=so?1.0f:-1.0f;}}\n",
 /* PSO_FIR_LP — FIR lowpass with per-channel history */
 "RWStructuredBuffer<float> u0:register(u0); RWStructuredBuffer<float> u1:register(u1);\n"
 "RWStructuredBuffer<float> u2:register(u2); RWStructuredBuffer<float> u3:register(u3);\n"
@@ -799,12 +832,13 @@ int gpu_dx12_trellis_full(dx12_t *c, const float *in, float *out,
         struct {
             int st, wu, nc, ord;
             float a[8], g[8];
-            float sl, p0, p1, p2;
+            float sl; int lat; float p1, p2;
         } p = {0};
         p.st = (int)seg_total; p.wu = warmup; p.nc = nc; p.ord = c->tr_order;
         memcpy(p.a, c->tr_a, sizeof(p.a));
         memcpy(p.g, c->tr_g, sizeof(p.g));
         p.sl = c->tr_limit;
+        p.lat = c->tr_lat;
         memcpy(c->cb_map, &p, sizeof(p));
     }
 
