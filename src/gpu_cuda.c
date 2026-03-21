@@ -1344,8 +1344,8 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
     int nc = c->trellis_cands;
     int lat = c->trellis_lat;
     int L = lat;
-    /* TEST: single segment — no stitching at all */
-    int num_segs = 1;
+    /* 2 segments for A/B comparison */
+    int num_segs = 2;
 
     int D = (int)(count / (size_t)num_segs);
 
@@ -1407,23 +1407,51 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
         return -1;
     }
 
-    /* Segment layout:
-     * Seg 0:       input[0 .. M+D+overlap+L], output capacity = D+overlap
-     * Seg i (mid): input[i*D-M .. i*D-M+M+D+overlap+L], output cap = D+overlap
-     * Seg N-1:     input[(N-1)*D-M .. end], output cap = D (no forward ext) */
+    /* Segment layout with jittered boundaries.
+     * Randomize segment sizes by ±30% to convert periodic stitch artifacts
+     * into broadband noise (+10-15 dB perceptual headroom per research).
+     * Uses a simple hash-based PRNG seeded from chunk sample count
+     * for deterministic but aperiodic boundaries. */
+    int *seg_D = (int *)calloc((size_t)num_segs, sizeof(int));
+    {
+        /* Distribute samples across segments with jitter */
+        unsigned rng = (unsigned)count ^ 0xDEADBEEF;
+        int remaining = (int)count;
+        for (int i = 0; i < num_segs; i++) {
+            if (i == num_segs - 1) {
+                seg_D[i] = remaining;
+            } else {
+                /* Jitter: D ± 30% */
+                rng = rng * 1103515245 + 12345;
+                int jitter_range = D * 30 / 100;
+                int jitter = (int)((rng >> 16) % (2 * (unsigned)jitter_range + 1)) - jitter_range;
+                int this_D = D + jitter;
+                if (this_D < das_overlap * 4) this_D = das_overlap * 4;
+                if (this_D > remaining - (num_segs - 1 - i) * (das_overlap * 4))
+                    this_D = remaining - (num_segs - 1 - i) * (das_overlap * 4);
+                if (this_D < 1) this_D = 1;
+                seg_D[i] = this_D;
+                remaining -= this_D;
+            }
+        }
+    }
+
+    /* Build segment descriptors using jittered sizes */
     size_t out_offset = 0;
+    int seg_pos = 0;  /* cumulative input position */
     for (int i = 0; i < num_segs; i++) {
-        int in_start = i * D - M;
+        int this_D = seg_D[i];
+        int in_start = seg_pos - M;
         if (in_start < 0) in_start = 0;
 
         int out_cap;
         int seg_total;
         if (i < num_segs - 1) {
-            out_cap = D + das_overlap;
-            seg_total = M + D + das_overlap + L;
+            out_cap = this_D + das_overlap;
+            seg_total = M + this_D + das_overlap + L;
         } else {
-            out_cap = D;
-            seg_total = M + D + L;
+            out_cap = this_D;
+            seg_total = M + this_D + L;
         }
 
         /* Clamp to input bounds */
@@ -1436,10 +1464,12 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
         h_seg_totals[i] = seg_total;
         h_seg_out_caps[i] = out_cap;
         out_offset += (size_t)out_cap;
+        seg_pos += this_D;
     }
+    free(seg_D);
 
     size_t total_seg_out = out_offset;  /* per-channel total with overlap */
-    size_t total_final = (size_t)D * (size_t)num_segs;  /* per-channel stitched */
+    size_t total_final = (size_t)count;  /* per-channel stitched = input count */
 
     /* Ensure DAS device buffers are large enough */
     if (c->das_alloc_segs < (size_t)num_segs ||

@@ -1350,11 +1350,11 @@ size_t plugin_process(plugin_state_t *s,
                     if (s->config.debug_log) {
                         extern void trellis_log_c(const char *);
                         static int das_dump_count = 0;
-                        if (das_dump_count < 3) {
+                        if (das_dump_count < 15) {
                             char fname[256];
                             HANDLE hf; DWORD bw;
-                            /* Dump GPU output (ch0, first 500K samples) */
-                            size_t dump_n = fir_n < 500000 ? fir_n : 500000;
+                            /* Dump GPU output (ch0, full chunk for DSF generation) */
+                            size_t dump_n = fir_n;
                             snprintf(fname, sizeof(fname),
                                 "C:\\Users\\manni\\source\\repos\\foo_dsd_trellis\\foobar2000-test\\profile\\user-components-x64\\"
                                 "foo_dsd_trellis\\gpu_das_out_%d.raw", das_dump_count);
@@ -1372,19 +1372,22 @@ size_t plugin_process(plugin_state_t *s,
                                 WriteFile(hf, s->gpu_das_in, (DWORD)(dump_n * sizeof(float)), &bw, NULL);
                                 CloseHandle(hf);
                             }
-                            /* CPU SDM on same input for comparison */
+                            /* CPU sequential SDM on same input (persistent across chunks) */
                             {
+                                static sdm_context_t *cpu_probe = NULL;
                                 const ntf_filter_t *pf = s->channels[0].sdm.filter;
                                 if (pf) {
-                                    sdm_context_t probe;
-                                    sdm_context_init(&probe, pf, pf->order,
-                                        s->config.trellis_cands, s->config.trellis_lat);
+                                    if (!cpu_probe) {
+                                        cpu_probe = (sdm_context_t *)calloc(1, sizeof(sdm_context_t));
+                                        sdm_context_init(cpu_probe, pf, pf->order,
+                                            s->config.trellis_cands, s->config.trellis_lat);
+                                    }
                                     double *din = (double *)malloc(dump_n * sizeof(double));
                                     float *cout = (float *)calloc(dump_n, sizeof(float));
                                     if (din && cout) {
                                         for (size_t i = 0; i < dump_n; i++)
                                             din[i] = (double)s->gpu_das_in[i];
-                                        sdm_process_block(&probe, din, cout, dump_n);
+                                        sdm_process_block(cpu_probe, din, cout, dump_n);
                                         snprintf(fname, sizeof(fname),
                                             "C:\\Users\\manni\\source\\repos\\foo_dsd_trellis\\foobar2000-test\\profile\\user-components-x64\\"
                                             "foo_dsd_trellis\\cpu_sdm_out_%d.raw", das_dump_count);
@@ -1395,7 +1398,7 @@ size_t plugin_process(plugin_state_t *s,
                                         }
                                     }
                                     free(din); free(cout);
-                                    sdm_context_free(&probe);
+                                    /* cpu_probe persists across chunks */
                                 }
                             }
                             das_dump_count++;
@@ -1661,6 +1664,16 @@ size_t plugin_process(plugin_state_t *s,
         s->time_sdm_ms = perf_ms(t_sdm_start, t_sdm_end);
 
         dsd_out_count = seg0_outs[0];
+
+        if (s->config.debug_log) {
+            extern void trellis_log_c(const char *);
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                "DAS output: %zu samples (fir_in=%zu, expected=%zu, diff=%d)",
+                dsd_out_count, fir_counts[0], fir_counts[0],
+                (int)((long long)dsd_out_count - (long long)fir_counts[0]));
+            trellis_log_c(msg);
+        }
 
         /* seg_bufs are cached — no per-chunk cleanup needed */
 

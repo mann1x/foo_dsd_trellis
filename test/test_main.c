@@ -54,6 +54,7 @@ static const suite_entry_t suites[] = {
     { "quality",   "Quality Metrics",   test_quality_suite,    0 },
     { "stitch",    "Stitch Convergence", test_stitch_suite,    1 },
     { "gpudebug",  "GPU Kernel Debug",  test_gpu_kernel_debug_suite, 1 },
+    { "dsfcompare","DSF A/B Compare",   test_dsf_compare,            1 },
 };
 
 #define SUITE_COUNT (sizeof(suites) / sizeof(suites[0]))
