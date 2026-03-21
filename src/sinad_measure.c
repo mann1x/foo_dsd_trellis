@@ -458,53 +458,63 @@ void sinad_measure_dsd_to_pcm(uint32_t dsd_rate, uint32_t pcm_rate,
                                sinad_result_t *result) {
     memset(result, 0, sizeof(*result));
 
+    unsigned dsd_base = rate_is_48k_family(dsd_rate) ? 48000 : 44100;
+    unsigned mult = dsd_rate / dsd_base;
+    size_t n_dsd;
+    if (mult <= 64)       n_dsd = 262144;
+    else if (mult <= 128) n_dsd = 524288;
+    else if (mult <= 256) n_dsd = 1048576;
+    else                  n_dsd = 2097152;
+
     uint32_t ratio = dsd_rate / pcm_rate;
-    size_t est_out = 262144 / ratio;  /* rough estimate */
-    double bw = (double)pcm_rate / (double)est_out;
+    size_t fir_stages = 0;
+    { uint32_t r = ratio; while (r > 1) { fir_stages++; r >>= 1; } }
+    size_t skip = 63 * fir_stages * 2;
+
+    /* Estimate output count exactly like the proven test code */
+    size_t est_in_produced = n_dsd - 512;  /* SDM latency */
+    size_t est_pcm_out = est_in_produced / ratio;
+    size_t est_measured = (est_pcm_out > skip) ? est_pcm_out - skip : est_pcm_out;
+    double bw = (double)pcm_rate / (double)est_measured;
     double freq = (unsigned)(1000.0 / bw + 0.5) * bw;
 
     /* Metric 1: SINAD + A-weighted */
     float *pcm = NULL;
-    size_t skip = 0;
+    size_t pipe_skip = 0;
     size_t pcm_count = dsd_to_pcm_pipeline(dsd_rate, pcm_rate, freq, 0.5,
-                                            &pcm, &skip);
+                                            &pcm, &pipe_skip);
     if (pcm_count == 0) return;
     result->sinad_theoretical = measure_pcm_sinad(
-        pcm + skip, pcm_count - skip, freq, pcm_rate, &result->sinad_awtd_theo);
+        pcm + pipe_skip, pcm_count - pipe_skip, freq, pcm_rate, &result->sinad_awtd_theo);
     free(pcm);
 
-    /* Metric 2: Multitone — 32 tones through DSD→PCM pipeline */
+    /* Metric 2: Multitone — 32 tones through DSD→PCM pipeline.
+     * Use the actual measurement length from metric 1 for bin alignment. */
+    size_t actual_meas_n = pcm_count - pipe_skip;  /* from metric 1 pipeline */
     {
-        float *mt_pcm = NULL;
-        size_t mt_skip = 0;
-
-        unsigned dsd_base = rate_is_48k_family(dsd_rate) ? 48000 : 44100;
-        unsigned mult = dsd_rate / dsd_base;
-        size_t n_in = (mult <= 64) ? 262144 : (mult <= 128) ? 524288 :
-                      (mult <= 256) ? 1048576 : 2097152;
+        size_t n_in = n_dsd;
         size_t max_out = n_in / 2 + 4096;
 
         float *dsd_in  = (float *)malloc(n_in * sizeof(float));
         float *pcm_out = (float *)malloc(max_out * sizeof(float));
         if (dsd_in && pcm_out) {
-            /* Generate 32-tone DSD */
             const ntf_filter_t *f = ntf_auto_select(dsd_rate);
             sdm_context_t ctx;
             if (f && sdm_context_init(&ctx, f, 8, 16, 512) == 0) {
-                double *multi = (double *)calloc(n_in, sizeof(double));
-                if (multi) {
-                    size_t est = (n_in - 512) / ratio;
+                double *multi_d = (double *)calloc(n_in, sizeof(double));
+                if (multi_d) {
+                    /* Bin-align each tone to the actual output measurement N */
+                    double abw_align = (double)pcm_rate / (double)actual_meas_n;
                     for (int t = 0; t < 32; t++) {
                         double tf = g_multitone_freqs[t];
                         if (tf > (double)pcm_rate / 2.0) continue;
-                        double abw = (double)pcm_rate / (double)est;
-                        double aligned = (unsigned)(tf / abw + 0.5) * abw;
+                        double aligned = (unsigned)(tf / abw_align + 0.5) * abw_align;
                         for (size_t i = 0; i < n_in; i++)
-                            multi[i] += (0.5 / 32.0) * sin(2.0 * M_PI * aligned *
+                            multi_d[i] += (0.5 / 32.0) * sin(2.0 * M_PI * aligned *
                                         (double)i / (double)dsd_rate);
                     }
-                    size_t dsd_count = sdm_process_block(&ctx, multi, dsd_in, n_in);
-                    free(multi);
+                    size_t dsd_count = sdm_process_block(&ctx, multi_d, dsd_in, n_in);
+                    free(multi_d);
                     sdm_context_free(&ctx);
 
                     size_t fir_stages2 = 0;
@@ -638,15 +648,18 @@ void sinad_measure_pcm_to_pcm(uint32_t fs_in, uint32_t fs_out,
     result->sinad_theoretical = measure_pcm_sinad(
         out, produced, freq, fs_out, &result->sinad_awtd_theo);
 
-    /* Multitone: 32 tones through PCM→PCM conversion */
+    /* Multitone: 32 tones through PCM→PCM conversion.
+     * Bin-align each tone to the actual output count from pass 2. */
     {
+        double abw_mt = (double)fs_out / (double)produced;
         for (size_t i = 0; i < n_in; i++) in[i] = 0.0f;
         int tone_count = 0;
         for (int t = 0; t < 32; t++) {
             double tf = g_multitone_freqs[t];
             if (tf > (double)fs_out / 2.0 || tf > (double)fs_in / 2.0) continue;
+            double aligned = (unsigned)(tf / abw_mt + 0.5) * abw_mt;
             for (size_t i = 0; i < n_in; i++)
-                in[i] += (float)((0.5 / 32.0) * sin(2.0 * M_PI * tf *
+                in[i] += (float)((0.5 / 32.0) * sin(2.0 * M_PI * aligned *
                          (double)i / (double)fs_in));
             tone_count++;
         }

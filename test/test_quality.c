@@ -100,6 +100,30 @@ static void test_quality_dsd256(void) {
     TEST_ASSERT_TRUE(r.nmr_db < -80.0, "DSD256 NMR < -80 dB");
 }
 
+/* ─── DSD→PCM quality test ─── */
+
+static void test_quality_dsd64_to_pcm44(void) {
+    sinad_result_t r;
+    sinad_measure_dsd_to_pcm(DSD_RATE_64, 44100, &r);
+    printf("    DSD64→PCM44.1k: SINAD=%.1f A-wtd=%.1f MT=%.1f NMod=%.1f\n",
+           r.sinad_theoretical, r.sinad_awtd_theo,
+           r.multitone_sinad_db, r.noise_mod_db);
+    TEST_ASSERT_TRUE(r.ok, "DSD64→PCM44.1k should succeed");
+    TEST_ASSERT_TRUE(r.sinad_theoretical > 90.0, "DSD64→PCM44.1k SINAD > 90 dB");
+    TEST_ASSERT_TRUE(r.multitone_sinad_db > 50.0, "DSD64→PCM44.1k multitone > 50 dB");
+}
+
+/* ─── PCM→PCM quality test ─── */
+
+static void test_quality_pcm_44_to_48(void) {
+    sinad_result_t r;
+    sinad_measure_pcm_to_pcm(44100, 48000, RESAMPLE_AUTO, SOXR_QUALITY_HQ, &r);
+    printf("    PCM 44.1k→48k: SINAD=%.1f A-wtd=%.1f MT=%.1f\n",
+           r.sinad_theoretical, r.sinad_awtd_theo, r.multitone_sinad_db);
+    TEST_ASSERT_TRUE(r.ok, "PCM 44.1k→48k should succeed");
+    TEST_ASSERT_TRUE(r.sinad_theoretical > 50.0, "PCM 44.1k→48k SINAD > 50 dB");
+}
+
 /* ─── DSD/48 quality test ─── */
 
 static void test_quality_dsd64_48(void) {
@@ -124,4 +148,6 @@ void test_quality_suite(void) {
     TEST_RUN(test_quality_dsd128);
     TEST_RUN(test_quality_dsd256);
     TEST_RUN(test_quality_dsd64_48);
+    TEST_RUN(test_quality_dsd64_to_pcm44);
+    TEST_RUN(test_quality_pcm_44_to_48);
 }
