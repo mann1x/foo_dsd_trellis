@@ -2244,7 +2244,7 @@ $L__BB0_256:
 
 	ld.shared.u32 	%r887, [_ZZ25trellis_parallel_segmentsE12s_output_bit];
 	setp.eq.s32 	%p227, %r887, 0;
-	selp.f32 	%f2, 0f3F800000, 0fBF800000, %p227;
+	selp.f32 	%f2, 0fBF800000, 0f3F800000, %p227;
 	add.s32 	%r291, %r1081, 1;
 	cvt.s64.s32 	%rd77, %r1081;
 	add.s64 	%rd78, %rd5, %rd77;

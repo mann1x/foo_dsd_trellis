@@ -270,7 +270,8 @@ __global__ void trellis_parallel_segments(
         if (eff_M < lat) eff_M = lat;  /* ensure history valid */
         bool hist_ready = (s_pending >= lat);
         if (tid == 0 && hist_ready && s >= eff_M && out_idx < out_cap) {
-            seg_out[out_idx++] = s_output_bit ? -1.0f : 1.0f;
+            /* bit=1 → y=+1.0, bit=0 → y=-1.0 (matches CPU convention) */
+            seg_out[out_idx++] = s_output_bit ? 1.0f : -1.0f;
         }
     }
 

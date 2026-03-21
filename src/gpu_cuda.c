@@ -1148,20 +1148,52 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
         c->boundary_alloc = needed;
     }
 
+    /* Build per-segment total-sizes and output-caps arrays for new kernel.
+     * Old path: no overlap, all segments have same total and output D. */
+    int *h_seg_totals = (int *)malloc((size_t)num_segs * sizeof(int));
+    int *h_seg_out_caps = (int *)malloc((size_t)num_segs * sizeof(int));
+    CUdeviceptr d_seg_totals, d_seg_out_caps;
+    pfn_cuMemAlloc(&d_seg_totals, (size_t)num_segs * sizeof(int));
+    pfn_cuMemAlloc(&d_seg_out_caps, (size_t)num_segs * sizeof(int));
+    for (int i = 0; i < num_segs; i++) {
+        h_seg_totals[i] = seg_total;
+        h_seg_out_caps[i] = D;
+    }
+    pfn_cuMemcpyHtoDAsync(d_seg_totals, h_seg_totals,
+                           (size_t)num_segs * sizeof(int), stream);
+    pfn_cuMemcpyHtoDAsync(d_seg_out_caps, h_seg_out_caps,
+                           (size_t)num_segs * sizeof(int), stream);
+
+    /* Replicate seg0 init state to all segments for new kernel */
+    CUdeviceptr d_all_init_s = (CUdeviceptr)0, d_all_init_c = (CUdeviceptr)0;
+    if (seg0_init_s) {
+        pfn_cuMemAlloc(&d_all_init_s, (size_t)num_segs * (size_t)nc * 8 * sizeof(double));
+        pfn_cuMemAlloc(&d_all_init_c, (size_t)num_segs * (size_t)nc * sizeof(double));
+        for (int i = 0; i < num_segs; i++) {
+            pfn_cuMemcpyDtoDAsync(d_all_init_s + (size_t)i * (size_t)nc * 8 * sizeof(double),
+                                   seg0_init_s, (size_t)nc * 8 * sizeof(double), stream);
+            pfn_cuMemcpyDtoDAsync(d_all_init_c + (size_t)i * (size_t)nc * sizeof(double),
+                                   seg0_init_c, (size_t)nc * sizeof(double), stream);
+        }
+    }
+
     /* Launch kernel */
     int block_size = 2 * nc;
     if (block_size < 32) block_size = 32;
-    int seg_total_i = seg_total;
     int M_param = M;
-    int D_param = D;
     int overlap_param = 0;
+    int ch_stride_in = (int)count;
+    int ch_stride_out = (int)total_out;
+    CUdeviceptr null_counts = (CUdeviceptr)0;
     void *args[] = {
         &c->d_sdm_in, &c->d_sdm_out,
         &d_seg_starts, &d_seg_out_starts,
-        &seg_total_i, &M_param, &D_param, &nc, &lat, &overlap_param,
-        &seg0_init_s, &seg0_init_c,
-        &d_seg0_final_s, &d_seg0_final_c,
-        &c->d_all_final_states, &c->d_all_final_costs
+        &d_seg_totals, &d_seg_out_caps,
+        &M_param, &nc, &lat, &overlap_param, &num_segs,
+        &ch_stride_in, &ch_stride_out,
+        &d_all_init_s, &d_all_init_c,
+        &c->d_all_final_states, &c->d_all_final_costs,
+        &null_counts
     };
     pfn_cuLaunchKernel(c->fn_trellis_parallel,
                         (unsigned)num_segs, 1, 1,
@@ -1169,11 +1201,16 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
                         0, stream, args, NULL);
     pfn_cuStreamSynchronize(stream);
 
-    /* Copy segment 0's final state to persistent buffer */
-    pfn_cuMemcpyDtoD(c->d_trellis_states, d_seg0_final_s,
-                      (size_t)nc * 8 * sizeof(double));
-    pfn_cuMemcpyDtoD(c->d_trellis_costs, d_seg0_final_c,
-                      (size_t)nc * sizeof(double));
+    /* Copy last segment's final state to persistent buffer */
+    {
+        size_t last_off = (size_t)(num_segs - 1) * (size_t)nc;
+        pfn_cuMemcpyDtoD(c->d_trellis_states,
+                          c->d_all_final_states + last_off * 8 * sizeof(double),
+                          (size_t)nc * 8 * sizeof(double));
+        pfn_cuMemcpyDtoD(c->d_trellis_costs,
+                          c->d_all_final_costs + last_off * sizeof(double),
+                          (size_t)nc * sizeof(double));
+    }
     QueryPerformanceCounter(&t_kernel);
 
     /* Download output + all-segment final states */
@@ -1263,8 +1300,14 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
 
     pfn_cuMemFree(d_seg_starts);
     pfn_cuMemFree(d_seg_out_starts);
+    pfn_cuMemFree(d_seg_totals);
+    pfn_cuMemFree(d_seg_out_caps);
+    if (d_all_init_s) pfn_cuMemFree(d_all_init_s);
+    if (d_all_init_c) pfn_cuMemFree(d_all_init_c);
     free(h_seg_starts);
     free(h_seg_out_starts);
+    free(h_seg_totals);
+    free(h_seg_out_caps);
 
     /* Log timing */
     {
@@ -1499,6 +1542,7 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
                             (unsigned)block_size, 1, 1,
                             0, stream, args, NULL);
     }
+    pfn_cuStreamSynchronize(stream);
     QueryPerformanceCounter(&t_k1);
 
     /* ═══ Kernel 2: DAS density scan (ch0 only) ═══ */
@@ -1524,6 +1568,7 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
                             256, 1, 1,
                             shared_bytes, stream, args, NULL);
     }
+    pfn_cuStreamSynchronize(stream);
     QueryPerformanceCounter(&t_k2);
 
     /* ═══ Kernel 3: DAS assemble (all channels) ═══ */
@@ -1546,12 +1591,18 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
                             256, 1, 1,
                             0, stream, args, NULL);
     }
+    pfn_cuStreamSynchronize(stream);
     QueryPerformanceCounter(&t_k3);
 
-    /* Copy seg0's final state to persistent buffer (ch0 only) */
-    pfn_cuMemcpyDtoD(c->d_trellis_states, c->d_all_final_states,
+    /* Copy LAST segment's final state to persistent buffer.
+     * The stitched output ends with the last segment's data, so
+     * the next chunk must seed from that segment's end state. */
+    size_t last_seg_off = (size_t)(num_segs - 1) * (size_t)nc;
+    pfn_cuMemcpyDtoD(c->d_trellis_states,
+                      c->d_all_final_states + last_seg_off * 8 * sizeof(double),
                       (size_t)nc * 8 * sizeof(double));
-    pfn_cuMemcpyDtoD(c->d_trellis_costs, c->d_all_final_costs,
+    pfn_cuMemcpyDtoD(c->d_trellis_costs,
+                      c->d_all_final_costs + last_seg_off * sizeof(double),
                       (size_t)nc * sizeof(double));
 
     /* Download final assembled output (all channels) */

@@ -110,6 +110,12 @@ typedef struct plugin_state {
     size_t             cached_seg_buf_sz;    /* per-buffer capacity (samples) */
     int                cached_seg_buf_count; /* number of buffers */
 
+    /* GPU DAS cached buffers (avoid per-chunk malloc/free) */
+    float             *gpu_das_in;       /* fp32 input [num_ch × count] */
+    float             *gpu_das_out;      /* fp32 output [num_ch × count] */
+    size_t             gpu_das_buf_cap;  /* allocated capacity per channel */
+    int                gpu_das_buf_nch;  /* allocated channel count */
+
     /* GPU compute context (shared across all channels, NULL if disabled) */
     gpu_context_t     *gpu;
 
@@ -1300,37 +1306,38 @@ size_t plugin_process(plugin_state_t *s,
          * GPU SDM is disabled or unavailable. */
         if (s->config.gpu_sdm_enabled && s->gpu &&
             (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)) {
-            /* Convert fp64 FIR output → fp32 for GPU (all channels contiguous) */
             size_t fir_n = fir_counts[0];
-            float *gpu_in = (float *)malloc(fir_n * (size_t)num_channels * sizeof(float));
-            if (gpu_in) {
-                for (int ch = 0; ch < num_channels; ch++) {
+            size_t total_samples = fir_n * (size_t)num_channels;
+
+            /* Grow cached GPU DAS buffers if needed */
+            if (s->gpu_das_buf_cap < fir_n ||
+                s->gpu_das_buf_nch < num_channels) {
+                free(s->gpu_das_in);  free(s->gpu_das_out);
+                s->gpu_das_in  = (float *)malloc(total_samples * sizeof(float));
+                s->gpu_das_out = (float *)malloc(total_samples * sizeof(float));
+                s->gpu_das_buf_cap = s->gpu_das_in ? fir_n : 0;
+                s->gpu_das_buf_nch = s->gpu_das_in ? num_channels : 0;
+            }
+
+            if (s->gpu_das_in && s->gpu_das_out) {
+                /* Convert fp64 FIR output → fp32 for GPU */
+                for (int ch = 0; ch < num_channels; ch++)
                     for (size_t i = 0; i < fir_counts[ch]; i++)
-                        gpu_in[ch * fir_n + i] = (float)fir_data[ch][i];
+                        s->gpu_das_in[ch * fir_n + i] = (float)fir_data[ch][i];
+
+                int rc = gpu_cuda_trellis_das(s->gpu, s->gpu_das_in,
+                                               s->gpu_das_out, fir_n,
+                                               num_channels);
+                if (rc == 0) {
+                    for (int ch = 0; ch < num_channels; ch++)
+                        memcpy(s->ch_out[ch], s->gpu_das_out + ch * fir_n,
+                               fir_n * sizeof(float));
+                    dsd_out_count = fir_n;
+
+                    QueryPerformanceCounter(&t_sdm_end);
+                    s->time_sdm_ms = perf_ms(t_sdm_start, t_sdm_end);
+                    goto sdm_done;
                 }
-
-                /* GPU DAS pipeline: SDM + stitch + assemble, all on device */
-                float *gpu_out = (float *)malloc(fir_n * (size_t)num_channels * sizeof(float));
-                if (gpu_out) {
-                    int rc = gpu_cuda_trellis_das(s->gpu, gpu_in, gpu_out,
-                                                   fir_n, num_channels);
-                    if (rc == 0) {
-                        /* Copy stitched output to ch_out */
-                        for (int ch = 0; ch < num_channels; ch++)
-                            memcpy(s->ch_out[ch], gpu_out + ch * fir_n,
-                                   fir_n * sizeof(float));
-                        dsd_out_count = fir_n;
-
-                        QueryPerformanceCounter(&t_sdm_end);
-                        s->time_sdm_ms = perf_ms(t_sdm_start, t_sdm_end);
-
-                        free(gpu_in);
-                        free(gpu_out);
-                        goto sdm_done;
-                    }
-                    free(gpu_out);
-                }
-                free(gpu_in);
             }
             /* Fall through to CPU path on GPU failure */
         }
