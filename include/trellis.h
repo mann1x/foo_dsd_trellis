@@ -73,6 +73,11 @@ size_t sdm_drain(sdm_context_t *ctx, float *out, size_t max_out);
  * dst must already be initialized with same filter/params. */
 void sdm_context_copy_state(sdm_context_t *dst, const sdm_context_t *src);
 
+/* Compute integrator state distance between two SDM contexts.
+ * Returns sum of squared differences of best candidate's integrator vectors.
+ * Used for finding optimal stitch points in parallel SDM. */
+double sdm_state_distance(const sdm_context_t *a, const sdm_context_t *b);
+
 /* Reset SDM state (on seek / discontinuity). */
 void sdm_context_reset(sdm_context_t *ctx);
 

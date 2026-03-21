@@ -1273,6 +1273,7 @@ size_t plugin_process(plugin_state_t *s,
          * Each channel's segment 0 uses its persistent SDM.
          * Use submit_to for guaranteed core distribution (heavy SDM tasks). */
         size_t seg0_sizes[32], seg0_outs[32];
+        size_t seg0_nominal[32]; /* seg0 output without overlap extension */
         {
             channel_block_t seg0_blocks[32];
             memset(seg0_blocks, 0, (size_t)num_channels * sizeof(channel_block_t));
@@ -1280,7 +1281,13 @@ size_t plugin_process(plugin_state_t *s,
                 size_t fir_count = fir_counts[ch];
                 size_t base_seg = fir_count / (size_t)segments_per_ch;
                 size_t remainder = fir_count % (size_t)segments_per_ch;
-                seg0_sizes[ch] = base_seg + (0 < remainder ? 1 : 0);
+                seg0_nominal[ch] = base_seg + (0 < remainder ? 1 : 0);
+
+                /* Extend seg0 by overlap to create overlap region with seg1.
+                 * Cap to available FIR output. */
+                seg0_sizes[ch] = seg0_nominal[ch];
+                if (segments_per_ch > 1 && seg0_sizes[ch] + overlap <= fir_count)
+                    seg0_sizes[ch] += overlap;
 
                 seg0_blocks[ch].mode    = BLOCK_MODE_SDM;
                 seg0_blocks[ch].sdm_ctx = &s->channels[ch].sdm;
@@ -1289,7 +1296,6 @@ size_t plugin_process(plugin_state_t *s,
                 seg0_blocks[ch].count   = seg0_sizes[ch];
                 seg0_blocks[ch].discard = 0;
                 seg0_blocks[ch].channel = ch;
-                /* Pin each channel to a dedicated worker for guaranteed parallelism */
                 threadpool_submit_to(s->pool, ch, &seg0_blocks[ch]);
             }
             threadpool_wait(s->pool);
@@ -1297,52 +1303,127 @@ size_t plugin_process(plugin_state_t *s,
                 seg0_outs[ch] = seg0_blocks[ch].out_count;
         }
 
-        /* Phase 2b: Seed temp SDMs from persistent SDM state, then
-         * launch segments 1+ in parallel on threadpool. */
+        /* Phase 2b: Seed temp SDMs, add overlap warmup for stitch alignment.
+         * Segment 1 starts `overlap` samples earlier than the nominal boundary
+         * and uses warmup/discard for the overlap region. After both segments
+         * complete, we scan the overlap for the optimal stitch point. */
         int par_blocks = 0;
+
+        /* Temporary buffers for segment 1 output (includes overlap output) */
+        float **seg1_bufs = NULL;
+        size_t *seg1_total_counts = NULL;
+        size_t *seg1_nominal_sizes = NULL;
+        if (segments_per_ch > 1) {
+            seg1_bufs = (float **)calloc((size_t)num_channels, sizeof(float *));
+            seg1_total_counts = (size_t *)calloc((size_t)num_channels, sizeof(size_t));
+            seg1_nominal_sizes = (size_t *)calloc((size_t)num_channels, sizeof(size_t));
+        }
+
         for (int ch = 0; ch < num_channels; ch++) {
             size_t fir_count = fir_counts[ch];
-            size_t base_seg = fir_count / (size_t)segments_per_ch;
-            size_t remainder = fir_count % (size_t)segments_per_ch;
-
-            size_t seg_start = seg0_sizes[ch];
-            size_t out_offset = seg0_outs[ch];
 
             for (int seg = 1; seg < segments_per_ch; seg++) {
-                size_t this_seg;
-                if (seg == segments_per_ch - 1)
-                    this_seg = fir_count - seg_start;
-                else
-                    this_seg = base_seg + ((size_t)seg < remainder ? 1 : 0);
+                size_t nominal_start = seg0_nominal[ch];
+                size_t this_seg = fir_count - nominal_start;
 
                 int temp_idx = ch * temps_per_ch + (seg - 1);
-
-                /* Seed temp SDM from persistent SDM's current state */
                 sdm_context_copy_state(&temp_sdms[temp_idx], &s->channels[ch].sdm);
+
+                /* Start overlap samples earlier for warmup convergence.
+                 * Input: [overlap warmup | nominal segment data]
+                 * discard = overlap (warmup output discarded)
+                 * But we actually want the overlap OUTPUT for stitch scanning.
+                 * So: discard=0, process full input, then overlap output is at
+                 * the start of the output buffer. */
+                size_t input_start = (nominal_start >= overlap) ? nominal_start - overlap : 0;
+                size_t input_count = fir_count - input_start;
+
+                /* Allocate temp output buffer for the full segment output */
+                size_t max_seg_out = input_count;
+                if (seg1_bufs)
+                    seg1_bufs[ch] = (float *)malloc(max_seg_out * sizeof(float));
+                if (seg1_nominal_sizes)
+                    seg1_nominal_sizes[ch] = this_seg;
 
                 blocks[par_blocks].mode     = BLOCK_MODE_SDM;
                 blocks[par_blocks].sdm_ctx  = &temp_sdms[temp_idx];
-                blocks[par_blocks].in       = fir_data[ch] + seg_start;
-                blocks[par_blocks].out      = s->ch_out[ch] + out_offset;
-                blocks[par_blocks].count    = this_seg;
-                blocks[par_blocks].discard  = 0;
+                blocks[par_blocks].in       = fir_data[ch] + input_start;
+                blocks[par_blocks].out      = seg1_bufs ? seg1_bufs[ch] : (s->ch_out[ch] + seg0_outs[ch]);
+                blocks[par_blocks].count    = input_count;
+                blocks[par_blocks].discard  = (nominal_start >= overlap) ? overlap - (size_t)s->config.trellis_lat : 0;
                 blocks[par_blocks].channel  = ch;
                 par_blocks++;
-
-                seg_start += this_seg;
-                out_offset += this_seg;
             }
         }
 
-        /* Launch segments 1+ in parallel — pin to dedicated workers */
         for (int i = 0; i < par_blocks; i++) {
-            int worker = num_channels + i;  /* workers 0..nch-1 used by seg0 */
+            int worker = num_channels + i;
             threadpool_submit_to(s->pool, worker % num_threads, &blocks[i]);
         }
         threadpool_wait(s->pool);
 
-        /* Copy last segment's final state back into persistent SDM.
-         * Skip if only 1 segment (persistent SDM already has correct state). */
+        /* Phase 2c: Optimal stitch — scan overlap for best match point.
+         * Compare seg0's overlap output with seg1's overlap output.
+         * Find the longest run of matching output bits (±1.0). */
+        if (segments_per_ch > 1 && seg1_bufs) {
+            for (int ch = 0; ch < num_channels; ch++) {
+                if (!seg1_bufs[ch]) continue;
+                size_t seg1_out = blocks[ch].out_count;  /* assumes 1 block per channel */
+                if (seg1_total_counts) seg1_total_counts[ch] = seg1_out;
+
+                /* seg0 overlap output: last `overlap` samples of seg0 */
+                size_t seg0_ovl_start = seg0_nominal[ch]; /* nominal end = overlap start */
+                size_t seg0_ovl_len = seg0_outs[ch] - seg0_ovl_start;
+                if (seg0_ovl_len == 0 || seg1_out == 0) continue;
+
+                float *seg0_ovl = s->ch_out[ch] + seg0_ovl_start;
+                /* seg1 overlap output: first `seg0_ovl_len` samples */
+                float *seg1_ovl = seg1_bufs[ch];
+                size_t scan_len = seg0_ovl_len < seg1_out ? seg0_ovl_len : seg1_out;
+
+                /* Find longest consecutive matching output bits */
+                int best_pos = 0, best_run = 0;
+                for (size_t p = 0; p < scan_len; p++) {
+                    if (seg0_ovl[p] == seg1_ovl[p]) {
+                        int run = 1;
+                        while (p + run < scan_len && seg0_ovl[p + run] == seg1_ovl[p + run])
+                            run++;
+                        if (run > best_run) { best_run = run; best_pos = (int)p; }
+                    }
+                }
+
+                /* Stitch at best_pos within the overlap.
+                 * Keep seg0 output up to seg0_nominal + best_pos.
+                 * Copy seg1 output from best_pos onward. */
+                size_t keep_seg0 = seg0_ovl_start + (size_t)best_pos;
+                size_t seg1_skip = (size_t)best_pos;
+                size_t seg1_keep = seg1_out - seg1_skip;
+
+                /* Copy seg1's kept output after seg0's kept output */
+                memcpy(s->ch_out[ch] + keep_seg0,
+                       seg1_bufs[ch] + seg1_skip,
+                       seg1_keep * sizeof(float));
+
+                if (ch == 0) {
+                    seg0_outs[ch] = keep_seg0;
+                    if (seg1_total_counts)
+                        seg1_total_counts[ch] = seg1_keep;
+                } else {
+                    seg0_outs[ch] = keep_seg0;
+                }
+
+                if (s->config.debug_log && ch == 0) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg),
+                             "stitch: overlap=%zu scan=%zu best_pos=%d best_run=%d",
+                             overlap, scan_len, best_pos, best_run);
+                    extern void trellis_log_c(const char *);
+                    trellis_log_c(msg);
+                }
+            }
+        }
+
+        /* Copy last segment's final state back into persistent SDM */
         if (segments_per_ch > 1) {
             for (int ch = 0; ch < num_channels; ch++) {
                 int last_temp = ch * temps_per_ch + (segments_per_ch - 2);
@@ -1354,12 +1435,21 @@ size_t plugin_process(plugin_state_t *s,
         QueryPerformanceCounter(&t_sdm_end);
         s->time_sdm_ms = perf_ms(t_sdm_start, t_sdm_end);
 
-        /* Sum output counts: seg0 (processed above) + parallel segments */
-        dsd_out_count = seg0_outs[0];  /* channel 0, segment 0 */
-        for (int i = 0; i < par_blocks; i++) {
-            if (blocks[i].channel == 0)
-                dsd_out_count += blocks[i].out_count;
+        /* Total output count */
+        if (segments_per_ch > 1 && seg1_total_counts) {
+            dsd_out_count = seg0_outs[0] + seg1_total_counts[0];
+        } else {
+            dsd_out_count = seg0_outs[0];
         }
+
+        /* Cleanup temp buffers */
+        if (seg1_bufs) {
+            for (int ch = 0; ch < num_channels; ch++)
+                free(seg1_bufs[ch]);
+            free(seg1_bufs);
+        }
+        free(seg1_total_counts);
+        free(seg1_nominal_sizes);
 
         /* Accumulate temp SDM diagnostics into persistent SDM for logging */
         if (temp_sdms && temp_sdm_count > 0) {

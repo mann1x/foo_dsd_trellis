@@ -809,6 +809,23 @@ void sdm_context_copy_state(sdm_context_t *dst, const sdm_context_t *src) {
     dst->total_children = 0;
 }
 
+double sdm_state_distance(const sdm_context_t *a, const sdm_context_t *b) {
+    /* Compare integrator states of the best (lowest-cost) candidate in each
+     * context. The active bank alternates each sample via idx. */
+    int bank_a = a->idx & 1;
+    int bank_b = b->idx & 1;
+    const sdm_state_t *sa = a->trellis[bank_a].act[0];
+    const sdm_state_t *sb = b->trellis[bank_b].act[0];
+    if (!sa || !sb) return 1e30;
+    int order = a->filter->order;
+    double dist = 0.0;
+    for (int i = 0; i < order; i++) {
+        double d = sa->state[i] - sb->state[i];
+        dist += d * d;
+    }
+    return dist;
+}
+
 void sdm_context_reset(sdm_context_t *ctx) {
     if (!ctx->filter)
         return;
