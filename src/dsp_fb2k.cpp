@@ -521,7 +521,7 @@ private:
         m_listRate.SetExtendedListViewStyle(
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
         ensure_reverse_map();
-        int cw[] = { 66, 66, 50, 46, 42, 42, 46, 34, 32, 38 };
+        int cw[] = { 66, 66, 50, 46, 42, 42, 46, 34, 32, 38, 32 };
         m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, cw[0]);
         m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, cw[1]);
         m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, cw[2]);
@@ -532,17 +532,17 @@ private:
         m_listRate.InsertColumn(7, L"ML", LVCFMT_LEFT, cw[7]);
         m_listRate.InsertColumn(8, L"GPU", LVCFMT_LEFT, cw[8]);
         m_listRate.InsertColumn(9, L"FIR", LVCFMT_LEFT, cw[9]);
+        m_listRate.InsertColumn(10, L"Par", LVCFMT_LEFT, cw[10]);
         /* Last column: fill remaining width to avoid horizontal scrollbar */
         {
             CRect rc;
             m_listRate.GetClientRect(&rc);
             int used = 0;
-            for (int c = 0; c < 10; c++) used += cw[c];
-            /* Subtract vertical scrollbar width (20 rows need scrollbar) */
+            for (int c = 0; c < 11; c++) used += cw[c];
             int vscroll = GetSystemMetrics(SM_CXVSCROLL);
             int remain = rc.Width() - used - vscroll - 4;
             if (remain < 30) remain = 30;
-            m_listRate.InsertColumn(10, L"Lat", LVCFMT_LEFT, remain);
+            m_listRate.InsertColumn(11, L"Lat", LVCFMT_LEFT, remain);
         }
 
         for (int row = 0; row < RATE_MAP_COUNT; row++) {
@@ -584,9 +584,13 @@ private:
                     wcscpy_s(buf, m_cfg.rate_fir_mode[i] == FIR_MODE_BOXCAR ? L"Boxcar" : L"FIR");
                     m_listRate.SetItemText(row, 9, buf);
                 }
+                if (m_cfg.rate_parallel[i] >= 0) {
+                    wcscpy_s(buf, m_cfg.rate_parallel[i] == TRELLIS_PAR_SEQUENTIAL ? L"Seq" : L"Par");
+                    m_listRate.SetItemText(row, 10, buf);
+                }
                 if (m_cfg.rate_lat[i] > 0) {
                     _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_lat[i]);
-                    m_listRate.SetItemText(row, 10, buf);
+                    m_listRate.SetItemText(row, 11, buf);
                 }
             }
             /* Resolve Auto values using path-optimal defaults */
@@ -842,7 +846,7 @@ private:
             ShowOutputCombo(nm->iItem);
         } else if (nm->iSubItem == 2) {
             ShowNtfCombo(nm->iItem);
-        } else if (nm->iSubItem >= 3 && nm->iSubItem <= 10) {
+        } else if (nm->iSubItem >= 3 && nm->iSubItem <= 11) {
             ShowPerRateCombo(nm->iItem, nm->iSubItem);
         }
 
@@ -980,6 +984,13 @@ private:
             int cur = m_cfg.rate_fir_mode[rowToIdx(row)];
             m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
         } else if (col == 10) {
+            /* Parallel mode: Auto/Sequential/Parallel */
+            m_ntfCombo.AddString(L"Auto");
+            m_ntfCombo.AddString(L"Seq");
+            m_ntfCombo.AddString(L"Par");
+            int cur = m_cfg.rate_parallel[rowToIdx(row)];
+            m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
+        } else if (col == 11) {
             /* Trellis latency */
             m_ntfCombo.AddString(L"Auto");
             m_ntfCombo.AddString(L"16"); m_ntfCombo.AddString(L"32");
@@ -1080,13 +1091,19 @@ private:
             const wchar_t *names[] = { L"Auto", L"Boxcar", L"FIR" };
             m_listRate.SetItemText(m_editRow, 9, names[sel < 3 ? sel : 0]);
         } else if (m_editCol == 10) {
+            /* Par: 0=Auto, 1=Sequential, 2=Parallel */
+            int8_t val = (int8_t)(sel == 0 ? -1 : sel - 1);
+            m_cfg.rate_parallel[idx] = val;
+            const wchar_t *names[] = { L"Auto", L"Seq", L"Par" };
+            m_listRate.SetItemText(m_editRow, 10, names[sel < 3 ? sel : 0]);
+        } else if (m_editCol == 11) {
             static const int16_t lvals[] = { 0, 16, 32, 64, 128, 256, 512 };
             int16_t val = (sel >= 0 && sel < 7) ? lvals[sel] : 0;
             m_cfg.rate_lat[idx] = val;
             if (val > 0) {
                 wchar_t buf[16];
                 _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", val);
-                m_listRate.SetItemText(m_editRow, 10, buf);
+                m_listRate.SetItemText(m_editRow, 11, buf);
             }
         }
 
@@ -1269,6 +1286,17 @@ private:
                     gpu_fir_active = m_cfg.gpu_enabled;
 
                 info << "\nGPU FIR: " << (gpu_fir_active ? "On" : "Off");
+
+                /* Parallel SDM mode (resolved) */
+                {
+                    int par = m_cfg.rate_parallel[idx];
+                    bool par_resolved;
+                    if (par == TRELLIS_PAR_SEQUENTIAL) par_resolved = false;
+                    else if (par == TRELLIS_PAR_PARALLEL) par_resolved = true;
+                    else par_resolved = (fs_out > DSD_RATE_64); /* Auto */
+                    if (sdm_mode == SDM_MODE_TRELLIS)
+                        info << "\nTrellis SDM: " << (par_resolved ? "Parallel" : "Sequential");
+                }
             }
         }
 
@@ -1527,8 +1555,10 @@ private:
             m_listRate.SetItemText(row, 8, L"Auto");
         if (m_cfg.rate_fir_mode[idx] < 0)
             m_listRate.SetItemText(row, 9, L"Auto");
-        if (m_cfg.rate_lat[idx] <= 0)
+        if (m_cfg.rate_parallel[idx] < 0)
             m_listRate.SetItemText(row, 10, L"Auto");
+        if (m_cfg.rate_lat[idx] <= 0)
+            m_listRate.SetItemText(row, 11, L"Auto");
     }
 
     void UpdatePreset() {

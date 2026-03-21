@@ -385,7 +385,13 @@ typedef struct {
     int8_t    soxr_quality;      /* soxr_quality_t: 0=MQ, 1=HQ(default), 2=VHQ */
     int8_t    rate_pcm_bits[RATE_MAP_COUNT];   /* Per-rate PCM bit depth override */
     int8_t    rate_pcm_dither[RATE_MAP_COUNT]; /* Per-rate PCM dither override */
+    int8_t    rate_parallel[RATE_MAP_COUNT];   /* Per-rate Trellis parallel: -1=Auto, 0=Sequential, 1=Parallel */
 } dsd_config_t;
+
+/* Trellis parallel mode */
+#define TRELLIS_PAR_AUTO       (-1)   /* Auto: Sequential for DSD64, Parallel above */
+#define TRELLIS_PAR_SEQUENTIAL  0
+#define TRELLIS_PAR_PARALLEL    1
 
 /* Pre-SDM filter mode */
 #define FIR_MODE_AUTO    (-1)
@@ -476,6 +482,7 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     cfg->soxr_quality = SOXR_QUALITY_HQ;
     memset(cfg->rate_pcm_bits, 0xFF, sizeof(cfg->rate_pcm_bits));     /* -1 = Auto */
     memset(cfg->rate_pcm_dither, 0xFF, sizeof(cfg->rate_pcm_dither)); /* -1 = Auto */
+    memset(cfg->rate_parallel, 0xFF, sizeof(cfg->rate_parallel));     /* -1 = Auto */
 }
 
 #endif /* DSD_TYPES_H */

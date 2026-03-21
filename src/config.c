@@ -190,6 +190,8 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     pos += RATE_MAP_COUNT;
     memcpy(buf + pos, cfg->rate_pcm_dither, RATE_MAP_COUNT);
     pos += RATE_MAP_COUNT;
+    memcpy(buf + pos, cfg->rate_parallel, RATE_MAP_COUNT);
+    pos += RATE_MAP_COUNT;
 
     return pos;
 }
@@ -337,6 +339,11 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
                 pos += RATE_MAP_COUNT;
                 memcpy(cfg->rate_pcm_dither, buf + pos, RATE_MAP_COUNT);
                 pos += RATE_MAP_COUNT;
+                /* rate_parallel added later in v16, may not be present */
+                if (pos + RATE_MAP_COUNT <= buf_size) {
+                    memcpy(cfg->rate_parallel, buf + pos, RATE_MAP_COUNT);
+                    pos += RATE_MAP_COUNT;
+                }
             }
         } else {
             /* Migrate from v1-v7: use fs_out + proc_mode to populate rate_map */

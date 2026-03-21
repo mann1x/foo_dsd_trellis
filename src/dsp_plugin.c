@@ -1029,7 +1029,25 @@ size_t plugin_process(plugin_state_t *s,
     bool is_same_rate = (s->config.fs_in == fs_out);
     bool skip_parallel = (is_same_rate && fs_out <= DSD_RATE_64);
 
-    if (need_rate_conv && !skip_parallel && num_threads > num_channels &&
+    /* Resolve per-rate parallel mode: Auto/Sequential/Parallel */
+    int par_mode = TRELLIS_PAR_AUTO;
+    {
+        int map_idx = rate_map_index(s->config.fs_in);
+        if (map_idx >= 0 && map_idx < RATE_MAP_COUNT)
+            par_mode = (int)s->config.rate_parallel[map_idx];
+    }
+
+    /* Auto: Sequential for DSD64 same-rate, Parallel for higher rates */
+    bool use_parallel;
+    if (par_mode == TRELLIS_PAR_SEQUENTIAL)
+        use_parallel = false;
+    else if (par_mode == TRELLIS_PAR_PARALLEL)
+        use_parallel = true;
+    else /* Auto */
+        use_parallel = (fs_out > DSD_RATE_64);
+
+    if (need_rate_conv && !skip_parallel && use_parallel &&
+        num_threads > num_channels &&
         s->config.sdm_mode == SDM_MODE_TRELLIS) {
         size_t fir_out_est = dsd_in_count;
         if (fs_out > s->config.fs_in)
