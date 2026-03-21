@@ -1294,13 +1294,46 @@ size_t plugin_process(plugin_state_t *s,
         LARGE_INTEGER t_sdm_start, t_sdm_end;
         QueryPerformanceCounter(&t_sdm_start);
 
-        /* TODO: GPU SDM SBVD path — requires kernel modification to output
-         * per-segment overlap data for CPU-side stitch scanning.
-         * When gpu_sdm_enabled is set, the CUDA kernel needs to:
-         * 1. Output overlap samples between segments (not discard)
-         * 2. Return segment boundary positions for stitch scanning
-         * 3. Use double precision input (currently float)
-         * Parked until kernel is properly updated. */
+        /* GPU DAS path: full SDM + density stitch + assemble on GPU.
+         * Converts fp64 FIR output to fp32, sends all channels to GPU,
+         * receives stitched output back. Falls through to CPU path if
+         * GPU SDM is disabled or unavailable. */
+        if (s->config.gpu_sdm_enabled && s->gpu &&
+            (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)) {
+            /* Convert fp64 FIR output → fp32 for GPU (all channels contiguous) */
+            size_t fir_n = fir_counts[0];
+            float *gpu_in = (float *)malloc(fir_n * (size_t)num_channels * sizeof(float));
+            if (gpu_in) {
+                for (int ch = 0; ch < num_channels; ch++) {
+                    for (size_t i = 0; i < fir_counts[ch]; i++)
+                        gpu_in[ch * fir_n + i] = (float)fir_data[ch][i];
+                }
+
+                /* GPU DAS pipeline: SDM + stitch + assemble, all on device */
+                float *gpu_out = (float *)malloc(fir_n * (size_t)num_channels * sizeof(float));
+                if (gpu_out) {
+                    int rc = gpu_cuda_trellis_das(s->gpu, gpu_in, gpu_out,
+                                                   fir_n, num_channels);
+                    if (rc == 0) {
+                        /* Copy stitched output to ch_out */
+                        for (int ch = 0; ch < num_channels; ch++)
+                            memcpy(s->ch_out[ch], gpu_out + ch * fir_n,
+                                   fir_n * sizeof(float));
+                        dsd_out_count = fir_n;
+
+                        QueryPerformanceCounter(&t_sdm_end);
+                        s->time_sdm_ms = perf_ms(t_sdm_start, t_sdm_end);
+
+                        free(gpu_in);
+                        free(gpu_out);
+                        goto sdm_done;
+                    }
+                    free(gpu_out);
+                }
+                free(gpu_in);
+            }
+            /* Fall through to CPU path on GPU failure */
+        }
 
         /* Phase 2: Launch ALL segments in parallel — no sequential dependency.
          * All segments (including seg0) are seeded from the persistent SDM's
@@ -1579,6 +1612,8 @@ size_t plugin_process(plugin_state_t *s,
             s->fir_tail_len = overlap;
             s->fir_tail_valid = true;
         }
+sdm_done:
+        ;  /* GPU DAS path jumps here after successful GPU processing */
     } else if (s->gpu && s->config.gpu_enabled) {
         gpu_reset_chunk(s->gpu);  /* reset per-channel boxcar history index */
         /* === Sequential path WITH GPU: run on calling thread ===

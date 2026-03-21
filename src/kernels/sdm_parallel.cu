@@ -1,9 +1,10 @@
 /*
- * foo_dsd_trellis — SBVD parallel-segment GPU Trellis SDM
+ * foo_dsd_trellis — SBVD parallel-segment GPU Trellis SDM with DAS
  *
  * Proper Sliding Block Viterbi Decoder with full traceback history.
- * Each segment: M (convergence) + D (output) + L (lookahead).
- * Children store their bit choice explicitly (no index tricks).
+ * Each segment: M (convergence) + D (output) + overlap (non-last) + L.
+ * All segments state-seeded from persistent SDM for DAS stitching.
+ * Multi-channel via grid.y — all channels processed simultaneously.
  */
 
 extern "C" {
@@ -26,31 +27,46 @@ __device__ double ntf_calc(const double *s, double *d,
 }
 
 /* Reduced from 32 to 8 to fit more blocks per SM.
- * With nc=4 (typical), shared mem drops from ~32KB to ~3KB per block.
+ * With nc=2 (typical), shared mem drops to ~1.5KB per block.
  * This allows ~30 blocks/SM × 84 SMs = 2520 concurrent segments.
  * Supports up to nc=8 candidates. */
 #define MAX_CANDS 8
 #define MAX_CHILDREN (2 * MAX_CANDS)
 #define MAX_HIST_BYTES 128  /* supports lat up to 1024 */
 
+/* DAS-enabled parallel-segment SBVD.
+ *
+ * Grid:  (num_segments, num_channels, 1)
+ * Block: (2 * num_cands, 1, 1)
+ *
+ * All segments are state-seeded from the same persistent SDM state
+ * (uploaded to all_init_states). Non-last segments output D + overlap
+ * samples for DAS overlap stitching. Last segment outputs D samples.
+ *
+ * seg_total_sizes[seg]: per-segment input count (M + D + [overlap] + L)
+ * seg_out_caps[seg]:    per-segment output capacity (D + overlap or D)
+ */
 __global__ void trellis_parallel_segments(
     const float *in, float *out,
     const int *seg_starts,
     const int *seg_out_starts,
-    int seg_total_size,
+    const int *seg_total_sizes,    /* per-segment input sample count */
+    const int *seg_out_caps,       /* per-segment output capacity */
     int M_convergence,
-    int D_output,
     int num_cands,
     int trellis_lat,
     int overlap,
-    const double *seg0_init_states,
-    const double *seg0_init_costs,
-    double *seg0_final_states,
-    double *seg0_final_costs,
-    double *all_final_states,
-    double *all_final_costs)
+    int num_segs,                  /* total segment count (= gridDim.x) */
+    int ch_stride_in,              /* per-channel input stride */
+    int ch_stride_out,             /* per-channel output stride */
+    const double *all_init_states, /* [num_segs * nc * 8] replicated seed */
+    const double *all_init_costs,  /* [num_segs * nc] replicated seed */
+    double *all_final_states,      /* [num_segs * nc * 8] */
+    double *all_final_costs,       /* [num_segs * nc] */
+    int *seg_actual_counts)        /* [num_ch * num_segs] actual output */
 {
     int seg = blockIdx.x;
+    int ch  = blockIdx.y;
     int tid = threadIdx.x;
     int order = c_ntf_order;
     double limit = c_state_limit;
@@ -58,9 +74,10 @@ __global__ void trellis_parallel_segments(
     int lat = trellis_lat;
     int hist_bytes = (lat + 7) / 8;
 
-    const float *seg_in = in + seg_starts[seg];
-    float *seg_out = out + seg_out_starts[seg];
-    int total = seg_total_size;
+    const float *seg_in = in + ch * ch_stride_in + seg_starts[seg];
+    float *seg_out = out + ch * ch_stride_out + seg_out_starts[seg];
+    int total = seg_total_sizes[seg];
+    int out_cap = seg_out_caps[seg];
 
     /* Parent state: slots 0..nc-1 */
     __shared__ double p_state[MAX_CANDS][8];
@@ -82,12 +99,15 @@ __global__ void trellis_parallel_segments(
     __shared__ int s_hist_pos;
     __shared__ int s_pending;
 
-    /* Initialize parents */
+    /* Initialize ALL segments from persistent state (DAS state seeding).
+     * Every segment starts from the same seed — the end state of the
+     * previous chunk. Convergence warmup (M samples) lets each segment's
+     * SDM diverge into its local signal before producing output. */
     if (tid < nc) {
-        if (seg == 0 && seg0_init_states) {
+        if (all_init_states) {
             for (int k = 0; k < order; k++)
-                p_state[tid][k] = seg0_init_states[tid * 8 + k];
-            p_cost[tid] = seg0_init_costs[tid];
+                p_state[tid][k] = all_init_states[seg * nc * 8 + tid * 8 + k];
+            p_cost[tid] = all_init_costs[seg * nc + tid];
         } else {
             for (int k = 0; k < order; k++)
                 p_state[tid][k] = 0.0;
@@ -109,9 +129,7 @@ __global__ void trellis_parallel_segments(
         double x = (double)seg_in[s] * 0.5;
         int ac = s_active;
 
-        /* Phase 0: Compute parent traceback bits (before expansion).
-         * Reads history for potential future use (traceback disabled
-         * for now but infrastructure preserved). */
+        /* Phase 0: Compute parent traceback bits (before expansion). */
         if (tid < ac) {
             if (s_pending >= lat) {
                 int next_pos = (s_hist_pos + 1) % lat;
@@ -242,31 +260,31 @@ __global__ void trellis_parallel_segments(
         }
         __syncthreads();
 
-        /* SBVD output.
-         * Segment 0: wait lat samples for history to fill.
-         * Segments 1+: wait M samples for NTF convergence.
-         * Traceback uses c_next[0] (best candidate, no majority vote). */
-        int eff_M = (seg == 0) ? ((seg0_init_states) ? 0 : lat)
-                                : (M_convergence - overlap);
+        /* SBVD output with DAS overlap extension.
+         * All segments: wait M samples for NTF convergence + history fill.
+         * Seeded segments (all_init_states != NULL): skip latency fill
+         * for seg0 (persistent state already has valid history).
+         * Non-last segments output D + overlap samples for DAS scanning.
+         * Last segment outputs D samples (no forward extension). */
+        int eff_M = (seg == 0 && all_init_states) ? 0 : M_convergence;
         if (eff_M < lat) eff_M = lat;  /* ensure history valid */
         bool hist_ready = (s_pending >= lat);
-        if (tid == 0 && hist_ready && s >= eff_M && out_idx < D_output) {
+        if (tid == 0 && hist_ready && s >= eff_M && out_idx < out_cap) {
             seg_out[out_idx++] = s_output_bit ? -1.0f : 1.0f;
         }
     }
 
-    /* Save all segments' final states for boundary re-encoding */
-    if (all_final_states && tid < nc) {
+    /* Save all segments' final states (channel 0 only — used for
+     * persistent state update from seg0, and potential diagnostics). */
+    if (ch == 0 && all_final_states && tid < nc) {
         for (int k = 0; k < order; k++)
             all_final_states[seg * nc * 8 + tid * 8 + k] = p_state[tid][k];
         all_final_costs[seg * nc + tid] = p_cost[tid];
     }
-    /* Segment 0: also save to persistent state buffers */
-    if (seg == 0 && seg0_final_states && tid < nc) {
-        for (int k = 0; k < order; k++)
-            seg0_final_states[tid * 8 + k] = p_state[tid][k];
-        seg0_final_costs[tid] = p_cost[tid];
-    }
+
+    /* Report actual output count per segment per channel */
+    if (tid == 0 && seg_actual_counts)
+        seg_actual_counts[ch * num_segs + seg] = out_idx;
 }
 
 } /* extern "C" */

@@ -23,6 +23,7 @@
 #include "kernels/sdm_kernels_ptx.h"
 #include "kernels/sdm_parallel_ptx.h"
 #include "kernels/sdm_hawksford_ptx.h"
+#include "kernels/das_stitch_ptx.h"
 
 /* ─── CUDA Driver API types (no CUDA headers needed) ─── */
 
@@ -69,6 +70,8 @@ DECL_PFN(CUresult, cuCtxGetStreamPriorityRange, int *, int *);
 DECL_PFN(CUresult, cuStreamDestroy, CUstream);
 DECL_PFN(CUresult, cuStreamSynchronize, CUstream);
 DECL_PFN(CUresult, cuMemcpyDtoD, CUdeviceptr, CUdeviceptr, size_t);
+DECL_PFN(CUresult, cuMemcpyDtoDAsync, CUdeviceptr, CUdeviceptr, size_t, CUstream);
+DECL_PFN(CUresult, cuMemsetD8Async, CUdeviceptr, unsigned char, size_t, CUstream);
 
 static HMODULE g_nvcuda = NULL;
 static bool    g_probed = false;
@@ -105,6 +108,8 @@ static PFN_cuCtxGetStreamPriorityRange pfn_cuCtxGetStreamPriorityRange;
 static PFN_cuStreamDestroy     pfn_cuStreamDestroy;
 static PFN_cuStreamSynchronize pfn_cuStreamSynchronize;
 static PFN_cuMemcpyDtoD        pfn_cuMemcpyDtoD;
+static PFN_cuMemcpyDtoDAsync   pfn_cuMemcpyDtoDAsync;
+static PFN_cuMemsetD8Async     pfn_cuMemsetD8Async;
 
 #define RESOLVE(name) do { \
     pfn_##name = (PFN_##name)GetProcAddress(g_nvcuda, #name); \
@@ -196,6 +201,22 @@ typedef struct {
     double        *h_all_final_states;
     double        *h_all_final_costs;
     int            boundary_alloc;  /* allocated num_segs * nc */
+    /* ─── DAS (Density-Aligned Stitching) buffers ─── */
+    CUmodule       mod_das_stitch;
+    CUfunction     fn_das_density_scan;
+    CUfunction     fn_das_assemble;
+    CUdeviceptr    d_das_seg_out;      /* segment outputs with overlap */
+    CUdeviceptr    d_das_final;        /* final stitched output */
+    CUdeviceptr    d_das_stitch_pos;   /* stitch positions [num_segs-1] */
+    CUdeviceptr    d_das_seg_starts;   /* per-seg input offsets */
+    CUdeviceptr    d_das_seg_out_starts; /* per-seg output offsets */
+    CUdeviceptr    d_das_seg_total_sizes; /* per-seg input count */
+    CUdeviceptr    d_das_seg_out_caps; /* per-seg output capacity */
+    CUdeviceptr    d_das_seg_counts;   /* actual output counts [num_ch × num_segs] */
+    CUdeviceptr    d_das_init_states;  /* replicated seed [num_segs × nc × 8] */
+    CUdeviceptr    d_das_init_costs;   /* replicated seed [num_segs × nc] */
+    size_t         das_alloc_segs;     /* allocated segment capacity */
+    size_t         das_alloc_samples;  /* allocated per-ch sample capacity */
     /* Boxcar history for chunk continuity — per channel */
 #define BOXCAR_MAX_CH 8
     CUdeviceptr    d_boxcar_hist;    /* last taps samples (shared device buf) */
@@ -315,6 +336,8 @@ bool gpu_cuda_probe(void) {
     RESOLVE_V2(cuStreamDestroy);
     RESOLVE(cuStreamSynchronize);
     RESOLVE_V2(cuMemcpyDtoD);
+    RESOLVE_V2(cuMemcpyDtoDAsync);
+    RESOLVE_V2(cuMemsetD8Async);
 
     if (!ok) { g_available = false; return false; }
 
@@ -403,6 +426,12 @@ gpu_context_t *gpu_cuda_create(void) {
     /* Load Hawksford kernel */
     if (pfn_cuModuleLoadData(&c->mod_hawksford, g_ptx_sdm_hawksford) == CUDA_SUCCESS)
         pfn_cuModuleGetFunction(&c->fn_hawksford, c->mod_hawksford, "trellis_hawksford");
+
+    /* Load DAS stitching kernels */
+    if (pfn_cuModuleLoadData(&c->mod_das_stitch, g_ptx_das_stitch) == CUDA_SUCCESS) {
+        pfn_cuModuleGetFunction(&c->fn_das_density_scan, c->mod_das_stitch, "das_density_scan");
+        pfn_cuModuleGetFunction(&c->fn_das_assemble, c->mod_das_stitch, "das_assemble");
+    }
 
     /* Create streams */
     for (int i = 0; i < NUM_STREAMS; i++) {
@@ -1247,6 +1276,310 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
         sprintf_s(msg, sizeof(msg),
             "[GPU CUDA SBVD] %zu samples, %d/%d segs/SMs, %d cands, M=%d D=%d L=%d: kernel=%.1fms total=%.1fms (%.2fx RT)",
             count, num_segs, c->num_sms, nc, M, D, L, kernel_ms, total_ms, total_ms / audio_ms);
+        trellis_log_c(msg);
+    }
+
+    c->trellis_state_valid = true;
+    return 0;
+}
+
+/* ─── DAS (Density-Aligned Stitching) GPU Pipeline ─── */
+
+int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
+                          size_t count, int num_channels) {
+    if (!c || !c->fn_trellis_parallel || !c->fn_das_density_scan ||
+        !c->fn_das_assemble || c->trellis_cands < 2)
+        return -1;
+
+    pfn_cuCtxSetCurrent(c->context);
+
+    int nc = c->trellis_cands;
+    int lat = c->trellis_lat;
+    int L = lat;
+    int M = 16 * lat;
+    if (M > 4096) M = 4096;
+
+    /* Maximize segments based on SM count */
+    int num_segs = c->num_sms * 3;
+    if (num_segs < 1) num_segs = 1;
+
+    int D = (int)(count / (size_t)num_segs);
+
+    /* Adaptive overlap: min(32×lat, D/2) — adapts to GPU SM layout */
+    int das_overlap = 32 * lat;
+    if (das_overlap > D / 2) das_overlap = D / 2;
+    if (das_overlap < lat) das_overlap = lat;
+
+    /* Ensure D is large enough for meaningful segments */
+    size_t min_seg = (size_t)(M + L + das_overlap + 256);
+    while (num_segs > 1 && (size_t)D < min_seg) {
+        num_segs--;
+        D = (int)(count / (size_t)num_segs);
+        das_overlap = 32 * lat;
+        if (das_overlap > D / 2) das_overlap = D / 2;
+        if (das_overlap < lat) das_overlap = lat;
+    }
+    if (num_segs < 1) num_segs = 1;
+
+    /* Fall back to non-DAS path for single segment */
+    if (num_segs <= 1) {
+        /* Single segment — no stitching needed, process each channel */
+        for (int ch = 0; ch < num_channels; ch++)
+            gpu_cuda_trellis(c, in + ch * count, out + ch * count, count);
+        return 0;
+    }
+
+    CUstream stream = c->sdm_stream;
+
+    /* Upload NTF constants */
+    {
+        CUdeviceptr d_a, d_g, d_order, d_limit;
+        size_t sz;
+        pfn_cuModuleGetGlobal(&d_a, &sz, c->mod_sdm_parallel, "c_ntf_a");
+        pfn_cuMemcpyHtoD(d_a, c->trellis_ntf_a, (size_t)c->trellis_order * sizeof(double));
+        pfn_cuModuleGetGlobal(&d_g, &sz, c->mod_sdm_parallel, "c_ntf_g");
+        pfn_cuMemcpyHtoD(d_g, c->trellis_ntf_g, (size_t)c->trellis_order * sizeof(double));
+        pfn_cuModuleGetGlobal(&d_order, &sz, c->mod_sdm_parallel, "c_ntf_order");
+        pfn_cuMemcpyHtoD(d_order, &c->trellis_order, sizeof(int));
+        pfn_cuModuleGetGlobal(&d_limit, &sz, c->mod_sdm_parallel, "c_state_limit");
+        double sl = 0.0;
+        pfn_cuMemcpyHtoD(d_limit, &sl, sizeof(double));
+    }
+
+    /* Build per-segment descriptors */
+    int *h_seg_starts     = (int *)calloc((size_t)num_segs, sizeof(int));
+    int *h_seg_out_starts = (int *)calloc((size_t)num_segs, sizeof(int));
+    int *h_seg_totals     = (int *)calloc((size_t)num_segs, sizeof(int));
+    int *h_seg_out_caps   = (int *)calloc((size_t)num_segs, sizeof(int));
+    if (!h_seg_starts || !h_seg_out_starts || !h_seg_totals || !h_seg_out_caps) {
+        free(h_seg_starts); free(h_seg_out_starts);
+        free(h_seg_totals); free(h_seg_out_caps);
+        return -1;
+    }
+
+    /* Segment layout:
+     * Seg 0:       input[0 .. M+D+overlap+L], output capacity = D+overlap
+     * Seg i (mid): input[i*D-M .. i*D-M+M+D+overlap+L], output cap = D+overlap
+     * Seg N-1:     input[(N-1)*D-M .. end], output cap = D (no forward ext) */
+    size_t out_offset = 0;
+    for (int i = 0; i < num_segs; i++) {
+        int in_start = i * D - M;
+        if (in_start < 0) in_start = 0;
+
+        int out_cap;
+        int seg_total;
+        if (i < num_segs - 1) {
+            out_cap = D + das_overlap;
+            seg_total = M + D + das_overlap + L;
+        } else {
+            out_cap = D;
+            seg_total = M + D + L;
+        }
+
+        /* Clamp to input bounds */
+        if (in_start + seg_total > (int)count)
+            seg_total = (int)count - in_start;
+        if (seg_total < 0) seg_total = 0;
+
+        h_seg_starts[i] = in_start;
+        h_seg_out_starts[i] = (int)out_offset;
+        h_seg_totals[i] = seg_total;
+        h_seg_out_caps[i] = out_cap;
+        out_offset += (size_t)out_cap;
+    }
+
+    size_t total_seg_out = out_offset;  /* per-channel total with overlap */
+    size_t total_final = (size_t)D * (size_t)num_segs;  /* per-channel stitched */
+
+    /* Ensure DAS device buffers are large enough */
+    if (c->das_alloc_segs < (size_t)num_segs ||
+        c->das_alloc_samples < total_seg_out * (size_t)num_channels) {
+        /* Free old */
+        if (c->d_das_seg_out)       pfn_cuMemFree(c->d_das_seg_out);
+        if (c->d_das_final)         pfn_cuMemFree(c->d_das_final);
+        if (c->d_das_stitch_pos)    pfn_cuMemFree(c->d_das_stitch_pos);
+        if (c->d_das_seg_starts)    pfn_cuMemFree(c->d_das_seg_starts);
+        if (c->d_das_seg_out_starts)pfn_cuMemFree(c->d_das_seg_out_starts);
+        if (c->d_das_seg_total_sizes)pfn_cuMemFree(c->d_das_seg_total_sizes);
+        if (c->d_das_seg_out_caps)  pfn_cuMemFree(c->d_das_seg_out_caps);
+        if (c->d_das_seg_counts)    pfn_cuMemFree(c->d_das_seg_counts);
+        if (c->d_das_init_states)   pfn_cuMemFree(c->d_das_init_states);
+        if (c->d_das_init_costs)    pfn_cuMemFree(c->d_das_init_costs);
+
+        pfn_cuMemAlloc(&c->d_das_seg_out, total_seg_out * (size_t)num_channels * sizeof(float));
+        pfn_cuMemAlloc(&c->d_das_final, total_final * (size_t)num_channels * sizeof(float));
+        pfn_cuMemAlloc(&c->d_das_stitch_pos, (size_t)(num_segs - 1) * sizeof(int));
+        pfn_cuMemAlloc(&c->d_das_seg_starts, (size_t)num_segs * sizeof(int));
+        pfn_cuMemAlloc(&c->d_das_seg_out_starts, (size_t)num_segs * sizeof(int));
+        pfn_cuMemAlloc(&c->d_das_seg_total_sizes, (size_t)num_segs * sizeof(int));
+        pfn_cuMemAlloc(&c->d_das_seg_out_caps, (size_t)num_segs * sizeof(int));
+        pfn_cuMemAlloc(&c->d_das_seg_counts, (size_t)num_segs * (size_t)num_channels * sizeof(int));
+        pfn_cuMemAlloc(&c->d_das_init_states, (size_t)num_segs * (size_t)nc * 8 * sizeof(double));
+        pfn_cuMemAlloc(&c->d_das_init_costs, (size_t)num_segs * (size_t)nc * sizeof(double));
+
+        c->das_alloc_segs = (size_t)num_segs;
+        c->das_alloc_samples = total_seg_out * (size_t)num_channels;
+    }
+
+    /* Ensure input buffer large enough for all channels */
+    size_t total_in = count * (size_t)num_channels;
+    if (c->sdm_buf_cap < total_in) {
+        if (c->d_sdm_in) pfn_cuMemFree(c->d_sdm_in);
+        pfn_cuMemAlloc(&c->d_sdm_in, total_in * sizeof(float));
+        c->sdm_buf_cap = total_in;
+    }
+
+    /* Upload all channels' input */
+    pfn_cuMemcpyHtoDAsync(c->d_sdm_in, in, total_in * sizeof(float), stream);
+
+    /* Upload segment descriptors */
+    pfn_cuMemcpyHtoDAsync(c->d_das_seg_starts, h_seg_starts,
+                           (size_t)num_segs * sizeof(int), stream);
+    pfn_cuMemcpyHtoDAsync(c->d_das_seg_out_starts, h_seg_out_starts,
+                           (size_t)num_segs * sizeof(int), stream);
+    pfn_cuMemcpyHtoDAsync(c->d_das_seg_total_sizes, h_seg_totals,
+                           (size_t)num_segs * sizeof(int), stream);
+    pfn_cuMemcpyHtoDAsync(c->d_das_seg_out_caps, h_seg_out_caps,
+                           (size_t)num_segs * sizeof(int), stream);
+
+    /* Replicate persistent state to all segment init slots.
+     * If state is valid, broadcast; otherwise leave zero-inited. */
+    if (c->trellis_state_valid) {
+        for (int i = 0; i < num_segs; i++) {
+            pfn_cuMemcpyDtoDAsync(
+                c->d_das_init_states + (size_t)i * (size_t)nc * 8 * sizeof(double),
+                c->d_trellis_states, (size_t)nc * 8 * sizeof(double), stream);
+            pfn_cuMemcpyDtoDAsync(
+                c->d_das_init_costs + (size_t)i * (size_t)nc * sizeof(double),
+                c->d_trellis_costs, (size_t)nc * sizeof(double), stream);
+        }
+    } else {
+        pfn_cuMemsetD8Async(c->d_das_init_states, 0,
+                            (size_t)num_segs * (size_t)nc * 8 * sizeof(double), stream);
+        pfn_cuMemsetD8Async(c->d_das_init_costs, 0,
+                            (size_t)num_segs * (size_t)nc * sizeof(double), stream);
+    }
+
+    /* Ensure all-final-states buffer */
+    int needed = num_segs * nc;
+    if (c->boundary_alloc < needed) {
+        if (c->d_all_final_states) pfn_cuMemFree(c->d_all_final_states);
+        if (c->d_all_final_costs)  pfn_cuMemFree(c->d_all_final_costs);
+        pfn_cuMemAlloc(&c->d_all_final_states, (size_t)needed * 8 * sizeof(double));
+        pfn_cuMemAlloc(&c->d_all_final_costs, (size_t)needed * sizeof(double));
+        c->boundary_alloc = needed;
+    }
+
+    LARGE_INTEGER t_start, t_k1, t_k2, t_k3, t_end, t_freq;
+    QueryPerformanceFrequency(&t_freq);
+    QueryPerformanceCounter(&t_start);
+
+    /* ═══ Kernel 1: Parallel-segment SBVD with DAS overlap ═══ */
+    {
+        int block_size = 2 * nc;
+        if (block_size < 32) block_size = 32;
+        int M_param = M;
+        int overlap_param = das_overlap;
+        int ch_stride_in = (int)count;
+        int ch_stride_out = (int)total_seg_out;
+        CUdeviceptr null_ptr = 0;
+
+        void *args[] = {
+            &c->d_sdm_in, &c->d_das_seg_out,
+            &c->d_das_seg_starts, &c->d_das_seg_out_starts,
+            &c->d_das_seg_total_sizes, &c->d_das_seg_out_caps,
+            &M_param, &nc, &lat, &overlap_param, &num_segs,
+            &ch_stride_in, &ch_stride_out,
+            &c->d_das_init_states, &c->d_das_init_costs,
+            &c->d_all_final_states, &c->d_all_final_costs,
+            &c->d_das_seg_counts
+        };
+        pfn_cuLaunchKernel(c->fn_trellis_parallel,
+                            (unsigned)num_segs, (unsigned)num_channels, 1,
+                            (unsigned)block_size, 1, 1,
+                            0, stream, args, NULL);
+    }
+    QueryPerformanceCounter(&t_k1);
+
+    /* ═══ Kernel 2: DAS density scan (ch0 only) ═══ */
+    {
+        int D_param = D;
+        int overlap_param = das_overlap;
+        int lat_param = lat;
+        int ch0_stride = (int)total_seg_out;
+
+        /* ch0 segment output is at offset 0 in d_das_seg_out */
+        CUdeviceptr ch0_seg_out = c->d_das_seg_out;
+        void *args[] = {
+            &ch0_seg_out,
+            &c->d_das_seg_out_starts,
+            &c->d_das_seg_out_caps,
+            &D_param, &overlap_param, &lat_param,
+            &c->d_das_stitch_pos
+        };
+        /* Dynamic shared memory: 2 × overlap floats for overlap region cache */
+        unsigned shared_bytes = (unsigned)(2 * das_overlap * sizeof(float));
+        pfn_cuLaunchKernel(c->fn_das_density_scan,
+                            (unsigned)(num_segs - 1), 1, 1,
+                            256, 1, 1,
+                            shared_bytes, stream, args, NULL);
+    }
+    QueryPerformanceCounter(&t_k2);
+
+    /* ═══ Kernel 3: DAS assemble (all channels) ═══ */
+    {
+        int D_param = D;
+        int overlap_param = das_overlap;
+        int final_count = (int)total_final;
+        int ch_stride_seg = (int)total_seg_out;
+        int ch_stride_final = (int)total_final;
+
+        void *args[] = {
+            &c->d_das_seg_out, &c->d_das_final,
+            &c->d_das_seg_out_starts, &c->d_das_stitch_pos,
+            &num_segs, &D_param, &overlap_param, &final_count,
+            &ch_stride_seg, &ch_stride_final
+        };
+        unsigned grid_x = (unsigned)((total_final + 255) / 256);
+        pfn_cuLaunchKernel(c->fn_das_assemble,
+                            grid_x, (unsigned)num_channels, 1,
+                            256, 1, 1,
+                            0, stream, args, NULL);
+    }
+    QueryPerformanceCounter(&t_k3);
+
+    /* Copy seg0's final state to persistent buffer (ch0 only) */
+    pfn_cuMemcpyDtoD(c->d_trellis_states, c->d_all_final_states,
+                      (size_t)nc * 8 * sizeof(double));
+    pfn_cuMemcpyDtoD(c->d_trellis_costs, c->d_all_final_costs,
+                      (size_t)nc * sizeof(double));
+
+    /* Download final assembled output (all channels) */
+    pfn_cuMemcpyDtoHAsync(out, c->d_das_final,
+                           total_final * (size_t)num_channels * sizeof(float), stream);
+    pfn_cuStreamSynchronize(stream);
+
+    QueryPerformanceCounter(&t_end);
+
+    /* Cleanup host arrays */
+    free(h_seg_starts); free(h_seg_out_starts);
+    free(h_seg_totals); free(h_seg_out_caps);
+
+    /* Log timing */
+    {
+        extern void trellis_log_c(const char *);
+        double k1_ms = (double)(t_k1.QuadPart - t_start.QuadPart) * 1000.0 / (double)t_freq.QuadPart;
+        double k2_ms = (double)(t_k2.QuadPart - t_k1.QuadPart) * 1000.0 / (double)t_freq.QuadPart;
+        double k3_ms = (double)(t_k3.QuadPart - t_k2.QuadPart) * 1000.0 / (double)t_freq.QuadPart;
+        double total_ms = (double)(t_end.QuadPart - t_start.QuadPart) * 1000.0 / (double)t_freq.QuadPart;
+        double audio_ms = (double)count / 2822400.0 * 1000.0;
+        char msg[320];
+        sprintf_s(msg, sizeof(msg),
+            "[GPU DAS] %zu samples, %dch, %d/%d segs/SMs, nc=%d, M=%d D=%d ovl=%d L=%d: "
+            "sdm=%.1fms scan=%.1fms asm=%.1fms total=%.1fms (%.2fx RT)",
+            count, num_channels, num_segs, c->num_sms, nc,
+            M, D, das_overlap, L,
+            k1_ms, k2_ms, k3_ms, total_ms, total_ms / audio_ms);
         trellis_log_c(msg);
     }
 
