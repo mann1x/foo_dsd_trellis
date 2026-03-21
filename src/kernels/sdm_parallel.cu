@@ -183,14 +183,59 @@ __global__ void trellis_parallel_segments(
         if (tid == 0) {
             int tc = 2 * ac;
 
-            /* Selection sort children by cost with path deduplication.
-             * After sorting by cost, skip children with duplicate path
-             * bits — they represent identical future trajectories and
-             * waste candidate slots. Matches CPU hash-based dedup. */
-            for (int i = 0; i < ac && i < tc; i++) {
+            /* CPU-matched sort: majority vote + next-filter + insertion
+             * sort with path dedup. Replicates sdm_sort_cands from trellis.c
+             * for identical noise-shaping quality. */
+
+            /* Step 1: Find best candidate and majority traceback vote */
+            int best_idx = 0;
+            int next_votes_0 = 0, next_votes_1 = 0;
+            for (int i = 0; i < tc; i++) {
+                if (c_cost[i] < c_cost[best_idx]) best_idx = i;
+                if (c_next[i] & 1) next_votes_1++; else next_votes_0++;
+            }
+            unsigned majority_next = (next_votes_1 > next_votes_0) ? 1 : 0;
+            unsigned min_next = c_next[best_idx];
+
+            /* Override min_next with majority if best-with-majority is
+             * within 10% cost of absolute best */
+            if (min_next != majority_next) {
+                int best_maj = -1;
+                for (int i = 0; i < tc; i++) {
+                    if (c_next[i] == majority_next &&
+                        (best_maj < 0 || c_cost[i] < c_cost[best_maj]))
+                        best_maj = i;
+                }
+                if (best_maj >= 0 && c_cost[best_maj] < c_cost[best_idx] * 1.1)
+                    min_next = majority_next;
+            }
+
+            /* Step 2: Next-filter — drop candidates with wrong traceback.
+             * This ensures output coherence across the trellis. */
+            int filtered = 0;
+            for (int i = 0; i < tc; i++) {
+                if (c_next[i] == min_next) {
+                    if (filtered != i) {
+                        c_cost[filtered] = c_cost[i];
+                        c_bit[filtered] = c_bit[i];
+                        c_path[filtered] = c_path[i];
+                        c_next[filtered] = c_next[i];
+                        for (int k = 0; k < order; k++)
+                            c_state[filtered][k] = c_state[i][k];
+                        for (int b = 0; b < hist_bytes; b++)
+                            c_hist[filtered][b] = c_hist[i][b];
+                    }
+                    filtered++;
+                }
+            }
+            tc = filtered;
+
+            /* Step 3: Selection sort (fast) + path dedup.
+             * Uses <= for tie-breaking to match CPU's sdm_cmple. */
+            for (int i = 0; i < nc && i < tc; i++) {
                 int best = i;
                 for (int j = i + 1; j < tc; j++)
-                    if (c_cost[j] < c_cost[best]) best = j;
+                    if (c_cost[j] <= c_cost[best]) best = j;
                 if (best != i) {
                     double t_c = c_cost[i]; c_cost[i] = c_cost[best]; c_cost[best] = t_c;
                     unsigned t_b = c_bit[i]; c_bit[i] = c_bit[best]; c_bit[best] = t_b;
@@ -204,36 +249,27 @@ __global__ void trellis_parallel_segments(
                     }
                 }
             }
-            /* Path dedup: collapse children with identical paths.
-             * Keep lowest-cost (already sorted). Remove duplicates by
-             * shifting remaining entries down. */
+            /* Path dedup */
             {
-                int deduped = 1; /* first is always unique */
-                for (int i = 1; i < ac; i++) {
+                int deduped = 1;
+                for (int i = 1; i < nc && i < tc; i++) {
                     int dup = 0;
-                    for (int j = 0; j < deduped; j++) {
+                    for (int j = 0; j < deduped; j++)
                         if (c_path[i] == c_path[j]) { dup = 1; break; }
-                    }
                     if (!dup) {
                         if (deduped != i) {
-                            c_cost[deduped] = c_cost[i];
-                            c_bit[deduped] = c_bit[i];
-                            c_path[deduped] = c_path[i];
-                            for (int k = 0; k < order; k++)
-                                c_state[deduped][k] = c_state[i][k];
-                            for (int b = 0; b < hist_bytes; b++)
-                                c_hist[deduped][b] = c_hist[i][b];
+                            c_cost[deduped] = c_cost[i]; c_bit[deduped] = c_bit[i];
+                            c_path[deduped] = c_path[i]; c_next[deduped] = c_next[i];
+                            for (int k = 0; k < order; k++) c_state[deduped][k] = c_state[i][k];
+                            for (int b = 0; b < hist_bytes; b++) c_hist[deduped][b] = c_hist[i][b];
                         }
                         deduped++;
                     }
                 }
-                ac = deduped;  /* may be less than nc */
+                ac = deduped;
             }
 
-            /* Output: best candidate's traceback bit (standard Viterbi).
-             * eff_M >= lat ensures s_pending >= lat before first output,
-             * so traceback is always valid — no mode transition artifact.
-             * No majority vote or candidate filtering (destroys diversity). */
+            /* Output: best candidate's traceback bit */
             s_output_bit = c_next[0];
 
             /* Record each selected child's bit in its history */
