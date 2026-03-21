@@ -46,6 +46,20 @@ void sinad_measure(uint32_t dsd_rate, int ntf_id,
                    int use_fir_lowpass, float fir_gain,
                    sinad_result_t *result);
 
+/* Measure DSD→PCM decimation quality.
+ * Generates DSD sine at dsd_rate, decimates via FIR to pcm_rate.
+ * Returns SINAD in result->sinad_theoretical. */
+void sinad_measure_dsd_to_pcm(uint32_t dsd_rate, uint32_t pcm_rate,
+                               sinad_result_t *result);
+
+/* Measure PCM→PCM resampling quality.
+ * Generates PCM sine at fs_in, resamples to fs_out.
+ * resample_engine: RESAMPLE_AUTO/IPP/SOXR.
+ * soxr_quality: SOXR_QUALITY_MQ/HQ/VHQ. */
+void sinad_measure_pcm_to_pcm(uint32_t fs_in, uint32_t fs_out,
+                               int resample_engine, int soxr_quality,
+                               sinad_result_t *result);
+
 /* A-weighting factor (linear power) for a given frequency.
  * IEC 61672 standard. Returns multiplier for noise power. */
 double a_weight_factor(double freq_hz);

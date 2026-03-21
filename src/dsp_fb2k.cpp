@@ -1451,6 +1451,7 @@ private:
         if (fs_out == 0) return;
 
         bool out_is_dsd_val = rate_out_is_dsd(out_idx);
+        bool in_is_dsd = rate_idx_is_dsd(idx);
 
         /* Pause playback */
         {
@@ -1485,9 +1486,22 @@ private:
                 SaveSinadResult(row, pi.ntf_filter, pi.cands, pi.depth, pi.lat,
                                 use_fir, &result);
             }
+        } else if (in_is_dsd) {
+            /* DSD → PCM: measure FIR decimation SINAD */
+            sinad_result_t result;
+            sinad_measure_dsd_to_pcm(fs_in, fs_out, &result);
+            if (result.ok) {
+                SaveSinadResult(row, 0, 0, 0, 0, 0, &result);
+            }
         } else {
-            /* PCM output: no SDM quality to measure.
-             * Show path info with FIR/resampler details instead. */
+            /* PCM → PCM: measure resample SINAD */
+            sinad_result_t result;
+            sinad_measure_pcm_to_pcm(fs_in, fs_out,
+                                      m_cfg.resample_engine, m_cfg.soxr_quality,
+                                      &result);
+            if (result.ok) {
+                SaveSinadResult(row, 0, 0, 0, 0, 0, &result);
+            }
         }
 
         ::EnableWindow(GetDlgItem(IDC_BTN_TEST_SINAD), TRUE);

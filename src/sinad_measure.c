@@ -14,6 +14,7 @@
 #include "../include/ntf.h"
 #include "../include/fir.h"
 #include "../include/dsd_types.h"
+#include "../include/resample.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -383,4 +384,143 @@ void sinad_measure(uint32_t dsd_rate, int ntf_id,
     /* ── Metric 3: Noise Modulation ── */
     result->noise_mod_db = measure_noise_modulation(
         dsd_rate, f, depth, cands, lat, use_fir_lowpass, gain);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * DSD → PCM decimation quality measurement
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+void sinad_measure_dsd_to_pcm(uint32_t dsd_rate, uint32_t pcm_rate,
+                               sinad_result_t *result) {
+    memset(result, 0, sizeof(*result));
+
+    unsigned dsd_base = rate_is_48k_family(dsd_rate) ? 48000 : 44100;
+    unsigned mult = dsd_rate / dsd_base;
+    size_t n_in;
+    if (mult <= 64)       n_in = 262144;
+    else if (mult <= 128) n_in = 524288;
+    else if (mult <= 256) n_in = 1048576;
+    else                  n_in = 2097152;
+
+    uint32_t ratio = dsd_rate / pcm_rate;
+    size_t max_out = n_in / 2 + 4096;
+
+    float *dsd_in  = (float *)malloc(n_in * sizeof(float));
+    float *pcm_out = (float *)malloc(max_out * sizeof(float));
+    if (!dsd_in || !pcm_out) { free(dsd_in); free(pcm_out); return; }
+
+    /* Skip FIR startup transient */
+    size_t fir_stages = 0;
+    { uint32_t r = ratio; while (r > 1) { fir_stages++; r >>= 1; } }
+    size_t skip = 63 * fir_stages * 2;
+
+    size_t est_out = (n_in - 512) / ratio;
+    size_t est_meas = (est_out > skip) ? est_out - skip : est_out;
+    double bw = (double)pcm_rate / (double)est_meas;
+    unsigned bin = (unsigned)(1000.0 / bw + 0.5);
+    double freq = bin * bw;
+
+    /* Generate DSD sine */
+    const ntf_filter_t *f = ntf_auto_select(dsd_rate);
+    if (!f) { free(dsd_in); free(pcm_out); return; }
+    sdm_context_t ctx;
+    if (sdm_context_init(&ctx, f, 8, 16, 512) != 0) {
+        free(dsd_in); free(pcm_out); return;
+    }
+    double *sine = (double *)malloc(n_in * sizeof(double));
+    if (!sine) { sdm_context_free(&ctx); free(dsd_in); free(pcm_out); return; }
+    for (size_t i = 0; i < n_in; i++)
+        sine[i] = 0.5 * sin(2.0 * M_PI * freq * (double)i / (double)dsd_rate);
+    size_t dsd_count = sdm_process_block(&ctx, sine, dsd_in, n_in);
+    free(sine);
+    sdm_context_free(&ctx);
+
+    if (dsd_count < 1024) { free(dsd_in); free(pcm_out); return; }
+
+    /* FIR decimation */
+    fir_chain_t fir;
+    if (fir_chain_init(&fir, dsd_rate, pcm_rate) != 0) {
+        free(dsd_in); free(pcm_out); return;
+    }
+    size_t pcm_count = fir_chain_process(&fir, dsd_in, pcm_out, dsd_count);
+    fir_chain_free(&fir);
+
+    if (pcm_count <= skip + 1024) { free(dsd_in); free(pcm_out); return; }
+
+    float *meas = pcm_out + skip;
+    size_t meas_n = pcm_count - skip;
+
+    result->sinad_theoretical = measure_goertzel_sinad(
+        meas, meas_n, freq, pcm_rate, &result->sinad_awtd_theo);
+    result->ok = 1;
+
+    free(dsd_in);
+    free(pcm_out);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * PCM → PCM resampling quality measurement
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+void sinad_measure_pcm_to_pcm(uint32_t fs_in, uint32_t fs_out,
+                               int resample_engine, int soxr_quality,
+                               sinad_result_t *result) {
+    memset(result, 0, sizeof(*result));
+
+    size_t n_in = fs_in;  /* 1 second */
+    size_t n_out = fs_out + 1024;
+
+    float *in  = (float *)malloc(n_in * sizeof(float));
+    float *out = (float *)malloc(n_out * sizeof(float));
+    if (!in || !out) { free(in); free(out); return; }
+
+    /* Two-pass approach: discover output count, then bin-align */
+    for (size_t i = 0; i < n_in; i++)
+        in[i] = (float)(0.5 * sin(2.0 * M_PI * 1000.0 * (double)i / (double)fs_in));
+
+    size_t produced = 0;
+    if (resample_needed(fs_in, fs_out)) {
+        resample_ctx_t *rs = resample_create(fs_in, fs_out, resample_engine, soxr_quality);
+        if (!rs) { free(in); free(out); return; }
+        produced = resample_process(rs, in, out, n_in);
+        resample_free(rs);
+    } else {
+        fir_chain_t fir;
+        if (fir_chain_init(&fir, fs_in, fs_out) != 0) { free(in); free(out); return; }
+        produced = fir_chain_process(&fir, in, out, n_in);
+        fir_chain_free(&fir);
+    }
+
+    if (produced < 1000) { free(in); free(out); return; }
+
+    /* Second pass: bin-aligned */
+    double bw = (double)fs_out / (double)produced;
+    unsigned bin = (unsigned)(1000.0 / bw + 0.5);
+    double freq = bin * bw;
+
+    for (size_t i = 0; i < n_in; i++)
+        in[i] = (float)(0.5 * sin(2.0 * M_PI * freq * (double)i / (double)fs_in));
+
+    if (resample_needed(fs_in, fs_out)) {
+        resample_ctx_t *rs = resample_create(fs_in, fs_out, resample_engine, soxr_quality);
+        if (!rs) { free(in); free(out); return; }
+        produced = resample_process(rs, in, out, n_in);
+        resample_free(rs);
+    } else {
+        fir_chain_t fir;
+        if (fir_chain_init(&fir, fs_in, fs_out) != 0) { free(in); free(out); return; }
+        produced = fir_chain_process(&fir, in, out, n_in);
+        fir_chain_free(&fir);
+    }
+
+    if (produced < 1000) { free(in); free(out); return; }
+
+    double meas_freq = (unsigned)(freq / ((double)fs_out / (double)produced) + 0.5)
+                       * ((double)fs_out / (double)produced);
+    result->sinad_theoretical = measure_goertzel_sinad(
+        out, produced, meas_freq, fs_out, &result->sinad_awtd_theo);
+    result->ok = 1;
+
+    free(in);
+    free(out);
 }
