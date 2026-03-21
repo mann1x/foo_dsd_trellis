@@ -137,6 +137,60 @@ static void test_quality_dsd64_48(void) {
     TEST_ASSERT_TRUE(r.multitone_sinad_db > 50.0, "DSD64/48 multitone > 50 dB");
 }
 
+/* ─── Full matrix test ─── */
+
+static void test_quality_matrix(void) {
+    /* Test all path types with representative rate pairs */
+    typedef struct { const char *name; uint32_t in; uint32_t out; int type; } qtest_t;
+    /* type: 0=DSD→DSD, 1=DSD→PCM, 2=PCM→DSD, 3=PCM→PCM */
+    static const qtest_t tests[] = {
+        /* DSD→DSD same-rate */
+        { "DSD128 re-encode",       DSD_RATE_128, DSD_RATE_128, 0 },
+        { "DSD256 re-encode",       DSD_RATE_256, DSD_RATE_256, 0 },
+        /* DSD→PCM same-family */
+        { "DSD64->PCM44.1k",        DSD_RATE_64,  44100,    1 },
+        { "DSD128->PCM88.2k",       DSD_RATE_128, 88200,    1 },
+        { "DSD256->PCM176.4k",      DSD_RATE_256, 176400,   1 },
+        /* DSD/48→PCM same-family */
+        { "DSD64/48->PCM48k",       DSD48_RATE_64, 48000,   1 },
+        /* PCM→PCM same-family */
+        { "44.1k->88.2k FIR",       44100, 88200,   3 },
+        { "96k->48k FIR",           96000, 48000,   3 },
+        /* PCM→PCM cross-family */
+        { "44.1k->48k polyphase",   44100, 48000,   3 },
+        { "96k->88.2k polyphase",   96000, 88200,   3 },
+    };
+    int n = sizeof(tests) / sizeof(tests[0]);
+    int ok = 0;
+    printf("    %-28s  %7s  %7s  %7s  %7s\n", "Path", "SINAD", "A-wtd", "MT", "NMod");
+    printf("    %-28s  %7s  %7s  %7s  %7s\n", "---", "---", "---", "---", "---");
+    for (int i = 0; i < n; i++) {
+        sinad_result_t r;
+        memset(&r, 0, sizeof(r));
+        if (tests[i].type == 0) {
+            sinad_measure(tests[i].out, -1, 2, 4, 128, 1, 0.708f, &r);
+        } else if (tests[i].type == 1) {
+            sinad_measure_dsd_to_pcm(tests[i].in, tests[i].out, &r);
+        } else if (tests[i].type == 3) {
+            sinad_measure_pcm_to_pcm(tests[i].in, tests[i].out,
+                                      RESAMPLE_AUTO, SOXR_QUALITY_HQ, &r);
+        }
+        printf("    %-28s  %6.1f  %6.1f  %6.1f  %6.1f  %s\n",
+               tests[i].name,
+               r.sinad_theoretical, r.sinad_awtd_theo,
+               r.multitone_sinad_db, r.noise_mod_db,
+               r.ok ? "OK" : "FAIL");
+        if (r.ok) {
+            TEST_ASSERT_TRUE(r.sinad_theoretical > 30.0, tests[i].name);
+            if (r.multitone_sinad_db != 0.0)
+                TEST_ASSERT_TRUE(r.multitone_sinad_db > 30.0, tests[i].name);
+            ok++;
+        }
+    }
+    printf("    %d/%d paths measured successfully\n", ok, n);
+    TEST_ASSERT_EQ(ok, n, "all matrix paths should succeed");
+}
+
 void test_quality_suite(void) {
     TEST_SUITE("Quality Metrics");
     TEST_RUN(test_a_weight_1khz);
@@ -150,4 +204,5 @@ void test_quality_suite(void) {
     TEST_RUN(test_quality_dsd64_48);
     TEST_RUN(test_quality_dsd64_to_pcm44);
     TEST_RUN(test_quality_pcm_44_to_48);
+    TEST_RUN(test_quality_matrix);
 }
