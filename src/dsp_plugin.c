@@ -761,6 +761,13 @@ int plugin_get_stressed_worker(const plugin_state_t *s, double *ratio) {
     return threadpool_get_stressed_thread(s->pool, ratio);
 }
 
+/* Query actual cpuset ID for a specific worker */
+uint32_t plugin_get_worker_cpuset(const plugin_state_t *s, int worker_index) {
+    if (!s || !s->pool)
+        return 0;
+    return threadpool_get_worker_cpuset(s->pool, worker_index);
+}
+
 /* Query CPUSET change info for debug logging */
 bool plugin_get_cpuset_change(const plugin_state_t *s, uint64_t *mask) {
     if (!s) {
@@ -783,127 +790,90 @@ static void migration_tick(plugin_state_t *s) {
 
     extern void trellis_log_c(const char *);
 
-    /* Cooldown */
+    /* Cooldown between re-selections */
     if (s->migration.cooldown_chunks > 0) {
         s->migration.cooldown_chunks--;
-        /* Allow bypass for CRITICAL (checked below) */
+        return;
     }
 
-    int num_workers = threadpool_get_thread_count(s->pool);
-
-    /* ── If a probe is active, count down and evaluate ── */
-    if (s->migration.active) {
-        s->migration.probe_chunks--;
-        if (s->migration.probe_chunks <= 0) {
-            /* Probe complete — evaluate */
-            int w = s->migration.stressed_worker;
-            double post_avg = threadpool_get_worker_avg_rt(s->pool, w);
-            double improvement = s->migration.pre_avg_rt - post_avg;
-
-            char msg[192];
-            if (improvement >= MIGRATION_THRESHOLD) {
-                /* WIRE: keep the new core assignment */
-                sprintf_s(msg, sizeof(msg),
-                    "migration: worker %d kept on LP%u (%.0f%% -> %.0f%% RT, -%.0f%%)",
-                    w, s->migration.candidate_cpuset,
-                    s->migration.pre_avg_rt * 100.0, post_avg * 100.0,
-                    improvement * 100.0);
-                trellis_log_c(msg);
-                /* Update tracked core IDs */
-                if (w < s->selected_core_count)
-                    s->selected_core_ids[w] = s->migration.candidate_cpuset;
-            } else {
-                /* ABANDON: revert to original core */
-                threadpool_migrate_thread(s->pool, w, s->migration.original_cpuset);
-                sprintf_s(msg, sizeof(msg),
-                    "migration: worker %d reverted to LP%u (%.0f%% -> %.0f%% RT, only -%.0f%%)",
-                    w, s->migration.original_cpuset,
-                    s->migration.pre_avg_rt * 100.0, post_avg * 100.0,
-                    improvement * 100.0);
-                trellis_log_c(msg);
-            }
-            s->migration.active = false;
-            s->migration.cooldown_chunks = MIGRATION_COOLDOWN;
-        }
-        return;  /* don't start new probe while one is active */
-    }
-
-    /* ── Find most stressed worker ── */
-    int worst = -1;
-    worker_stress_level_t worst_level = WORKER_HEALTHY;
-    for (int i = 0; i < num_workers; i++) {
-        worker_stress_level_t level = threadpool_get_worker_stress(s->pool, i);
-        if (level > worst_level) {
-            worst_level = level;
-            worst = i;
-        }
-    }
-
-    if (worst_level == WORKER_HEALTHY)
+    /* ── Check if any worker's core became loaded ──
+     * Read fresh load data from background monitor.
+     * If any assigned core has >30% load, re-select all workers. */
+    if (!s->cpu_monitor)
         return;
 
-    /* Respect cooldown unless CRITICAL */
-    if (s->migration.cooldown_chunks > 0 && worst_level != WORKER_CRITICAL)
-        return;
-
-    /* ── Start probe: migrate to best available core ── */
-
-    /* Read latest topology snapshot from background monitor */
     cpu_topology_t snap;
-    if (s->cpu_monitor)
-        cpuset_monitor_read(s->cpu_monitor, &snap);
-    else
-        memcpy(&snap, &s->topology, sizeof(snap));
+    cpuset_monitor_read(s->cpu_monitor, &snap);
 
-    /* Select the best single core not currently used by any worker */
-    uint32_t best_ids[CPUSET_MAX_CPUS];
-    int best_count = cpuset_select(&snap,
+    /* Check load on cores assigned to workers */
+    int num_workers = threadpool_get_thread_count(s->pool);
+    bool any_loaded = false;
+    uint32_t loaded_cpuset = 0;
+    double loaded_pct = 0.0;
+    for (int i = 0; i < num_workers; i++) {
+        uint32_t wid = threadpool_get_worker_cpuset(s->pool, i);
+        if (wid == 0) continue;
+        for (int j = 0; j < snap.count; j++) {
+            if (snap.entries[j].id == wid && snap.entries[j].load > 0.30) {
+                if (snap.entries[j].load > loaded_pct) {
+                    loaded_pct = snap.entries[j].load;
+                    loaded_cpuset = wid;
+                }
+                any_loaded = true;
+            }
+        }
+    }
+
+    if (!any_loaded)
+        return;
+
+    /* ── Core contention detected: re-select ALL workers ── */
+    uint32_t new_ids[CPUSET_MAX_CPUS];
+    uint8_t  new_lps[CPUSET_MAX_CPUS];
+    int max_t = s->config.thread_count > 0 ? s->config.thread_count : 0;
+    int new_count = cpuset_select(&snap,
         (smt_mode_t)s->config.smt_mode,
         (ccd_mode_t)s->config.ccd_mode,
         (ecore_mode_t)s->config.ecore_mode,
-        0, best_ids, NULL, NULL, CPUSET_MAX_CPUS);
+        max_t, new_ids, new_lps, NULL, CPUSET_MAX_CPUS);
 
-    /* Find first core not already assigned to any worker */
-    uint32_t candidate = 0;
-    for (int i = 0; i < best_count; i++) {
-        bool in_use = false;
-        for (int w = 0; w < s->selected_core_count; w++) {
-            if (s->selected_core_ids[w] == best_ids[i]) {
-                in_use = true;
-                break;
-            }
-        }
-        if (!in_use) {
-            candidate = best_ids[i];
-            break;
+    if (new_count <= 0)
+        return;
+
+    int pool_count = threadpool_get_thread_count(s->pool);
+    int repinned = 0;
+    for (int i = 0; i < pool_count; i++) {
+        int core_idx = i % new_count;
+        uint32_t cur = threadpool_get_worker_cpuset(s->pool, i);
+        if (cur != new_ids[core_idx]) {
+            threadpool_migrate_thread(s->pool, i, new_ids[core_idx]);
+            repinned++;
         }
     }
 
-    if (candidate == 0)
-        return;  /* no free cores available */
+    if (repinned > 0) {
+        s->selected_core_count = new_count;
+        memcpy(s->selected_core_ids, new_ids,
+               (size_t)new_count * sizeof(uint32_t));
 
-    /* Record pre-migration stats and migrate */
-    s->migration.active = true;
-    s->migration.stressed_worker = worst;
-    s->migration.original_cpuset = threadpool_get_worker_cpuset(s->pool, worst);
-    s->migration.candidate_cpuset = candidate;
-    s->migration.pre_avg_rt = threadpool_get_worker_avg_rt(s->pool, worst);
-    s->migration.probe_chunks = MIGRATION_PROBE_CHUNKS;
+        /* Find LP index of loaded core for logging */
+        uint8_t loaded_lp = 0;
+        for (int j = 0; j < snap.count; j++)
+            if (snap.entries[j].id == loaded_cpuset)
+                { loaded_lp = snap.entries[j].logical_index; break; }
 
-    /* Migrate the stressed worker's thread to the candidate core.
-     * The worker keeps producing audio — zero gap. We measure its
-     * performance on the new core for PROBE_CHUNKS and decide. */
-    threadpool_migrate_thread(s->pool, worst, candidate);
-
-    {
-        char msg[192];
-        sprintf_s(msg, sizeof(msg),
-            "migration: probing worker %d from LP%u to LP%u (avg %.0f%% RT, %s)",
-            worst, s->migration.original_cpuset, candidate,
-            s->migration.pre_avg_rt * 100.0,
-            worst_level == WORKER_CRITICAL ? "CRITICAL" : "WARN");
+        char msg[256];
+        int pos = snprintf(msg, sizeof(msg),
+            "migration: LP%d loaded (%.0f%%), re-pinned %d workers to (",
+            loaded_lp, loaded_pct * 100.0, repinned);
+        for (int i = 0; i < new_count && pos < 240; i++)
+            pos += snprintf(msg + pos, sizeof(msg) - pos,
+                "LP%d%s", new_lps[i], i < new_count - 1 ? "," : "");
+        snprintf(msg + pos, sizeof(msg) - pos, ")");
         trellis_log_c(msg);
     }
+
+    s->migration.cooldown_chunks = MIGRATION_COOLDOWN;
 }
 
 /*

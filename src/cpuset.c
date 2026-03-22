@@ -683,6 +683,7 @@ void cpuset_update_load(cpu_topology_t *topo) {
     if (status != 0) return;
 
     int n_procs = (int)(ret_len / sizeof(info[0]));
+    int nonzero = 0;
     for (int i = 0; i < topo->count && i < n_procs; i++) {
         int lp = topo->entries[i].logical_index;
         if (lp >= n_procs) continue;
@@ -694,16 +695,36 @@ void cpuset_update_load(cpu_topology_t *topo) {
         if (g_load_initialized) {
             LONGLONG d_total = total.QuadPart - g_prev_total[lp].QuadPart;
             LONGLONG d_idle = idle.QuadPart - g_prev_idle[lp].QuadPart;
-            if (d_total > 0)
+            if (d_total > 0) {
                 topo->entries[i].load = 1.0 - (double)d_idle / (double)d_total;
-            else
+                if (topo->entries[i].load > 0.05) nonzero++;
+            } else {
                 topo->entries[i].load = 0.0;
+            }
         }
 
         g_prev_idle[lp] = idle;
         g_prev_total[lp] = total;
     }
     g_load_initialized = true;
+
+    /* Debug: log when loaded cores are detected */
+    {
+        static int load_log_count = 0;
+        if (nonzero > 0 && load_log_count++ < 20) {
+            extern void log_ring_write(const char *);
+            char msg[512];
+            int pos = 0;
+            pos += snprintf(msg + pos, sizeof(msg) - pos, "load_update: ");
+            for (int i = 0; i < topo->count && pos < 480; i++) {
+                if (topo->entries[i].load > 0.05)
+                    pos += snprintf(msg + pos, sizeof(msg) - pos, "LP%d=%.0f%% ",
+                        topo->entries[i].logical_index,
+                        topo->entries[i].load * 100.0);
+            }
+            log_ring_write(msg);
+        }
+    }
 }
 
 /* ─── Thread selection (tiered) ─── */

@@ -71,6 +71,7 @@ bool            plugin_get_cpuset_change(const plugin_state_t *s, uint64_t *mask
 int             plugin_get_selected_cores(const plugin_state_t *s,
                                            uint32_t *ids, int max_ids);
 int             plugin_get_stressed_worker(const plugin_state_t *s, double *ratio);
+uint32_t        plugin_get_worker_cpuset(const plugin_state_t *s, int worker_index);
 
 /* Config serialization (config.c) */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size);
@@ -2136,15 +2137,13 @@ public:
                             t_unpack, t_fir, t_sdm, t_pack,
                             chunk_ms, ratio);
 
-                /* Log worker RT stress with core ID */
+                /* Log worker RT stress with actual core assignment */
                 double stressed_ratio = 0.0;
                 int stressed_idx = plugin_get_stressed_worker(m_state, &stressed_ratio);
                 if (stressed_idx >= 0) {
-                    uint32_t core_ids[64];
-                    int n_cores = plugin_get_selected_cores(m_state, core_ids, 64);
-                    int core_lp = (stressed_idx < n_cores) ? core_ids[stressed_idx] : -1;
-                    trellis_log("  WARNING: worker %d stressed (%.0f%% RT budget) on LP%d",
-                                stressed_idx, stressed_ratio * 100.0, core_lp);
+                    uint32_t worker_cpuset = plugin_get_worker_cpuset(m_state, stressed_idx);
+                    trellis_log("  WARNING: worker %d stressed (%.0f%% RT budget) on cpuset %u",
+                                stressed_idx, stressed_ratio * 100.0, worker_cpuset);
                 }
 
                 /* Log which cores actually processed work (first chunk only) */
