@@ -1387,8 +1387,7 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
      * Too many segments per chunk = dense stitching = noise floor rises.
      * With D≥64K, stitch density is low enough for 275+ dB SINAD. */
     {
-        int max_by_density = (int)(count / 65536);
-        if (max_by_density < 1) max_by_density = 1;
+        int max_by_density = 4;  /* TEST: 4 segments */
         if (num_segs > max_by_density) num_segs = max_by_density;
     }
 
