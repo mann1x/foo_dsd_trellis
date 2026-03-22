@@ -38,7 +38,10 @@ typedef struct {
  * to keep the signal within the SDM's linear operating range. */
 static const path_config_t path_table[] = {
     /*                                            lim  cands lat  depth gain  */
-    /* All paths use 0.708 (-3 dB) gain for uniform volume across rates.
+    /* All paths use gain=1.0 (0 dB) for maximum signal-to-quantization ratio.
+     * SDM limiter (state_limit) handles FIR overload on rate-conversion paths.
+     * Previous -3 dB attenuation was unnecessary and worsened noise modulation
+     * by reducing the signal to ~7% of the quantizer range on same-rate paths.
      * lat = 0 means "auto" (computed as cands * 8 at runtime).
      * Optimal lat from nc×lat sweep: nc=2→16, nc=4→32, nc=8→64. */
     /* Same-rate re-encode (boxcar/FIR → SDM).
@@ -48,44 +51,47 @@ static const path_config_t path_table[] = {
      *   DSD128: SDM6/nc=2/lat=128   → 127.4 dB, 0 collapse
      *   DSD256: CLANS6/nc=2/lat=128 → 143.5 dB, 0 collapse
      *   DSD512: SDM6/nc=2/lat=32    → 137.6 dB, 0 collapse */
-    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
-    { DSD_RATE_128, DSD_RATE_128, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
-    { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
-    { DSD_RATE_512, DSD_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
+    /* Same-rate: gain=1.0 (no attenuation). FIR lowpass output is already
+     * tiny (~±0.097 for DSD128); -3 dB attenuation makes it even smaller,
+     * worsening the signal-to-quantization ratio and noise modulation. */
+    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_6, 0.0,  2,  0, 4, 1.0f },
+    { DSD_RATE_128, DSD_RATE_128, NTF_SDM_6,   0.0,  2,  0, 4, 1.0f },
+    { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 1.0f },
+    { DSD_RATE_512, DSD_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 1.0f },
     /* Upsample paths */
-    { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },
-    { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 0.708f },
-    { DSD_RATE_64,  DSD_RATE_512, NTF_CLANS_6, 10.0, 2,  0, 4, 0.708f },
-    { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 0.708f },
-    { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_8, 12.0, 2,  0, 4, 0.708f },
-    { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 0.708f },
+    { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 1.0f },
+    { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 1.0f },
+    { DSD_RATE_64,  DSD_RATE_512, NTF_CLANS_6, 10.0, 2,  0, 4, 1.0f },
+    { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 1.0f },
+    { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_8, 12.0, 2,  0, 4, 1.0f },
+    { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 1.0f },
     /* Downsample paths */
-    { DSD_RATE_128, DSD_RATE_64,  NTF_CLANS_4, 0.0,  32, 0, 0, 0.708f },
-    { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  0, 0, 0.708f },
-    { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_4, 0.0,  8,  0, 0, 0.708f },
-    { DSD_RATE_512, DSD_RATE_64,  NTF_SDM_6,   0.0,  8,  0, 0, 0.708f },
-    { DSD_RATE_512, DSD_RATE_128, NTF_SDM_4,  16.0, 16,  0, 0, 0.708f },
-    { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 0.708f },
+    { DSD_RATE_128, DSD_RATE_64,  NTF_CLANS_4, 0.0,  32, 0, 0, 1.0f },
+    { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  0, 0, 1.0f },
+    { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_4, 0.0,  8,  0, 0, 1.0f },
+    { DSD_RATE_512, DSD_RATE_64,  NTF_SDM_6,   0.0,  8,  0, 0, 1.0f },
+    { DSD_RATE_512, DSD_RATE_128, NTF_SDM_4,  16.0, 16,  0, 0, 1.0f },
+    { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 1.0f },
     /* ─── DSD/48 paths (mirror DSD/44 NTF choices) ─── */
     /* Same-rate re-encode */
-    { DSD48_RATE_64,  DSD48_RATE_64,  NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
-    { DSD48_RATE_128, DSD48_RATE_128, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
-    { DSD48_RATE_256, DSD48_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
-    { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_64,  DSD48_RATE_64,  NTF_CLANS_6, 0.0,  2,  0, 4, 1.0f },
+    { DSD48_RATE_128, DSD48_RATE_128, NTF_SDM_6,   0.0,  2,  0, 4, 1.0f },
+    { DSD48_RATE_256, DSD48_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 1.0f },
+    { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 1.0f },
     /* DSD/48 upsample */
-    { DSD48_RATE_64,  DSD48_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },
-    { DSD48_RATE_64,  DSD48_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 0.708f },
-    { DSD48_RATE_64,  DSD48_RATE_512, NTF_CLANS_6, 10.0, 2,  0, 4, 0.708f },
-    { DSD48_RATE_128, DSD48_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 0.708f },
-    { DSD48_RATE_128, DSD48_RATE_512, NTF_CLANS_8, 12.0, 2,  0, 4, 0.708f },
-    { DSD48_RATE_256, DSD48_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_64,  DSD48_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 1.0f },
+    { DSD48_RATE_64,  DSD48_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 1.0f },
+    { DSD48_RATE_64,  DSD48_RATE_512, NTF_CLANS_6, 10.0, 2,  0, 4, 1.0f },
+    { DSD48_RATE_128, DSD48_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 1.0f },
+    { DSD48_RATE_128, DSD48_RATE_512, NTF_CLANS_8, 12.0, 2,  0, 4, 1.0f },
+    { DSD48_RATE_256, DSD48_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 1.0f },
     /* DSD/48 downsample */
-    { DSD48_RATE_128, DSD48_RATE_64,  NTF_CLANS_4, 0.0,  32, 0, 0, 0.708f },
-    { DSD48_RATE_256, DSD48_RATE_64,  NTF_CLANS_8, 0.0,  8,  0, 0, 0.708f },
-    { DSD48_RATE_256, DSD48_RATE_128, NTF_CLANS_4, 0.0,  8,  0, 0, 0.708f },
-    { DSD48_RATE_512, DSD48_RATE_64,  NTF_SDM_6,   0.0,  8,  0, 0, 0.708f },
-    { DSD48_RATE_512, DSD48_RATE_128, NTF_SDM_4,  16.0, 16,  0, 0, 0.708f },
-    { DSD48_RATE_512, DSD48_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 0.708f },
+    { DSD48_RATE_128, DSD48_RATE_64,  NTF_CLANS_4, 0.0,  32, 0, 0, 1.0f },
+    { DSD48_RATE_256, DSD48_RATE_64,  NTF_CLANS_8, 0.0,  8,  0, 0, 1.0f },
+    { DSD48_RATE_256, DSD48_RATE_128, NTF_CLANS_4, 0.0,  8,  0, 0, 1.0f },
+    { DSD48_RATE_512, DSD48_RATE_64,  NTF_SDM_6,   0.0,  8,  0, 0, 1.0f },
+    { DSD48_RATE_512, DSD48_RATE_128, NTF_SDM_4,  16.0, 16,  0, 0, 1.0f },
+    { DSD48_RATE_512, DSD48_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 1.0f },
 };
 
 #define PATH_TABLE_COUNT (sizeof(path_table) / sizeof(path_table[0]))

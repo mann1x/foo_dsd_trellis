@@ -155,6 +155,7 @@
     <ClCompile Include="test\test_stitch.c" />
     <ClCompile Include="test\test_gpu_kernel_debug.c" />
     <ClCompile Include="test\test_dsf_compare.c" />
+    <ClCompile Include="test\test_1_5bit.c" />
     <!-- Library sources (linked directly, no DLL dependency) -->
     <ClCompile Include="src\config.c" />
     <ClCompile Include="src\dop.c" />
