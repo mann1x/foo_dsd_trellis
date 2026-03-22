@@ -404,7 +404,7 @@ typedef struct {
 
 /* FIR gain Auto sentinel and default */
 #define FIR_GAIN_AUTO    (-128)
-#define FIR_GAIN_DEFAULT (0)    /* 0 dB = unity gain */
+#define FIR_GAIN_DEFAULT (-3)   /* -3 dB = 0.708 linear */
 
 /* Convert FIR gain dB to linear. Handles Auto sentinel. */
 static inline float fir_gain_db_to_linear(int8_t db) {
