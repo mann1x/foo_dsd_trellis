@@ -281,8 +281,13 @@ static void test_gpu_das_sinad(void) {
     }
     gpu_cuda_trellis_setup(ctx, nc, f->order, lat, f->a, f->g, 0.0);
 
-    /* DAS path: 1 channel */
-    int rc = gpu_cuda_trellis_das(ctx, smoothed, gpu_out, enc_n, 1);
+    /* DAS path: 1 channel (fp64 input) */
+    double *smoothed_d_das = (double *)malloc(enc_n * sizeof(double));
+    if (smoothed_d_das) {
+        for (size_t i = 0; i < enc_n; i++) smoothed_d_das[i] = (double)smoothed[i];
+    }
+    int rc = gpu_cuda_trellis_das(ctx, smoothed_d_das, gpu_out, enc_n, 1);
+    free(smoothed_d_das);
     gpu_destroy(ctx);
     free(smoothed_d);
 
@@ -301,7 +306,13 @@ static void test_gpu_das_sinad(void) {
     double old_sinad = -999.0;
     if (ctx2 && old_out) {
         gpu_cuda_trellis_setup(ctx2, nc, f->order, lat, f->a, f->g, 0.0);
-        int rc2 = gpu_cuda_trellis(ctx2, smoothed, old_out, enc_n);
+        /* Convert fp32 input to fp64 for trellis kernel */
+        double *smoothed_d2 = (double *)malloc(enc_n * sizeof(double));
+        if (smoothed_d2) {
+            for (size_t i = 0; i < enc_n; i++) smoothed_d2[i] = (double)smoothed[i];
+        }
+        int rc2 = smoothed_d2 ? gpu_cuda_trellis(ctx2, smoothed_d2, old_out, enc_n) : -1;
+        free(smoothed_d2);
         if (rc2 == 0)
             old_sinad = measure_sinad(old_out, enc_n, dsd_rate, test_freq);
         gpu_destroy(ctx2);
@@ -393,8 +404,15 @@ static void test_gpu_das_multi_chunk(void) {
         float *chunk_out = (float *)calloc(in_count, sizeof(float));
         if (!chunk_out) break;
 
-        int rc = gpu_cuda_trellis_das(ctx, smoothed + in_start,
+        /* Convert chunk to fp64 for trellis kernel */
+        double *chunk_d = (double *)malloc(in_count * sizeof(double));
+        if (chunk_d) {
+            for (size_t i = 0; i < in_count; i++)
+                chunk_d[i] = (double)smoothed[in_start + i];
+        }
+        int rc = gpu_cuda_trellis_das(ctx, chunk_d,
                                        chunk_out, in_count, 1);
+        free(chunk_d);
         if (rc != 0) {
             printf("    DAS chunk %d failed\n", c);
             free(chunk_out);

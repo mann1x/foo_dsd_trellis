@@ -576,7 +576,8 @@ static int ensure_sdm_bufs(cuda_context_t *c, size_t floats) {
     if (c->sdm_buf_cap >= floats) return 0;
     if (c->d_sdm_in)  pfn_cuMemFree(c->d_sdm_in);
     if (c->d_sdm_out) pfn_cuMemFree(c->d_sdm_out);
-    if (pfn_cuMemAlloc(&c->d_sdm_in, floats * sizeof(float)) != CUDA_SUCCESS)
+    /* Allocate as doubles (largest element) — covers both fp64 trellis and fp32 precorr */
+    if (pfn_cuMemAlloc(&c->d_sdm_in, floats * sizeof(double)) != CUDA_SUCCESS)
         return -1;
     if (pfn_cuMemAlloc(&c->d_sdm_out, floats * sizeof(float)) != CUDA_SUCCESS)
         return -1;
@@ -1056,7 +1057,7 @@ int gpu_cuda_fir_batch(cuda_context_t *c, const float *in_batch,
 /* Parallel-segment GPU Trellis: launches num_sms independent segments,
  * each with overlap warmup. Massive parallelism across segments.
  * Same approach as CPU threadpool segmentation but with 84+ segments. */
-int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
+int gpu_cuda_trellis(cuda_context_t *c, const double *in, float *out,
                       size_t count) {
     if (!c || !c->fn_trellis_parallel || c->trellis_cands < 2)
         return -1;
@@ -1144,11 +1145,11 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
         return -1;
     }
 
-    /* Upload input + segment descriptors */
+    /* Upload input (fp64) + segment descriptors */
     CUdeviceptr d_seg_starts, d_seg_out_starts;
     pfn_cuMemAlloc(&d_seg_starts, (size_t)num_segs * sizeof(int));
     pfn_cuMemAlloc(&d_seg_out_starts, (size_t)num_segs * sizeof(int));
-    pfn_cuMemcpyHtoDAsync(c->d_sdm_in, in, count * sizeof(float), stream);
+    pfn_cuMemcpyHtoDAsync(c->d_sdm_in, in, count * sizeof(double), stream);
     pfn_cuMemcpyHtoDAsync(d_seg_starts, h_seg_starts, (size_t)num_segs * sizeof(int), stream);
     pfn_cuMemcpyHtoDAsync(d_seg_out_starts, h_seg_out_starts, (size_t)num_segs * sizeof(int), stream);
 
@@ -1619,8 +1620,8 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
         int ch_stride_out = (int)total_seg_out;
 
         int D_nominal = D;
-        /* Use ext_seed if uploaded (full history/path/traceback) */
-        CUdeviceptr ext_seed_ptr = s_d_ext_seed;
+        /* DAS path: no ext_seed (segments use NTF state from all_init_states) */
+        CUdeviceptr ext_seed_ptr = 0;
         void *args[] = {
             &c->d_sdm_in, &c->d_das_seg_out,
             &c->d_das_seg_starts, &c->d_das_seg_out_starts,

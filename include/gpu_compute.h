@@ -211,7 +211,7 @@ int gpu_cuda_precorr_setup(void *ctx, int order,
                             const float *pred_table, float state_limit);
 
 /* Persistent-buffer SDM process (no per-chunk alloc) */
-int gpu_cuda_trellis(void *ctx, const float *in, float *out, size_t count);
+int gpu_cuda_trellis(void *ctx, const double *in, float *out, size_t count);
 /* DAS (Density-Aligned Stitching) GPU pipeline: SDM + stitch + assemble.
  * All channels processed simultaneously. Input/output: [num_ch × count] */
 int gpu_cuda_trellis_das(void *ctx, const double *in, float *out,

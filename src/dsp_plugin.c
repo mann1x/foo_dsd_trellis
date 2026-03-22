@@ -1074,8 +1074,10 @@ size_t plugin_process(plugin_state_t *s,
         if (s->config.gpu_sdm_enabled && s->gpu &&
             s->config.sdm_mode == SDM_MODE_TRELLIS &&
             (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)) {
-            max_seg = 4;  /* TEST: 4 GPU segments */
-            segments_per_ch = max_seg;
+            /* Hybrid CPU+GPU: allow many segments. CPU takes 1, GPU takes
+             * the rest in parallel across SMs. Cap by D≥64K density rule. */
+            max_seg = (fs_out >= DSD_RATE_512) ? 4 : 2;
+            if (segments_per_ch > max_seg) segments_per_ch = max_seg;
         } else {
             max_seg = (fs_out >= DSD_RATE_512) ? 4 : 2;
             if (segments_per_ch > max_seg) segments_per_ch = max_seg;
@@ -1454,199 +1456,64 @@ size_t plugin_process(plugin_state_t *s,
                         cur_lat, f->a, f->g, s->channels[0].sdm.state_limit);
             }
 
-            /* ═══ GPU offload: CPU state pass → GPU parallel output ═══
-             *
-             * Step 1: CPU processes ch0 sequentially in segments, capturing
-             *         full SDM state (history/path/traceback) at each boundary.
-             * Step 2: Upload boundary states + fp64 input to GPU.
-             * Step 3: GPU processes all segments, each perfectly seeded.
-             * Step 4: Download GPU output. No stitching needed.
-             *
-             * Ch1 runs in parallel with ch0 on threadpool (state capture
-             * only needed for ch0 — ch1 uses same boundary positions). */
+            /* GPU Trellis SDM: 2-pass DAS with internal stitching.
+             * gpu_cuda_trellis_das handles segment layout, 2-pass state
+             * chaining, and DAS density-matched stitching internally. */
             {
-                int num_gpu_segs = segments_per_ch;
-                size_t seg_size = fir_n / (size_t)num_gpu_segs;
-                int nc_cfg = s->config.trellis_cands;
-                int lat_cfg = s->config.trellis_lat;
-                int order = s->channels[0].sdm.filter->order;
-                int hb = (lat_cfg + 7) / 8;
-                size_t seed_struct_size = 8 * 128 + 8 * 4 + 8 * 4 + 4 + 4 + 4;
-
-                /* ── Step 1: CPU state pass on ch0 (sequential, captures states) ── */
-                unsigned char *all_seeds = (unsigned char *)calloc(
-                    (size_t)num_gpu_segs, seed_struct_size);
-                double *all_states = (double *)calloc(
-                    (size_t)num_gpu_segs * (size_t)nc_cfg * 8, sizeof(double));
-                double *all_costs = (double *)calloc(
-                    (size_t)num_gpu_segs * (size_t)nc_cfg, sizeof(double));
-                float *cpu_out_ch0 = (float *)malloc(fir_n * sizeof(float));
-
-                bool gpu_ok = false;
-                if (all_seeds && all_states && all_costs && cpu_out_ch0) {
-                    sdm_context_t *ctx = &s->channels[0].sdm;
-
-                    for (int seg = 0; seg < num_gpu_segs; seg++) {
-                        size_t start = seg * seg_size;
-                        size_t count_s = (seg == num_gpu_segs - 1) ?
-                                         fir_n - start : seg_size;
-
-                        /* Capture FULL state before processing this segment:
-                         * - NTF integrators + costs → all_states/all_costs
-                         * - History/path/traceback → all_seeds */
-                        {
-                            int bank = ctx->idx & 1;
-                            sdm_trellis_t *st = &ctx->trellis[bank];
-                            int na = (int)ctx->num_cands;
-
-                            /* NTF state + cost */
-                            for (int i = 0; i < na && i < nc_cfg; i++) {
-                                sdm_state_t *a = st->act[i];
-                                if (a) {
-                                    for (int k = 0; k < order && k < 8; k++)
-                                        all_states[seg * nc_cfg * 8 + i * 8 + k] = a->state[k];
-                                    all_costs[seg * nc_cfg + i] = a->cost;
-                                }
-                            }
-
-                            /* History/path/traceback */
-                            unsigned char *seed = all_seeds + seg * seed_struct_size;
-                            memset(seed, 0, seed_struct_size);
-                            for (int i = 0; i < na && i < 8; i++) {
-                                sdm_state_t *a = st->act[i];
-                                if (a) {
-                                    int hi = a->hist;
-                                    for (int b = 0; b < hb && b < 128; b++)
-                                        seed[i * 128 + b] = ctx->hist[hi][b];
-                                    ((unsigned *)(seed + 1024))[i] = a->path;
-                                    ((unsigned *)(seed + 1056))[i] = a->next;
-                                }
-                            }
-                            *(int *)(seed + 1088) = (int)ctx->pos;
-                            *(int *)(seed + 1092) = (int)ctx->pending;
-                            *(int *)(seed + 1096) = na;
-                        }
-
-                        /* Process segment (advances CPU state) */
-                        sdm_process_block(ctx, fir_data[0] + start,
-                                          cpu_out_ch0 + start, count_s);
-                    }
-
-                    /* ── Step 1b: Ch1 on threadpool (just output, no state capture) ── */
-                    channel_block_t ch1_block;
-                    memset(&ch1_block, 0, sizeof(ch1_block));
-                    if (num_channels > 1) {
-                        ch1_block.mode     = BLOCK_MODE_SDM;
-                        ch1_block.sdm_ctx  = &s->channels[1].sdm;
-                        ch1_block.in       = fir_data[1];
-                        ch1_block.out      = s->ch_out[1];
-                        ch1_block.count    = fir_n;
-                        ch1_block.discard  = 0;
-                        ch1_block.channel  = 1;
-                        threadpool_submit(s->pool, &ch1_block);
-                    }
-
-                    /* ── Step 2: Upload boundary seeds + launch GPU ── */
-                    int *gpu_starts = (int *)calloc((size_t)num_gpu_segs, sizeof(int));
-                    int *gpu_out_starts = (int *)calloc((size_t)num_gpu_segs, sizeof(int));
-                    int *gpu_totals = (int *)calloc((size_t)num_gpu_segs, sizeof(int));
-                    int *gpu_caps = (int *)calloc((size_t)num_gpu_segs, sizeof(int));
-
-                    if (gpu_starts && gpu_out_starts && gpu_totals && gpu_caps) {
-                        size_t out_off = 0;
-                        for (int seg = 0; seg < num_gpu_segs; seg++) {
-                            size_t start = seg * seg_size;
-                            size_t count_s = (seg == num_gpu_segs - 1) ?
-                                             fir_n - start : seg_size;
-                            gpu_starts[seg] = (int)start;
-                            gpu_out_starts[seg] = (int)out_off;
-                            gpu_totals[seg] = (int)count_s;
-                            gpu_caps[seg] = (int)count_s;
-                            out_off += count_s;
-                        }
-
-                        /* Upload fp64 input */
-                        if (s->gpu_das_buf_cap < fir_n) {
-                            free(s->gpu_das_in);
-                            s->gpu_das_in = (float *)malloc(fir_n * sizeof(double));
-                            s->gpu_das_buf_cap = s->gpu_das_in ? fir_n : 0;
-                        }
-                        if (s->gpu_das_in)
-                            memcpy(s->gpu_das_in, fir_data[0], fir_n * sizeof(double));
-
-                        /* Upload all boundary seeds (per-segment ext_seeds) */
-                        gpu_cuda_upload_boundary_seeds(s->gpu,
-                            all_seeds, num_gpu_segs,
-                            all_states, all_costs, nc_cfg);
-
-                        int rc = gpu_cuda_hybrid_async(s->gpu,
-                            (const double *)s->gpu_das_in, fir_n, 1,
-                            gpu_starts, gpu_out_starts,
-                            gpu_totals, gpu_caps,
-                            num_gpu_segs, 0, fir_n);
-
-                        if (rc == 0) {
-                            if (num_channels > 1)
-                                threadpool_wait(s->pool);
-
-                            /* Download GPU output into seg_bufs (same buffers
-                             * CPU segments use). DAS stitching handles assembly. */
-                            float *gpu_seg_ptrs[64];
-                            size_t gpu_seg_counts_tmp[64];
-                            memset(gpu_seg_counts_tmp, 0, sizeof(gpu_seg_counts_tmp));
-                            for (int seg = 0; seg < num_gpu_segs; seg++)
-                                gpu_seg_ptrs[seg] = seg_bufs[0 * segments_per_ch + seg];
-
-                            gpu_cuda_hybrid_finish(s->gpu, gpu_seg_ptrs,
-                                                    gpu_seg_counts_tmp,
-                                                    num_gpu_segs, 1);
-
-                            /* Copy GPU output counts to seg_out_counts for ch0 */
-                            for (int seg = 0; seg < num_gpu_segs; seg++)
-                                seg_out_counts[0 * segments_per_ch + seg] =
-                                    gpu_seg_counts_tmp[seg];
-
-                            /* Ch1: use CPU output from threadpool (already in seg_bufs via ch1_block) */
-                            /* Actually ch1 was submitted as BLOCK_MODE_SDM to ch_out[1].
-                             * For DAS stitching, ch1 needs to be in seg_bufs too.
-                             * For now: ch1 uses CPU output directly in ch_out[1].
-                             * DAS stitching only runs on ch0 to find positions,
-                             * then applies same positions to ch1. */
-                            seg_out_counts[1 * segments_per_ch + 0] = ch1_block.out_count;
-
-                            gpu_ok = true;
-                            /* Don't set dsd_out_count — let DAS stitching handle it */
-
-                            {
-                                static int offload_log = 0;
-                                if (offload_log++ < 3) {
-                                    char msg[128];
-                                    snprintf(msg, sizeof(msg),
-                                        "GPU offload: %d segs, %zu samples → DAS stitch",
-                                        num_gpu_segs, fir_n);
-                                    trellis_log_c(msg);
-                                }
-                            }
-                        } else {
-                            if (num_channels > 1)
-                                threadpool_wait(s->pool);
-                        }
-                    }
-                    free(gpu_starts); free(gpu_out_starts);
-                    free(gpu_totals); free(gpu_caps);
-                    free(all_states); free(all_costs);
+                /* Pack fp64 fir_data into contiguous buffer for GPU */
+                size_t total_f64 = fir_n * (size_t)num_channels;
+                if (s->gpu_das_buf_cap < fir_n || s->gpu_das_buf_nch < num_channels) {
+                    free(s->gpu_das_in); free(s->gpu_das_out);
+                    s->gpu_das_in  = (float *)malloc(total_f64 * sizeof(double));
+                    s->gpu_das_out = (float *)malloc(total_f64 * sizeof(float));
+                    s->gpu_das_buf_cap = s->gpu_das_in ? fir_n : 0;
+                    s->gpu_das_buf_nch = s->gpu_das_in ? num_channels : 0;
                 }
-                free(all_seeds);
-                free(cpu_out_ch0);
 
-                /* GPU output is in seg_bufs — fall through to DAS stitching.
-                 * If GPU failed, fall through to CPU parallel path. */
-                if (!gpu_ok)
-                    ;  /* CPU parallel path will run below */
+                if (s->gpu_das_in && s->gpu_das_out) {
+                    double *das_in_f64 = (double *)s->gpu_das_in;
+                    for (int ch = 0; ch < num_channels; ch++)
+                        memcpy(das_in_f64 + ch * fir_n, fir_data[ch],
+                               fir_n * sizeof(double));
+
+                    int rc = gpu_cuda_trellis_das(s->gpu, das_in_f64,
+                                                   s->gpu_das_out, fir_n,
+                                                   num_channels);
+                    if (rc == 0) {
+                        for (int ch = 0; ch < num_channels; ch++)
+                            memcpy(s->ch_out[ch], s->gpu_das_out + ch * fir_n,
+                                   fir_n * sizeof(float));
+                        dsd_out_count = fir_n;
+                    }
+                }
+
+                {
+                    static int offload_log = 0;
+                    if (offload_log++ < 3) {
+                        char msg[128];
+                        snprintf(msg, sizeof(msg),
+                            "GPU SDM: trellis_das %zu samples, %d ch, rc=%d",
+                            fir_n, num_channels, dsd_out_count > 0 ? 0 : -1);
+                        trellis_log_c(msg);
+                    }
+                }
             }
 
+            if (dsd_out_count > 0) {
+                QueryPerformanceCounter(&t_sdm_end);
+                s->time_sdm_ms = perf_ms(t_sdm_start, t_sdm_end);
+                goto sdm_done;
+            }
+            /* Fall through to CPU parallel path on failure */
+        }
+
+        /* Phase 2: Launch ALL segments in parallel — no sequential dependency.
+         * All segments (including seg0) are seeded from the persistent SDM's
+         * current state and run simultaneously. Overlap stitching handles
+         * boundary alignment after all segments complete. */
+
         /* Compute nominal segment boundaries */
-        size_t seg_nominal_start[32][64];
+        size_t seg_nominal_start[32][64];  /* [ch][seg] — up to 64 segs/ch for hybrid */
         size_t seg_nominal_size[32][64];
         size_t seg0_nominal[32];
         size_t seg0_outs[32];
@@ -1668,11 +1535,13 @@ size_t plugin_process(plugin_state_t *s,
             seg0_nominal[ch] = seg_nominal_size[ch][0];
         }
 
-        /* Ensure cached segment output buffers */
+        /* Ensure cached segment output buffers are large enough.
+         * Reused across chunks to avoid malloc/free contention. */
         int total_all_segs = num_channels * segments_per_ch;
         size_t max_seg_samples = fir_counts[0] / (size_t)segments_per_ch + overlap + 4096;
         if (s->cached_seg_buf_count < total_all_segs ||
             s->cached_seg_buf_sz < max_seg_samples) {
+            /* Grow cached buffers */
             if (s->cached_seg_bufs) {
                 for (int i = 0; i < s->cached_seg_buf_count; i++)
                     free(s->cached_seg_bufs[i]);
@@ -1685,13 +1554,9 @@ size_t plugin_process(plugin_state_t *s,
             s->cached_seg_buf_sz = max_seg_samples;
         }
         float **seg_bufs = s->cached_seg_bufs;
-        size_t seg_out_counts_arr[128];
+        size_t seg_out_counts_arr[128];  /* up to 64 segs × 2 ch */
         size_t *seg_out_counts = seg_out_counts_arr;
         memset(seg_out_counts, 0, (size_t)total_all_segs * sizeof(size_t));
-
-        /* If GPU produced output in seg_bufs, skip CPU segment launch
-         * and go directly to DAS stitching (Phase 2c below). */
-        if (!gpu_hybrid_ok) {
 
         /* ── Hybrid CPU+GPU segment split ──
          * CPU processes segments 0..(cpu_segs-1) on threadpool.
