@@ -149,6 +149,9 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     int lat   = pi.lat > 0 ? pi.lat : SINAD_TRELLIS_LAT;
     int depth = pi.depth > 0 ? pi.depth : SINAD_TRELLIS_DEPTH;
 
+    /* Align test frequency to the FINAL PCM measurement grid (44100/48000 Hz).
+     * This ensures clean Goertzel measurement after DSD→PCM decimation. */
+    unsigned meas_pcm_rate = rate_is_48k_family(fs_out) ? 48000 : 44100;
     size_t est_in_produced = n_in - (size_t)lat;
     size_t est_fir_out;
     if (fs_out >= fs_in)
@@ -156,7 +159,9 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     else
         est_fir_out = est_in_produced / (fs_in / fs_out);
     size_t est_sdm_out = est_fir_out - (size_t)lat;
-    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm_out);
+    size_t est_pcm_out = est_sdm_out / (fs_out / meas_pcm_rate);
+    if (est_pcm_out < 256) est_pcm_out = 256;
+    double freq = bin_align_freq(1000.0, (double)meas_pcm_rate, est_pcm_out);
     size_t dsd_in_count = generate_dsd_sine(fs_in, freq, 0.5, n_in, dsd_in);
 
     if (dsd_in_count < 1024) {
@@ -231,19 +236,17 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
      * FIR decimation removes ultrasonic noise → accurate in-band SINAD. */
     double sinad_db;
     {
-        unsigned pcm_rate = rate_is_48k_family(fs_out) ? 48000 : 44100;
         fir_chain_t dec_fir;
         memset(&dec_fir, 0, sizeof(dec_fir));
-        fir_chain_init(&dec_fir, fs_out, pcm_rate);
+        fir_chain_init(&dec_fir, fs_out, meas_pcm_rate);
         float *pcm_buf = (float *)calloc(out_count, sizeof(float));
         size_t pcm_n = pcm_buf ? fir_chain_process(&dec_fir, dsd_out, pcm_buf, out_count) : 0;
         fir_chain_free(&dec_fir);
         size_t skip = 256;
         if (pcm_n > skip + 1024) {
-            /* Re-align frequency to decimated PCM rate's bin grid */
             size_t meas_n = pcm_n - skip;
-            double pcm_freq = bin_align_freq(freq, (double)pcm_rate, meas_n);
-            sinad_db = measure_sinad(pcm_buf + skip, meas_n, pcm_freq, (double)pcm_rate);
+            /* freq is already bin-aligned to meas_pcm_rate from the start */
+            sinad_db = measure_sinad(pcm_buf + skip, meas_n, freq, (double)meas_pcm_rate);
         } else {
             sinad_db = -999.0;
         }
@@ -1537,6 +1540,9 @@ static double measure_weak_path_sinad(uint32_t fs_in, uint32_t fs_out,
         return -999.0;
     }
 
+    /* Align test frequency to the FINAL PCM measurement grid (44100/48000 Hz).
+     * This ensures clean Goertzel measurement after DSD→PCM decimation. */
+    unsigned meas_pcm_rate = rate_is_48k_family(fs_out) ? 48000 : 44100;
     size_t est_in_produced = n_in - (size_t)lat;
     size_t est_fir_out;
     if (fs_out >= fs_in)
@@ -1544,7 +1550,9 @@ static double measure_weak_path_sinad(uint32_t fs_in, uint32_t fs_out,
     else
         est_fir_out = est_in_produced / (fs_in / fs_out);
     size_t est_sdm_out = est_fir_out - (size_t)lat;
-    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm_out);
+    size_t est_pcm_out = est_sdm_out / (fs_out / meas_pcm_rate);
+    if (est_pcm_out < 256) est_pcm_out = 256;
+    double freq = bin_align_freq(1000.0, (double)meas_pcm_rate, est_pcm_out);
     size_t dsd_in_count = generate_dsd_sine(fs_in, freq, 0.5, n_in, dsd_in);
 
     if (dsd_in_count < 1024) {
