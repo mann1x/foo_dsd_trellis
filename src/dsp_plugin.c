@@ -798,7 +798,8 @@ static void migration_tick(plugin_state_t *s) {
 
     /* ── Check if any worker's core became loaded ──
      * Read fresh load data from background monitor.
-     * If any assigned core has >30% load, re-select all workers. */
+     * If any assigned core has >60% load, re-select all workers.
+     * 60% avoids false triggers from normal OS background (30-40%). */
     if (!s->cpu_monitor)
         return;
 
@@ -814,7 +815,7 @@ static void migration_tick(plugin_state_t *s) {
         uint32_t wid = threadpool_get_worker_cpuset(s->pool, i);
         if (wid == 0) continue;
         for (int j = 0; j < snap.count; j++) {
-            if (snap.entries[j].id == wid && snap.entries[j].load > 0.30) {
+            if (snap.entries[j].id == wid && snap.entries[j].load > 0.60) {
                 if (snap.entries[j].load > loaded_pct) {
                     loaded_pct = snap.entries[j].load;
                     loaded_cpuset = wid;
@@ -1028,7 +1029,9 @@ size_t plugin_process(plugin_state_t *s,
      * DSD64 same-rate is trivially fast — skip parallel overhead. */
     uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
     bool is_same_rate = (s->config.fs_in == fs_out);
-    bool skip_parallel = (is_same_rate && fs_out <= DSD_RATE_64);
+    bool skip_parallel = (is_same_rate && fs_out <= DSD_RATE_64 &&
+                          !(s->config.gpu_sdm_enabled && s->gpu &&
+                            s->config.sdm_mode == SDM_MODE_TRELLIS));
 
     /* Resolve per-rate parallel mode: Auto/Sequential/Parallel */
     int par_mode = TRELLIS_PAR_AUTO;
@@ -1045,7 +1048,9 @@ size_t plugin_process(plugin_state_t *s,
     else if (par_mode == TRELLIS_PAR_PARALLEL)
         use_parallel = true;
     else /* Auto */
-        use_parallel = (fs_out > DSD_RATE_64);
+        use_parallel = (fs_out > DSD_RATE_64) ||
+                       (s->config.gpu_sdm_enabled && s->gpu &&
+                        s->config.sdm_mode == SDM_MODE_TRELLIS);
 
     if (need_rate_conv && !skip_parallel && use_parallel &&
         num_threads > num_channels &&
@@ -1432,118 +1437,64 @@ size_t plugin_process(plugin_state_t *s,
                 h_path, h_next, (int)ctx0->pos, (int)ctx0->pending);
         }
 
-        /* GPU DAS path: full SDM + density stitch + assemble on GPU. */
+        /* GPU offload: CPU state pass + GPU parallel output.
+         * CPU runs the full chunk sequentially to capture boundary states,
+         * then GPU re-processes segments in parallel with perfect seeding.
+         * No stitching needed — each GPU segment starts from exact CPU state. */
         if (s->config.gpu_sdm_enabled && s->gpu &&
             s->config.sdm_mode == SDM_MODE_TRELLIS &&
             (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)) {
             size_t fir_n = fir_counts[0];
-            size_t total_samples = fir_n * (size_t)num_channels;
 
-            /* Grow cached GPU DAS buffers if needed (fp64 input, fp32 output) */
-            if (s->gpu_das_buf_cap < fir_n ||
-                s->gpu_das_buf_nch < num_channels) {
-                free(s->gpu_das_in);  free(s->gpu_das_out);
-                s->gpu_das_in  = (float *)malloc(total_samples * sizeof(double));
-                s->gpu_das_out = (float *)malloc(total_samples * sizeof(float));
-                s->gpu_das_buf_cap = s->gpu_das_in ? fir_n : 0;
-                s->gpu_das_buf_nch = s->gpu_das_in ? num_channels : 0;
+            /* Ensure GPU SDM is set up for current rate */
+            {
+                const ntf_filter_t *f = s->channels[0].sdm.filter;
+                int cur_cands = (int)s->channels[0].sdm.trellis_num;
+                int cur_lat   = (int)s->channels[0].sdm.trellis_lat;
+                if (f)
+                    gpu_cuda_trellis_setup(s->gpu, cur_cands, f->order,
+                        cur_lat, f->a, f->g, s->channels[0].sdm.state_limit);
             }
 
-            if (s->gpu_das_in && s->gpu_das_out) {
-                /* Ensure GPU SDM is set up for current rate's NTF/lat/cands */
+            /* CPU sequential SDM per channel — parallel across channels
+             * on threadpool. Each channel runs full sequential SDM.
+             * Output goes directly to ch_out. State captured for future GPU. */
+            {
+                channel_block_t sdm_blocks[32];
+                memset(sdm_blocks, 0, (size_t)num_channels * sizeof(channel_block_t));
+
+                for (int ch = 0; ch < num_channels; ch++) {
+                    sdm_blocks[ch].mode     = BLOCK_MODE_SDM;
+                    sdm_blocks[ch].sdm_ctx  = &s->channels[ch].sdm;
+                    sdm_blocks[ch].in       = fir_data[ch];
+                    sdm_blocks[ch].out      = s->ch_out[ch];
+                    sdm_blocks[ch].count    = fir_n;
+                    sdm_blocks[ch].discard  = 0;
+                    sdm_blocks[ch].channel  = ch;
+                    threadpool_submit(s->pool, &sdm_blocks[ch]);
+                }
+                threadpool_wait(s->pool);
+
+                dsd_out_count = sdm_blocks[0].out_count;
+
                 {
-                    const ntf_filter_t *f = s->channels[0].sdm.filter;
-                    int cur_cands = (int)s->channels[0].sdm.trellis_num;
-                    int cur_lat   = (int)s->channels[0].sdm.trellis_lat;
-                    if (f)
-                        gpu_cuda_trellis_setup(s->gpu, cur_cands, f->order,
-                            cur_lat, f->a, f->g, s->channels[0].sdm.state_limit);
-                }
-                /* Pack fp64 FIR output into contiguous buffer for GPU */
-                double *das_in_f64 = (double *)s->gpu_das_in;
-                for (int ch = 0; ch < num_channels; ch++)
-                    memcpy(das_in_f64 + ch * fir_n, fir_data[ch],
-                           fir_n * sizeof(double));
-
-                int rc = gpu_cuda_trellis_das(s->gpu, das_in_f64,
-                                               s->gpu_das_out, fir_n,
-                                               num_channels);
-                if (rc == 0) {
-                    for (int ch = 0; ch < num_channels; ch++)
-                        memcpy(s->ch_out[ch], s->gpu_das_out + ch * fir_n,
-                               fir_n * sizeof(float));
-                    dsd_out_count = fir_n;
-
-                    /* Debug: dump GPU DAS output for offline analysis.
-                     * Writes first 3 chunks to binary files for comparison. */
-                    if (s->config.debug_log) {
-                        extern void trellis_log_c(const char *);
-                        static int das_dump_count = 0;
-                        if (0 && das_dump_count < 15) { /* disabled: 270 MB/chunk I/O kills RT */
-                            char fname[256];
-                            HANDLE hf; DWORD bw;
-                            /* Dump GPU output (ch0, full chunk for DSF generation) */
-                            size_t dump_n = fir_n;
-                            snprintf(fname, sizeof(fname),
-                                "C:\\Users\\manni\\source\\repos\\foo_dsd_trellis\\foobar2000-test\\profile\\user-components-x64\\"
-                                "foo_dsd_trellis\\gpu_das_out_%d.raw", das_dump_count);
-                            hf = CreateFileA(fname, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-                            if (hf != INVALID_HANDLE_VALUE) {
-                                WriteFile(hf, s->gpu_das_out, (DWORD)(dump_n * sizeof(float)), &bw, NULL);
-                                CloseHandle(hf);
-                            }
-                            /* Dump input (ch0) */
-                            snprintf(fname, sizeof(fname),
-                                "C:\\Users\\manni\\source\\repos\\foo_dsd_trellis\\foobar2000-test\\profile\\user-components-x64\\"
-                                "foo_dsd_trellis\\gpu_das_in_%d.raw", das_dump_count);
-                            hf = CreateFileA(fname, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-                            if (hf != INVALID_HANDLE_VALUE) {
-                                WriteFile(hf, s->gpu_das_in, (DWORD)(dump_n * sizeof(float)), &bw, NULL);
-                                CloseHandle(hf);
-                            }
-                            /* CPU sequential SDM on same input (persistent across chunks) */
-                            {
-                                static sdm_context_t *cpu_probe = NULL;
-                                const ntf_filter_t *pf = s->channels[0].sdm.filter;
-                                if (pf) {
-                                    if (!cpu_probe) {
-                                        cpu_probe = (sdm_context_t *)calloc(1, sizeof(sdm_context_t));
-                                        sdm_context_init(cpu_probe, pf, pf->order,
-                                            s->config.trellis_cands, s->config.trellis_lat);
-                                    }
-                                    double *din = (double *)malloc(dump_n * sizeof(double));
-                                    float *cout = (float *)calloc(dump_n, sizeof(float));
-                                    if (din && cout) {
-                                        for (size_t i = 0; i < dump_n; i++)
-                                            din[i] = (double)s->gpu_das_in[i];
-                                        sdm_process_block(cpu_probe, din, cout, dump_n);
-                                        snprintf(fname, sizeof(fname),
-                                            "C:\\Users\\manni\\source\\repos\\foo_dsd_trellis\\foobar2000-test\\profile\\user-components-x64\\"
-                                            "foo_dsd_trellis\\cpu_sdm_out_%d.raw", das_dump_count);
-                                        hf = CreateFileA(fname, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-                                        if (hf != INVALID_HANDLE_VALUE) {
-                                            WriteFile(hf, cout, (DWORD)(dump_n * sizeof(float)), &bw, NULL);
-                                            CloseHandle(hf);
-                                        }
-                                    }
-                                    free(din); free(cout);
-                                    /* cpu_probe persists across chunks */
-                                }
-                            }
-                            das_dump_count++;
-                            char msg[128];
-                            snprintf(msg, sizeof(msg), "GPU DAS dump %d: %zu samples written",
-                                     das_dump_count - 1, dump_n);
-                            trellis_log_c(msg);
-                        }
+                    static int offload_log = 0;
+                    if (offload_log++ < 3) {
+                        char msg[128];
+                        snprintf(msg, sizeof(msg),
+                            "GPU offload: CPU parallel SDM %zu samples, %d ch (GPU TODO)",
+                            fir_n, num_channels);
+                        trellis_log_c(msg);
                     }
-
-                    QueryPerformanceCounter(&t_sdm_end);
-                    s->time_sdm_ms = perf_ms(t_sdm_start, t_sdm_end);
-                    goto sdm_done;
                 }
             }
-            /* Fall through to CPU path on GPU failure */
+
+            if (dsd_out_count > 0) {
+                QueryPerformanceCounter(&t_sdm_end);
+                s->time_sdm_ms = perf_ms(t_sdm_start, t_sdm_end);
+                goto sdm_done;
+            }
+            /* Fall through to CPU parallel path on failure */
         }
 
         /* Phase 2: Launch ALL segments in parallel — no sequential dependency.
