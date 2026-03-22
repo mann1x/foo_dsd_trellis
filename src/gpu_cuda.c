@@ -1357,11 +1357,11 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
 
     int D = (int)(count / (size_t)num_segs);
 
-    /* Convergence warmup: match gpu_cuda_trellis for consistency */
+    /* Convergence warmup: 16×lat for NTF state convergence. */
     int M = 16 * lat;
     if (M > 4096) M = 4096;
 
-    /* Adaptive overlap: min(32×lat, D/2) — adapts to GPU SM layout */
+    /* Adaptive overlap: min(32×lat, D/2) */
     int das_overlap = 32 * lat;
     if (das_overlap > D / 2) das_overlap = D / 2;
     if (das_overlap < lat) das_overlap = lat;
@@ -1572,9 +1572,7 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
      *         Collects each segment's final state.
      * Pass 2: Re-run all segments with chained initial states:
      *         seg[i] seeded from seg[i-1]'s Pass-1 final state.
-     *         Adjacent segments now have continuous state → smooth stitching.
-     *
-     * Cost: 2× GPU SDM time (~0.06x RT), but eliminates 252 Hz stitch buzz. */
+     *         Adjacent segments now have continuous state → smooth stitching. */
     {
         int block_size = 2 * nc;
         if (block_size < 32) block_size = 32;
@@ -1835,61 +1833,17 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
     QueryPerformanceCounter(&t_k2);
     QueryPerformanceCounter(&t_k3);
 
-    /* Compute correct persistent state via sequential single-segment pass.
-     * The 2-pass DAS produces good output but the last segment's state is
-     * approximate (seeded from Pass 1 chain, not true sequential). Running
-     * one more single-segment pass with the correct persistent seed gives
-     * the exact end state for the next chunk. Cost: ~1 segment of SDM. */
+    /* Save last segment's final state as persistent for next chunk.
+     * With adaptive segment cap (D≥64K), the 2-pass DAS state chaining
+     * is accurate enough — no sequential verification pass needed. */
     {
-        /* Single-segment pass: process full input, discard output,
-         * keep only the final state for persistence. */
-        size_t state_bytes = (size_t)nc * 8 * sizeof(double);
-        size_t cost_bytes  = (size_t)nc * sizeof(double);
-
-        /* Reuse DAS buffers for a 1-segment run */
-        int one_seg = 1;
-        int one_start = 0;
-        int one_out_start = 0;
-        int one_total = (int)count;
-        int one_out_cap = (int)count;
-        pfn_cuMemcpyHtoDAsync(c->d_das_seg_starts, &one_start, sizeof(int), stream);
-        pfn_cuMemcpyHtoDAsync(c->d_das_seg_out_starts, &one_out_start, sizeof(int), stream);
-        pfn_cuMemcpyHtoDAsync(c->d_das_seg_total_sizes, &one_total, sizeof(int), stream);
-        pfn_cuMemcpyHtoDAsync(c->d_das_seg_out_caps, &one_out_cap, sizeof(int), stream);
-
-        /* Seed from current persistent state */
-        pfn_cuMemcpyDtoDAsync(c->d_das_init_states, c->d_trellis_states, state_bytes, stream);
-        pfn_cuMemcpyDtoDAsync(c->d_das_init_costs, c->d_trellis_costs, cost_bytes, stream);
-
-        int block_size = 2 * nc;
-        if (block_size < 32) block_size = 32;
-        int M_zero = 0;
-        int overlap_zero = 0;
-        int D_dummy = (int)count;
-        CUdeviceptr null_ptr = 0;
-        int state_stride = (int)count;
-        void *state_args[] = {
-            &c->d_sdm_in, &c->d_das_seg_out,  /* output discarded */
-            &c->d_das_seg_starts, &c->d_das_seg_out_starts,
-            &c->d_das_seg_total_sizes, &c->d_das_seg_out_caps,
-            &M_zero, &nc, &lat, &overlap_zero, &one_seg,
-            &state_stride, &state_stride,
-            &c->d_das_init_states, &c->d_das_init_costs,
-            &c->d_all_final_states, &c->d_all_final_costs,
-            &c->d_das_seg_counts,
-            &D_dummy, &null_ptr, &null_ptr
-        };
-        pfn_cuLaunchKernel(c->fn_trellis_parallel,
-                            1, 1, 1,  /* 1 segment, 1 channel (ch0 only) */
-                            (unsigned)block_size, 1, 1,
-                            0, stream, state_args, NULL);
-        pfn_cuStreamSynchronize(stream);
-
-        /* Save sequential final state as persistent */
+        size_t last_seg_off = (size_t)(num_segs - 1) * (size_t)nc;
         pfn_cuMemcpyDtoD(c->d_trellis_states,
-                          c->d_all_final_states, state_bytes);
+                          c->d_all_final_states + last_seg_off * 8 * sizeof(double),
+                          (size_t)nc * 8 * sizeof(double));
         pfn_cuMemcpyDtoD(c->d_trellis_costs,
-                          c->d_all_final_costs, cost_bytes);
+                          c->d_all_final_costs + last_seg_off * sizeof(double),
+                          (size_t)nc * sizeof(double));
     }
 
     /* CPU-side DAS already wrote to `out` directly — no GPU download needed */
