@@ -1922,6 +1922,9 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
  * Call before gpu_cuda_trellis_das() for full state continuity.
  * Without this, GPU segments start with zeroed history → 60% stitch density. */
 
+/* sdm_ext_seed struct size (must match CUDA kernel struct layout) */
+#define EXT_SEED_SIZE (8 * 128 + 8 * 4 + 8 * 4 + 4 + 4 + 4)  /* 1100 bytes */
+
 int gpu_cuda_upload_ext_seed(cuda_context_t *c,
                               const unsigned char *hist, int hist_bytes, int nc,
                               const unsigned *path,
@@ -1930,44 +1933,65 @@ int gpu_cuda_upload_ext_seed(cuda_context_t *c,
     if (!c) return -1;
     pfn_cuCtxSetCurrent(c->context);
 
-    /* sdm_ext_seed layout must match the CUDA struct */
-    /* hist: [MAX_CANDS][MAX_HIST_BYTES] = 8 × 128 = 1024 bytes */
-    /* path: [MAX_CANDS] = 8 × 4 = 32 bytes */
-    /* next_stored: [MAX_CANDS] = 8 × 4 = 32 bytes */
-    /* hist_pos: 4 bytes, pending: 4 bytes, num_cands: 4 bytes */
-    /* Total struct size = 1024 + 32 + 32 + 4 + 4 + 4 = 1100 bytes */
-    size_t struct_size = 8 * 128 + 8 * 4 + 8 * 4 + 4 + 4 + 4;
-
     if (!s_d_ext_seed)
-        pfn_cuMemAlloc(&s_d_ext_seed, struct_size);
+        pfn_cuMemAlloc(&s_d_ext_seed, EXT_SEED_SIZE);
     if (!s_d_ext_seed) return -1;
 
-    /* Build host-side struct */
-    unsigned char h_seed[1100];
+    unsigned char h_seed[EXT_SEED_SIZE];
     memset(h_seed, 0, sizeof(h_seed));
-
-    /* Copy history: per-candidate hist_bytes, padded to MAX_HIST_BYTES */
     for (int i = 0; i < nc && i < 8; i++) {
         int copy = hist_bytes < 128 ? hist_bytes : 128;
         memcpy(h_seed + i * 128, hist + i * hist_bytes, (size_t)copy);
     }
-
-    /* path[MAX_CANDS] at offset 1024 */
     unsigned *p_path = (unsigned *)(h_seed + 1024);
-    for (int i = 0; i < nc && i < 8; i++)
-        p_path[i] = path[i];
-
-    /* next_stored[MAX_CANDS] at offset 1024+32=1056 */
     unsigned *p_next = (unsigned *)(h_seed + 1056);
-    for (int i = 0; i < nc && i < 8; i++)
+    for (int i = 0; i < nc && i < 8; i++) {
+        p_path[i] = path[i];
         p_next[i] = next_stored[i];
-
-    /* hist_pos at 1088, pending at 1092, num_cands at 1096 */
+    }
     *(int *)(h_seed + 1088) = hist_pos;
     *(int *)(h_seed + 1092) = pending;
     *(int *)(h_seed + 1096) = nc;
 
-    pfn_cuMemcpyHtoD(s_d_ext_seed, h_seed, struct_size);
+    pfn_cuMemcpyHtoD(s_d_ext_seed, h_seed, EXT_SEED_SIZE);
+    return 0;
+}
+
+/* Upload array of ext_seeds (one per segment) + per-segment NTF states.
+ * seeds: packed array [num_segs × EXT_SEED_SIZE] from CPU boundary capture.
+ * states/costs: [num_segs × nc × 8] / [num_segs × nc] NTF integrator states. */
+int gpu_cuda_upload_boundary_seeds(cuda_context_t *c,
+                                     const unsigned char *seeds, int num_segs,
+                                     const double *states, const double *costs,
+                                     int nc) {
+    if (!c) return -1;
+    pfn_cuCtxSetCurrent(c->context);
+    CUstream stream = c->sdm_stream;
+
+    size_t total_seed_bytes = (size_t)num_segs * EXT_SEED_SIZE;
+
+    /* Grow ext_seed device buffer for array */
+    if (!s_d_ext_seed || total_seed_bytes > EXT_SEED_SIZE) {
+        if (s_d_ext_seed) pfn_cuMemFree(s_d_ext_seed);
+        pfn_cuMemAlloc(&s_d_ext_seed, total_seed_bytes);
+    }
+    if (!s_d_ext_seed) return -1;
+
+    pfn_cuMemcpyHtoDAsync(s_d_ext_seed, seeds, total_seed_bytes, stream);
+
+    /* Upload per-segment NTF states */
+    size_t state_bytes = (size_t)num_segs * (size_t)nc * 8 * sizeof(double);
+    size_t cost_bytes = (size_t)num_segs * (size_t)nc * sizeof(double);
+
+    if (c->das_alloc_segs < (size_t)num_segs) {
+        if (c->d_das_init_states) pfn_cuMemFree(c->d_das_init_states);
+        if (c->d_das_init_costs) pfn_cuMemFree(c->d_das_init_costs);
+        pfn_cuMemAlloc(&c->d_das_init_states, state_bytes);
+        pfn_cuMemAlloc(&c->d_das_init_costs, cost_bytes);
+    }
+    pfn_cuMemcpyHtoDAsync(c->d_das_init_states, states, state_bytes, stream);
+    pfn_cuMemcpyHtoDAsync(c->d_das_init_costs, costs, cost_bytes, stream);
+
     return 0;
 }
 
@@ -2034,22 +2058,27 @@ int gpu_cuda_hybrid_async(cuda_context_t *c,
         c->das_alloc_samples = total_out;
     }
 
-    /* Ensure descriptor buffers */
+    /* Ensure descriptor buffers.
+     * Skip init_states/costs realloc if boundary seeds already uploaded
+     * (s_d_ext_seed != 0 means gpu_cuda_upload_boundary_seeds was called). */
     if (c->das_alloc_segs < (size_t)num_gpu_segs) {
         if (c->d_das_seg_starts) pfn_cuMemFree(c->d_das_seg_starts);
         if (c->d_das_seg_out_starts) pfn_cuMemFree(c->d_das_seg_out_starts);
         if (c->d_das_seg_total_sizes) pfn_cuMemFree(c->d_das_seg_total_sizes);
         if (c->d_das_seg_out_caps) pfn_cuMemFree(c->d_das_seg_out_caps);
         if (c->d_das_seg_counts) pfn_cuMemFree(c->d_das_seg_counts);
-        if (c->d_das_init_states) pfn_cuMemFree(c->d_das_init_states);
-        if (c->d_das_init_costs) pfn_cuMemFree(c->d_das_init_costs);
         pfn_cuMemAlloc(&c->d_das_seg_starts, (size_t)num_gpu_segs * sizeof(int));
         pfn_cuMemAlloc(&c->d_das_seg_out_starts, (size_t)num_gpu_segs * sizeof(int));
         pfn_cuMemAlloc(&c->d_das_seg_total_sizes, (size_t)num_gpu_segs * sizeof(int));
         pfn_cuMemAlloc(&c->d_das_seg_out_caps, (size_t)num_gpu_segs * sizeof(int));
         pfn_cuMemAlloc(&c->d_das_seg_counts, (size_t)num_gpu_segs * (size_t)num_channels * sizeof(int));
-        pfn_cuMemAlloc(&c->d_das_init_states, (size_t)num_gpu_segs * (size_t)nc * 8 * sizeof(double));
-        pfn_cuMemAlloc(&c->d_das_init_costs, (size_t)num_gpu_segs * (size_t)nc * sizeof(double));
+        if (!s_d_ext_seed) {
+            /* Only alloc init_states/costs if no boundary seeds uploaded */
+            if (c->d_das_init_states) pfn_cuMemFree(c->d_das_init_states);
+            if (c->d_das_init_costs) pfn_cuMemFree(c->d_das_init_costs);
+            pfn_cuMemAlloc(&c->d_das_init_states, (size_t)num_gpu_segs * (size_t)nc * 8 * sizeof(double));
+            pfn_cuMemAlloc(&c->d_das_init_costs, (size_t)num_gpu_segs * (size_t)nc * sizeof(double));
+        }
         c->das_alloc_segs = (size_t)num_gpu_segs;
     }
 
@@ -2083,24 +2112,30 @@ int gpu_cuda_hybrid_async(cuda_context_t *c,
     pfn_cuMemcpyHtoDAsync(c->d_das_seg_out_caps, seg_out_caps,
                            (size_t)num_gpu_segs * sizeof(int), stream);
 
-    /* Seed all GPU segments from persistent state */
-    if (c->trellis_state_valid) {
-        size_t state_stride = (size_t)nc * 8 * sizeof(double);
-        size_t cost_stride = (size_t)nc * sizeof(double);
-        for (int i = 0; i < num_gpu_segs; i++) {
-            pfn_cuMemcpyDtoDAsync(
-                c->d_das_init_states + (size_t)i * state_stride,
-                c->d_trellis_states, state_stride, stream);
-            pfn_cuMemcpyDtoDAsync(
-                c->d_das_init_costs + (size_t)i * cost_stride,
-                c->d_trellis_costs, cost_stride, stream);
+    /* Seed GPU segments' NTF state.
+     * If per-segment boundary seeds were uploaded via gpu_cuda_upload_boundary_seeds,
+     * d_das_init_states already has the correct per-segment states — skip. */
+    if (!s_d_ext_seed) {
+        /* No boundary seeds — use persistent state for all segments */
+        if (c->trellis_state_valid) {
+            size_t state_stride = (size_t)nc * 8 * sizeof(double);
+            size_t cost_stride = (size_t)nc * sizeof(double);
+            for (int i = 0; i < num_gpu_segs; i++) {
+                pfn_cuMemcpyDtoDAsync(
+                    c->d_das_init_states + (size_t)i * state_stride,
+                    c->d_trellis_states, state_stride, stream);
+                pfn_cuMemcpyDtoDAsync(
+                    c->d_das_init_costs + (size_t)i * cost_stride,
+                    c->d_trellis_costs, cost_stride, stream);
+            }
+        } else {
+            pfn_cuMemsetD8Async(c->d_das_init_states, 0,
+                (size_t)num_gpu_segs * (size_t)nc * 8 * sizeof(double), stream);
+            pfn_cuMemsetD8Async(c->d_das_init_costs, 0,
+                (size_t)num_gpu_segs * (size_t)nc * sizeof(double), stream);
         }
-    } else {
-        pfn_cuMemsetD8Async(c->d_das_init_states, 0,
-            (size_t)num_gpu_segs * (size_t)nc * 8 * sizeof(double), stream);
-        pfn_cuMemsetD8Async(c->d_das_init_costs, 0,
-            (size_t)num_gpu_segs * (size_t)nc * sizeof(double), stream);
     }
+    /* else: per-segment states already in d_das_init_states from boundary upload */
 
     /* Pass 1 only: all GPU segments from persistent state (parallel).
      * Pass 2 runs later via gpu_cuda_hybrid_pass2() after CPU seg0
