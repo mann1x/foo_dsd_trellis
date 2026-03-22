@@ -21,6 +21,7 @@ typedef struct {
     double cost[8];
     unsigned path[8];
     unsigned char hist[8][128]; /* [candidate][hist_bytes] */
+    unsigned next_stored[8]; /* traceback from previous iteration (CPU pipeline) */
     int active;
     int hist_pos;
     int pending;
@@ -38,7 +39,7 @@ static void gpu_emu_init(gpu_emu_t *e, const ntf_filter_t *f, int nc, int lat) {
     e->lat = lat;
     e->a = f->a;
     e->g = f->g;
-    e->active = nc;
+    e->active = 1;  /* match CPU: starts with 1 candidate, grows after first sort */
 }
 
 /* Returns the output bit (0 or 1) */
@@ -50,16 +51,18 @@ static int gpu_emu_sample(gpu_emu_t *e, double x_raw,
     int order = e->order;
     int lat = e->lat;
 
-    /* Phase 0: traceback bits */
-    unsigned p_next[8];
+    /* Phase 0: Read CURRENT traceback from history.
+     * Children will inherit STORED traceback (from previous post-sort),
+     * matching the CPU's 1-step pipeline delay. */
+    unsigned cur_tb[8];  /* current traceback (for post-sort saving) */
     for (int t = 0; t < ac; t++) {
         if (e->pending >= lat) {
             int next_pos = (e->hist_pos + 1) % lat;
             int nb = next_pos / 8;
             int ni = next_pos % 8;
-            p_next[t] = (e->hist[t][nb] >> ni) & 1;
+            cur_tb[t] = (e->hist[t][nb] >> ni) & 1;
         } else {
-            p_next[t] = 0;
+            cur_tb[t] = 0;
         }
     }
 
@@ -69,11 +72,12 @@ static int gpu_emu_sample(gpu_emu_t *e, double x_raw,
     unsigned c_bit[16];
     unsigned c_path[16];
     unsigned c_next[16];
+    unsigned c_pi[16]; /* parent index for post-sort traceback */
     unsigned char c_hist[16][128];
 
     for (int t = 0; t < 2 * ac; t++) {
         int pi = t / 2;
-        double y_b = (t & 1) ? 1.0 : -1.0;
+        double y_b = (t & 1) ? -1.0 : 1.0;
         double d[8];
 
         /* NTF calc — exact copy from GPU kernel */
@@ -91,9 +95,10 @@ static int gpu_emu_sample(gpu_emu_t *e, double x_raw,
         for (int k = 0; k < order; k++)
             c_state[t][k] = d[k];
         c_cost[t] = e->cost[pi] + (v + e->a[0]*y_b)*(v + e->a[0]*y_b);
-        c_bit[t] = (t & 1) ? 0u : 1u;
+        c_bit[t] = t & 1;
         c_path[t] = (e->path[pi] << 1 | c_bit[t]) & 0xFF;
-        c_next[t] = p_next[pi];
+        c_next[t] = e->next_stored[pi]; /* inherit STORED, not current */
+        c_pi[t] = pi; /* track parent */
         memcpy(c_hist[t], e->hist[pi], sizeof(c_hist[0]));
 
         if (t == 0) {
@@ -142,6 +147,7 @@ static int gpu_emu_sample(gpu_emu_t *e, double x_raw,
                     c_bit[filtered] = c_bit[i];
                     c_path[filtered] = c_path[i];
                     c_next[filtered] = c_next[i];
+                    c_pi[filtered] = c_pi[i];
                     for (int k = 0; k < e->order; k++)
                         c_state[filtered][k] = c_state[i][k];
                     memcpy(c_hist[filtered], c_hist[i], sizeof(c_hist[0]));
@@ -152,46 +158,43 @@ static int gpu_emu_sample(gpu_emu_t *e, double x_raw,
         tc = filtered;
     }
 
-    /* Selection sort by cost */
-    for (int i = 0; i < ac && i < tc; i++) {
-        int best = i;
-        for (int j = i + 1; j < tc; j++)
-            if (c_cost[j] <= c_cost[best]) best = j;
-        if (best != i) {
-            double t_c = c_cost[i]; c_cost[i] = c_cost[best]; c_cost[best] = t_c;
-            unsigned t_b = c_bit[i]; c_bit[i] = c_bit[best]; c_bit[best] = t_b;
-            unsigned t_p = c_path[i]; c_path[i] = c_path[best]; c_path[best] = t_p;
-            unsigned t_n = c_next[i]; c_next[i] = c_next[best]; c_next[best] = t_n;
-            for (int k = 0; k < order; k++) {
-                double t_s = c_state[i][k]; c_state[i][k] = c_state[best][k]; c_state[best][k] = t_s;
-            }
-            unsigned char t_h[128];
-            memcpy(t_h, c_hist[i], sizeof(t_h));
-            memcpy(c_hist[i], c_hist[best], sizeof(t_h));
-            memcpy(c_hist[best], t_h, sizeof(t_h));
-        }
-    }
-    /* Path dedup */
+    /* Dedup-aware greedy selection (matches GPU kernel + CPU sdm_sort_cands) */
     {
-        int dd = 1;
-        for (int i = 1; i < ac; i++) {
-            int dup = 0;
-            for (int j = 0; j < dd; j++)
-                if (c_path[i] == c_path[j]) { dup = 1; break; }
-            if (!dup) {
-                if (dd != i) {
-                    c_cost[dd] = c_cost[i]; c_bit[dd] = c_bit[i];
-                    c_path[dd] = c_path[i]; c_next[dd] = c_next[i];
-                    for (int k = 0; k < order; k++) c_state[dd][k] = c_state[i][k];
-                    memcpy(c_hist[dd], c_hist[i], sizeof(c_hist[0]));
-                }
-                dd++;
+        int selected = 0;
+        unsigned used_paths[8];
+        for (int slot = 0; slot < e->nc && slot < tc; slot++) {
+            int best = -1;
+            for (int j = 0; j < tc; j++) {
+                if (c_cost[j] < 0.0) continue;
+                int dup = 0;
+                for (int k = 0; k < selected; k++)
+                    if (c_path[j] == used_paths[k]) { dup = 1; break; }
+                if (dup) continue;
+                if (best < 0 || c_cost[j] < c_cost[best])
+                    best = j;
             }
+            if (best < 0) break;
+            used_paths[selected] = c_path[best];
+            if (best != selected) {
+                double t_c = c_cost[selected]; c_cost[selected] = c_cost[best]; c_cost[best] = t_c;
+                unsigned t_b = c_bit[selected]; c_bit[selected] = c_bit[best]; c_bit[best] = t_b;
+                unsigned t_p = c_path[selected]; c_path[selected] = c_path[best]; c_path[best] = t_p;
+                unsigned t_n = c_next[selected]; c_next[selected] = c_next[best]; c_next[best] = t_n;
+                unsigned t_pi2 = c_pi[selected]; c_pi[selected] = c_pi[best]; c_pi[best] = t_pi2;
+                for (int k = 0; k < order; k++) {
+                    double t_s = c_state[selected][k]; c_state[selected][k] = c_state[best][k]; c_state[best][k] = t_s;
+                }
+                unsigned char t_h[128];
+                memcpy(t_h, c_hist[selected], sizeof(t_h));
+                memcpy(c_hist[selected], c_hist[best], sizeof(t_h));
+                memcpy(c_hist[best], t_h, sizeof(t_h));
+            }
+            selected++;
         }
-        ac = dd;
+        ac = selected;
     }
 
-    /* Output = traceback of best candidate */
+    /* Output = traceback of best candidate (STORED from previous iteration) */
     unsigned output_bit = c_next[0];
 
     /* Record bits in history */
@@ -207,12 +210,15 @@ static int gpu_emu_sample(gpu_emu_t *e, double x_raw,
     e->hist_pos = (e->hist_pos + 1) % lat;
     if (e->pending < lat) e->pending++;
 
-    /* Promote children to parents */
+    /* Promote children to parents.
+     * CPU pipeline: s->next = s->parent->next (parent's CURRENT traceback).
+     * Save parent's current traceback as next_stored for next iteration. */
     e->active = ac;
     double min_c = c_cost[0];
     for (int i = 0; i < ac; i++) {
         e->cost[i] = c_cost[i] - min_c;
         e->path[i] = c_path[i];
+        e->next_stored[i] = cur_tb[c_pi[i]]; /* parent's current traceback */
         for (int k = 0; k < order; k++)
             e->state[i][k] = c_state[i][k];
         memcpy(e->hist[i], c_hist[i], sizeof(e->hist[0]));
@@ -245,7 +251,7 @@ static void test_gpu_cpu_divergence(void) {
 
     int first_diff = -1;
     for (int s = 0; s < 300; s++) {
-        /* CPU */
+/* CPU */
         float cpu_out_f;
         double cpu_in = input_val;
         size_t cpu_n = sdm_process_block(&cpu, &cpu_in, &cpu_out_f, 1);
@@ -262,6 +268,7 @@ static void test_gpu_cpu_divergence(void) {
             /* Get CPU's recorded bit (path & 1 of best candidate after sort) */
             int cpu_bank_pre = cpu.idx & 1;
             sdm_state_t *cpu_best_pre = cpu.trellis[cpu_bank_pre].act[0];
+            sdm_state_t *cpu_sec_pre = (cpu.num_cands > 1) ? cpu.trellis[cpu_bank_pre].act[1] : NULL;
             unsigned cpu_recorded = cpu_best_pre ? (cpu_best_pre->path & 1) : 99;
             unsigned gpu_recorded = gpu.path[0] & 1;
             printf("    s=%3d: cpu_bit_recorded=%u gpu_bit_recorded=%u %s",

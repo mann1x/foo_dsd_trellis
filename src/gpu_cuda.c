@@ -1344,16 +1344,14 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
     int nc = c->trellis_cands;
     int lat = c->trellis_lat;
     int L = lat;
-    /* 2 segments for A/B comparison */
-    int num_segs = 2;
+    int num_segs = c->num_sms * 3;
+    if (num_segs < 1) num_segs = 1;
 
     int D = (int)(count / (size_t)num_segs);
 
-    /* Convergence warmup M: use full D to give SDMs maximum time to
-     * converge from seed state before producing output. This doubles
-     * kernel time but each segment processes 2D input samples before
-     * its first output, making state convergence much more likely. */
-    int M = D;
+    /* Convergence warmup: match gpu_cuda_trellis for consistency */
+    int M = 16 * lat;
+    if (M > 4096) M = 4096;
 
     /* Adaptive overlap: min(32×lat, D/2) — adapts to GPU SM layout */
     int das_overlap = 32 * lat;

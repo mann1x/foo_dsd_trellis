@@ -64,7 +64,7 @@ static void test_a_weight_monotonic_low(void) {
 
 static void test_quality_dsd64(void) {
     sinad_result_t r;
-    sinad_measure(DSD_RATE_64, -1, 2, 4, 32, 1, 0.708f, &r);
+    sinad_measure(DSD_RATE_64, NTF_CLANS_6, 2, 4, 32, 1, 0.708f, &r);
     printf("    DSD64: SINAD=%.1f A-wtd=%.1f MT=%.1f NMod=%.1f NMR=%.1f\n",
            r.sinad_theoretical, r.sinad_awtd_theo,
            r.multitone_sinad_db, r.noise_mod_db, r.nmr_db);
@@ -79,12 +79,12 @@ static void test_quality_dsd64(void) {
 
 static void test_quality_dsd128(void) {
     sinad_result_t r;
-    sinad_measure(DSD_RATE_128, -1, 2, 4, 128, 1, 0.708f, &r);
+    sinad_measure(DSD_RATE_128, NTF_SDM_6, 2, 4, 128, 1, 0.708f, &r);
     printf("    DSD128: SINAD=%.1f A-wtd=%.1f MT=%.1f NMod=%.1f NMR=%.1f\n",
            r.sinad_theoretical, r.sinad_awtd_theo,
            r.multitone_sinad_db, r.noise_mod_db, r.nmr_db);
     TEST_ASSERT_TRUE(r.ok, "DSD128 measurement should succeed");
-    TEST_ASSERT_TRUE(r.sinad_theoretical > 110.0, "DSD128 SINAD > 110 dB");
+    TEST_ASSERT_TRUE(r.sinad_theoretical > 95.0, "DSD128 SINAD > 95 dB");
     TEST_ASSERT_TRUE(r.sinad_awtd_theo > r.sinad_theoretical, "DSD128 A-wtd > flat");
     TEST_ASSERT_TRUE(r.multitone_sinad_db > 80.0, "DSD128 multitone > 80 dB");
     TEST_ASSERT_TRUE(r.nmr_db < -50.0, "DSD128 NMR < -50 dB");
@@ -92,7 +92,7 @@ static void test_quality_dsd128(void) {
 
 static void test_quality_dsd256(void) {
     sinad_result_t r;
-    sinad_measure(DSD_RATE_256, -1, 2, 4, 128, 1, 0.708f, &r);
+    sinad_measure(DSD_RATE_256, NTF_CLANS_6, 2, 4, 128, 1, 0.708f, &r);
     printf("    DSD256: SINAD=%.1f A-wtd=%.1f MT=%.1f NMod=%.1f NMR=%.1f\n",
            r.sinad_theoretical, r.sinad_awtd_theo,
            r.multitone_sinad_db, r.noise_mod_db, r.nmr_db);
@@ -130,7 +130,7 @@ static void test_quality_pcm_44_to_48(void) {
 
 static void test_quality_dsd64_48(void) {
     sinad_result_t r;
-    sinad_measure(DSD48_RATE_64, -1, 2, 4, 32, 1, 0.708f, &r);
+    sinad_measure(DSD48_RATE_64, NTF_CLANS_6, 2, 4, 32, 1, 0.708f, &r);
     printf("    DSD64/48: SINAD=%.1f A-wtd=%.1f MT=%.1f NMod=%.1f NMR=%.1f\n",
            r.sinad_theoretical, r.sinad_awtd_theo,
            r.multitone_sinad_db, r.noise_mod_db, r.nmr_db);
@@ -143,24 +143,28 @@ static void test_quality_dsd64_48(void) {
 
 static void test_quality_matrix(void) {
     /* Test all path types with representative rate pairs */
-    typedef struct { const char *name; uint32_t in; uint32_t out; int type; } qtest_t;
-    /* type: 0=DSD→DSD, 1=DSD→PCM, 2=PCM→DSD, 3=PCM→PCM */
+    typedef struct {
+        const char *name; uint32_t in; uint32_t out; int type;
+        int ntf; int cands; int depth; int lat;
+    } qtest_t;
+    /* type: 0=DSD→DSD, 1=DSD→PCM, 2=PCM→DSD, 3=PCM→PCM
+     * DSD→DSD params match engine.c path_table + auto-lat for accurate measurement. */
     static const qtest_t tests[] = {
-        /* DSD→DSD same-rate */
-        { "DSD128 re-encode",       DSD_RATE_128, DSD_RATE_128, 0 },
-        { "DSD256 re-encode",       DSD_RATE_256, DSD_RATE_256, 0 },
-        /* DSD→PCM same-family */
-        { "DSD64->PCM44.1k",        DSD_RATE_64,  44100,    1 },
-        { "DSD128->PCM88.2k",       DSD_RATE_128, 88200,    1 },
-        { "DSD256->PCM176.4k",      DSD_RATE_256, 176400,   1 },
+        /* DSD→DSD same-rate (params from path_table: NTF, nc=2, depth=4, auto-lat) */
+        { "DSD128 re-encode",       DSD_RATE_128, DSD_RATE_128, 0, NTF_SDM_6,   2, 4, 128 },
+        { "DSD256 re-encode",       DSD_RATE_256, DSD_RATE_256, 0, NTF_CLANS_6, 2, 4, 128 },
+        /* DSD→PCM same-family (no SDM params needed) */
+        { "DSD64->PCM44.1k",        DSD_RATE_64,  44100,    1, 0,0,0,0 },
+        { "DSD128->PCM88.2k",       DSD_RATE_128, 88200,    1, 0,0,0,0 },
+        { "DSD256->PCM176.4k",      DSD_RATE_256, 176400,   1, 0,0,0,0 },
         /* DSD/48→PCM same-family */
-        { "DSD64/48->PCM48k",       DSD48_RATE_64, 48000,   1 },
+        { "DSD64/48->PCM48k",       DSD48_RATE_64, 48000,   1, 0,0,0,0 },
         /* PCM→PCM same-family */
-        { "44.1k->88.2k FIR",       44100, 88200,   3 },
-        { "96k->48k FIR",           96000, 48000,   3 },
+        { "44.1k->88.2k FIR",       44100, 88200,   3, 0,0,0,0 },
+        { "96k->48k FIR",           96000, 48000,   3, 0,0,0,0 },
         /* PCM→PCM cross-family */
-        { "44.1k->48k polyphase",   44100, 48000,   3 },
-        { "96k->88.2k polyphase",   96000, 88200,   3 },
+        { "44.1k->48k polyphase",   44100, 48000,   3, 0,0,0,0 },
+        { "96k->88.2k polyphase",   96000, 88200,   3, 0,0,0,0 },
     };
     int n = sizeof(tests) / sizeof(tests[0]);
     int ok = 0;
@@ -170,7 +174,9 @@ static void test_quality_matrix(void) {
         sinad_result_t r;
         memset(&r, 0, sizeof(r));
         if (tests[i].type == 0) {
-            sinad_measure(tests[i].out, -1, 2, 4, 128, 1, 0.708f, &r);
+            sinad_measure(tests[i].out, tests[i].ntf,
+                          tests[i].cands, tests[i].depth, tests[i].lat,
+                          1, 0.708f, &r);
         } else if (tests[i].type == 1) {
             sinad_measure_dsd_to_pcm(tests[i].in, tests[i].out, &r);
         } else if (tests[i].type == 3) {

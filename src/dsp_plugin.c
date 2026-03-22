@@ -27,6 +27,7 @@
 #include "../include/onnx_filter.h"
 #include "../include/httpapi.h"
 #include "../include/fir.h"
+#include "../include/precorr.h"
 #include "../include/resample.h"
 
 /*
@@ -494,6 +495,8 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     if (s->cpu_monitor)
         cpuset_monitor_read(s->cpu_monitor, &s->topology);
 
+    extern void trellis_log_c(const char *);
+
     /* Select threads based on topology, load, and config */
     uint32_t selected_ids[CPUSET_MAX_CPUS];
     uint8_t  selected_lps[CPUSET_MAX_CPUS];
@@ -522,6 +525,28 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         } else {
             int tc = s->config.thread_count > 0 ? s->config.thread_count : 0;
             s->pool = threadpool_create(tc, s->config.affinity_mask);
+        }
+    } else if (selected > 0 && s->topology.initialized) {
+        /* Pool exists — re-pin ALL workers to freshly selected cores.
+         * Core loads change over time; workers may be stuck on cores
+         * that were idle at pool creation but are now loaded.
+         * Workers wrap around selected cores (e.g., 16 workers / 7 cores). */
+        int pool_count = threadpool_get_thread_count(s->pool);
+        int repinned = 0;
+        for (int i = 0; i < pool_count; i++) {
+            int core_idx = i % selected;
+            uint32_t cur = threadpool_get_worker_cpuset(s->pool, i);
+            if (cur != selected_ids[core_idx]) {
+                threadpool_migrate_thread(s->pool, i, selected_ids[core_idx]);
+                repinned++;
+            }
+        }
+        if (repinned > 0) {
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                "re-pinned %d/%d workers to %d selected cores",
+                repinned, pool_count, selected);
+            trellis_log_c(msg);
         }
     }
     if (!s->pool) {
@@ -1054,7 +1079,11 @@ size_t plugin_process(plugin_state_t *s,
 
     if (need_rate_conv && !skip_parallel && use_parallel &&
         num_threads > num_channels &&
-        s->config.sdm_mode == SDM_MODE_TRELLIS) {
+        (s->config.sdm_mode == SDM_MODE_TRELLIS || s->config.fs_in != fs_out)) {
+        /* Trellis: always (same-rate uses boxcar internally via GPU lowpass).
+         * PreCorr rate-conv: GPU FIR + GPU PreCorr intercept.
+         * PreCorr same-rate: engine_process_block (CPU boxcar + CPU PreCorr).
+         * GPU PreCorr is single-threaded → too slow for 22M samples. */
         size_t fir_out_est = dsd_in_count;
         if (fs_out > s->config.fs_in)
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);
@@ -1066,9 +1095,6 @@ size_t plugin_process(plugin_state_t *s,
         if (overlap > 1024) overlap = 1024;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
-        /* State-seeded parallelism with overlap stitching.
-         * DSD512: up to 4 segments for sub-RT processing.
-         * Lower rates: max 2 (sufficient for RT). */
         int max_seg = (fs_out >= DSD_RATE_512) ? 4 : 2;
         if (segments_per_ch > max_seg) segments_per_ch = max_seg;
 
@@ -1229,6 +1255,94 @@ size_t plugin_process(plugin_state_t *s,
         QueryPerformanceCounter(&t_fir_end);
         s->time_fir_ms = perf_ms(t_fir_start, t_fir_end);
 
+        /* PreCorr: GPU FIR done above, now run GPU PreCorr SDM.
+         * Skip the parallel Trellis Phase 2 entirely. */
+        if (s->config.sdm_mode == SDM_MODE_PRECORR) {
+            LARGE_INTEGER t_pc_start, t_pc_end;
+            QueryPerformanceCounter(&t_pc_start);
+            size_t fir_n = fir_counts[0];
+            /* Convert fp64 FIR output → fp32 for GPU PreCorr */
+            size_t total_f32 = fir_n * (size_t)num_channels;
+            if (s->gpu_das_buf_cap < fir_n || s->gpu_das_buf_nch < num_channels) {
+                free(s->gpu_das_in); free(s->gpu_das_out);
+                s->gpu_das_in  = (float *)malloc(total_f32 * sizeof(float));
+                s->gpu_das_out = (float *)malloc(total_f32 * sizeof(float));
+                s->gpu_das_buf_cap = s->gpu_das_in ? fir_n : 0;
+                s->gpu_das_buf_nch = s->gpu_das_in ? num_channels : 0;
+            }
+            if (s->gpu_das_in && s->gpu_das_out) {
+                for (int ch = 0; ch < num_channels; ch++)
+                    for (size_t i = 0; i < fir_n; i++)
+                        s->gpu_das_in[ch * fir_n + i] = (float)fir_data[ch][i];
+                /* Ensure GPU PreCorr kernel is set up for current NTF */
+                {
+                    const ntf_filter_t *pf = s->channels[0].precorr.filter;
+                    if (pf) {
+                        float a_f[8], g_f[8];
+                        for (int k = 0; k < pf->order; k++) {
+                            a_f[k] = s->channels[0].precorr.a[k];
+                            g_f[k] = s->channels[0].precorr.g[k];
+                        }
+                        gpu_cuda_precorr_setup(s->gpu, pf->order, a_f, g_f,
+                            (const float *)s->channels[0].precorr.pred_table,
+                            s->channels[0].precorr.state_limit);
+                    }
+                }
+                /* GPU PreCorr: single kernel for all samples */
+                int rc = -1;
+                for (int ch = 0; ch < num_channels; ch++) {
+                    rc = gpu_cuda_precorr(s->gpu,
+                        s->gpu_das_in + ch * fir_n,
+                        s->gpu_das_out + ch * fir_n,
+                        fir_n, NULL, NULL);
+                    if (rc != 0) break;
+                }
+                if (rc == 0) {
+                    {
+                        static int pc_ok_log = 0;
+                        if (pc_ok_log++ < 3) {
+                            char msg[128];
+                            snprintf(msg, sizeof(msg),
+                                "GPU PreCorr OK: %zu samples, %d ch",
+                                fir_n, num_channels);
+                            trellis_log_c(msg);
+                        }
+                    }
+                    for (int ch = 0; ch < num_channels; ch++)
+                        memcpy(s->ch_out[ch], s->gpu_das_out + ch * fir_n,
+                               fir_n * sizeof(float));
+                    dsd_out_count = fir_n;
+                } else {
+                    /* GPU PreCorr failed, fall back to CPU */
+                    {
+                        static int pc_fail_log = 0;
+                        if (pc_fail_log++ < 5) {
+                            const ntf_filter_t *pf = s->channels[0].precorr.filter;
+                            char msg[256];
+                            snprintf(msg, sizeof(msg),
+                                "GPU PreCorr FAILED rc=%d, filter=%p, "
+                                "fir_n=%zu, CPU fallback",
+                                rc, (void *)pf, fir_n);
+                            trellis_log_c(msg);
+                        }
+                    }
+                    for (int ch = 0; ch < num_channels; ch++)
+                        dsd_out_count = precorr_process_block(
+                            &s->channels[ch].precorr, fir_data[ch],
+                            s->ch_out[ch], fir_n);
+                }
+            } else {
+                /* Buffer alloc failed, CPU fallback */
+                for (int ch = 0; ch < num_channels; ch++)
+                    dsd_out_count = precorr_process_block(
+                        &s->channels[ch].precorr, fir_data[ch],
+                        s->ch_out[ch], fir_n);
+            }
+            QueryPerformanceCounter(&t_pc_end);
+            s->time_sdm_ms = perf_ms(t_pc_start, t_pc_end);
+            goto sdm_done;
+        }
+
         /* Phase 2: Get temp SDM contexts.
          * When fir_tail is available (chunk 2+), ALL segments use temp SDMs.
          * This keeps segment boundary artifacts symmetric (both sides warmup). */
@@ -1307,6 +1421,7 @@ size_t plugin_process(plugin_state_t *s,
          * receives stitched output back. Falls through to CPU path if
          * GPU SDM is disabled or unavailable. */
         if (s->config.gpu_sdm_enabled && s->gpu &&
+            s->config.sdm_mode == SDM_MODE_TRELLIS &&
             (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)) {
             size_t fir_n = fir_counts[0];
             size_t total_samples = fir_n * (size_t)num_channels;
@@ -1350,7 +1465,7 @@ size_t plugin_process(plugin_state_t *s,
                     if (s->config.debug_log) {
                         extern void trellis_log_c(const char *);
                         static int das_dump_count = 0;
-                        if (das_dump_count < 15) {
+                        if (0 && das_dump_count < 15) { /* disabled: 270 MB/chunk I/O kills RT */
                             char fname[256];
                             HANDLE hf; DWORD bw;
                             /* Dump GPU output (ch0, full chunk for DSF generation) */
@@ -1706,18 +1821,13 @@ size_t plugin_process(plugin_state_t *s,
         }
 sdm_done:
         ;  /* GPU DAS path jumps here after successful GPU processing */
-    } else if (s->gpu && s->config.gpu_enabled) {
-        gpu_reset_chunk(s->gpu);  /* reset per-channel boxcar history index */
-        /* === Sequential path WITH GPU: run on calling thread ===
-         * D3D11 contexts are single-threaded — GPU dispatch must run
-         * from the thread that created the device. CUDA also benefits
-         * from main-thread dispatch (no cuCtxSetCurrent overhead). */
-        for (int ch = 0; ch < num_channels; ch++) {
-            dsd_out_count = engine_process_block(&s->channels[ch],
-                s->ch_in[ch], s->ch_out[ch], dsd_in_count, &s->config);
-        }
     } else {
-        /* === Sequential path: dispatch full blocks per channel === */
+        /* === Channel-parallel path: dispatch full blocks to threadpool.
+         * Each channel runs boxcar+SDM independently on separate workers.
+         * For stereo, 2 channels run in parallel → halves wall-clock time. */
+        if (s->gpu && s->config.gpu_enabled)
+            gpu_reset_chunk(s->gpu);  /* reset per-channel boxcar history index */
+
         channel_block_t blocks[32];
         memset(blocks, 0, (size_t)num_channels * sizeof(channel_block_t));
 
@@ -1735,7 +1845,6 @@ sdm_done:
         threadpool_wait(s->pool);
 
         dsd_out_count = blocks[0].out_count;
-        /* blocks is stack-allocated, no free needed */
     }
 
     /* Worker migration tick — evaluate/start probes after SDM completes */
