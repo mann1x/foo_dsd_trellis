@@ -46,6 +46,15 @@ void sinad_measure(uint32_t dsd_rate, int ntf_id,
                    int use_fir_lowpass, float fir_gain,
                    sinad_result_t *result);
 
+/* Measure DSD→DSD rate conversion quality.
+ * Generates clean PCM sine, encodes to DSD at fs_in, FIR rate-converts,
+ * re-encodes via SDM at fs_out, decimates to PCM, measures SINAD.
+ * Tests the full conversion pipeline. */
+void sinad_measure_dsd_to_dsd(uint32_t fs_in, uint32_t fs_out,
+                               int ntf_id, int cands, int depth, int lat,
+                               float fir_gain, double state_limit,
+                               sinad_result_t *result);
+
 /* Measure DSD→PCM decimation quality.
  * Generates DSD sine at dsd_rate, decimates via FIR to pcm_rate.
  * Returns SINAD in result->sinad_theoretical. */

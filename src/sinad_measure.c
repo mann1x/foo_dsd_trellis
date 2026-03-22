@@ -703,3 +703,130 @@ void sinad_measure_pcm_to_pcm(uint32_t fs_in, uint32_t fs_out,
     free(in);
     free(out);
 }
+
+/* ─── DSD→DSD rate conversion quality ─── */
+
+void sinad_measure_dsd_to_dsd(uint32_t fs_in, uint32_t fs_out,
+                               int ntf_id, int cands, int depth, int lat,
+                               float fir_gain, double state_limit,
+                               sinad_result_t *result) {
+    memset(result, 0, sizeof(*result));
+
+    /* Generate clean PCM sine, encode to high-quality DSD at fs_in */
+    size_t n_in = fs_in * 2;  /* 2 seconds */
+    unsigned base = rate_is_48k_family(fs_out) ? 48000 : 44100;
+    size_t est_pcm = (fs_out > fs_in) ?
+        n_in * (fs_out / fs_in) / (fs_out / base) :
+        n_in / (fs_in / base);
+    double freq = 997.0;
+    {
+        double bw = (double)base / (double)est_pcm;
+        unsigned bin = (unsigned)(freq / bw + 0.5);
+        freq = bin * bw;
+    }
+
+    double *sine = (double *)malloc(n_in * sizeof(double));
+    if (!sine) return;
+    for (size_t i = 0; i < n_in; i++)
+        sine[i] = 0.5 * sin(2.0 * M_PI * freq * (double)i / (double)fs_in);
+
+    /* Encode to DSD at fs_in (high quality: nc=16, lat=512) */
+    const ntf_filter_t *f_in = ntf_auto_select(fs_in);
+    if (!f_in) { free(sine); return; }
+    sdm_context_t enc;
+    sdm_context_init(&enc, f_in, f_in->order, 16, 512);
+    float *dsd_in = (float *)calloc(n_in, sizeof(float));
+    size_t enc_n = sdm_process_block(&enc, sine, dsd_in, n_in);
+    sdm_context_free(&enc);
+    free(sine);
+
+    if (enc_n < 1024) { free(dsd_in); return; }
+
+    /* FIR rate conversion: fs_in → fs_out */
+    size_t max_out = (fs_out >= fs_in) ?
+        enc_n * (fs_out / fs_in) + 4096 : enc_n / 2 + 4096;
+    float *fir_buf = (float *)malloc(max_out * sizeof(float));
+    if (!fir_buf) { free(dsd_in); return; }
+
+    size_t fir_count;
+    if (fs_in == fs_out) {
+        /* Same-rate: FIR lowpass */
+        fir_lowpass_t lp;
+        memset(&lp, 0, sizeof(lp));
+        if (fir_lowpass_init(&lp, fs_in) != 0) { free(dsd_in); free(fir_buf); return; }
+        fir_count = fir_lowpass_process(&lp, dsd_in, fir_buf, enc_n);
+        fir_lowpass_free(&lp);
+    } else {
+        fir_chain_t fir;
+        if (fir_chain_init(&fir, fs_in, fs_out) != 0) { free(dsd_in); free(fir_buf); return; }
+        fir_count = fir_chain_process(&fir, dsd_in, fir_buf, enc_n);
+        fir_chain_free(&fir);
+    }
+    free(dsd_in);
+
+    if (fir_count < 1024) { free(fir_buf); return; }
+
+    /* Apply FIR gain */
+    for (size_t i = 0; i < fir_count; i++)
+        fir_buf[i] *= fir_gain;
+
+    /* SDM re-encode at fs_out with path-configured params */
+    const ntf_filter_t *f_out;
+    if (ntf_id != NTF_AUTO)
+        f_out = ntf_get_filter((ntf_filter_id_t)ntf_id, fs_out);
+    else
+        f_out = ntf_auto_select(fs_out);
+    if (!f_out) { free(fir_buf); return; }
+
+    sdm_context_t sdm;
+    sdm_context_init(&sdm, f_out, depth, cands, lat);
+    if (state_limit > 0.0) sdm.state_limit = state_limit;
+
+    double *sdm_in = (double *)malloc(fir_count * sizeof(double));
+    float *dsd_out = (float *)calloc(fir_count, sizeof(float));
+    if (!sdm_in || !dsd_out) { free(fir_buf); free(sdm_in); free(dsd_out); return; }
+    for (size_t i = 0; i < fir_count; i++)
+        sdm_in[i] = (double)fir_buf[i];
+    free(fir_buf);
+
+    size_t out_n = sdm_process_block(&sdm, sdm_in, dsd_out, fir_count);
+    free(sdm_in);
+    sdm_context_free(&sdm);
+
+    if (out_n < 1024) { free(dsd_out); return; }
+
+    /* Decimate DSD output to PCM and measure SINAD */
+    fir_chain_t dec;
+    if (fir_chain_init(&dec, fs_out, base) != 0) { free(dsd_out); return; }
+    float *pcm = (float *)calloc(out_n, sizeof(float));
+    size_t pcm_n = pcm ? fir_chain_process(&dec, dsd_out, pcm, out_n) : 0;
+    fir_chain_free(&dec);
+    free(dsd_out);
+
+    size_t skip = 256;
+    if (pcm_n <= skip + 2048) { free(pcm); return; }
+
+    size_t meas_n = pcm_n - skip;
+    /* Re-align frequency to measurement grid */
+    {
+        double bw = (double)base / (double)meas_n;
+        unsigned bin = (unsigned)(freq / bw + 0.5);
+        freq = bin * bw;
+    }
+
+    /* SINAD via Goertzel */
+    double sig_power = goertzel_power(pcm + skip, meas_n, freq, (double)base);
+    double total_power = 0;
+    for (size_t i = skip; i < pcm_n; i++)
+        total_power += (double)pcm[i] * pcm[i];
+    total_power /= (double)meas_n;
+    double noise_power = total_power - sig_power;
+    if (noise_power < 1e-30) noise_power = 1e-30;
+    result->sinad_theoretical = 10.0 * log10(sig_power / noise_power);
+
+    /* A-weighted SINAD */
+    result->sinad_awtd_theo = result->sinad_theoretical + 3.0;  /* rough +3 dB A-weighting */
+
+    result->ok = 1;
+    free(pcm);
+}

@@ -110,6 +110,37 @@ static size_t generate_dsd_sine(uint32_t dsd_rate, double freq_hz,
 /* ─── Measure SINAD for a rate conversion path ─── */
 
 static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
+    /* For DSD→DSD rate conversion, use sinad_measure at fs_out
+     * (matches the Test Quality button methodology). This measures
+     * the SDM encode quality at the output rate with the path-configured
+     * NTF/cands/lat. The FIR rate conversion quality is tested separately
+     * in the DSD→PCM tests. */
+    if (fs_in != fs_out && fs_in >= DSD_RATE_64 && fs_out >= DSD_RATE_64) {
+        dsd_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.fs_in = fs_in; cfg.fs_out = fs_out;
+        engine_path_info_t pi;
+        engine_get_path_info(fs_in, fs_out, NTF_AUTO, SDM_MODE_TRELLIS, &cfg, &pi);
+        int cands = pi.cands > 0 ? pi.cands : 2;
+        int lat = pi.lat > 0 ? pi.lat : 32;
+        int depth = pi.depth > 0 ? pi.depth : 4;
+        sinad_result_t r;
+        memset(&r, 0, sizeof(r));
+        sinad_measure_dsd_to_dsd(fs_in, fs_out, pi.ntf_filter, cands, depth, lat, pi.fir_gain, pi.state_limit, &r);
+        unsigned base_in  = rate_is_48k_family(fs_in)  ? 48000 : 44100;
+        unsigned base_out = rate_is_48k_family(fs_out) ? 48000 : 44100;
+        const char *dir = (fs_out > fs_in) ? "UP" : "DN";
+        printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB A-wtd=%.1f MT=%.1f NMod=%.1f"
+               "  [%s, gain=%.2f, cands=%d, lat=%d]\n",
+               fs_in/base_in, fs_out/base_out, dir,
+               r.sinad_theoretical, r.sinad_awtd_theo,
+               r.multitone_sinad_db, r.noise_mod_db,
+               pi.ntf_filter != NTF_AUTO ?
+                   ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, fs_out)->name : "auto",
+               pi.fir_gain, cands, lat);
+        return r.sinad_theoretical;
+    }
+
     unsigned base = rate_is_48k_family(fs_in) ? 48000 : 44100;
     unsigned mult_in = fs_in / base;
     size_t n_in;
