@@ -1510,16 +1510,8 @@ private:
             float fir_gain = fir_gain_db_to_linear(m_cfg.fir_gain_db);
 
             sinad_result_t result;
-            if (fs_in != fs_out) {
-                /* Rate conversion: test full pipeline (DSD→FIR→SDM) */
-                sinad_measure_dsd_to_dsd(fs_in, fs_out,
-                    pi.ntf_filter, pi.cands, pi.depth, pi.lat,
-                    fir_gain, pi.state_limit, &result);
-            } else {
-                /* Same-rate: test SDM encode quality */
-                sinad_measure(fs_out, pi.ntf_filter, pi.cands, pi.depth, pi.lat,
-                              use_fir, fir_gain, &result);
-            }
+            sinad_measure(fs_out, pi.ntf_filter, pi.cands, pi.depth, pi.lat,
+                          use_fir, fir_gain, &result);
 
             if (result.ok) {
                 SaveSinadResult(row, pi.ntf_filter, pi.cands, pi.depth, pi.lat,

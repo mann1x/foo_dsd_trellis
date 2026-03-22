@@ -126,7 +126,7 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
         int depth = pi.depth > 0 ? pi.depth : 4;
         sinad_result_t r;
         memset(&r, 0, sizeof(r));
-        sinad_measure_dsd_to_dsd(fs_in, fs_out, pi.ntf_filter, cands, depth, lat, pi.fir_gain, pi.state_limit, &r);
+        sinad_measure(fs_out, pi.ntf_filter, cands, depth, lat, 1, pi.fir_gain, &r);
         unsigned base_in  = rate_is_48k_family(fs_in)  ? 48000 : 44100;
         unsigned base_out = rate_is_48k_family(fs_out) ? 48000 : 44100;
         const char *dir = (fs_out > fs_in) ? "UP" : "DN";
