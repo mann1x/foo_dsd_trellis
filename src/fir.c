@@ -452,13 +452,16 @@ const char *fir_ipp_kernel_name(void) {
  * Cutoff at ~50 kHz (audio band + margin) regardless of DSD rate.
  */
 
-#define LP_NTAPS 63
-#define LP_KAISER_BETA 8.0   /* ~80 dB stopband, wider transition */
+#define LP_NTAPS 127         /* more taps = sharper transition, less noise leakage */
+#define LP_KAISER_BETA 10.0  /* ~100 dB stopband */
 
 int fir_lowpass_init(fir_lowpass_t *lp, uint32_t dsd_rate) {
     memset(lp, 0, sizeof(*lp));
 
-    /* Design lowpass kernel: windowed sinc at cutoff = 50 kHz / (fs/2) */
+    /* Design lowpass kernel: cutoff at 50 kHz.
+     * With 127 taps the transition band is ~22 kHz (50-72 kHz),
+     * rejecting most ultrasonic noise while preserving SDM headroom.
+     * 22 kHz cutoff caused Gibbs ringing artifacts (pops). */
     double fc = 50000.0 / ((double)dsd_rate / 2.0);  /* normalized cutoff */
     if (fc > 0.5) fc = 0.5;  /* can't exceed Nyquist/2 */
 
