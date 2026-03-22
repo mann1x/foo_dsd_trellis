@@ -712,7 +712,7 @@ void cpuset_update_load(cpu_topology_t *topo) {
     {
         static int load_log_count = 0;
         if (nonzero > 0 && load_log_count++ < 20) {
-            extern void log_ring_write(const char *);
+            extern void trellis_log_c(const char *);
             char msg[512];
             int pos = 0;
             pos += snprintf(msg + pos, sizeof(msg) - pos, "load_update: ");
@@ -722,7 +722,7 @@ void cpuset_update_load(cpu_topology_t *topo) {
                         topo->entries[i].logical_index,
                         topo->entries[i].load * 100.0);
             }
-            log_ring_write(msg);
+            trellis_log_c(msg);
         }
     }
 }

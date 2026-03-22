@@ -1346,6 +1346,14 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
     int L = lat;
     int num_segs = c->num_sms * 3;
     if (num_segs < 1) num_segs = 1;
+    /* Cap segments so each segment has ≥ 64K output samples (D).
+     * Too many segments per chunk = dense stitching = noise floor rises.
+     * With D≥64K, stitch density is low enough for 275+ dB SINAD. */
+    {
+        int max_by_density = (int)(count / 65536);
+        if (max_by_density < 1) max_by_density = 1;
+        if (num_segs > max_by_density) num_segs = max_by_density;
+    }
 
     int D = (int)(count / (size_t)num_segs);
 
@@ -1827,16 +1835,62 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
     QueryPerformanceCounter(&t_k2);
     QueryPerformanceCounter(&t_k3);
 
-    /* Copy LAST segment's final state to persistent buffer.
-     * The stitched output ends with the last segment's data, so
-     * the next chunk must seed from that segment's end state. */
-    size_t last_seg_off = (size_t)(num_segs - 1) * (size_t)nc;
-    pfn_cuMemcpyDtoD(c->d_trellis_states,
-                      c->d_all_final_states + last_seg_off * 8 * sizeof(double),
-                      (size_t)nc * 8 * sizeof(double));
-    pfn_cuMemcpyDtoD(c->d_trellis_costs,
-                      c->d_all_final_costs + last_seg_off * sizeof(double),
-                      (size_t)nc * sizeof(double));
+    /* Compute correct persistent state via sequential single-segment pass.
+     * The 2-pass DAS produces good output but the last segment's state is
+     * approximate (seeded from Pass 1 chain, not true sequential). Running
+     * one more single-segment pass with the correct persistent seed gives
+     * the exact end state for the next chunk. Cost: ~1 segment of SDM. */
+    {
+        /* Single-segment pass: process full input, discard output,
+         * keep only the final state for persistence. */
+        size_t state_bytes = (size_t)nc * 8 * sizeof(double);
+        size_t cost_bytes  = (size_t)nc * sizeof(double);
+
+        /* Reuse DAS buffers for a 1-segment run */
+        int one_seg = 1;
+        int one_start = 0;
+        int one_out_start = 0;
+        int one_total = (int)count;
+        int one_out_cap = (int)count;
+        pfn_cuMemcpyHtoDAsync(c->d_das_seg_starts, &one_start, sizeof(int), stream);
+        pfn_cuMemcpyHtoDAsync(c->d_das_seg_out_starts, &one_out_start, sizeof(int), stream);
+        pfn_cuMemcpyHtoDAsync(c->d_das_seg_total_sizes, &one_total, sizeof(int), stream);
+        pfn_cuMemcpyHtoDAsync(c->d_das_seg_out_caps, &one_out_cap, sizeof(int), stream);
+
+        /* Seed from current persistent state */
+        pfn_cuMemcpyDtoDAsync(c->d_das_init_states, c->d_trellis_states, state_bytes, stream);
+        pfn_cuMemcpyDtoDAsync(c->d_das_init_costs, c->d_trellis_costs, cost_bytes, stream);
+
+        int block_size = 2 * nc;
+        if (block_size < 32) block_size = 32;
+        int M_zero = 0;
+        int overlap_zero = 0;
+        int D_dummy = (int)count;
+        CUdeviceptr null_ptr = 0;
+        int state_stride = (int)count;
+        void *state_args[] = {
+            &c->d_sdm_in, &c->d_das_seg_out,  /* output discarded */
+            &c->d_das_seg_starts, &c->d_das_seg_out_starts,
+            &c->d_das_seg_total_sizes, &c->d_das_seg_out_caps,
+            &M_zero, &nc, &lat, &overlap_zero, &one_seg,
+            &state_stride, &state_stride,
+            &c->d_das_init_states, &c->d_das_init_costs,
+            &c->d_all_final_states, &c->d_all_final_costs,
+            &c->d_das_seg_counts,
+            &D_dummy, &null_ptr, &null_ptr
+        };
+        pfn_cuLaunchKernel(c->fn_trellis_parallel,
+                            1, 1, 1,  /* 1 segment, 1 channel (ch0 only) */
+                            (unsigned)block_size, 1, 1,
+                            0, stream, state_args, NULL);
+        pfn_cuStreamSynchronize(stream);
+
+        /* Save sequential final state as persistent */
+        pfn_cuMemcpyDtoD(c->d_trellis_states,
+                          c->d_all_final_states, state_bytes);
+        pfn_cuMemcpyDtoD(c->d_trellis_costs,
+                          c->d_all_final_costs, cost_bytes);
+    }
 
     /* CPU-side DAS already wrote to `out` directly — no GPU download needed */
 

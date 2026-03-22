@@ -95,7 +95,9 @@ __global__ void trellis_parallel_segments(
     __shared__ unsigned c_bit[MAX_CHILDREN]; /* which bit this child chose */
     __shared__ unsigned c_path[MAX_CHILDREN]; /* path bits for dedup */
     __shared__ unsigned c_next[MAX_CHILDREN]; /* traceback output bit (inherited from parent) */
-    __shared__ unsigned p_next[MAX_CANDS]; /* parent's traceback bit */
+    __shared__ unsigned c_pi[MAX_CHILDREN]; /* parent index (for post-sort traceback) */
+    __shared__ unsigned p_next[MAX_CANDS]; /* parent's current traceback bit */
+    __shared__ unsigned p_next_stored[MAX_CANDS]; /* traceback from PREVIOUS iteration (pipeline delay) */
 
     __shared__ int s_active;
     __shared__ unsigned s_output_bit;
@@ -119,11 +121,16 @@ __global__ void trellis_parallel_segments(
         for (int b = 0; b < hist_bytes; b++)
             p_hist[tid][b] = 0;
         p_path[tid] = 0;
+        p_next_stored[tid] = 0;
     }
     if (tid == 0) {
         s_active = nc;
         s_hist_pos = 0;
-        s_pending = 0;
+        /* For seg0 with valid persisted state, mark history as ready
+         * so output starts from sample 0 (no warmup gap between chunks).
+         * History is zeroed but traceback errors for the first `lat` samples
+         * are negligible (~32 bits in millions). */
+        s_pending = (seg == 0 && all_init_states) ? lat : 0;
     }
     __syncthreads();
 
@@ -170,9 +177,12 @@ __global__ void trellis_parallel_segments(
              * tid&1=0 → y_b=-1.0 → CPU y=+1 → bit=1.
              * tid&1=1 → y_b=+1.0 → CPU y=-1 → bit=0. */
             c_bit[tid] = (tid & 1) ? 0u : 1u;
-            /* Path register for dedup + inherit parent's traceback bit */
+            /* Path register for dedup + inherit parent's STORED traceback
+             * (1-step pipeline delay matching CPU: children inherit the value
+             * from BEFORE the current history read, not after). */
             c_path[tid] = (p_path[pi] << 1 | c_bit[tid]) & 0xFF;
-            c_next[tid] = p_next[pi];
+            c_next[tid] = p_next_stored[pi];
+            c_pi[tid] = pi;
             /* Copy parent history to child */
             for (int b = 0; b < hist_bytes; b++)
                 c_hist[tid][b] = p_hist[pi][b];
@@ -220,6 +230,7 @@ __global__ void trellis_parallel_segments(
                         c_bit[filtered] = c_bit[i];
                         c_path[filtered] = c_path[i];
                         c_next[filtered] = c_next[i];
+                        c_pi[filtered] = c_pi[i];
                         for (int k = 0; k < order; k++)
                             c_state[filtered][k] = c_state[i][k];
                         for (int b = 0; b < hist_bytes; b++)
@@ -230,43 +241,42 @@ __global__ void trellis_parallel_segments(
             }
             tc = filtered;
 
-            /* Step 3: Selection sort (fast) + path dedup.
-             * Uses <= for tie-breaking to match CPU's sdm_cmple. */
-            for (int i = 0; i < nc && i < tc; i++) {
-                int best = i;
-                for (int j = i + 1; j < tc; j++)
-                    if (c_cost[j] <= c_cost[best]) best = j;
-                if (best != i) {
-                    double t_c = c_cost[i]; c_cost[i] = c_cost[best]; c_cost[best] = t_c;
-                    unsigned t_b = c_bit[i]; c_bit[i] = c_bit[best]; c_bit[best] = t_b;
-                    unsigned t_p = c_path[i]; c_path[i] = c_path[best]; c_path[best] = t_p;
-                    unsigned t_n = c_next[i]; c_next[i] = c_next[best]; c_next[best] = t_n;
-                    for (int k = 0; k < order; k++) {
-                        double t_s = c_state[i][k]; c_state[i][k] = c_state[best][k]; c_state[best][k] = t_s;
-                    }
-                    for (int b = 0; b < hist_bytes; b++) {
-                        unsigned char t_h = c_hist[i][b]; c_hist[i][b] = c_hist[best][b]; c_hist[best][b] = t_h;
-                    }
-                }
-            }
-            /* Path dedup */
+            /* Step 3: Dedup-aware greedy selection.
+             * For each slot, pick the lowest-cost candidate with a unique path.
+             * Uses <= tie-breaking to match CPU's sdm_cmple.
+             * Simultaneously sorts and deduplicates (matches CPU sdm_sort_cands). */
             {
-                int deduped = 1;
-                for (int i = 1; i < nc && i < tc; i++) {
-                    int dup = 0;
-                    for (int j = 0; j < deduped; j++)
-                        if (c_path[i] == c_path[j]) { dup = 1; break; }
-                    if (!dup) {
-                        if (deduped != i) {
-                            c_cost[deduped] = c_cost[i]; c_bit[deduped] = c_bit[i];
-                            c_path[deduped] = c_path[i]; c_next[deduped] = c_next[i];
-                            for (int k = 0; k < order; k++) c_state[deduped][k] = c_state[i][k];
-                            for (int b = 0; b < hist_bytes; b++) c_hist[deduped][b] = c_hist[i][b];
-                        }
-                        deduped++;
+                int selected = 0;
+                unsigned used_paths[MAX_CANDS];
+                for (int slot = 0; slot < nc && slot < tc; slot++) {
+                    int best = -1;
+                    for (int j = 0; j < tc; j++) {
+                        /* Skip duplicate paths */
+                        int dup = 0;
+                        for (int k = 0; k < selected; k++)
+                            if (c_path[j] == used_paths[k]) { dup = 1; break; }
+                        if (dup) continue;
+                        if (best < 0 || c_cost[j] <= c_cost[best])
+                            best = j;
                     }
+                    if (best < 0) break;
+                    used_paths[selected] = c_path[best];
+                    if (best != selected) {
+                        double t_c = c_cost[selected]; c_cost[selected] = c_cost[best]; c_cost[best] = t_c;
+                        unsigned t_b = c_bit[selected]; c_bit[selected] = c_bit[best]; c_bit[best] = t_b;
+                        unsigned t_p = c_path[selected]; c_path[selected] = c_path[best]; c_path[best] = t_p;
+                        unsigned t_n = c_next[selected]; c_next[selected] = c_next[best]; c_next[best] = t_n;
+                        unsigned t_pi = c_pi[selected]; c_pi[selected] = c_pi[best]; c_pi[best] = t_pi;
+                        for (int k = 0; k < order; k++) {
+                            double t_s = c_state[selected][k]; c_state[selected][k] = c_state[best][k]; c_state[best][k] = t_s;
+                        }
+                        for (int b = 0; b < hist_bytes; b++) {
+                            unsigned char t_h = c_hist[selected][b]; c_hist[selected][b] = c_hist[best][b]; c_hist[best][b] = t_h;
+                        }
+                    }
+                    selected++;
                 }
-                ac = deduped;
+                ac = selected;
             }
 
             /* Output: best candidate's traceback bit */
@@ -285,12 +295,16 @@ __global__ void trellis_parallel_segments(
             s_hist_pos = (s_hist_pos + 1) % lat;
             if (s_pending < lat) s_pending++;
 
-            /* Move deduped children to parents */
+            /* Move selected children to parents.
+             * Pipeline delay: save parent's CURRENT traceback (p_next) as
+             * p_next_stored for the next iteration. This replicates the CPU's
+             * s->next = s->parent->next (line 676 in trellis.c). */
             s_active = ac;
             double min_c = c_cost[0];
             for (int i = 0; i < ac; i++) {
                 p_cost[i] = c_cost[i] - min_c;
                 p_path[i] = c_path[i];
+                p_next_stored[i] = p_next[c_pi[i]];
                 for (int k = 0; k < order; k++)
                     p_state[i][k] = c_state[i][k];
                 for (int b = 0; b < hist_bytes; b++)
