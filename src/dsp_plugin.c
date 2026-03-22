@@ -1065,8 +1065,18 @@ size_t plugin_process(plugin_state_t *s,
         if (overlap > 1024) overlap = 1024;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
-        int max_seg = (fs_out >= DSD_RATE_512) ? 4 : 2;
-        if (segments_per_ch > max_seg) segments_per_ch = max_seg;
+        int max_seg;
+        if (s->config.gpu_sdm_enabled && s->gpu &&
+            s->config.sdm_mode == SDM_MODE_TRELLIS &&
+            (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)) {
+            /* Hybrid CPU+GPU: allow many segments. CPU takes 1, GPU takes
+             * the rest in parallel across SMs. Cap by D≥64K density rule. */
+            max_seg = (fs_out >= DSD_RATE_512) ? 4 : 2;
+            if (segments_per_ch > max_seg) segments_per_ch = max_seg;
+        } else {
+            max_seg = (fs_out >= DSD_RATE_512) ? 4 : 2;
+            if (segments_per_ch > max_seg) segments_per_ch = max_seg;
+        }
 
         /* Ensure minimum segment size (at least 4x overlap) */
         size_t min_seg = overlap * 4;
@@ -1099,12 +1109,14 @@ size_t plugin_process(plugin_state_t *s,
         size_t fir_counts[32];
 
         /* GPU FIR: single batched dispatch for all channels when available.
-         * Falls back to threadpool FIR on GPU failure or small buffers. */
+         * Falls back to threadpool FIR on GPU failure or small buffers.
+         * TEMP: force CPU FIR to isolate GPU SDM noise source. */
         bool gpu_fir_ok = false;
+        bool force_cpu_fir = false;
 
         /* GPU FIR lowpass for same-rate path (no rate conversion stages).
          * Runs on main thread (GPU not thread-safe). */
-        if (s->gpu && dsd_in_count >= GPU_MIN_SAMPLES &&
+        if (!force_cpu_fir && s->gpu && dsd_in_count >= GPU_MIN_SAMPLES &&
             s->channels[0].fir.num_stages == 0 &&
             s->channels[0].lowpass.initialized) {
             float combined = s->channels[0].fir_gain * s->config.gain;
@@ -1386,21 +1398,52 @@ size_t plugin_process(plugin_state_t *s,
         LARGE_INTEGER t_sdm_start, t_sdm_end;
         QueryPerformanceCounter(&t_sdm_start);
 
-        /* GPU DAS path: full SDM + density stitch + assemble on GPU.
-         * Converts fp64 FIR output to fp32, sends all channels to GPU,
-         * receives stitched output back. Falls through to CPU path if
-         * GPU SDM is disabled or unavailable. */
+        /* Upload extended seed (history/path/traceback) from CPU SDM context
+         * for full state continuity in GPU segments. Without this, GPU segments
+         * start with zeroed history → low stitch density with complex signals. */
+        if (s->gpu && s->config.gpu_sdm_enabled &&
+            s->config.sdm_mode == SDM_MODE_TRELLIS) {
+            sdm_context_t *ctx0 = &s->channels[0].sdm;
+            int bank = ctx0->idx & 1;
+            sdm_trellis_t *st = &ctx0->trellis[bank];
+            int nc_act = (int)ctx0->num_cands;
+            int lat_act = (int)ctx0->trellis_lat;
+            int hist_bytes_act = (lat_act + 7) / 8;
+
+            /* Extract per-candidate history, path, next from CPU context */
+            unsigned char h_hist[8][128];
+            unsigned h_path[8], h_next[8];
+            memset(h_hist, 0, sizeof(h_hist));
+            memset(h_path, 0, sizeof(h_path));
+            memset(h_next, 0, sizeof(h_next));
+            for (int i = 0; i < nc_act && i < 8; i++) {
+                sdm_state_t *a = st->act[i];
+                if (a) {
+                    /* Copy history ring buffer */
+                    int hist_idx = a->hist;
+                    for (int b = 0; b < hist_bytes_act && b < 128; b++)
+                        h_hist[i][b] = ctx0->hist[hist_idx][b];
+                    h_path[i] = a->path;
+                    h_next[i] = a->next;
+                }
+            }
+            gpu_cuda_upload_ext_seed(s->gpu,
+                (const unsigned char *)h_hist, hist_bytes_act, nc_act,
+                h_path, h_next, (int)ctx0->pos, (int)ctx0->pending);
+        }
+
+        /* GPU DAS path: full SDM + density stitch + assemble on GPU. */
         if (s->config.gpu_sdm_enabled && s->gpu &&
             s->config.sdm_mode == SDM_MODE_TRELLIS &&
             (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)) {
             size_t fir_n = fir_counts[0];
             size_t total_samples = fir_n * (size_t)num_channels;
 
-            /* Grow cached GPU DAS buffers if needed */
+            /* Grow cached GPU DAS buffers if needed (fp64 input, fp32 output) */
             if (s->gpu_das_buf_cap < fir_n ||
                 s->gpu_das_buf_nch < num_channels) {
                 free(s->gpu_das_in);  free(s->gpu_das_out);
-                s->gpu_das_in  = (float *)malloc(total_samples * sizeof(float));
+                s->gpu_das_in  = (float *)malloc(total_samples * sizeof(double));
                 s->gpu_das_out = (float *)malloc(total_samples * sizeof(float));
                 s->gpu_das_buf_cap = s->gpu_das_in ? fir_n : 0;
                 s->gpu_das_buf_nch = s->gpu_das_in ? num_channels : 0;
@@ -1416,12 +1459,13 @@ size_t plugin_process(plugin_state_t *s,
                         gpu_cuda_trellis_setup(s->gpu, cur_cands, f->order,
                             cur_lat, f->a, f->g, s->channels[0].sdm.state_limit);
                 }
-                /* Convert fp64 FIR output → fp32 for GPU */
+                /* Pack fp64 FIR output into contiguous buffer for GPU */
+                double *das_in_f64 = (double *)s->gpu_das_in;
                 for (int ch = 0; ch < num_channels; ch++)
-                    for (size_t i = 0; i < fir_counts[ch]; i++)
-                        s->gpu_das_in[ch * fir_n + i] = (float)fir_data[ch][i];
+                    memcpy(das_in_f64 + ch * fir_n, fir_data[ch],
+                           fir_n * sizeof(double));
 
-                int rc = gpu_cuda_trellis_das(s->gpu, s->gpu_das_in,
+                int rc = gpu_cuda_trellis_das(s->gpu, das_in_f64,
                                                s->gpu_das_out, fir_n,
                                                num_channels);
                 if (rc == 0) {
@@ -1508,8 +1552,8 @@ size_t plugin_process(plugin_state_t *s,
          * boundary alignment after all segments complete. */
 
         /* Compute nominal segment boundaries */
-        size_t seg_nominal_start[32][8];  /* [ch][seg] */
-        size_t seg_nominal_size[32][8];
+        size_t seg_nominal_start[32][64];  /* [ch][seg] — up to 64 segs/ch for hybrid */
+        size_t seg_nominal_size[32][64];
         size_t seg0_nominal[32];
         size_t seg0_outs[32];
         for (int ch = 0; ch < num_channels; ch++) {
@@ -1549,26 +1593,130 @@ size_t plugin_process(plugin_state_t *s,
             s->cached_seg_buf_sz = max_seg_samples;
         }
         float **seg_bufs = s->cached_seg_bufs;
-        size_t seg_out_counts_arr[32];
+        size_t seg_out_counts_arr[128];  /* up to 64 segs × 2 ch */
         size_t *seg_out_counts = seg_out_counts_arr;
         memset(seg_out_counts, 0, (size_t)total_all_segs * sizeof(size_t));
 
-        /* Configure ALL segment blocks */
-        channel_block_t all_blocks[32];  /* max 8 ch × 4 segs */
+        /* ── Hybrid CPU+GPU segment split ──
+         * CPU processes segments 0..(cpu_segs-1) on threadpool.
+         * GPU processes segments cpu_segs..(segments_per_ch-1) concurrently.
+         * Both seed from the same persistent state. DAS stitching merges all. */
+        int cpu_segs = segments_per_ch;
+        int gpu_segs = 0;
+        bool gpu_hybrid_ok = false;
+
+        if (s->config.gpu_sdm_enabled && s->gpu &&
+            s->config.sdm_mode == SDM_MODE_TRELLIS &&
+            (s->config.gpu_backend == 2 || s->config.gpu_backend == 3) &&
+            segments_per_ch >= 2) {
+            /* GPU handles ALL output segments (self-consistent fp32).
+             * CPU runs seg0 concurrently for state persistence only
+             * (fp64 accuracy for next chunk). No CPU-GPU stitch needed. */
+            cpu_segs = 1;  /* CPU seg0: for state persistence, output discarded */
+            gpu_segs = segments_per_ch;  /* GPU: ALL segments produce output */
+        }
+
+        /* ── Phase 2a: Launch GPU segments async (non-blocking) ── */
+        if (gpu_segs > 0) {
+            /* Build GPU segment descriptors (GPU segments = cpu_segs..segments_per_ch-1) */
+            int *gpu_seg_starts = (int *)calloc((size_t)gpu_segs, sizeof(int));
+            int *gpu_seg_out_starts = (int *)calloc((size_t)gpu_segs, sizeof(int));
+            int *gpu_seg_totals = (int *)calloc((size_t)gpu_segs, sizeof(int));
+            int *gpu_seg_out_caps_arr = (int *)calloc((size_t)gpu_segs, sizeof(int));
+
+            if (gpu_seg_starts && gpu_seg_out_starts && gpu_seg_totals && gpu_seg_out_caps_arr) {
+                size_t fir_count = fir_counts[0];
+                int M_gpu = 16 * s->config.trellis_lat;
+                if (M_gpu > 4096) M_gpu = 4096;
+                int gpu_overlap = (int)overlap;
+
+                size_t gpu_out_offset = 0;
+                for (int g = 0; g < gpu_segs; g++) {
+                    int seg = g;  /* GPU handles ALL segments (0..gpu_segs-1) */
+                    size_t nom_start = seg_nominal_start[0][seg];
+                    size_t nom_size = seg_nominal_size[0][seg];
+
+                    int in_start = (int)nom_start - M_gpu;
+                    if (in_start < 0) in_start = 0;
+
+                    int out_cap;
+                    int seg_total;
+                    bool extend = (seg < segments_per_ch - 1);
+                    if (extend) {
+                        out_cap = (int)nom_size + gpu_overlap;
+                        seg_total = M_gpu + (int)nom_size + gpu_overlap + s->config.trellis_lat;
+                    } else {
+                        out_cap = (int)nom_size;
+                        seg_total = M_gpu + (int)nom_size + s->config.trellis_lat;
+                    }
+                    if (in_start + seg_total > (int)fir_count)
+                        seg_total = (int)fir_count - in_start;
+
+                    gpu_seg_starts[g] = in_start;
+                    gpu_seg_out_starts[g] = (int)gpu_out_offset;
+                    gpu_seg_totals[g] = seg_total;
+                    gpu_seg_out_caps_arr[g] = out_cap;
+                    gpu_out_offset += (size_t)out_cap;
+                }
+
+                /* Pack fp64 fir_data into contiguous buffer for GPU */
+                size_t total_f64 = fir_count * (size_t)num_channels;
+                if (s->gpu_das_buf_cap < fir_count || s->gpu_das_buf_nch < num_channels) {
+                    free(s->gpu_das_in);
+                    s->gpu_das_in = (float *)malloc(total_f64 * sizeof(double));
+                    s->gpu_das_buf_cap = s->gpu_das_in ? fir_count : 0;
+                    s->gpu_das_buf_nch = s->gpu_das_in ? num_channels : 0;
+                }
+                if (s->gpu_das_in) {
+                    double *das_in_f64 = (double *)s->gpu_das_in;
+                    for (int ch = 0; ch < num_channels; ch++)
+                        memcpy(das_in_f64 + ch * fir_count, fir_data[ch],
+                               fir_count * sizeof(double));
+                }
+
+                /* Launch GPU segments (returns immediately) */
+                int rc = gpu_cuda_hybrid_async(s->gpu,
+                    (const double *)s->gpu_das_in, fir_count, num_channels,
+                    gpu_seg_starts, gpu_seg_out_starts,
+                    gpu_seg_totals, gpu_seg_out_caps_arr,
+                    gpu_segs, gpu_overlap, gpu_out_offset);
+
+                if (rc == 0) {
+                    gpu_hybrid_ok = true;
+                    {
+                        static int hybrid_log = 0;
+                        if (hybrid_log++ < 3) {
+                            char msg[128];
+                            snprintf(msg, sizeof(msg),
+                                "hybrid: %d CPU + %d GPU segments, %zu samples",
+                                cpu_segs, gpu_segs, fir_count);
+                            trellis_log_c(msg);
+                        }
+                    }
+                }
+            }
+            free(gpu_seg_starts); free(gpu_seg_out_starts);
+            free(gpu_seg_totals); free(gpu_seg_out_caps_arr);
+
+            if (!gpu_hybrid_ok) {
+                /* GPU launch failed — fall back to all-CPU */
+                cpu_segs = segments_per_ch;
+                gpu_segs = 0;
+            }
+        }
+
+        /* ── Phase 2b: Configure CPU segment blocks ── */
+        channel_block_t all_blocks[32];
         int all_block_count = 0;
         memset(all_blocks, 0, sizeof(all_blocks));
 
         for (int ch = 0; ch < num_channels; ch++) {
             size_t fir_count = fir_counts[ch];
-            for (int seg = 0; seg < segments_per_ch; seg++) {
+            for (int seg = 0; seg < cpu_segs; seg++) {
                 int buf_idx = ch * segments_per_ch + seg;
                 size_t nom_start = seg_nominal_start[ch][seg];
                 size_t nom_size = seg_nominal_size[ch][seg];
 
-                /* All non-last segments extend by overlap into the next segment's
-                 * territory.  Segs 1+ also start overlap earlier for warmup.
-                 * This ensures every boundary has a full overlap region in
-                 * BOTH segments' output for proper stitch scanning. */
                 size_t input_start, input_count, warmup_discard;
                 bool extend_fwd = (seg < segments_per_ch - 1);
                 if (seg == 0) {
@@ -1586,10 +1734,6 @@ size_t plugin_process(plugin_state_t *s,
                         overlap - (size_t)s->config.trellis_lat : 0;
                 }
 
-                /* seg_bufs[buf_idx] already pre-allocated in cached buffers */
-
-                /* Seg0 uses persistent SDM, segs 1+ use state-seeded temps.
-                 * ALL seeded from the SAME persistent state (previous chunk end). */
                 sdm_context_t *ctx;
                 if (seg == 0) {
                     ctx = &s->channels[ch].sdm;
@@ -1610,20 +1754,66 @@ size_t plugin_process(plugin_state_t *s,
             }
         }
 
-        /* Launch ALL segments simultaneously */
+        /* Launch CPU segments (runs concurrently with GPU) */
         for (int i = 0; i < all_block_count; i++)
             threadpool_submit_to(s->pool, i % num_threads, &all_blocks[i]);
         threadpool_wait(s->pool);
 
-        /* Record output counts */
-        for (int i = 0; i < all_block_count; i++)
-            seg_out_counts[i] = all_blocks[i].out_count;
+        /* Record CPU output counts */
+        for (int i = 0; i < all_block_count; i++) {
+            int ch = all_blocks[i].channel;
+            int seg = i - ch * cpu_segs;
+            int idx = ch * segments_per_ch + seg;
+            seg_out_counts[idx] = all_blocks[i].out_count;
+        }
+
+        /* ── Phase 2c: GPU pass 2 + download ── */
+        if (gpu_hybrid_ok && gpu_segs > 0) {
+            /* GPU pass 2: chained from pass-1 finals (no CPU state needed —
+             * GPU handles ALL segments self-consistently in fp32). */
+            {
+                /* Wait for pass 1, chain, launch pass 2 */
+                int nc_cfg = s->config.trellis_cands;
+                /* Use persistent state as seg0 seed (same as pass 1) */
+                double dummy_states[8 * 8] = {0};
+                double dummy_costs[8] = {0};
+                /* Actually: pass2 should chain from pass-1 finals.
+                 * seg0 keeps persistent seed (already in d_das_init_states[0]).
+                 * Use pass2 with seg0 re-seeded from persistent state. */
+                gpu_cuda_hybrid_pass2(s->gpu, NULL, NULL);
+            }
+
+            /* Download GPU results into seg_bufs */
+            float *gpu_seg_ptrs[128];
+            size_t gpu_seg_counts[128];
+            memset(gpu_seg_counts, 0, sizeof(gpu_seg_counts));
+            for (int ch = 0; ch < num_channels; ch++)
+                for (int g = 0; g < gpu_segs; g++)
+                    gpu_seg_ptrs[g * num_channels + ch] =
+                        seg_bufs[ch * segments_per_ch + g];
+
+            gpu_cuda_hybrid_finish(s->gpu, gpu_seg_ptrs, gpu_seg_counts,
+                                    gpu_segs, num_channels);
+
+            /* Record GPU output counts — GPU covers ALL segments */
+            for (int ch = 0; ch < num_channels; ch++)
+                for (int g = 0; g < gpu_segs; g++)
+                    seg_out_counts[ch * segments_per_ch + g] =
+                        gpu_seg_counts[g * num_channels + ch];
+
+            /* CPU seg0 output is discarded (only used for state persistence).
+             * Clear its count so DAS stitching skips it. */
+            /* Actually: GPU covers seg0..N, DAS uses seg_bufs[0..N].
+             * CPU seg0's output in seg_bufs[ch*segs+0] gets OVERWRITTEN
+             * by GPU seg0's output above. That's correct — GPU output
+             * is self-consistent. */
+        }
 
         /* Phase 2c: Assemble output with hybrid overlap stitching.
          * Uses windowed match density to find the region of best SDM
          * convergence, then picks the nearest exact bit-match for a
          * clean transition.  Computed on ch0, applied to all channels. */
-        int stitch_positions[8];
+        int stitch_positions[64];
         memset(stitch_positions, 0, sizeof(stitch_positions));
 
         /* Pass 1: find stitch positions on channel 0 */

@@ -34,6 +34,7 @@ typedef void          *CUmodule;
 typedef void          *CUfunction;
 typedef unsigned long long CUdeviceptr;
 typedef void          *CUstream;
+typedef void          *CUevent;
 
 #define CUDA_SUCCESS   0
 #define CU_CTX_SCHED_AUTO 0
@@ -72,6 +73,10 @@ DECL_PFN(CUresult, cuStreamSynchronize, CUstream);
 DECL_PFN(CUresult, cuMemcpyDtoD, CUdeviceptr, CUdeviceptr, size_t);
 DECL_PFN(CUresult, cuMemcpyDtoDAsync, CUdeviceptr, CUdeviceptr, size_t, CUstream);
 DECL_PFN(CUresult, cuMemsetD8Async, CUdeviceptr, unsigned char, size_t, CUstream);
+DECL_PFN(CUresult, cuEventCreate, CUevent *, unsigned int);
+DECL_PFN(CUresult, cuEventDestroy, CUevent);
+DECL_PFN(CUresult, cuEventRecord, CUevent, CUstream);
+DECL_PFN(CUresult, cuEventSynchronize, CUevent);
 
 static HMODULE g_nvcuda = NULL;
 static bool    g_probed = false;
@@ -110,6 +115,13 @@ static PFN_cuStreamSynchronize pfn_cuStreamSynchronize;
 static PFN_cuMemcpyDtoD        pfn_cuMemcpyDtoD;
 static PFN_cuMemcpyDtoDAsync   pfn_cuMemcpyDtoDAsync;
 static PFN_cuMemsetD8Async     pfn_cuMemsetD8Async;
+static PFN_cuEventCreate       pfn_cuEventCreate;
+static PFN_cuEventDestroy      pfn_cuEventDestroy;
+static PFN_cuEventRecord       pfn_cuEventRecord;
+static PFN_cuEventSynchronize  pfn_cuEventSynchronize;
+
+/* Extended seed device buffer (used by DAS and hybrid paths) */
+static CUdeviceptr s_d_ext_seed = 0;
 
 #define RESOLVE(name) do { \
     pfn_##name = (PFN_##name)GetProcAddress(g_nvcuda, #name); \
@@ -220,6 +232,21 @@ typedef struct {
     double        *h_das_mid_states;   /* host mirror for CPU re-encoding */
     size_t         das_alloc_segs;     /* allocated segment capacity */
     size_t         das_alloc_samples;  /* allocated per-ch sample capacity */
+    /* ─── Hybrid CPU+GPU async state ─── */
+    CUevent        hybrid_event;       /* signaled when GPU segments finish */
+    bool           hybrid_event_valid; /* true if event was created */
+    float         *hybrid_host_out;    /* pinned host buffer for GPU segment outputs */
+    size_t         hybrid_host_cap;    /* capacity in floats */
+    int            hybrid_num_gpu_segs;/* number of GPU segments in flight */
+    int            hybrid_first_seg;   /* first GPU segment index */
+    int            hybrid_num_ch;      /* channels in flight */
+    int           *hybrid_out_caps;    /* per-segment output capacity [num_segs] */
+    int           *hybrid_out_starts;  /* per-segment output offset [num_segs] */
+    int            hybrid_block_size;
+    int            hybrid_ch_stride_in;
+    int            hybrid_ch_stride_out;
+    int            hybrid_overlap;
+    int            hybrid_M;
     /* Boxcar history for chunk continuity — per channel */
 #define BOXCAR_MAX_CH 8
     CUdeviceptr    d_boxcar_hist;    /* last taps samples (shared device buf) */
@@ -341,6 +368,13 @@ bool gpu_cuda_probe(void) {
     RESOLVE_V2(cuMemcpyDtoD);
     RESOLVE_V2(cuMemcpyDtoDAsync);
     RESOLVE_V2(cuMemsetD8Async);
+    /* Event API (optional — hybrid mode only) */
+    pfn_cuEventCreate = (PFN_cuEventCreate)GetProcAddress(g_nvcuda, "cuEventCreate");
+    pfn_cuEventDestroy = (PFN_cuEventDestroy)GetProcAddress(g_nvcuda, "cuEventDestroy_v2");
+    if (!pfn_cuEventDestroy)
+        pfn_cuEventDestroy = (PFN_cuEventDestroy)GetProcAddress(g_nvcuda, "cuEventDestroy");
+    pfn_cuEventRecord = (PFN_cuEventRecord)GetProcAddress(g_nvcuda, "cuEventRecord");
+    pfn_cuEventSynchronize = (PFN_cuEventSynchronize)GetProcAddress(g_nvcuda, "cuEventSynchronize");
 
     if (!ok) { g_available = false; return false; }
 
@@ -1189,6 +1223,7 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
     CUdeviceptr null_mid_s = (CUdeviceptr)0;
     CUdeviceptr null_mid_c = (CUdeviceptr)0;
     int D_param_old = D;
+    CUdeviceptr null_seed = 0;
     void *args[] = {
         &c->d_sdm_in, &c->d_sdm_out,
         &d_seg_starts, &d_seg_out_starts,
@@ -1198,7 +1233,8 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
         &d_all_init_s, &d_all_init_c,
         &c->d_all_final_states, &c->d_all_final_costs,
         &null_counts,
-        &D_param_old, &null_mid_s, &null_mid_c
+        &D_param_old, &null_mid_s, &null_mid_c,
+        &null_seed
     };
     pfn_cuLaunchKernel(c->fn_trellis_parallel,
                         (unsigned)num_segs, 1, 1,
@@ -1333,7 +1369,7 @@ int gpu_cuda_trellis(cuda_context_t *c, const float *in, float *out,
 
 /* ─── DAS (Density-Aligned Stitching) GPU Pipeline ─── */
 
-int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
+int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
                           size_t count, int num_channels) {
     if (!c || !c->fn_trellis_parallel || !c->fn_das_density_scan ||
         !c->fn_das_assemble || c->trellis_cands < 2)
@@ -1513,16 +1549,17 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
         c->das_alloc_samples = total_seg_out * (size_t)num_channels;
     }
 
-    /* Ensure input buffer large enough for all channels */
+    /* Ensure input buffer large enough for all channels (fp64 for trellis) */
     size_t total_in = count * (size_t)num_channels;
-    if (c->sdm_buf_cap < total_in) {
+    size_t total_in_bytes = total_in * sizeof(double);
+    if (c->sdm_buf_cap < total_in * 2) {  /* *2 because doubles are 2× floats */
         if (c->d_sdm_in) pfn_cuMemFree(c->d_sdm_in);
-        pfn_cuMemAlloc(&c->d_sdm_in, total_in * sizeof(float));
-        c->sdm_buf_cap = total_in;
+        pfn_cuMemAlloc(&c->d_sdm_in, total_in_bytes);
+        c->sdm_buf_cap = total_in * 2;
     }
 
-    /* Upload all channels' input */
-    pfn_cuMemcpyHtoDAsync(c->d_sdm_in, in, total_in * sizeof(float), stream);
+    /* Upload all channels' input (fp64) */
+    pfn_cuMemcpyHtoDAsync(c->d_sdm_in, in, total_in_bytes, stream);
 
     /* Upload segment descriptors */
     pfn_cuMemcpyHtoDAsync(c->d_das_seg_starts, h_seg_starts,
@@ -1582,6 +1619,8 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
         int ch_stride_out = (int)total_seg_out;
 
         int D_nominal = D;
+        /* Use ext_seed if uploaded (full history/path/traceback) */
+        CUdeviceptr ext_seed_ptr = s_d_ext_seed;
         void *args[] = {
             &c->d_sdm_in, &c->d_das_seg_out,
             &c->d_das_seg_starts, &c->d_das_seg_out_starts,
@@ -1591,7 +1630,8 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
             &c->d_das_init_states, &c->d_das_init_costs,
             &c->d_all_final_states, &c->d_all_final_costs,
             &c->d_das_seg_counts,
-            &D_nominal, &c->d_das_mid_states, &c->d_das_mid_costs
+            &D_nominal, &c->d_das_mid_states, &c->d_das_mid_costs,
+            &ext_seed_ptr
         };
 
         /* Pass 1: all segments from global seed */
@@ -1873,6 +1913,379 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const float *in, float *out,
     }
 
     c->trellis_state_valid = true;
+    return 0;
+}
+
+/* ─── Extended seed upload ─── */
+
+/* Upload extended seed (history/path/traceback) from CPU SDM context.
+ * Call before gpu_cuda_trellis_das() for full state continuity.
+ * Without this, GPU segments start with zeroed history → 60% stitch density. */
+
+int gpu_cuda_upload_ext_seed(cuda_context_t *c,
+                              const unsigned char *hist, int hist_bytes, int nc,
+                              const unsigned *path,
+                              const unsigned *next_stored,
+                              int hist_pos, int pending) {
+    if (!c) return -1;
+    pfn_cuCtxSetCurrent(c->context);
+
+    /* sdm_ext_seed layout must match the CUDA struct */
+    /* hist: [MAX_CANDS][MAX_HIST_BYTES] = 8 × 128 = 1024 bytes */
+    /* path: [MAX_CANDS] = 8 × 4 = 32 bytes */
+    /* next_stored: [MAX_CANDS] = 8 × 4 = 32 bytes */
+    /* hist_pos: 4 bytes, pending: 4 bytes, num_cands: 4 bytes */
+    /* Total struct size = 1024 + 32 + 32 + 4 + 4 + 4 = 1100 bytes */
+    size_t struct_size = 8 * 128 + 8 * 4 + 8 * 4 + 4 + 4 + 4;
+
+    if (!s_d_ext_seed)
+        pfn_cuMemAlloc(&s_d_ext_seed, struct_size);
+    if (!s_d_ext_seed) return -1;
+
+    /* Build host-side struct */
+    unsigned char h_seed[1100];
+    memset(h_seed, 0, sizeof(h_seed));
+
+    /* Copy history: per-candidate hist_bytes, padded to MAX_HIST_BYTES */
+    for (int i = 0; i < nc && i < 8; i++) {
+        int copy = hist_bytes < 128 ? hist_bytes : 128;
+        memcpy(h_seed + i * 128, hist + i * hist_bytes, (size_t)copy);
+    }
+
+    /* path[MAX_CANDS] at offset 1024 */
+    unsigned *p_path = (unsigned *)(h_seed + 1024);
+    for (int i = 0; i < nc && i < 8; i++)
+        p_path[i] = path[i];
+
+    /* next_stored[MAX_CANDS] at offset 1024+32=1056 */
+    unsigned *p_next = (unsigned *)(h_seed + 1056);
+    for (int i = 0; i < nc && i < 8; i++)
+        p_next[i] = next_stored[i];
+
+    /* hist_pos at 1088, pending at 1092, num_cands at 1096 */
+    *(int *)(h_seed + 1088) = hist_pos;
+    *(int *)(h_seed + 1092) = pending;
+    *(int *)(h_seed + 1096) = nc;
+
+    pfn_cuMemcpyHtoD(s_d_ext_seed, h_seed, struct_size);
+    return 0;
+}
+
+/* ─── Hybrid CPU+GPU async SDM ─── */
+
+/* Launch GPU segments asynchronously. Returns immediately.
+ * Call gpu_cuda_hybrid_finish() to wait and download results.
+ *
+ * in: fp32 input per channel [count * num_channels], channel-strided
+ * seg_starts/sizes/out_caps: per-GPU-segment descriptors (host arrays)
+ * first_seg: index of first GPU segment (for output buffer offset)
+ * num_gpu_segs: how many segments the GPU processes
+ */
+int gpu_cuda_hybrid_async(cuda_context_t *c,
+                           const double *in, size_t count,
+                           int num_channels,
+                           const int *seg_starts,
+                           const int *seg_out_starts,
+                           const int *seg_total_sizes,
+                           const int *seg_out_caps,
+                           int num_gpu_segs,
+                           int overlap,
+                           size_t total_seg_out) {
+    if (!c || !c->fn_trellis_parallel || !pfn_cuEventCreate || num_gpu_segs < 1)
+        return -1;
+
+    pfn_cuCtxSetCurrent(c->context);
+
+    int nc = c->trellis_cands;
+    int lat = c->trellis_lat;
+    int M = 16 * lat;
+    if (M > 4096) M = 4096;
+    CUstream stream = c->sdm_stream;
+
+    /* Upload NTF constants */
+    {
+        CUdeviceptr d_a, d_g, d_order, d_limit;
+        size_t sz;
+        pfn_cuModuleGetGlobal(&d_a, &sz, c->mod_sdm_parallel, "c_ntf_a");
+        pfn_cuMemcpyHtoD(d_a, c->trellis_ntf_a, (size_t)c->trellis_order * sizeof(double));
+        pfn_cuModuleGetGlobal(&d_g, &sz, c->mod_sdm_parallel, "c_ntf_g");
+        pfn_cuMemcpyHtoD(d_g, c->trellis_ntf_g, (size_t)c->trellis_order * sizeof(double));
+        pfn_cuModuleGetGlobal(&d_order, &sz, c->mod_sdm_parallel, "c_ntf_order");
+        pfn_cuMemcpyHtoD(d_order, &c->trellis_order, sizeof(int));
+        pfn_cuModuleGetGlobal(&d_limit, &sz, c->mod_sdm_parallel, "c_state_limit");
+        double sl = 0.0;
+        pfn_cuMemcpyHtoD(d_limit, &sl, sizeof(double));
+    }
+
+    /* Ensure input buffer (fp64) */
+    size_t total_in = count * (size_t)num_channels;
+    size_t total_in_bytes = total_in * sizeof(double);
+    if (c->sdm_buf_cap < total_in * 2) {
+        if (c->d_sdm_in) pfn_cuMemFree(c->d_sdm_in);
+        pfn_cuMemAlloc(&c->d_sdm_in, total_in_bytes);
+        c->sdm_buf_cap = total_in * 2;
+    }
+
+    /* Ensure segment output buffer */
+    size_t total_out = total_seg_out * (size_t)num_channels;
+    if (c->das_alloc_samples < total_out) {
+        if (c->d_das_seg_out) pfn_cuMemFree(c->d_das_seg_out);
+        pfn_cuMemAlloc(&c->d_das_seg_out, total_out * sizeof(float));
+        c->das_alloc_samples = total_out;
+    }
+
+    /* Ensure descriptor buffers */
+    if (c->das_alloc_segs < (size_t)num_gpu_segs) {
+        if (c->d_das_seg_starts) pfn_cuMemFree(c->d_das_seg_starts);
+        if (c->d_das_seg_out_starts) pfn_cuMemFree(c->d_das_seg_out_starts);
+        if (c->d_das_seg_total_sizes) pfn_cuMemFree(c->d_das_seg_total_sizes);
+        if (c->d_das_seg_out_caps) pfn_cuMemFree(c->d_das_seg_out_caps);
+        if (c->d_das_seg_counts) pfn_cuMemFree(c->d_das_seg_counts);
+        if (c->d_das_init_states) pfn_cuMemFree(c->d_das_init_states);
+        if (c->d_das_init_costs) pfn_cuMemFree(c->d_das_init_costs);
+        pfn_cuMemAlloc(&c->d_das_seg_starts, (size_t)num_gpu_segs * sizeof(int));
+        pfn_cuMemAlloc(&c->d_das_seg_out_starts, (size_t)num_gpu_segs * sizeof(int));
+        pfn_cuMemAlloc(&c->d_das_seg_total_sizes, (size_t)num_gpu_segs * sizeof(int));
+        pfn_cuMemAlloc(&c->d_das_seg_out_caps, (size_t)num_gpu_segs * sizeof(int));
+        pfn_cuMemAlloc(&c->d_das_seg_counts, (size_t)num_gpu_segs * (size_t)num_channels * sizeof(int));
+        pfn_cuMemAlloc(&c->d_das_init_states, (size_t)num_gpu_segs * (size_t)nc * 8 * sizeof(double));
+        pfn_cuMemAlloc(&c->d_das_init_costs, (size_t)num_gpu_segs * (size_t)nc * sizeof(double));
+        c->das_alloc_segs = (size_t)num_gpu_segs;
+    }
+
+    /* Ensure final state buffers */
+    int needed = num_gpu_segs * nc;
+    if (c->boundary_alloc < needed) {
+        if (c->d_all_final_states) pfn_cuMemFree(c->d_all_final_states);
+        if (c->d_all_final_costs) pfn_cuMemFree(c->d_all_final_costs);
+        pfn_cuMemAlloc(&c->d_all_final_states, (size_t)needed * 8 * sizeof(double));
+        pfn_cuMemAlloc(&c->d_all_final_costs, (size_t)needed * sizeof(double));
+        c->boundary_alloc = needed;
+    }
+
+    /* Ensure host output buffer (pinned) */
+    if (c->hybrid_host_cap < total_out) {
+        if (c->hybrid_host_out) pfn_cuMemFreeHost(c->hybrid_host_out);
+        pfn_cuMemAllocHost((void **)&c->hybrid_host_out, total_out * sizeof(float));
+        c->hybrid_host_cap = c->hybrid_host_out ? total_out : 0;
+    }
+
+    /* Upload input (fp64) */
+    pfn_cuMemcpyHtoDAsync(c->d_sdm_in, in, total_in_bytes, stream);
+
+    /* Upload segment descriptors */
+    pfn_cuMemcpyHtoDAsync(c->d_das_seg_starts, seg_starts,
+                           (size_t)num_gpu_segs * sizeof(int), stream);
+    pfn_cuMemcpyHtoDAsync(c->d_das_seg_out_starts, seg_out_starts,
+                           (size_t)num_gpu_segs * sizeof(int), stream);
+    pfn_cuMemcpyHtoDAsync(c->d_das_seg_total_sizes, seg_total_sizes,
+                           (size_t)num_gpu_segs * sizeof(int), stream);
+    pfn_cuMemcpyHtoDAsync(c->d_das_seg_out_caps, seg_out_caps,
+                           (size_t)num_gpu_segs * sizeof(int), stream);
+
+    /* Seed all GPU segments from persistent state */
+    if (c->trellis_state_valid) {
+        size_t state_stride = (size_t)nc * 8 * sizeof(double);
+        size_t cost_stride = (size_t)nc * sizeof(double);
+        for (int i = 0; i < num_gpu_segs; i++) {
+            pfn_cuMemcpyDtoDAsync(
+                c->d_das_init_states + (size_t)i * state_stride,
+                c->d_trellis_states, state_stride, stream);
+            pfn_cuMemcpyDtoDAsync(
+                c->d_das_init_costs + (size_t)i * cost_stride,
+                c->d_trellis_costs, cost_stride, stream);
+        }
+    } else {
+        pfn_cuMemsetD8Async(c->d_das_init_states, 0,
+            (size_t)num_gpu_segs * (size_t)nc * 8 * sizeof(double), stream);
+        pfn_cuMemsetD8Async(c->d_das_init_costs, 0,
+            (size_t)num_gpu_segs * (size_t)nc * sizeof(double), stream);
+    }
+
+    /* Pass 1 only: all GPU segments from persistent state (parallel).
+     * Pass 2 runs later via gpu_cuda_hybrid_pass2() after CPU seg0
+     * provides its final state for proper state chaining. */
+    int block_size = 2 * nc;
+    if (block_size < 32) block_size = 32;
+    c->hybrid_block_size = block_size;
+    c->hybrid_ch_stride_in = (int)count;
+    c->hybrid_ch_stride_out = (int)total_seg_out;
+    c->hybrid_overlap = overlap;
+    c->hybrid_M = M;
+
+    int ch_stride_in = (int)count;
+    int ch_stride_out = (int)total_seg_out;
+    int D_nominal = seg_out_caps[0];
+    CUdeviceptr null_ptr = 0;
+    CUdeviceptr null_seed = 0;
+
+    void *args[] = {
+        &c->d_sdm_in, &c->d_das_seg_out,
+        &c->d_das_seg_starts, &c->d_das_seg_out_starts,
+        &c->d_das_seg_total_sizes, &c->d_das_seg_out_caps,
+        &M, &nc, &lat, &overlap, &num_gpu_segs,
+        &ch_stride_in, &ch_stride_out,
+        &c->d_das_init_states, &c->d_das_init_costs,
+        &c->d_all_final_states, &c->d_all_final_costs,
+        &c->d_das_seg_counts,
+        &D_nominal, &null_ptr, &null_ptr,
+        &null_seed
+    };
+
+    pfn_cuLaunchKernel(c->fn_trellis_parallel,
+                        (unsigned)num_gpu_segs, (unsigned)num_channels, 1,
+                        (unsigned)block_size, 1, 1,
+                        0, stream, args, NULL);
+
+    /* Record event — caller can check/wait for completion */
+    if (!c->hybrid_event_valid) {
+        pfn_cuEventCreate(&c->hybrid_event, 0x02 /* CU_EVENT_DISABLE_TIMING */);
+        c->hybrid_event_valid = true;
+    }
+    pfn_cuEventRecord(c->hybrid_event, stream);
+
+    /* Save metadata for finish() — copy arrays (caller may free originals) */
+    c->hybrid_num_gpu_segs = num_gpu_segs;
+    c->hybrid_num_ch = num_channels;
+    {
+        size_t arr_bytes = (size_t)num_gpu_segs * sizeof(int);
+        c->hybrid_out_caps = (int *)realloc(c->hybrid_out_caps, arr_bytes);
+        c->hybrid_out_starts = (int *)realloc(c->hybrid_out_starts, arr_bytes);
+        if (c->hybrid_out_caps) memcpy(c->hybrid_out_caps, seg_out_caps, arr_bytes);
+        if (c->hybrid_out_starts) memcpy(c->hybrid_out_starts, seg_out_starts, arr_bytes);
+    }
+
+    return 0;
+}
+
+/* Run GPU pass 2 with CPU seg0's final state seeding GPU seg0.
+ * Call after CPU seg0 finishes and GPU pass 1 completes.
+ * cpu_states: [nc * 8] doubles from CPU seg0's final candidates.
+ * cpu_costs: [nc] doubles. */
+int gpu_cuda_hybrid_pass2(cuda_context_t *c,
+                           const double *cpu_states, const double *cpu_costs) {
+    if (!c || !c->hybrid_event_valid)
+        return -1;
+
+    pfn_cuCtxSetCurrent(c->context);
+    CUstream stream = c->sdm_stream;
+    int nc = c->trellis_cands;
+    int lat = c->trellis_lat;
+    int num_gpu_segs = c->hybrid_num_gpu_segs;
+    int num_ch = c->hybrid_num_ch;
+
+    /* Wait for pass 1 to complete */
+    pfn_cuEventSynchronize(c->hybrid_event);
+
+    /* Seed GPU seg0: from CPU state if provided, else from persistent state */
+    if (cpu_states && cpu_costs) {
+        pfn_cuMemcpyHtoDAsync(c->d_das_init_states,
+            cpu_states, (size_t)nc * 8 * sizeof(double), stream);
+        pfn_cuMemcpyHtoDAsync(c->d_das_init_costs,
+            cpu_costs, (size_t)nc * sizeof(double), stream);
+    } else if (c->trellis_state_valid) {
+        pfn_cuMemcpyDtoDAsync(c->d_das_init_states,
+            c->d_trellis_states, (size_t)nc * 8 * sizeof(double), stream);
+        pfn_cuMemcpyDtoDAsync(c->d_das_init_costs,
+            c->d_trellis_costs, (size_t)nc * sizeof(double), stream);
+    }
+
+    /* Chain seg1+ from pass-1 finals */
+    {
+        size_t state_stride = (size_t)nc * 8 * sizeof(double);
+        size_t cost_stride = (size_t)nc * sizeof(double);
+        for (int i = 1; i < num_gpu_segs; i++) {
+            pfn_cuMemcpyDtoDAsync(
+                c->d_das_init_states + (size_t)i * state_stride,
+                c->d_all_final_states + (size_t)(i - 1) * state_stride,
+                state_stride, stream);
+            pfn_cuMemcpyDtoDAsync(
+                c->d_das_init_costs + (size_t)i * cost_stride,
+                c->d_all_final_costs + (size_t)(i - 1) * cost_stride,
+                cost_stride, stream);
+        }
+    }
+
+    /* Launch pass 2 */
+    CUdeviceptr null_ptr = 0;
+    CUdeviceptr null_seed = 0;
+    int M = c->hybrid_M;
+    int overlap = c->hybrid_overlap;
+    int D_nominal = c->hybrid_out_caps ? c->hybrid_out_caps[0] : 0;
+
+    void *args[] = {
+        &c->d_sdm_in, &c->d_das_seg_out,
+        &c->d_das_seg_starts, &c->d_das_seg_out_starts,
+        &c->d_das_seg_total_sizes, &c->d_das_seg_out_caps,
+        &M, &nc, &lat, &overlap, &num_gpu_segs,
+        &c->hybrid_ch_stride_in, &c->hybrid_ch_stride_out,
+        &c->d_das_init_states, &c->d_das_init_costs,
+        &c->d_all_final_states, &c->d_all_final_costs,
+        &c->d_das_seg_counts,
+        &D_nominal, &null_ptr, &null_ptr,
+        &null_seed
+    };
+
+    pfn_cuLaunchKernel(c->fn_trellis_parallel,
+                        (unsigned)num_gpu_segs, (unsigned)num_ch, 1,
+                        (unsigned)c->hybrid_block_size, 1, 1,
+                        0, stream, args, NULL);
+
+    pfn_cuEventRecord(c->hybrid_event, stream);
+    return 0;
+}
+
+/* Wait for GPU segments to complete, download results into seg_bufs.
+ * seg_bufs[seg * num_ch + ch]: pre-allocated output buffer per segment per channel.
+ * seg_out_counts[seg * num_ch + ch]: filled with actual output sample count. */
+int gpu_cuda_hybrid_finish(cuda_context_t *c,
+                            float **seg_bufs,
+                            size_t *seg_out_counts,
+                            int num_gpu_segs, int num_channels) {
+    if (!c || !c->hybrid_event_valid)
+        return -1;
+
+    pfn_cuCtxSetCurrent(c->context);
+
+    /* Wait for kernel completion */
+    pfn_cuEventSynchronize(c->hybrid_event);
+
+    /* Download segment outputs */
+    CUstream stream = c->sdm_stream;
+    size_t total_out = c->hybrid_host_cap;
+    if (c->hybrid_host_out && total_out > 0) {
+        pfn_cuMemcpyDtoH(c->hybrid_host_out, c->d_das_seg_out,
+                          total_out * sizeof(float));
+    }
+
+    /* Download actual output counts */
+    int *h_counts = (int *)calloc((size_t)num_gpu_segs * (size_t)num_channels, sizeof(int));
+    if (h_counts) {
+        pfn_cuMemcpyDtoH(h_counts, c->d_das_seg_counts,
+                          (size_t)num_gpu_segs * (size_t)num_channels * sizeof(int));
+    }
+
+    /* Copy per-segment outputs to caller's buffers */
+    for (int ch = 0; ch < num_channels; ch++) {
+        size_t ch_off = (size_t)ch * c->hybrid_host_cap / (size_t)num_channels;
+        for (int seg = 0; seg < num_gpu_segs; seg++) {
+            int out_start = c->hybrid_out_starts[seg];
+            int out_cap = c->hybrid_out_caps[seg];
+            int actual = h_counts ? h_counts[ch * num_gpu_segs + seg] : out_cap;
+            if (actual > out_cap) actual = out_cap;
+
+            int buf_idx = seg * num_channels + ch;
+            if (seg_bufs[buf_idx]) {
+                memcpy(seg_bufs[buf_idx],
+                       c->hybrid_host_out + ch_off + out_start,
+                       (size_t)actual * sizeof(float));
+            }
+            if (seg_out_counts)
+                seg_out_counts[buf_idx] = (size_t)actual;
+        }
+    }
+
+    free(h_counts);
     return 0;
 }
 

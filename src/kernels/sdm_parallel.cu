@@ -34,6 +34,18 @@ __device__ double ntf_calc(const double *s, double *d,
 #define MAX_CHILDREN (2 * MAX_CANDS)
 #define MAX_HIST_BYTES 128  /* supports lat up to 1024 */
 
+/* Extended seed: history + path + traceback for full state continuity.
+ * When provided (non-NULL), segments start with perfect traceback
+ * instead of zeroed history. Tiny: ~32 bytes for nc=2 lat=32. */
+struct sdm_ext_seed {
+    unsigned char hist[MAX_CANDS][MAX_HIST_BYTES];
+    unsigned      path[MAX_CANDS];
+    unsigned      next_stored[MAX_CANDS];
+    int           hist_pos;
+    int           pending;
+    int           num_cands;  /* how many candidates are valid */
+};
+
 /* DAS-enabled parallel-segment SBVD.
  *
  * Grid:  (num_segments, num_channels, 1)
@@ -47,7 +59,7 @@ __device__ double ntf_calc(const double *s, double *d,
  * seg_out_caps[seg]:    per-segment output capacity (D + overlap or D)
  */
 __global__ void trellis_parallel_segments(
-    const float *in, float *out,
+    const double *in, float *out,
     const int *seg_starts,
     const int *seg_out_starts,
     const int *seg_total_sizes,    /* per-segment input sample count */
@@ -66,7 +78,8 @@ __global__ void trellis_parallel_segments(
     int *seg_actual_counts,        /* [num_ch * num_segs] actual output */
     int D_nominal,                 /* snapshot trigger: save state at this output count */
     double *all_mid_states,        /* [num_segs * nc * 8] state at output[D] (NULL=skip) */
-    double *all_mid_costs)         /* [num_segs * nc] cost at output[D] (NULL=skip) */
+    double *all_mid_costs,         /* [num_segs * nc] cost at output[D] (NULL=skip) */
+    const struct sdm_ext_seed *ext_seed)  /* extended seed with history (NULL=zero-init) */
 {
     int seg = blockIdx.x;
     int ch  = blockIdx.y;
@@ -77,7 +90,7 @@ __global__ void trellis_parallel_segments(
     int lat = trellis_lat;
     int hist_bytes = (lat + 7) / 8;
 
-    const float *seg_in = in + ch * ch_stride_in + seg_starts[seg];
+    const double *seg_in = in + ch * ch_stride_in + seg_starts[seg];
     float *seg_out = out + ch * ch_stride_out + seg_out_starts[seg];
     int total = seg_total_sizes[seg];
     int out_cap = seg_out_caps[seg];
@@ -118,25 +131,37 @@ __global__ void trellis_parallel_segments(
                 p_state[tid][k] = 0.0;
             p_cost[tid] = 0.0;
         }
-        for (int b = 0; b < hist_bytes; b++)
-            p_hist[tid][b] = 0;
-        p_path[tid] = 0;
-        p_next_stored[tid] = 0;
+        /* Extended seed: restore full history/path/traceback for perfect
+         * state continuity. Without this, segments start with zeroed history
+         * → wrong traceback for first `lat` samples → NTF state corruption
+         * → low stitch density (60%) with complex signals. */
+        if (ext_seed && tid < ext_seed->num_cands) {
+            for (int b = 0; b < hist_bytes; b++)
+                p_hist[tid][b] = ext_seed->hist[tid][b];
+            p_path[tid] = ext_seed->path[tid];
+            p_next_stored[tid] = ext_seed->next_stored[tid];
+        } else {
+            for (int b = 0; b < hist_bytes; b++)
+                p_hist[tid][b] = 0;
+            p_path[tid] = 0;
+            p_next_stored[tid] = 0;
+        }
     }
     if (tid == 0) {
-        s_active = nc;
-        s_hist_pos = 0;
-        /* For seg0 with valid persisted state, mark history as ready
-         * so output starts from sample 0 (no warmup gap between chunks).
-         * History is zeroed but traceback errors for the first `lat` samples
-         * are negligible (~32 bits in millions). */
-        s_pending = (seg == 0 && all_init_states) ? lat : 0;
+        s_active = ext_seed ? ext_seed->num_cands : nc;
+        if (ext_seed) {
+            s_hist_pos = ext_seed->hist_pos;
+            s_pending = ext_seed->pending;
+        } else {
+            s_hist_pos = 0;
+            s_pending = (seg == 0 && all_init_states) ? lat : 0;
+        }
     }
     __syncthreads();
 
     int out_idx = 0;
     for (int s = 0; s < total; s++) {
-        double x = (double)seg_in[s] * 0.5;
+        double x = seg_in[s] * 0.5;
         int ac = s_active;
 
         /* Phase 0: Compute parent traceback bits (before expansion). */

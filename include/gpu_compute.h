@@ -214,8 +214,22 @@ int gpu_cuda_precorr_setup(void *ctx, int order,
 int gpu_cuda_trellis(void *ctx, const float *in, float *out, size_t count);
 /* DAS (Density-Aligned Stitching) GPU pipeline: SDM + stitch + assemble.
  * All channels processed simultaneously. Input/output: [num_ch × count] */
-int gpu_cuda_trellis_das(void *ctx, const float *in, float *out,
+int gpu_cuda_trellis_das(void *ctx, const double *in, float *out,
                           size_t count, int num_channels);
+/* Upload extended seed (history/path/traceback) for full state continuity */
+int gpu_cuda_upload_ext_seed(void *ctx,
+                              const unsigned char *hist, int hist_bytes, int nc,
+                              const unsigned *path, const unsigned *next_stored,
+                              int hist_pos, int pending);
+/* Hybrid CPU+GPU: launch GPU segments async, finish downloads results */
+int gpu_cuda_hybrid_async(void *ctx, const double *in, size_t count,
+                           int num_channels,
+                           const int *seg_starts, const int *seg_out_starts,
+                           const int *seg_total_sizes, const int *seg_out_caps,
+                           int num_gpu_segs, int overlap, size_t total_seg_out);
+int gpu_cuda_hybrid_pass2(void *ctx, const double *cpu_states, const double *cpu_costs);
+int gpu_cuda_hybrid_finish(void *ctx, float **seg_bufs, size_t *seg_out_counts,
+                            int num_gpu_segs, int num_channels);
 int gpu_cuda_precorr(void *ctx, const float *in, float *out, size_t count,
                       const gpu_precorr_state_t *init,
                       gpu_precorr_state_t *final_state);

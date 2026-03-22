@@ -1,0 +1,56 @@
+=== Trellis SDM ===
+    [SINAD] DSD64: 262112 samples, signal=1.56e-02 noise=1.44e-11 SINAD=90.3 dB (conv_fail=2241 collapse=2241 drops=1.5%, 2047 bins)
+    [SINAD] DSD128: 524256 samples, signal=1.56e-02 noise=1.62e-12 SINAD=99.8 dB (conv_fail=5028 collapse=5028 drops=1.6%, 2047 bins)
+    [SINAD] DSD256: 1048544 samples, signal=1.56e-02 noise=7.82e-14 SINAD=113.0 dB (conv_fail=11103 collapse=11103 drops=1.8%, 2047 bins)
+    [SINAD] DSD512: 2097120 samples, signal=1.56e-02 noise=1.35e-16 SINAD=140.6 dB (conv_fail=22030 collapse=22030 drops=1.8%, 2047 bins)
+=== Rate Conversion SINAD ===
+    [SINAD] DSD64->DSD128 (UP): SINAD=16.5 dB  [sdm-4, gain=0.71, lim=off, cands=2, depth=4]
+    [SINAD] DSD64->DSD256 (UP): SINAD=16.5 dB  [clans-8, gain=0.71, lim=off, cands=2, depth=4]
+    [SINAD] DSD64->DSD512 (UP): SINAD=14.7 dB  [clans-6, gain=0.71, lim=on, cands=2, depth=4]
+    [SINAD] DSD128->DSD256 (UP): SINAD=22.3 dB  [clans-8, gain=0.71, lim=off, cands=2, depth=4]
+    [SINAD] DSD128->DSD512 (UP): SINAD=20.4 dB  [clans-8, gain=0.71, lim=on, cands=2, depth=4]
+    [SINAD] DSD256->DSD512 (UP): SINAD=26.3 dB  [clans-8, gain=0.71, lim=on, cands=2, depth=4]
+    [SINAD] DSD128->DSD64 (DN): SINAD=22.3 dB  [clans-4, gain=0.71, lim=off, cands=32, depth=8]
+    [SINAD] DSD256->DSD64 (DN): SINAD=28.3 dB  [clans-8, gain=0.71, lim=off, cands=8, depth=8]
+    [SINAD] DSD512->DSD64 (DN): SINAD=32.1 dB  [sdm-6, gain=0.71, lim=off, cands=8, depth=8]
+    [SINAD] DSD256->DSD128 (DN): SINAD=28.3 dB  [clans-4, gain=0.71, lim=off, cands=8, depth=8]
+    [SINAD] DSD512->DSD128 (DN): SINAD=32.3 dB  [sdm-4, gain=0.71, lim=on, cands=16, depth=8]
+    [SINAD] DSD512->DSD256 (DN): SINAD=32.3 dB  [sdm-6, gain=0.71, lim=on, cands=8, depth=8]
+    [SINAD] DSD64->PCM44100: SINAD=103.3 dB  [64x, n=3332, skip=756, amp=0.2500, range=[-0.2500,0.2500]]
+    [SINAD] DSD64->PCM88200: SINAD=103.0 dB  [32x, n=7546, skip=630, amp=0.2500, range=[-0.2505,0.2504]]
+    [SINAD] DSD64->PCM176400: SINAD=85.7 dB  [16x, n=15848, skip=504, amp=0.2500, range=[-0.2707,0.2678]]
+    [SINAD] DSD128->PCM44100: SINAD=131.9 dB  [128x, n=3210, skip=882, amp=0.2500, range=[-0.2500,0.2500]]
+    [SINAD] DSD128->PCM88200: SINAD=132.3 dB  [64x, n=7428, skip=756, amp=0.2500, range=[-0.2500,0.2500]]
+    [SINAD] DSD128->PCM176400: SINAD=121.1 dB  [32x, n=15738, skip=630, amp=0.2500, range=[-0.2507,0.2507]]
+    [SINAD] DSD256->PCM44100: SINAD=134.0 dB  [256x, n=3086, skip=1008, amp=0.2500, range=[-0.2500,0.2500]]
+    [SINAD] DSD256->PCM88200: SINAD=133.6 dB  [128x, n=7306, skip=882, amp=0.2500, range=[-0.2500,0.2500]]
+    [SINAD] DSD256->PCM176400: SINAD=133.5 dB  [64x, n=15620, skip=756, amp=0.2500, range=[-0.2500,0.2500]]
+    [SINAD] DSD512->PCM44100: SINAD=135.8 dB  [512x, n=2961, skip=1134, amp=0.2500, range=[-0.2500,0.2500]]
+    [SINAD] DSD512->PCM88200: SINAD=136.8 dB  [256x, n=7182, skip=1008, amp=0.2500, range=[-0.2500,0.2500]]
+    [SINAD] DSD512->PCM176400: SINAD=136.3 dB  [128x, n=15498, skip=882, amp=0.2500, range=[-0.2500,0.2500]]
+    [SINAD] DSD512->PCM352800: SINAD=136.6 dB  [64x, n=32004, skip=756, amp=0.2500, range=[-0.2500,0.2500]]
+    [SINAD] DSD64->DSD64 (DN): SINAD=15.4 dB  [clans-6, gain=0.71, lim=off, cands=4, depth=8]
+    [SINAD] DSD128->DSD128 (DN): SINAD=23.1 dB  [sdm-6, gain=0.71, lim=off, cands=4, depth=8]
+    [SINAD] DSD256->DSD256 (DN): SINAD=29.1 dB  [clans-6, gain=0.71, lim=off, cands=4, depth=8]
+    [SINAD] DSD512->DSD512 (DN): SINAD=33.1 dB  [sdm-6, gain=0.71, lim=off, cands=4, depth=8]
+    [SINAD] DSD64->DSD128 (UP): SINAD=17.2 dB  [sdm-4, gain=0.71, lim=off, cands=2, depth=4]
+    [SINAD] DSD64->DSD256 (UP): SINAD=17.2 dB  [clans-8, gain=0.71, lim=off, cands=2, depth=4]
+    [SINAD] DSD128->DSD256 (UP): SINAD=23.1 dB  [clans-8, gain=0.71, lim=off, cands=2, depth=4]
+    [SINAD] DSD128->DSD64 (DN): SINAD=23.1 dB  [clans-4, gain=0.71, lim=off, cands=32, depth=8]
+    [SINAD] DSD256->DSD128 (DN): SINAD=29.1 dB  [clans-4, gain=0.71, lim=off, cands=8, depth=8]
+    [SINAD] DSD256->DSD64 (DN): SINAD=29.0 dB  [clans-8, gain=0.71, lim=off, cands=8, depth=8]
+    [SINAD] DSD64/48->PCM48000: SINAD=105.0 dB  [64x, n=3332, skip=756, amp=0.2500, range=[-0.2500,0.2500]]
+    [SINAD] DSD128/48->PCM96000: SINAD=132.4 dB  [64x, n=7428, skip=756, amp=0.2500, range=[-0.2500,0.2500]]
+=== Quality Metrics ===
+    DSD64: SINAD=102.5 A-wtd=105.2 MT=89.1 NMod=4.3 NMR=-87.7
+    DSD128: SINAD=121.5 A-wtd=126.8 MT=120.3 NMod=10.3 NMR=-110.9
+    DSD256: SINAD=112.0 A-wtd=117.1 MT=132.5 NMod=15.7 NMR=-103.5
+    DSD64/48: SINAD=101.6 A-wtd=104.7 MT=102.4 NMod=11.7 NMR=-87.6
+    DSD64→PCM44.1k: SINAD=104.7 A-wtd=106.9 MT=93.6 NMod=3.7
+    PCM 44.1k→48k: SINAD=95.3 A-wtd=102.2 MT=62.7
+    Path                            SINAD    A-wtd       MT     NMod
+    DSD128 re-encode               121.5   126.8   120.3    10.3  OK
+    DSD256 re-encode               112.0   117.1   132.5    15.7  OK
+    FIR 44100->88200: 88200 samples, peak=0.5000, SINAD=146.4 dB, top noise: bin 19061 (19089 Hz) = -169.6 dB
+    FIR 96000->48000: 48000 samples, peak=0.5000, SINAD=146.1 dB, top noise: bin 16917 (16962 Hz) = -169.7 dB
+    FIR 44100->176400: 176400 samples, peak=0.5000, SINAD=130.1 dB, top noise: bin 18981 (18995 Hz) = -161.3 dB
