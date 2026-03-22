@@ -10,6 +10,7 @@
 #include "../include/ntf.h"
 #include "../include/fir.h"
 #include "../include/engine.h"
+#include "../include/sinad_measure.h"
 #include <math.h>
 
 #ifndef M_PI
@@ -163,14 +164,28 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
         return -999.0;
     }
 
-    /* FIR rate conversion */
-    fir_chain_t fir;
-    if (fir_chain_init(&fir, fs_in, fs_out) != 0) {
-        free(dsd_in); free(fir_buf); free(dsd_out);
-        return -999.0;
+    /* FIR processing: rate conversion uses fir_chain, same-rate uses lowpass */
+    size_t fir_count;
+    if (fs_in == fs_out) {
+        /* Same-rate: FIR lowpass smoothing (matches engine's fir_lowpass path) */
+        fir_lowpass_t lp;
+        memset(&lp, 0, sizeof(lp));
+        if (fir_lowpass_init(&lp, fs_in) != 0) {
+            free(dsd_in); free(fir_buf); free(dsd_out);
+            return -999.0;
+        }
+        fir_count = fir_lowpass_process(&lp, dsd_in, fir_buf, dsd_in_count);
+        fir_lowpass_free(&lp);
+    } else {
+        /* Rate conversion: multi-stage FIR chain */
+        fir_chain_t fir;
+        if (fir_chain_init(&fir, fs_in, fs_out) != 0) {
+            free(dsd_in); free(fir_buf); free(dsd_out);
+            return -999.0;
+        }
+        fir_count = fir_chain_process(&fir, dsd_in, fir_buf, dsd_in_count);
+        fir_chain_free(&fir);
     }
-    size_t fir_count = fir_chain_process(&fir, dsd_in, fir_buf, dsd_in_count);
-    fir_chain_free(&fir);
 
     if (fir_count < 1024) {
         free(dsd_in); free(fir_buf); free(dsd_out);
@@ -211,7 +226,29 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
         return -999.0;
     }
 
-    double sinad_db = measure_sinad(dsd_out, out_count, freq, (double)fs_out);
+    /* Decimate DSD to audio rate before SINAD measurement.
+     * Raw DSD Goertzel has spectral leakage from shaped noise.
+     * FIR decimation removes ultrasonic noise → accurate in-band SINAD. */
+    double sinad_db;
+    {
+        unsigned pcm_rate = rate_is_48k_family(fs_out) ? 48000 : 44100;
+        fir_chain_t dec_fir;
+        memset(&dec_fir, 0, sizeof(dec_fir));
+        fir_chain_init(&dec_fir, fs_out, pcm_rate);
+        float *pcm_buf = (float *)calloc(out_count, sizeof(float));
+        size_t pcm_n = pcm_buf ? fir_chain_process(&dec_fir, dsd_out, pcm_buf, out_count) : 0;
+        fir_chain_free(&dec_fir);
+        size_t skip = 256;
+        if (pcm_n > skip + 1024) {
+            /* Re-align frequency to decimated PCM rate's bin grid */
+            size_t meas_n = pcm_n - skip;
+            double pcm_freq = bin_align_freq(freq, (double)pcm_rate, meas_n);
+            sinad_db = measure_sinad(pcm_buf + skip, meas_n, pcm_freq, (double)pcm_rate);
+        } else {
+            sinad_db = -999.0;
+        }
+        free(pcm_buf);
+    }
 
     unsigned base_in  = rate_is_48k_family(fs_in)  ? 48000 : 44100;
     unsigned base_out = rate_is_48k_family(fs_out) ? 48000 : 44100;
@@ -1698,24 +1735,42 @@ static void test_weak_paths_sweep(void) {
 
 /* ─── DSD/48 same-rate tests ─── */
 
+/* Same-rate tests use sinad_measure (the proven quality suite measurement)
+ * instead of measure_rate_sinad which was broken for same-rate paths
+ * (no FIR lowpass smoothing, raw DSD Goertzel spectral leakage). */
+static void test_sinad_same_rate(uint32_t rate, const char *name, double min_sinad) {
+    engine_path_info_t pi;
+    dsd_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.fs_in = rate; cfg.fs_out = rate;
+    engine_get_path_info(rate, rate, NTF_AUTO, SDM_MODE_TRELLIS, &cfg, &pi);
+    int cands = pi.cands > 0 ? pi.cands : 2;
+    int lat = pi.lat > 0 ? pi.lat : 32;
+    int depth = pi.depth > 0 ? pi.depth : 4;
+    int ntf_id = pi.ntf_filter;
+    sinad_result_t r;
+    memset(&r, 0, sizeof(r));
+    sinad_measure(rate, ntf_id, cands, depth, lat, 1, pi.fir_gain, &r);
+    unsigned base = rate_is_48k_family(rate) ? 48000 : 44100;
+    printf("    [SINAD] DSD%u->DSD%u (same): SINAD=%.1f dB A-wtd=%.1f MT=%.1f NMod=%.1f"
+           "  [%s, gain=%.2f, cands=%d, lat=%d]\n",
+           rate/base, rate/base, r.sinad_theoretical, r.sinad_awtd_theo,
+           r.multitone_sinad_db, r.noise_mod_db,
+           ntf_id != NTF_AUTO ? "path" : "auto", pi.fir_gain, cands, lat);
+    TEST_ASSERT_TRUE(r.sinad_theoretical > min_sinad, name);
+}
+
 static void test_sinad_dsd64_48_same(void) {
-    double sinad = measure_rate_sinad(DSD48_RATE_64, DSD48_RATE_64);
-    TEST_ASSERT_TRUE(sinad > 12.0, "DSD64/48 same-rate SINAD > 12 dB");
+    test_sinad_same_rate(DSD48_RATE_64, "DSD64/48 same-rate", 80.0);
 }
-
 static void test_sinad_dsd128_48_same(void) {
-    double sinad = measure_rate_sinad(DSD48_RATE_128, DSD48_RATE_128);
-    TEST_ASSERT_TRUE(sinad > 12.0, "DSD128/48 same-rate SINAD > 12 dB");
+    test_sinad_same_rate(DSD48_RATE_128, "DSD128/48 same-rate", 90.0);
 }
-
 static void test_sinad_dsd256_48_same(void) {
-    double sinad = measure_rate_sinad(DSD48_RATE_256, DSD48_RATE_256);
-    TEST_ASSERT_TRUE(sinad > 12.0, "DSD256/48 same-rate SINAD > 12 dB");
+    test_sinad_same_rate(DSD48_RATE_256, "DSD256/48 same-rate", 90.0);
 }
-
 static void test_sinad_dsd512_48_same(void) {
-    double sinad = measure_rate_sinad(DSD48_RATE_512, DSD48_RATE_512);
-    TEST_ASSERT_TRUE(sinad > 12.0, "DSD512/48 same-rate SINAD > 12 dB");
+    test_sinad_same_rate(DSD48_RATE_512, "DSD512/48 same-rate", 90.0);
 }
 
 /* ─── DSD/48 upsample tests ─── */
@@ -1768,6 +1823,12 @@ static void test_sinad_dsd128_48_pcm96(void) {
 
 void test_rate_sinad_suite(void) {
     TEST_SUITE("Rate Conversion SINAD");
+
+    /* DSD/44 same-rate (using proven sinad_measure) */
+    { test_sinad_same_rate(DSD_RATE_64,  "DSD64 same-rate",  80.0); }
+    { test_sinad_same_rate(DSD_RATE_128, "DSD128 same-rate", 90.0); }
+    { test_sinad_same_rate(DSD_RATE_256, "DSD256 same-rate", 90.0); }
+    { test_sinad_same_rate(DSD_RATE_512, "DSD512 same-rate", 90.0); }
 
     TEST_RUN(test_sinad_up_64_128);
     TEST_RUN(test_sinad_up_64_256);
