@@ -1050,7 +1050,7 @@ size_t plugin_process(plugin_state_t *s,
      * DSD64 same-rate is trivially fast — skip parallel overhead. */
     uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
     bool is_same_rate = (s->config.fs_in == fs_out);
-    bool skip_parallel = (is_same_rate && fs_out <= DSD_RATE_64 &&
+    bool skip_parallel = (0 && is_same_rate && fs_out <= DSD_RATE_64 &&
                           !(s->config.gpu_sdm_enabled && s->gpu &&
                             s->config.sdm_mode == SDM_MODE_TRELLIS));
 
@@ -1933,10 +1933,14 @@ size_t plugin_process(plugin_state_t *s,
             }
         }
 
-        /* Copy last segment's final state back into persistent SDM */
+        /* Copy last segment's final state back into persistent SDM.
+         * Must use temps_per_ch-1 (last temp), NOT segments_per_ch-2.
+         * When use_fir_tail=true, ALL segments are temps (temps_per_ch == segments_per_ch),
+         * so the last segment is temps_per_ch-1. Previously used segments_per_ch-2
+         * which selected seg2 instead of seg3 — corrupting persistent state. */
         if (segments_per_ch > 1) {
             for (int ch = 0; ch < num_channels; ch++) {
-                int last_temp = ch * temps_per_ch + (segments_per_ch - 2);
+                int last_temp = ch * temps_per_ch + (temps_per_ch - 1);
                 if (last_temp >= 0 && last_temp < temp_sdm_count)
                     sdm_context_copy_state(&s->channels[ch].sdm, &temp_sdms[last_temp]);
             }
