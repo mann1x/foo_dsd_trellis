@@ -1148,7 +1148,9 @@ size_t plugin_process(plugin_state_t *s,
          * Falls back to threadpool FIR on GPU failure or small buffers.
          * TEMP: force CPU FIR to isolate GPU SDM noise source. */
         bool gpu_fir_ok = false;
-        bool force_cpu_fir = false;
+        /* GPU FIR lowpass produces zeros/wrong values (CUDA kernel bug).
+         * Force CPU FIR until the kernel is fixed. */
+        bool force_cpu_fir = true;
 
         /* GPU FIR lowpass for same-rate path (no rate conversion stages).
          * Runs on main thread (GPU not thread-safe).
