@@ -1029,6 +1029,8 @@ size_t plugin_process(plugin_state_t *s,
     QueryPerformanceCounter(&t_end);
     s->time_unpack_ms = perf_ms(t_start, t_end);
 
+    /* Diagnostic removed — input verified OK */
+
     /* Determine if parallel SDM segmentation is beneficial.
      * Worth it only when rate-converting (SDM is the bottleneck)
      * and we have more threads than channels. */

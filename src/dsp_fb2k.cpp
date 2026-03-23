@@ -1677,8 +1677,12 @@ public:
         , m_pcm_rate(0)
         , m_httpapi(nullptr)
     {
-        if (m_state)
-            plugin_set_config(m_state, &m_config);
+        /* Do NOT call plugin_set_config here with the raw global config.
+         * The global sdm_mode may differ from the per-rate override (e.g.,
+         * global=PreCorr but rate_sdm[DSD128]=Trellis). Setting the wrong
+         * mode here would cause a wasteful engine reinit on the first chunk,
+         * losing audio. The first on_chunk() resolves per-rate overrides
+         * and calls plugin_set_config with the correct config. */
 
         log_set_enabled(m_config.debug_log);
 
@@ -1686,9 +1690,7 @@ public:
         trellis_log("DSD Trellis v%s (build %s, %s %s)",
                     BUILD_VERSION, BUILD_GIT_HASH, BUILD_DATE, BUILD_TIME);
 
-        trellis_log("initialized (global_sdm=%s, fir=%s) — actual SDM mode resolved per-rate",
-                    m_config.sdm_mode == SDM_MODE_TRELLIS ? "Trellis" : "PreCorr",
-                    fir_ipp_kernel_name());
+        trellis_log("initialized (fir=%s)", fir_ipp_kernel_name());
 
         /* Start REST API server */
         if (m_config.api_port > 0) {
