@@ -1551,6 +1551,15 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
 
     CUstream stream = c->sdm_stream;
 
+    /* Save previous chunk's persistent NTF state for chunk boundary re-encoding.
+     * Downloaded before d_trellis_states is overwritten at the end. */
+    double h_prev_states[8 * 8];  /* max nc=8, order=8 */
+    bool prev_state_valid = c->trellis_state_valid;
+    if (prev_state_valid) {
+        pfn_cuMemcpyDtoH(h_prev_states, c->d_trellis_states,
+                          (size_t)nc * 8 * sizeof(double));
+    }
+
     /* Upload NTF constants */
     {
         CUdeviceptr d_a, d_g, d_order, d_limit;
@@ -1996,6 +2005,101 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
     }
     QueryPerformanceCounter(&t_k2);
     QueryPerformanceCounter(&t_k3);
+
+    /* ── CPU chunk boundary re-encoding ──
+     * Re-encode the first ~256 output samples using a CPU SDM seeded from
+     * the previous chunk's persistent NTF state. This bridges the traceback
+     * latency gap: GPU seg0 starts with zeroed history (neutral but
+     * discontinuous), while CPU re-encoding provides perfect continuity.
+     *
+     * GPU output[0] corresponds to input[M] (after M warmup in seg0).
+     * CPU must process input[0..M+re_half-1]: first M consumed for
+     * pipeline fill + convergence, last re_half produce replacement output. */
+    if (prev_state_valid && M + das_overlap * 2 <= (int)count) {
+        /* Re-encode region: CPU produces re_total output samples.
+         * First re_replace samples directly replace GPU output.
+         * Next das_overlap samples are DAS density-matched with GPU output
+         * to find a clean stitch point (same algorithm as segment stitching). */
+        int re_replace = das_overlap;     /* guaranteed replacement */
+        int re_total = re_replace + das_overlap;  /* total CPU output */
+
+        ntf_filter_t re_flt;
+        memset(&re_flt, 0, sizeof(re_flt));
+        re_flt.order = c->trellis_order;
+        for (int k = 0; k < c->trellis_order; k++) {
+            re_flt.a[k] = c->trellis_ntf_a[k];
+            re_flt.g[k] = c->trellis_ntf_g[k];
+        }
+
+        float *discard_buf = (float *)malloc((size_t)M * sizeof(float));
+        float *re_buf = (float *)malloc((size_t)re_total * sizeof(float));
+        if (discard_buf && re_buf) {
+            for (int ch = 0; ch < num_channels; ch++) {
+                float *ch_out = out + ch * (int)count;
+                const double *ch_in = in + ch * (int)count;
+
+                sdm_context_t tmp;
+                sdm_context_init(&tmp, &re_flt, 8, nc, lat);
+                {
+                    sdm_state_t *s = tmp.trellis[0].act[0];
+                    for (int k = 0; k < c->trellis_order; k++)
+                        s->state[k] = h_prev_states[k];
+                    s->cost = 0.0;
+                }
+
+                /* Warmup: M input samples → fills pipeline + NTF convergence */
+                sdm_process_block(&tmp, ch_in, discard_buf, (size_t)M);
+
+                /* CPU re-encode: re_total output samples starting at output[0] */
+                sdm_process_block(&tmp, ch_in + M, re_buf, (size_t)re_total);
+
+                /* Direct replacement: output[0..re_replace-1] = CPU output */
+                memcpy(ch_out, re_buf, (size_t)re_replace * sizeof(float));
+
+                /* DAS density-matched stitch in the overlap region.
+                 * CPU re_buf[re_replace..re_total-1] overlaps with
+                 * GPU ch_out[re_replace..re_replace+das_overlap-1]. */
+                {
+                    float *cpu_ovl = re_buf + re_replace;
+                    float *gpu_ovl = ch_out + re_replace;
+                    int ovl_n = das_overlap;
+                    int hw = lat;
+                    if (hw > ovl_n / 2) hw = ovl_n / 2;
+                    if (hw < 4) hw = 4;
+
+                    /* Find best density match */
+                    int best_d = 0, best_p = 0;
+                    for (int p = 0; p < ovl_n; p++) {
+                        int s = p - hw, e = p + hw;
+                        if (s < 0) s = 0;
+                        if (e > ovl_n) e = ovl_n;
+                        int m = 0;
+                        for (int w = s; w < e; w++)
+                            if (cpu_ovl[w] == gpu_ovl[w]) m++;
+                        if (m > best_d) { best_d = m; best_p = p; }
+                    }
+                    /* Find nearest exact bit match */
+                    int sp = best_p;
+                    for (int r = 0; r <= hw; r++) {
+                        int lo = best_p - r, hi = best_p + r;
+                        if (lo >= 0 && lo < ovl_n &&
+                            cpu_ovl[lo] == gpu_ovl[lo]) { sp = lo; break; }
+                        if (hi != lo && hi >= 0 && hi < ovl_n &&
+                            cpu_ovl[hi] == gpu_ovl[hi]) { sp = hi; break; }
+                    }
+
+                    /* Copy CPU output up to stitch point */
+                    if (sp > 0)
+                        memcpy(gpu_ovl, cpu_ovl, (size_t)sp * sizeof(float));
+                    /* GPU output continues from stitch point onward (already in place) */
+                }
+
+                sdm_context_free(&tmp);
+            }
+        }
+        free(discard_buf);
+        free(re_buf);
+    }
 
     /* Save last segment's final state as persistent for next chunk.
      * With adaptive segment cap (D≥64K), the 2-pass DAS state chaining
