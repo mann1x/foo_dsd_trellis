@@ -480,18 +480,76 @@ This ensures every boundary has a genuine shared overlap region where both segme
 
 ---
 
-## 6. Applicability to GPU-Accelerated SDM
+## 6. GPU-Accelerated SDM: Implementation and Conclusion
 
-DAS was designed with GPU parallelism in mind. A GPU SDM (e.g., CUDA-based Simplified Bit-Vector Decimation) would process dozens or hundreds of segments simultaneously. At lower DSD rates (DSD64, DSD128) where each sample carries more analog weight, stitch quality becomes more critical:
+### 6.1 Architecture
 
-| Rate | Sample Period | Segments (GPU) | Stitch Points | Artifact Visibility |
-|------|-------------- |----------------|---------------|---------------------|
-| DSD64 | 355 ns | 32+ | 31+ | High |
-| DSD128 | 178 ns | 32+ | 31+ | Medium |
-| DSD256 | 89 ns | 32+ | 31+ | Low |
-| DSD512 | 44 ns | 32+ | 31+ | Very low |
+A CUDA-based GPU trellis SDM was implemented using the same parallel-segment approach as CPU DAS. Each GPU segment runs as a CUDA block on an SM (Streaming Multiprocessor), processing M warmup + D output + overlap extension samples. The 2-pass DAS pipeline runs entirely on GPU:
 
-At DSD64, a single bit flip at a stitch boundary produces a ±2 impulse visible through the DAC's reconstruction filter. With 31 stitch boundaries per chunk, 31 such impulses would create measurable distortion. The DAS hybrid approach — density-guided convergence + exact bit-match — ensures zero impulse artifacts regardless of segment count or DSD rate.
+- **Pass 1**: All segments seeded from persistent NTF state (replicated), run in parallel
+- **Pass 2**: Segments re-run with chained states (seg[i] seeded from seg[i-1]'s Pass 1 final state)
+- **CPU-side DAS assembly**: Segment outputs downloaded, density-scanned, stitched on CPU
+
+### 6.2 Conclusion: GPU SDM is Not Feasible
+
+**After extensive investigation (3 sessions, 13 bug fixes, comprehensive measurements), GPU-accelerated trellis SDM is not viable for production audio.** The combination of elevated noise floor and extreme computational cost for fp64 precision makes it impractical at any DSD rate.
+
+#### Quality: Unacceptable Noise at All Rates
+
+The GPU kernel produces 10-40% more in-band noise than CPU sequential SDM, manifesting as audible pops and elevated noise floor. This is **not** from DAS stitching (segment boundaries are clean) but from the GPU kernel's per-sample noise shaping quality. The trellis algorithm is uniquely sensitive to FP rounding: with nc=2 candidates, ULP-level cost differences flip candidate selection, cascading into a completely different bit stream. GPU and CPU produce 49% different bits (essentially uncorrelated) even with identical algorithm and `--fmad=false`.
+
+Listening tests confirmed the noise is clearly audible at DSD64 and remains audible at DSD256. The hypothesis that higher DSD rates would mask the noise was tested and disproven — the elevated base noise is perceptible regardless of rate.
+
+#### Performance: fp64 Too Expensive for GPU
+
+Trellis SDM requires fp64 precision for the NTF integrator states and cost computation. On NVIDIA GPUs, fp64 throughput is 1/32 to 1/64 of fp32 (consumer GPUs like RTX 5080). This makes GPU SDM dramatically slower per-sample than CPU AVX2:
+
+| Configuration | RT Ratio | Notes |
+|---------------|----------|-------|
+| CPU sequential (1 core) | 0.12x | AVX2 fp64, DSD64 |
+| GPU 4 segments | 10x | RTX 5080, DSD64 |
+| GPU 42 segments | 1.42x | RTX 5080, DSD64, barely real-time |
+| GPU 42 segments | >2x | RTX 5080, DSD256, NOT real-time |
+
+Even with 42 segments utilizing half the GPU's 84 SMs, DSD64 barely achieves real-time (1.42x) and DSD256 cannot reach real-time (>2x). Higher segment counts hit CUDA_ERROR_ILLEGAL_ADDRESS (kernel crash at lat≥128) and further increase the noise floor.
+
+#### Root Causes Investigated
+
+Thirteen bugs were found and fixed across three sessions:
+
+1. Majority vote on traceback bit
+2. Next-filter for candidate selection
+3. Sort tie-breaking `<=` not `<`
+4. Traceback pipeline delay (`p_next_stored[]`)
+5. Dedup-aware greedy selection
+6. FIR lowpass fp32→fp64
+7. GPU FIR lowpass host narrowing
+8. Missing gain in parallel FIR path
+9. ext_seed out-of-bounds access
+10. NTF child mapping inversion (reverted)
+11. DAS assembly capacity vs actual counts
+12. FMA rounding divergence (`--fmad=false`)
+13. Analog compensation bit-flipping (removed)
+
+Additional findings:
+- **Self-seeding degrades quality by ~29%** — stale traceback history biases convergence
+- **Cross-channel ext_seed contamination** — fixed to per-channel arrays
+- **CPU chunk boundary re-encoding** — helps but creates new stitch artifacts
+- **Pop count scales linearly with segments** (~3 pops/segment/5 seconds)
+
+### 6.3 Measurements (Short People, DSD64, FIR 255-tap 50kHz Kaiser)
+
+| Configuration | RMS | max_deriv | pops/5s | RT ratio |
+|---------------|-----|-----------|---------|----------|
+| CPU sequential | 0.004185 | 0.001803 | 2 | 0.12x |
+| GPU 4 seg | 0.004609 | 0.001776 | 11 | 10x |
+| GPU 4 seg + CPU re-encode | 0.003832 | 0.003360 | 17 | 10x |
+| GPU 42 seg | ~0.006 | ~0.003 | ~100+ | 1.42x |
+| GPU 1 seg (no DAS) | 0.006539 | 0.002059 | 9 | 22x |
+
+### 6.4 Recommendation
+
+GPU acceleration remains valuable for the **FIR filtering pipeline** (upsampling, lowpass, gain), where fp32 is sufficient and GPU parallelism provides genuine speedup. The SDM feedback loop should remain on CPU where AVX2 fp64 provides both superior quality and faster per-sample throughput. The CPU parallel DAS algorithm (Section 4-5) achieves clean, artifact-free parallelization across multiple CPU cores — this is the production path.
 
 ---
 
@@ -530,11 +588,19 @@ The algorithm is computationally free (zero measurable overhead), achieves 100% 
 
 DAS is implemented in the `foo_dsd_trellis` foobar2000 DSP plugin:
 
+### CPU Parallel SDM
 - **Segment layout & overlap**: `src/dsp_plugin.c` (parallel SDM path)
 - **SDM core & state copy**: `src/trellis.c` (`sdm_context_copy_state`, `sdm_state_distance`)
 - **Segment processing**: `src/engine.c` (`sdm_segment_process`)
 - **Thread pool dispatch**: `src/threadpool.c` (MMCSS "Pro Audio" workers)
 - **Convergence diagnostics**: `test/test_stitch.c` (overlap sweep, density vs. state-distance comparison)
+
+### GPU Parallel SDM (CUDA)
+- **GPU trellis kernel**: `src/kernels/sdm_parallel.cu` (per-segment SBVD with traceback)
+- **GPU host dispatch**: `src/gpu_cuda.c` (`gpu_cuda_trellis_das` — 2-pass DAS pipeline)
+- **CPU-side DAS assembly**: `src/gpu_cuda.c` (density scan + stitch, boundary re-encoding)
+- **PTX compilation**: `--fmad=false` required (CUDA 12.8, sm_52)
+- **GPU algorithm test**: `test/test_trellis.c` (`test_gpu_cpu_divergence`)
 
 ---
 

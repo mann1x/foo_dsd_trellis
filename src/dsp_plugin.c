@@ -1050,7 +1050,7 @@ size_t plugin_process(plugin_state_t *s,
      * DSD64 same-rate is trivially fast — skip parallel overhead. */
     uint32_t fs_out = s->config.fs_out ? s->config.fs_out : s->config.fs_in;
     bool is_same_rate = (s->config.fs_in == fs_out);
-    bool skip_parallel = (0 && is_same_rate && fs_out <= DSD_RATE_64 &&
+    bool skip_parallel = (is_same_rate && fs_out <= DSD_RATE_64 &&
                           !(s->config.gpu_sdm_enabled && s->gpu &&
                             s->config.sdm_mode == SDM_MODE_TRELLIS));
 
@@ -1084,9 +1084,11 @@ size_t plugin_process(plugin_state_t *s,
         if (fs_out > s->config.fs_in)
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);
 
-        /* Overlap for SDM convergence: 32x lat for all rates.
-         * 32x proven optimal for convergence quality. */
+        /* Overlap for SDM convergence: 32x lat, capped at 1024 samples.
+         * 32x optimal at lat=32 (DSD512). Cap prevents excessive overlap
+         * at higher latencies (lat=128 → would be 4096 uncapped). */
         overlap = 32 * (size_t)s->config.trellis_lat;
+        if (overlap > 1024) overlap = 1024;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
         int max_seg;
@@ -1834,30 +1836,22 @@ size_t plugin_process(plugin_state_t *s,
                 if (ovl_len > overlap) ovl_len = overlap;
 
                 /* Step 1: Windowed match density — find region of best
-                 * convergence. Incremental sliding window: O(overlap) instead
-                 * of O(overlap × window). Window=64 samples. */
-                int half_w = 32;
+                 * convergence.  Window size = 2 × trellis_lat. */
+                int half_w = s->config.trellis_lat;
                 if (half_w > (int)ovl_len / 2) half_w = (int)ovl_len / 2;
                 if (half_w < 4) half_w = 4;
 
                 int best_density = 0, best_density_pos = 0;
-                /* Initialize window at position 0 */
-                int matches = 0;
-                int w_end = half_w < (int)ovl_len ? half_w : (int)ovl_len;
-                for (int w = 0; w < w_end; w++)
-                    if (prev_ovl[w] == this_ovl[w]) matches++;
-                best_density = matches;
-                best_density_pos = 0;
-
-                for (size_t p = 1; p < ovl_len; p++) {
-                    /* Remove sample leaving the window (at p - 1 - half_w) */
-                    int leaving = (int)p - 1 - half_w;
-                    if (leaving >= 0 && leaving < (int)ovl_len)
-                        if (prev_ovl[leaving] == this_ovl[leaving]) matches--;
-                    /* Add sample entering the window (at p - 1 + half_w) */
-                    int entering = (int)p - 1 + half_w;
-                    if (entering >= 0 && entering < (int)ovl_len)
-                        if (prev_ovl[entering] == this_ovl[entering]) matches++;
+                for (size_t p = 0; p < ovl_len; p++) {
+                    int start = (int)p - half_w;
+                    int end   = (int)p + half_w;
+                    if (start < 0) start = 0;
+                    if (end > (int)ovl_len) end = (int)ovl_len;
+                    int matches = 0;
+                    for (int w = start; w < end; w++) {
+                        if (prev_ovl[w] == this_ovl[w])
+                            matches++;
+                    }
                     if (matches > best_density) {
                         best_density = matches;
                         best_density_pos = (int)p;
@@ -1933,14 +1927,10 @@ size_t plugin_process(plugin_state_t *s,
             }
         }
 
-        /* Copy last segment's final state back into persistent SDM.
-         * Must use temps_per_ch-1 (last temp), NOT segments_per_ch-2.
-         * When use_fir_tail=true, ALL segments are temps (temps_per_ch == segments_per_ch),
-         * so the last segment is temps_per_ch-1. Previously used segments_per_ch-2
-         * which selected seg2 instead of seg3 — corrupting persistent state. */
+        /* Copy last segment's final state back into persistent SDM */
         if (segments_per_ch > 1) {
             for (int ch = 0; ch < num_channels; ch++) {
-                int last_temp = ch * temps_per_ch + (temps_per_ch - 1);
+                int last_temp = ch * temps_per_ch + (segments_per_ch - 2);
                 if (last_temp >= 0 && last_temp < temp_sdm_count)
                     sdm_context_copy_state(&s->channels[ch].sdm, &temp_sdms[last_temp]);
             }
