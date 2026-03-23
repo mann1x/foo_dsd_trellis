@@ -228,6 +228,35 @@ int gpu_fir_lowpass(gpu_context_t *ctx, const float *in, float *out,
     }
 }
 
+int gpu_fir_lowpass_f64(gpu_context_t *ctx, const float *in, double *out,
+                        size_t count, double gain) {
+    if (!ctx) return -1;
+    switch (ctx_backend(ctx)) {
+    case GPU_BACKEND_CUDA:
+        return gpu_cuda_fir_lowpass_f64(ctx, in, out, count, gain);
+    case GPU_BACKEND_DIRECTX: {
+        /* DX12/DX11 lowpass is float32 only. Run float lowpass then
+         * widen to double. Uses static TLS buffer to avoid per-call malloc. */
+        static __declspec(thread) float *tls_f32 = NULL;
+        static __declspec(thread) size_t tls_cap = 0;
+        if (tls_cap < count) {
+            free(tls_f32);
+            tls_f32 = (float *)malloc(count * sizeof(float));
+            tls_cap = tls_f32 ? count : 0;
+        }
+        if (!tls_f32) return -1;
+        int r = gpu_dx12_fir_lowpass(ctx, in, tls_f32, count, (float)gain);
+        if (r != 0)
+            r = gpu_dx11_fir_lowpass(ctx, in, tls_f32, count, (float)gain);
+        if (r != 0) return r;
+        for (size_t i = 0; i < count; i++)
+            out[i] = (double)tls_f32[i];
+        return 0;
+    }
+    default: return -1;
+    }
+}
+
 int gpu_gain_apply(gpu_context_t *ctx, float *buf, size_t count, float gain) {
     if (!ctx) return -1;
     switch (ctx_backend(ctx)) {

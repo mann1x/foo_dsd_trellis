@@ -1167,9 +1167,9 @@ size_t plugin_process(plugin_state_t *s,
                     s->channels[ch].fir_buf_sz = s->channels[ch].fir_buf ? dsd_in_count * sizeof(double) : 0;
                 }
                 if (!s->channels[ch].fir_buf) { gpu_fir_ok = false; break; }
-                if (gpu_cuda_fir_lowpass_f64(s->gpu, s->ch_in[ch],
-                                              s->channels[ch].fir_buf,
-                                              dsd_in_count, (double)combined) != 0) {
+                if (gpu_fir_lowpass_f64(s->gpu, s->ch_in[ch],
+                                        s->channels[ch].fir_buf,
+                                        dsd_in_count, (double)combined) != 0) {
                     gpu_fir_ok = false; break;
                 }
                 fir_counts[ch] = dsd_in_count;

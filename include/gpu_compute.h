@@ -92,6 +92,11 @@ int gpu_fir_lowpass_setup(gpu_context_t *ctx, const float *taps, int ntaps);
 int gpu_fir_lowpass(gpu_context_t *ctx, const float *in, float *out,
                     size_t count, float gain);
 
+/* FIR lowpass with fp64 output (for SDM pipeline).
+ * CUDA: native fp64. DX12/DX11: float lowpass → widen to double. */
+int gpu_fir_lowpass_f64(gpu_context_t *ctx, const float *in, double *out,
+                        size_t count, double gain);
+
 /* ─── Gain & Boxcar ─── */
 
 /* Apply gain multiply in-place. */
