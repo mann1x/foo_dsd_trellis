@@ -1737,10 +1737,11 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
         int ch_stride_out = (int)total_seg_out;
 
         int D_nominal = D;
-        /* TODO: persistent seed for chunk continuity (disabled for debugging) */
+        /* DAS path: ext_seed=NULL. Segments seed from NTF init_states only.
+         * CPU SDM runs alongside for state persistence (dsp_plugin.c).
+         * s_d_ext_seed causes kernel failure — do NOT use here. */
         CUdeviceptr ext_seed_ptr = 0;
         CUdeviceptr null_final_seed = 0;
-        static CUdeviceptr s_d_das_final_seed = 0;
 
         void *args_p1[] = {
             &c->d_sdm_in, &c->d_das_seg_out,
@@ -1789,15 +1790,13 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
             &c->d_das_seg_counts,
             &D_nominal, &c->d_das_mid_states, &c->d_das_mid_costs,
             &ext_seed_ptr,
-            &null_final_seed  /* TODO: save final seed */
+            &null_final_seed
         };
         pfn_cuLaunchKernel(c->fn_trellis_parallel,
                             (unsigned)num_segs, (unsigned)num_channels, 1,
                             (unsigned)block_size, 1, 1,
                             0, stream, args_p2, NULL);
         pfn_cuStreamSynchronize(stream);
-
-        /* TODO: download final seed for chunk continuity */
     }
     QueryPerformanceCounter(&t_k1);
 

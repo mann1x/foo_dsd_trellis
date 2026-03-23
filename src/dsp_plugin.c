@@ -1491,6 +1491,21 @@ size_t plugin_process(plugin_state_t *s,
             }
 
             if (dsd_out_count > 0) {
+                /* Run CPU SDM on the same input to keep persistent state
+                 * current for next chunk's ext_seed. Output discarded —
+                 * only the state evolution matters. */
+                for (int ch = 0; ch < num_channels; ch++) {
+                    static __declspec(thread) float *tls_trash = NULL;
+                    static __declspec(thread) size_t tls_trash_sz = 0;
+                    if (tls_trash_sz < fir_n) {
+                        free(tls_trash);
+                        tls_trash = (float *)malloc(fir_n * sizeof(float));
+                        tls_trash_sz = tls_trash ? fir_n : 0;
+                    }
+                    if (tls_trash)
+                        sdm_process_block(&s->channels[ch].sdm,
+                                           fir_data[ch], tls_trash, fir_n);
+                }
                 QueryPerformanceCounter(&t_sdm_end);
                 s->time_sdm_ms = perf_ms(t_sdm_start, t_sdm_end);
                 goto sdm_done;
