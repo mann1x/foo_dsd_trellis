@@ -13,13 +13,14 @@ __constant__ double c_ntf_a[8];
 __constant__ double c_ntf_g[8];
 __constant__ int    c_ntf_order;
 __constant__ double c_state_limit;
-/* Path mask: 0xFF (8-bit) matches CPU when trellis_depth=8.
- * Wider paths = fewer dedup collisions = better candidate diversity. */
+/* Path mask: 0xFF (8-bit) for best candidate diversity.
+ * Wider paths = fewer false dedup collisions = better noise shaping. */
 #define PATH_MASK 0xFF
 
-/* NTF filter calc matching CPU's sdm_filter_calc exactly.
- * Includes y term in d[0] and computes v in one pass.
- * This ensures identical FP rounding as CPU's unrolled version. */
+/* NTF filter calc matching CPU's unrolled sdm_filter_calc_oN.
+ * Two-loop structure: compute all d[] first, then accumulate v.
+ * With --fmad=false, this produces identical FP rounding to the
+ * CPU's single-expression return (evaluated left-to-right). */
 __device__ double ntf_calc_with_y(const double *s, double *d,
                                     int order, double x, double y) {
     d[0] = s[0] - c_ntf_g[0] * s[1] + x - y;

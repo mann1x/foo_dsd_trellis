@@ -1944,72 +1944,10 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
                        copy_count * sizeof(float));
                 write_pos = stitch_at + copy_count;
 
-                /* Gradual analog compensation: measure the DC jump at the
-                 * stitch and spread bit-flips over a wide window to gently
-                 * correct it. Only flip bits that REDUCE the local error.
-                 * Preserves the original 6th-order trellis noise shaping
-                 * while smoothing the level transition. */
-                {
-                    int comp_half = das_overlap / 2;  /* half-width: half the overlap */
-                    int meas_w = 64;
-
-                    if ((int)stitch_at < comp_half + meas_w) goto skip_comp;
-                    if (stitch_at + (size_t)comp_half + (size_t)meas_w > write_pos) goto skip_comp;
-
-                    /* Measure analog level on both sides */
-                    double sum_before = 0, sum_after = 0;
-                    for (int j = 0; j < meas_w; j++) {
-                        sum_before += out[stitch_at - 1 - j];
-                        sum_after  += out[stitch_at + j];
-                    }
-                    double avg_before = sum_before / meas_w;
-                    double avg_after  = sum_after / meas_w;
-                    double delta = avg_after - avg_before;
-
-                    if (fabs(delta) > 0.001) {
-                        /* Spread corrections over comp_half samples AFTER stitch.
-                         * Flip probability ramps down with distance from stitch.
-                         * Total flips = |delta| * meas_w / 2 (to match the averages).
-                         * Spread over comp_half samples. */
-                        int total_flips = (int)(fabs(delta) * (double)meas_w / 2.0 + 0.5);
-                        if (total_flips > comp_half / 4) total_flips = comp_half / 4;
-                        float target_bit = (delta > 0) ? -1.0f : 1.0f;
-                        float source_bit = -target_bit;
-
-                        /* Distribute flips with decreasing density */
-                        int flipped = 0;
-                        int stride = (total_flips > 0) ? comp_half / total_flips : comp_half;
-                        if (stride < 2) stride = 2;
-                        for (int j = 0; j < comp_half && flipped < total_flips; j += stride) {
-                            /* Find nearest flippable bit in [j, j+stride) */
-                            for (int k = j; k < j + stride && k < comp_half; k++) {
-                                size_t idx = stitch_at + k;
-                                if (idx < write_pos && out[idx] == source_bit) {
-                                    out[idx] = target_bit;
-                                    flipped++;
-                                    break;
-                                }
-                            }
-                        }
-
-                        /* Also apply smaller correction BEFORE the stitch */
-                        int pre_flips = total_flips / 2;
-                        flipped = 0;
-                        stride = (pre_flips > 0) ? comp_half / pre_flips : comp_half;
-                        if (stride < 2) stride = 2;
-                        for (int j = 0; j < comp_half && flipped < pre_flips; j += stride) {
-                            for (int k = j; k < j + stride && k < comp_half; k++) {
-                                size_t idx = stitch_at - 1 - k;
-                                if (idx < write_pos && out[idx] == source_bit) {
-                                    out[idx] = target_bit;
-                                    flipped++;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                skip_comp: ;
+                /* Analog compensation disabled — bit-flipping corrupts
+                 * trellis-optimized noise shaping. CPU parallel SDM
+                 * does not use this; DAS density-matched stitching alone
+                 * is sufficient for clean boundaries. */
             }
             /* write_pos is the final output count for ch0 */
         }
