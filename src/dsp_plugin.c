@@ -708,6 +708,10 @@ const dsd_config_t *plugin_get_config(const plugin_state_t *s) {
     return s ? &s->config : NULL;
 }
 
+void plugin_set_gpu_sdm(plugin_state_t *s, bool enabled) {
+    if (s) s->config.gpu_sdm_enabled = enabled;
+}
+
 const engine_channel_t *plugin_get_channels(const plugin_state_t *s) {
     return (s && s->initialized) ? s->channels : NULL;
 }
@@ -905,6 +909,19 @@ size_t plugin_process(plugin_state_t *s,
     /* Detect DoP markers in channel 0 of interleaved data */
     if (pcm_frames >= 8 && !dop_detect_interleaved(in_pcm, pcm_frames, num_channels))
         return 0;  /* No DoP markers, pass through */
+
+    /* Check lightweight GPU SDM toggle from REST API */
+    {
+        extern volatile LONG g_gpu_sdm_override;
+        extern volatile LONG g_gpu_sdm_override_valid;
+        if (InterlockedCompareExchange(&g_gpu_sdm_override_valid, 0, 1)) {
+            bool new_val = InterlockedCompareExchange(&g_gpu_sdm_override, 0, 0) ? true : false;
+            if (new_val != s->config.gpu_sdm_enabled) {
+                s->config.gpu_sdm_enabled = new_val;
+                trellis_log_c(new_val ? "GPU SDM: enabled via API" : "GPU SDM: disabled via API");
+            }
+        }
+    }
 
     /* Always keep fs_in in sync (plugin_set_config may have overwritten it) */
     s->config.fs_in = dsd_rate;

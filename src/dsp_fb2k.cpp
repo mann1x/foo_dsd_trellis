@@ -1746,19 +1746,14 @@ public:
                     pending.fs_in = current->fs_in;
                 /* Check if only gpu_sdm_enabled changed (safe toggle,
                  * no engine reinit needed — flag checked each chunk). */
-                bool sdm_toggle_only = (current &&
-                    pending.gpu_sdm_enabled != current->gpu_sdm_enabled &&
-                    pending.sdm_mode == current->sdm_mode &&
-                    pending.gpu_enabled == current->gpu_enabled &&
-                    pending.gpu_backend == current->gpu_backend);
+                if (current)
+                    pending.fs_in = current->fs_in;
                 m_config = pending;
                 plugin_set_config(m_state, &m_config);
-                if (!sdm_toggle_only)
-                    plugin_reconfigure(m_state, &m_config);
+                plugin_reconfigure(m_state, &m_config);
                 httpapi_update_config(m_httpapi, &m_config);
                 log_set_enabled(m_config.debug_log);
-                trellis_log(sdm_toggle_only ?
-                    "GPU SDM toggled (no reinit)" : "config updated via REST API");
+                trellis_log("config updated via REST API");
             }
         }
 

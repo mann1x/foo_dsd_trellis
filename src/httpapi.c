@@ -69,6 +69,10 @@ int log_ring_read(char *buf, int buf_size, int max_lines) {
 
 audio_capture_t g_audio_capture = { .state = CAPTURE_IDLE };
 
+/* Lightweight GPU SDM toggle (avoids pending_config → reconfigure crash) */
+volatile LONG g_gpu_sdm_override = 0;
+volatile LONG g_gpu_sdm_override_valid = 0;
+
 void capture_write(const float *samples, size_t count, int channels, uint32_t rate) {
     if (g_audio_capture.state != CAPTURE_RECORDING)
         return;
@@ -932,17 +936,16 @@ static void handle_request(httpapi_t *api, SOCKET client) {
                 if (ep) enabled = atoi(ep + 8);
             }
             if (enabled >= 0) {
-                /* Use pending config — fb2k applies on next chunk.
-                 * gpu_sdm_enabled change doesn't trigger engine reinit. */
-                AcquireSRWLockExclusive(&api->pending_lock);
-                dsd_config_t cfg;
-                AcquireSRWLockShared(&api->lock);
-                cfg = api->config;
-                ReleaseSRWLockShared(&api->lock);
-                cfg.gpu_sdm_enabled = enabled ? true : false;
-                api->pending_config = cfg;
-                InterlockedExchange(&api->has_pending, 1);
-                ReleaseSRWLockExclusive(&api->pending_lock);
+                /* Direct toggle — update API config only.
+                 * Don't use pending_config (causes crash via plugin_reconfigure).
+                 * The plugin reads gpu_sdm_enabled from its own s->config which
+                 * is synced from m_config in fb2k. We set a dedicated flag. */
+                AcquireSRWLockExclusive(&api->lock);
+                api->config.gpu_sdm_enabled = enabled ? true : false;
+                ReleaseSRWLockExclusive(&api->lock);
+                /* Set a lightweight flag that fb2k picks up without reconfigure */
+                InterlockedExchange(&g_gpu_sdm_override, enabled ? 1 : 0);
+                InterlockedExchange(&g_gpu_sdm_override_valid, 1);
                 char json[128];
                 int len = sprintf_s(json, sizeof(json),
                     "{\"gpu_sdm_enabled\":%s}", enabled ? "true" : "false");
