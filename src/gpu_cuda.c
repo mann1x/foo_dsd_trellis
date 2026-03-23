@@ -270,6 +270,12 @@ typedef struct {
     int            lp_hist_len;      /* allocated history length (ntaps-1) */
     bool           lp_hist_valid[BOXCAR_MAX_CH];
     int            lp_ch;            /* current lowpass channel index */
+    /* FIR lowpass fp64 device buffers (per-context, not static) */
+    CUdeviceptr    d_lp_f64_in;
+    CUdeviceptr    d_lp_f64_out;
+    size_t         lp_f64_cap;
+    double        *h_lp_f64_in;     /* host staging buffer */
+    size_t         h_lp_f64_cap;
 } cuda_context_t;
 
 /* ─── Helpers ─── */
@@ -540,6 +546,9 @@ void gpu_cuda_destroy(void *ptr) {
     for (int i = 0; i < BOXCAR_MAX_CH; i++) free(c->h_boxcar_hist[i]);
     if (c->d_lp_hist) pfn_cuMemFree(c->d_lp_hist);
     for (int i = 0; i < BOXCAR_MAX_CH; i++) free(c->h_lp_hist[i]);
+    if (c->d_lp_f64_in)  pfn_cuMemFree(c->d_lp_f64_in);
+    if (c->d_lp_f64_out) pfn_cuMemFree(c->d_lp_f64_out);
+    free(c->h_lp_f64_in);
     if (c->mod_sdm_parallel) pfn_cuModuleUnload(c->mod_sdm_parallel);
     if (c->mod_hawksford)    pfn_cuModuleUnload(c->mod_hawksford);
     if (c->sdm_stream && c->sdm_stream != c->streams[0])
@@ -1011,57 +1020,67 @@ int gpu_cuda_fir_lowpass_f64(cuda_context_t *c, const float *in, double *out,
                                size_t count, double gain) {
     if (!c || count < GPU_MIN_SAMPLES) return -1;
 
-    pfn_cuCtxSetCurrent(c->context);
+    CUresult rc;
+    rc = pfn_cuCtxSetCurrent(c->context);
+    if (rc != CUDA_SUCCESS) return -1;
+
     CUstream stream = c->sdm_stream ? c->sdm_stream : c->streams[0];
 
     size_t bytes_d = count * sizeof(double);
-    static CUdeviceptr s_d_lp_in2 = 0, s_d_lp_out2 = 0;
-    static size_t s_lp_cap2 = 0;
-    if (s_lp_cap2 < count) {
-        if (s_d_lp_in2)  pfn_cuMemFree(s_d_lp_in2);
-        if (s_d_lp_out2) pfn_cuMemFree(s_d_lp_out2);
-        pfn_cuMemAlloc(&s_d_lp_in2, bytes_d);
-        pfn_cuMemAlloc(&s_d_lp_out2, bytes_d);
-        s_lp_cap2 = (s_d_lp_in2 && s_d_lp_out2) ? count : 0;
-    }
-    if (!s_lp_cap2) return -1;
 
-    static double *s_h_lp_in2 = NULL;
-    static size_t s_h_lp_cap2 = 0;
-    if (s_h_lp_cap2 < count) {
-        free(s_h_lp_in2);
-        s_h_lp_in2 = (double *)malloc(bytes_d);
-        s_h_lp_cap2 = s_h_lp_in2 ? count : 0;
+    /* Per-context device buffers (NOT static — static pointers become
+     * invalid when the CUDA context is destroyed and recreated). */
+    if (c->lp_f64_cap < count) {
+        if (c->d_lp_f64_in)  pfn_cuMemFree(c->d_lp_f64_in);
+        if (c->d_lp_f64_out) pfn_cuMemFree(c->d_lp_f64_out);
+        c->d_lp_f64_in = 0; c->d_lp_f64_out = 0;
+        rc = pfn_cuMemAlloc(&c->d_lp_f64_in, bytes_d);
+        if (rc != CUDA_SUCCESS) { c->lp_f64_cap = 0; return -1; }
+        rc = pfn_cuMemAlloc(&c->d_lp_f64_out, bytes_d);
+        if (rc != CUDA_SUCCESS) { pfn_cuMemFree(c->d_lp_f64_in); c->d_lp_f64_in = 0; c->lp_f64_cap = 0; return -1; }
+        c->lp_f64_cap = count;
     }
-    if (!s_h_lp_cap2) return -1;
+
+    /* Host staging buffer */
+    if (c->h_lp_f64_cap < count) {
+        free(c->h_lp_f64_in);
+        c->h_lp_f64_in = (double *)malloc(bytes_d);
+        c->h_lp_f64_cap = c->h_lp_f64_in ? count : 0;
+    }
+    if (!c->h_lp_f64_cap) return -1;
 
     for (size_t i = 0; i < count; i++)
-        s_h_lp_in2[i] = (double)in[i];
-    pfn_cuMemcpyHtoDAsync(s_d_lp_in2, s_h_lp_in2, bytes_d, stream);
+        c->h_lp_f64_in[i] = (double)in[i];
+
+    rc = pfn_cuMemcpyHtoDAsync(c->d_lp_f64_in, c->h_lp_f64_in, bytes_d, stream);
+    if (rc != CUDA_SUCCESS) return -1;
 
     int ch = c->lp_ch % BOXCAR_MAX_CH;
     c->lp_ch++;
 
     CUdeviceptr hist_ptr = (CUdeviceptr)0;
     if (c->lp_hist_valid[ch] && c->h_lp_hist[ch] && c->lp_hist_len > 0) {
-        pfn_cuMemcpyHtoDAsync(c->d_lp_hist, c->h_lp_hist[ch],
-                               (size_t)c->lp_hist_len * sizeof(double), stream);
-        hist_ptr = c->d_lp_hist;
+        rc = pfn_cuMemcpyHtoDAsync(c->d_lp_hist, c->h_lp_hist[ch],
+                                    (size_t)c->lp_hist_len * sizeof(double), stream);
+        if (rc == CUDA_SUCCESS)
+            hist_ptr = c->d_lp_hist;
     }
 
     int cnt = (int)count;
-    void *args[] = { &s_d_lp_in2, &s_d_lp_out2, &cnt, &gain, &hist_ptr };
+    void *args[] = { &c->d_lp_f64_in, &c->d_lp_f64_out, &cnt, &gain, &hist_ptr };
     launch_kernel(c, c->fn_fir_lowpass, args, (int)count);
 
     /* Download fp64 output directly to caller's double buffer */
-    pfn_cuMemcpyDtoHAsync(out, s_d_lp_out2, bytes_d, stream);
-    pfn_cuStreamSynchronize(stream);
+    rc = pfn_cuMemcpyDtoHAsync(out, c->d_lp_f64_out, bytes_d, stream);
+    if (rc != CUDA_SUCCESS) return -1;
+    rc = pfn_cuStreamSynchronize(stream);
+    if (rc != CUDA_SUCCESS) return -1;
 
     /* Save last hist_len INPUT samples as fp64 FIR delay line */
     if (count >= (size_t)c->lp_hist_len && c->h_lp_hist[ch]) {
         double *hist_d = (double *)c->h_lp_hist[ch];
         for (size_t i = 0; i < (size_t)c->lp_hist_len; i++)
-            hist_d[i] = s_h_lp_in2[count - (size_t)c->lp_hist_len + i];
+            hist_d[i] = c->h_lp_f64_in[count - (size_t)c->lp_hist_len + i];
         c->lp_hist_valid[ch] = true;
     }
 
