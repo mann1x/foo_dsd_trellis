@@ -302,15 +302,9 @@ plugin_state_t *plugin_create(void) {
             s->config.thread_count > 0 ? s->config.thread_count : 0,
             s->config.affinity_mask);
 
-    /* Eagerly create GPU context (device + shader compilation = 400ms+).
-     * Create unconditionally — config.gpu_enabled isn't loaded yet
-     * (fb2k applies config after plugin_create via plugin_set_config).
-     * If GPU is later disabled, the context sits idle (no overhead). */
-    {
-        gpu_backend_t be = GPU_BACKEND_AUTO;
-        if (gpu_available(be))
-            s->gpu = gpu_create(be);
-    }
+    /* Don't eagerly create GPU — config.gpu_enabled and gpu_backend
+     * aren't loaded yet (fb2k applies config after plugin_create).
+     * GPU context is created in plugin_init_engine with correct backend. */
 
     return s;
 }
@@ -1137,6 +1131,12 @@ size_t plugin_process(plugin_state_t *s,
         if (s->gpu)
             gpu_reset_chunk(s->gpu);
 
+        /* Reset GPU per-chunk state BEFORE FIR phase — the lp_ch counter
+         * is shared between FIR lowpass and boxcar/SDM. Without reset here,
+         * chunk 2+ uses wrong history channel for FIR lowpass. */
+        if (s->gpu)
+            gpu_reset_chunk(s->gpu);
+
         /* Phase 1: FIR + gain per channel (parallel via threadpool) */
         LARGE_INTEGER t_fir_start, t_fir_end;
         QueryPerformanceCounter(&t_fir_start);
@@ -1177,8 +1177,41 @@ size_t plugin_process(plugin_state_t *s,
             }
             if (gpu_fir_ok) {
                 static int lp_log_count = 0;
-                if (lp_log_count++ < 3)
+                if (lp_log_count++ < 3) {
                     trellis_log_c("GPU FIR lowpass: dispatched on main thread");
+                    /* Verify GPU output: run CPU FIR on ch0 and compare */
+                    if (s->channels[0].lowpass.initialized) {
+                        size_t n = dsd_in_count < 1024 ? dsd_in_count : 1024;
+                        double *cpu_buf = (double *)malloc(n * sizeof(double));
+                        double *cpu_in = (double *)malloc(n * sizeof(double));
+                        if (cpu_buf && cpu_in) {
+                            for (size_t i = 0; i < n; i++)
+                                cpu_in[i] = s->ch_in[0][i] >= 0.0f ? 1.0 : -1.0;
+                            /* Temporary copy of lowpass to avoid disturbing state */
+                            fir_lowpass_t tmp_lp;
+                            memset(&tmp_lp, 0, sizeof(tmp_lp));
+                            fir_lowpass_init(&tmp_lp, s->config.fs_out ? s->config.fs_out : s->config.fs_in);
+                            fir_lowpass_process(&tmp_lp, cpu_in, cpu_buf, n);
+                            double cg = (double)s->channels[0].fir_gain * (double)s->config.gain;
+                            double max_diff = 0, gpu_max = 0, cpu_max = 0;
+                            for (size_t i = 64; i < n; i++) {
+                                double cv = cpu_buf[i] * cg;
+                                double gv = fir_data[0][i];
+                                double d = fabs(gv - cv);
+                                if (d > max_diff) max_diff = d;
+                                if (fabs(gv) > gpu_max) gpu_max = fabs(gv);
+                                if (fabs(cv) > cpu_max) cpu_max = fabs(cv);
+                            }
+                            char msg[256];
+                            snprintf(msg, sizeof(msg),
+                                "GPU vs CPU FIR: max_diff=%.6f gpu_peak=%.6f cpu_peak=%.6f (n=%zu)",
+                                max_diff, gpu_max, cpu_max, n);
+                            trellis_log_c(msg);
+                            fir_lowpass_free(&tmp_lp);
+                        }
+                        free(cpu_buf); free(cpu_in);
+                    }
+                }
             }
         }
 
