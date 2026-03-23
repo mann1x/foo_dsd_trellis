@@ -1085,8 +1085,8 @@ size_t plugin_process(plugin_state_t *s,
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);
 
         /* Overlap for SDM convergence: 32x lat, capped at 1024 samples.
-         * 32x optimal at lat=32 (DSD512). Cap prevents excessive overlap
-         * at higher latencies (lat=128 → would be 4096 uncapped). */
+         * Uncapped overlap (>1024) causes audio crackling and broken restart
+         * at DSD128+ — root cause unknown, needs investigation. */
         overlap = 32 * (size_t)s->config.trellis_lat;
         if (overlap > 1024) overlap = 1024;
         segments_per_ch = num_threads / num_channels;
