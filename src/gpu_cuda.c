@@ -1742,19 +1742,9 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
         int ch_stride_out = (int)total_seg_out;
 
         int D_nominal = D;
-        /* ext_seed for seg0 from GPU's own final_seed (previous chunk).
-         * Copy to a separate buffer to avoid read-write race with final_seed. */
-        static CUdeviceptr s_d_ext_seed_in = 0;
+        /* No ext_seed — all segments seed from NTF init_states + M warmup.
+         * Self-seeding via final_seed disabled (kernel fails with non-NULL). */
         CUdeviceptr ext_seed_ptr = 0;
-        if (c->persistent_seed_valid && c->d_persistent_seed) {
-            if (!s_d_ext_seed_in)
-                pfn_cuMemAlloc(&s_d_ext_seed_in, EXT_SEED_SIZE);
-            if (s_d_ext_seed_in) {
-                pfn_cuMemcpyDtoDAsync(s_d_ext_seed_in, c->d_persistent_seed,
-                                       EXT_SEED_SIZE, stream);
-                ext_seed_ptr = s_d_ext_seed_in;
-            }
-        }
         CUdeviceptr null_final_seed = 0;
 
         void *args_p1[] = {
@@ -1804,11 +1794,8 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
             &c->d_das_seg_counts,
             &D_nominal, &c->d_das_mid_states, &c->d_das_mid_costs,
             &ext_seed_ptr,
-            &c->d_persistent_seed
+            &null_final_seed  /* no final_seed write */
         };
-        /* Ensure persistent seed buffer exists */
-        if (!c->d_persistent_seed)
-            pfn_cuMemAlloc(&c->d_persistent_seed, EXT_SEED_SIZE);
 
         pfn_cuLaunchKernel(c->fn_trellis_parallel,
                             (unsigned)num_segs, (unsigned)num_channels, 1,
@@ -1816,10 +1803,7 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
                             0, stream, args_p2, NULL);
         pfn_cuStreamSynchronize(stream);
 
-        /* Download GPU's own final seed for next chunk */
-        if (c->d_persistent_seed) {
-            pfn_cuMemcpyDtoH(c->h_persistent_seed, c->d_persistent_seed, EXT_SEED_SIZE);
-            c->persistent_seed_valid = true;
+        {
             {
                 static int fs_log = 0;
                 if (fs_log++ < 5) {
