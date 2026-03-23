@@ -1484,7 +1484,7 @@ int gpu_cuda_trellis(cuda_context_t *c, const double *in, float *out,
         extern void trellis_log_c(const char *);
         double kernel_ms = (double)(t_kernel.QuadPart - t_start_qpc.QuadPart) * 1000.0 / (double)t_freq.QuadPart;
         double total_ms = (double)(t_end.QuadPart - t_start_qpc.QuadPart) * 1000.0 / (double)t_freq.QuadPart;
-        double audio_ms = (double)count / 2822400.0 * 1000.0;
+        double audio_ms = (double)count / (44100.0 * 2.0 * (double)c->trellis_lat) * 1000.0;
         char msg[256];
         sprintf_s(msg, sizeof(msg),
             "[GPU CUDA SBVD] %zu samples, %d/%d segs/SMs, %d cands, M=%d D=%d L=%d: kernel=%.1fms total=%.1fms (%.2fx RT)",
@@ -1511,23 +1511,21 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
     int L = lat;
     int num_segs = c->num_sms * 3;
     if (num_segs < 1) num_segs = 1;
-    /* Cap segments so each segment has ≥ 64K output samples (D).
-     * Too many segments per chunk = dense stitching = noise floor rises.
-     * With D≥64K, stitch density is low enough for 275+ dB SINAD. */
-    {
-        int max_by_density = 4;
-        if (num_segs > max_by_density) num_segs = max_by_density;
-    }
+    /* Cap at num_sms/2 to balance parallelism vs memory/stitch overhead.
+     * 84 segments causes CUDA_ERROR_ILLEGAL_ADDRESS at DSD256 — needs investigation. */
+    if (num_segs > c->num_sms / 2) num_segs = c->num_sms / 2;
 
     int D = (int)(count / (size_t)num_segs);
 
-    /* Convergence warmup: 32×lat for NTF state + history convergence. */
-    int M = 32 * lat;
-    if (M > 8192) M = 8192;
+    /* Convergence warmup: scale with lat but cap to keep overhead low.
+     * With many segments, M overhead dominates — use 8×lat minimum. */
+    int M = 8 * lat;
+    if (M < 256) M = 256;
+    if (M > 4096) M = 4096;
 
-    /* Adaptive overlap: min(64×lat, D/2) — balanced convergence/density */
-    int das_overlap = 64 * lat;
-    if (das_overlap > D / 2) das_overlap = D / 2;
+    /* Adaptive overlap: min(16×lat, D/4) — keep overhead under 20% */
+    int das_overlap = 16 * lat;
+    if (das_overlap > D / 4) das_overlap = D / 4;
     if (das_overlap < lat) das_overlap = lat;
 
     /* Ensure D is large enough for meaningful segments */
@@ -1665,8 +1663,19 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
         if (c->d_das_init_states)   pfn_cuMemFree(c->d_das_init_states);
         if (c->d_das_init_costs)    pfn_cuMemFree(c->d_das_init_costs);
 
-        pfn_cuMemAlloc(&c->d_das_seg_out, total_seg_out * (size_t)num_channels * sizeof(float));
-        pfn_cuMemAlloc(&c->d_das_final, total_final * (size_t)num_channels * sizeof(float));
+        {
+            int alloc_rc = 0;
+            alloc_rc |= (int)pfn_cuMemAlloc(&c->d_das_seg_out, total_seg_out * (size_t)num_channels * sizeof(float));
+            alloc_rc |= (int)pfn_cuMemAlloc(&c->d_das_final, total_final * (size_t)num_channels * sizeof(float));
+            if (alloc_rc != 0) {
+                extern void trellis_log_c(const char *);
+                char msg[256];
+                snprintf(msg, sizeof(msg), "GPU DAS alloc FAILED: rc=%d seg_out=%zu final=%zu",
+                         alloc_rc, total_seg_out * (size_t)num_channels * sizeof(float),
+                         total_final * (size_t)num_channels * sizeof(float));
+                trellis_log_c(msg);
+            }
+        }
         pfn_cuMemAlloc(&c->d_das_stitch_pos, (size_t)(num_segs - 1) * sizeof(int));
         pfn_cuMemAlloc(&c->d_das_seg_starts, (size_t)num_segs * sizeof(int));
         pfn_cuMemAlloc(&c->d_das_seg_out_starts, (size_t)num_segs * sizeof(int));
@@ -1780,11 +1789,28 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
         };
 
         /* Pass 1: all segments from global seed (seg0 gets ext_seed if valid) */
-        pfn_cuLaunchKernel(c->fn_trellis_parallel,
-                            (unsigned)num_segs, (unsigned)num_channels, 1,
-                            (unsigned)block_size, 1, 1,
-                            0, stream, args_p1, NULL);
-        pfn_cuStreamSynchronize(stream);
+        {
+            int launch_rc = (int)pfn_cuLaunchKernel(c->fn_trellis_parallel,
+                                (unsigned)num_segs, (unsigned)num_channels, 1,
+                                (unsigned)block_size, 1, 1,
+                                0, stream, args_p1, NULL);
+            if (launch_rc != 0) {
+                extern void trellis_log_c(const char *);
+                char msg[128];
+                snprintf(msg, sizeof(msg), "GPU DAS pass1 launch FAILED: rc=%d segs=%d ch=%d blk=%d",
+                         launch_rc, num_segs, num_channels, block_size);
+                trellis_log_c(msg);
+            }
+        }
+        {
+            int sync_rc = (int)pfn_cuStreamSynchronize(stream);
+            if (sync_rc != 0) {
+                extern void trellis_log_c(const char *);
+                char msg[128];
+                snprintf(msg, sizeof(msg), "GPU DAS pass1 sync FAILED: rc=%d", sync_rc);
+                trellis_log_c(msg);
+            }
+        }
 
         /* Build chained init states for Pass 2 */
         size_t state_stride = (size_t)nc * 8 * sizeof(double);
@@ -2129,7 +2155,11 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
         double k2_ms = (double)(t_k2.QuadPart - t_k1.QuadPart) * 1000.0 / (double)t_freq.QuadPart;
         double k3_ms = (double)(t_k3.QuadPart - t_k2.QuadPart) * 1000.0 / (double)t_freq.QuadPart;
         double total_ms = (double)(t_end.QuadPart - t_start.QuadPart) * 1000.0 / (double)t_freq.QuadPart;
-        double audio_ms = (double)count / 2822400.0 * 1000.0;
+        /* Compute actual audio duration from sample rate.
+         * DSD rates: lat=32→2822400, lat=64→5644800, lat=128→11289600, lat=256→22579200.
+         * Rate = 44100 × 64 × (lat / 32) = 44100 × 2 × lat. */
+        double dsd_rate = 44100.0 * 2.0 * (double)lat;
+        double audio_ms = (double)count / dsd_rate * 1000.0;
         char msg[320];
         sprintf_s(msg, sizeof(msg),
             "[GPU DAS] %zu samples, %dch, %d/%d segs/SMs, nc=%d, M=%d D=%d ovl=%d L=%d: "
@@ -2616,7 +2646,7 @@ int gpu_cuda_trellis_hawksford(cuda_context_t *c, const float *in, float *out,
     {
         extern void trellis_log_c(const char *);
         double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
-        double audio_ms = (double)count / 2822400.0 * 1000.0;
+        double audio_ms = (double)count / (44100.0 * 2.0 * (double)c->trellis_lat) * 1000.0;
         char msg[256];
         sprintf_s(msg, sizeof(msg),
             "[GPU Hawksford] %zu samples, nc=%d, lat=%d: %.1fms (%.2fx RT)",
