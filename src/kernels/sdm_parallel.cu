@@ -17,9 +17,12 @@ __constant__ double c_state_limit;
  * Wider paths = fewer dedup collisions = better candidate diversity. */
 #define PATH_MASK 0xFF
 
-__device__ double ntf_calc(const double *s, double *d,
-                            int order, double x) {
-    d[0] = s[0] - c_ntf_g[0] * s[1] + x;
+/* NTF filter calc matching CPU's sdm_filter_calc exactly.
+ * Includes y term in d[0] and computes v in one pass.
+ * This ensures identical FP rounding as CPU's unrolled version. */
+__device__ double ntf_calc_with_y(const double *s, double *d,
+                                    int order, double x, double y) {
+    d[0] = s[0] - c_ntf_g[0] * s[1] + x - y;
     for (int k = 1; k < order - 1; k++)
         d[k] = s[k] + s[k-1] - c_ntf_g[k] * s[k+1];
     d[order-1] = s[order-1] + s[order-2];
@@ -183,15 +186,23 @@ __global__ void trellis_parallel_segments(
         /* Phase 1: Parallel candidate expansion */
         if (tid < 2 * ac) {
             int pi = tid / 2;
-            /* y_b is the NEGATED quantizer output: y_b = -y.
-             * CPU: d[0] = s[0] - g[0]*s[1] + x - y
-             * GPU: d[0] = s[0] - g[0]*s[1] + x  (from ntf_calc) + y_b
-             * So y_b must equal -y for the NTF state to match CPU.
-             * tid&1=0 → y_b=-1.0 (CPU y=+1), tid&1=1 → y_b=+1.0 (CPU y=-1) */
-            double y_b = (tid & 1) ? 1.0 : -1.0;
+            /* Match CPU's sdm_filter_calc2 exactly:
+             * 1. Compute NTF with y=0 to get base d[] and v
+             * 2. Copy d[] for both children
+             * 3. Child 0 (bit=1, y=+1): d[0] -= 1, cost = (v + a[0])^2
+             * 4. Child 1 (bit=0, y=-1): d[0] += 1, cost = (v - a[0])^2
+             * This matches CPU's sqr(v + a[0]) / sqr(v - a[0]). */
             double d[8];
-            double v = ntf_calc(p_state[pi], d, order, x);
-            d[0] += y_b;
+            double v = ntf_calc_with_y(p_state[pi], d, order, x, 0.0);
+            /* Apply y adjustment to d[0]: child 0 gets +1 (y=+1→d[0]-=1→+1 state),
+             * child 1 gets -1 (y=-1→d[0]+=1→-1 state).
+             * CPU: dst[0].state[0] += 1.0 (y=-1 child), dst[1].state[0] -= 1.0 (y=+1 child)
+             * GPU tid&1=0 maps to CPU dst[0] (bit=1→y=+1): state += 1
+             * GPU tid&1=1 maps to CPU dst[1] (bit=0→y=-1): state -= 1 */
+            if (tid & 1)
+                d[0] -= 1.0;  /* y=-1 child: same as CPU dst[1].state[0] -= 1.0 */
+            else
+                d[0] += 1.0;  /* y=+1 child: same as CPU dst[0].state[0] += 1.0 */
             if (limit > 0.0) {
                 for (int k = 0; k < order; k++) {
                     if (d[k] > limit) d[k] = limit;
@@ -200,7 +211,9 @@ __global__ void trellis_parallel_segments(
             }
             for (int k = 0; k < order; k++)
                 c_state[tid][k] = d[k];
-            c_cost[tid] = p_cost[pi] + (v + c_ntf_a[0]*y_b)*(v + c_ntf_a[0]*y_b);
+            /* Cost: match CPU's sqr(v + a[0]) / sqr(v - a[0]) */
+            double vc = (tid & 1) ? (v - c_ntf_a[0]) : (v + c_ntf_a[0]);
+            c_cost[tid] = p_cost[pi] + vc * vc;
             /* Bit convention: 1 = y=+1.0, 0 = y=-1.0 (matches CPU).
              * tid&1=0 → y_b=-1.0 → CPU y=+1 → bit=1.
              * tid&1=1 → y_b=+1.0 → CPU y=-1 → bit=0. */

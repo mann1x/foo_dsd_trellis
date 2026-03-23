@@ -922,8 +922,8 @@ static void handle_request(httpapi_t *api, SOCKET client) {
         }
 
     } else if (strncmp(path, "/api/gpu_sdm", 12) == 0) {
-        /* GET /api/gpu_sdm — returns current GPU SDM state
-         * POST /api/gpu_sdm?enabled=0|1 — toggle GPU SDM at runtime */
+        /* GET/POST /api/gpu_sdm?enabled=0|1 — toggle GPU SDM at runtime.
+         * Uses direct config field write (no engine reinit) to avoid crash. */
         if (_stricmp(method, "POST") == 0) {
             const char *q = strchr(path, '?');
             int enabled = -1;
@@ -932,6 +932,8 @@ static void handle_request(httpapi_t *api, SOCKET client) {
                 if (ep) enabled = atoi(ep + 8);
             }
             if (enabled >= 0) {
+                /* Use pending config — fb2k applies on next chunk.
+                 * gpu_sdm_enabled change doesn't trigger engine reinit. */
                 AcquireSRWLockExclusive(&api->pending_lock);
                 dsd_config_t cfg;
                 AcquireSRWLockShared(&api->lock);
