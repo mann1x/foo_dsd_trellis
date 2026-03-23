@@ -370,17 +370,20 @@ __global__ void trellis_parallel_segments(
     }
 
     /* Save last segment's full trellis state for chunk-to-chunk persistence.
-     * This includes history, path, next_stored, hist_pos, pending —
-     * everything needed to continue the trellis seamlessly next chunk. */
+     * Write as raw bytes to avoid struct alignment issues between host/device. */
     if (ch == 0 && final_seed && seg == num_segs - 1 && tid < nc) {
+        unsigned char *raw = (unsigned char *)final_seed;
+        /* hist[tid][0..hist_bytes-1] at offset tid*128 */
         for (int b = 0; b < hist_bytes; b++)
-            final_seed[0].hist[tid][b] = p_hist[tid][b];
-        final_seed[0].path[tid] = p_path[tid];
-        final_seed[0].next_stored[tid] = p_next_stored[tid];
+            raw[tid * 128 + b] = p_hist[tid][b];
+        /* path[tid] at offset 1024 + tid*4 */
+        ((unsigned *)(raw + 1024))[tid] = p_path[tid];
+        /* next_stored[tid] at offset 1056 + tid*4 */
+        ((unsigned *)(raw + 1056))[tid] = p_next_stored[tid];
         if (tid == 0) {
-            final_seed[0].hist_pos = s_hist_pos;
-            final_seed[0].pending = s_pending;
-            final_seed[0].num_cands = s_active;
+            ((int *)(raw + 1088))[0] = s_hist_pos;
+            ((int *)(raw + 1092))[0] = s_pending;
+            ((int *)(raw + 1096))[0] = s_active;
         }
     }
 

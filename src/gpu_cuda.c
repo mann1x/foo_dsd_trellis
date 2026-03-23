@@ -1737,9 +1737,19 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
         int ch_stride_out = (int)total_seg_out;
 
         int D_nominal = D;
-        /* ext_seed for seg0 chunk continuity (uploaded by dsp_plugin.c).
-         * Only seg0 reads it — other segments use NTF init_states only. */
-        CUdeviceptr ext_seed_ptr = s_d_ext_seed;
+        /* ext_seed for seg0 from GPU's own final_seed (previous chunk).
+         * Copy to a separate buffer to avoid read-write race with final_seed. */
+        static CUdeviceptr s_d_ext_seed_in = 0;
+        CUdeviceptr ext_seed_ptr = 0;
+        if (c->persistent_seed_valid && c->d_persistent_seed) {
+            if (!s_d_ext_seed_in)
+                pfn_cuMemAlloc(&s_d_ext_seed_in, EXT_SEED_SIZE);
+            if (s_d_ext_seed_in) {
+                pfn_cuMemcpyDtoDAsync(s_d_ext_seed_in, c->d_persistent_seed,
+                                       EXT_SEED_SIZE, stream);
+                ext_seed_ptr = s_d_ext_seed_in;
+            }
+        }
         CUdeviceptr null_final_seed = 0;
 
         void *args_p1[] = {
@@ -1789,13 +1799,42 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
             &c->d_das_seg_counts,
             &D_nominal, &c->d_das_mid_states, &c->d_das_mid_costs,
             &ext_seed_ptr,
-            &null_final_seed
+            &c->d_persistent_seed
         };
+        /* Ensure persistent seed buffer exists */
+        if (!c->d_persistent_seed)
+            pfn_cuMemAlloc(&c->d_persistent_seed, EXT_SEED_SIZE);
+
         pfn_cuLaunchKernel(c->fn_trellis_parallel,
                             (unsigned)num_segs, (unsigned)num_channels, 1,
                             (unsigned)block_size, 1, 1,
                             0, stream, args_p2, NULL);
         pfn_cuStreamSynchronize(stream);
+
+        /* Download GPU's own final seed for next chunk */
+        if (c->d_persistent_seed) {
+            pfn_cuMemcpyDtoH(c->h_persistent_seed, c->d_persistent_seed, EXT_SEED_SIZE);
+            c->persistent_seed_valid = true;
+            {
+                static int fs_log = 0;
+                if (fs_log++ < 5) {
+                    unsigned char *s = c->h_persistent_seed;
+                    unsigned *p = (unsigned *)(s + 1024);
+                    unsigned *nx = (unsigned *)(s + 1056);
+                    int hp = *(int *)(s + 1088);
+                    int pend = *(int *)(s + 1092);
+                    int nc2 = *(int *)(s + 1096);
+                    extern void trellis_log_c(const char *);
+                    char msg[256];
+                    snprintf(msg, sizeof(msg),
+                        "GPU final_seed: nc=%d hp=%d pend=%d path=[%u,%u] "
+                        "next=[%u,%u] hist=[%02x%02x%02x%02x]",
+                        nc2, hp, pend, p[0], p[1], nx[0], nx[1],
+                        s[0], s[1], s[2], s[3]);
+                    trellis_log_c(msg);
+                }
+            }
+        }
     }
     QueryPerformanceCounter(&t_k1);
 
