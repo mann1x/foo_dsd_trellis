@@ -1099,10 +1099,12 @@ size_t plugin_process(plugin_state_t *s,
         if (fs_out > s->config.fs_in)
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);
 
-        /* Overlap for SDM convergence: 32x lat.
-         * DSD128 lat=128 → overlap=4096 (32×lat, optimal density).
-         * Previously capped at 1024, causing low DAS density at DSD128+. */
+        /* Overlap for SDM convergence: 32x lat, capped at 1024.
+         * Matches validated config (commit 4e00224) that had zero artifacts.
+         * DSD128 lat=128 → overlap=1024 (8×lat). Uncapping to 4096 didn't
+         * improve audible quality (pops are ultrasonic, not overlap-related). */
         overlap = 32 * (size_t)s->config.trellis_lat;
+        if (overlap > 1024) overlap = 1024;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
         int max_seg;
@@ -1741,18 +1743,12 @@ size_t plugin_process(plugin_state_t *s,
                         input_count += overlap;
                     warmup_discard = 0;
                 } else {
-                    /* Extended warmup: start 2× overlap before nominal start
-                     * for better SDM convergence. Extra warmup beyond overlap
-                     * is discarded but improves noise-shaping pattern alignment
-                     * at the stitch point (reduces ultrasonic discontinuity). */
-                    size_t warmup_extend = overlap * 2;
-                    input_start = (nom_start >= warmup_extend) ? nom_start - warmup_extend : 0;
+                    input_start = (nom_start >= overlap) ? nom_start - overlap : 0;
                     input_count = nom_start + nom_size - input_start;
                     if (extend_fwd && nom_start + nom_size + overlap <= fir_count)
                         input_count += overlap;
-                    size_t actual_back = nom_start - input_start;
-                    warmup_discard = (actual_back > (size_t)s->config.trellis_lat) ?
-                        actual_back - (size_t)s->config.trellis_lat : 0;
+                    warmup_discard = (nom_start >= overlap) ?
+                        overlap - (size_t)s->config.trellis_lat : 0;
                 }
 
                 sdm_context_t *ctx;
