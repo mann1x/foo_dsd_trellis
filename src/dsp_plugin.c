@@ -1426,6 +1426,19 @@ size_t plugin_process(plugin_state_t *s,
             gpu_cuda_upload_ext_seed(s->gpu,
                 (const unsigned char *)h_hist, hist_bytes_act, nc_act,
                 h_path, h_next, (int)ctx0->pos, (int)ctx0->pending);
+            {
+                static int seed_log = 0;
+                if (seed_log++ < 5) {
+                    char msg[256];
+                    snprintf(msg, sizeof(msg),
+                        "ext_seed: nc=%d pos=%d pending=%d path=[%u,%u] "
+                        "next=[%u,%u] hist[0]=[%02x%02x%02x%02x]",
+                        nc_act, (int)ctx0->pos, (int)ctx0->pending,
+                        h_path[0], h_path[1], h_next[0], h_next[1],
+                        h_hist[0][0], h_hist[0][1], h_hist[0][2], h_hist[0][3]);
+                    trellis_log_c(msg);
+                }
+            }
         }
 
         /* GPU offload: CPU state pass + GPU parallel output.

@@ -132,22 +132,14 @@ __global__ void trellis_parallel_segments(
                 p_state[tid][k] = 0.0;
             p_cost[tid] = 0.0;
         }
-        /* Extended seed: restore full history/path/traceback for perfect
-         * state continuity. Without this, segments start with zeroed history
-         * → wrong traceback for first `lat` samples → NTF state corruption
-         * → low stitch density (60%) with complex signals. */
-        /* ext_seed is an array: ext_seed[seg] for per-segment seeding */
-        if (ext_seed && tid < ext_seed[seg].num_cands) {
+        /* Extended seed: restore full history/path/traceback for seg0 only.
+         * Only seg0 needs chunk-to-chunk continuity. Other segments get
+         * their state from 2-pass chaining (NTF states from init_states). */
+        if (ext_seed && seg == 0 && tid < ext_seed[0].num_cands) {
             for (int b = 0; b < hist_bytes; b++)
-                p_hist[tid][b] = ext_seed[seg].hist[tid][b];
-            p_path[tid] = ext_seed[seg].path[tid];
-            p_next_stored[tid] = ext_seed[seg].next_stored[tid];
-        } else if (ext_seed) {
-            /* tid >= num_cands in this segment's seed */
-            for (int b = 0; b < hist_bytes; b++)
-                p_hist[tid][b] = 0;
-            p_path[tid] = 0;
-            p_next_stored[tid] = 0;
+                p_hist[tid][b] = ext_seed[0].hist[tid][b];
+            p_path[tid] = ext_seed[0].path[tid];
+            p_next_stored[tid] = ext_seed[0].next_stored[tid];
         } else {
             for (int b = 0; b < hist_bytes; b++)
                 p_hist[tid][b] = 0;
@@ -156,10 +148,10 @@ __global__ void trellis_parallel_segments(
         }
     }
     if (tid == 0) {
-        s_active = ext_seed ? ext_seed[seg].num_cands : nc;
-        if (ext_seed) {
-            s_hist_pos = ext_seed[seg].hist_pos;
-            s_pending = ext_seed[seg].pending;
+        s_active = (ext_seed && seg == 0) ? ext_seed[0].num_cands : nc;
+        if (ext_seed && seg == 0) {
+            s_hist_pos = ext_seed[0].hist_pos;
+            s_pending = ext_seed[0].pending;
         } else {
             s_hist_pos = 0;
             s_pending = (seg == 0 && all_init_states) ? lat : 0;

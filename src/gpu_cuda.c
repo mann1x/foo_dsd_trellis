@@ -1737,10 +1737,9 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
         int ch_stride_out = (int)total_seg_out;
 
         int D_nominal = D;
-        /* DAS path: ext_seed=NULL. Segments seed from NTF init_states only.
-         * CPU SDM runs alongside for state persistence (dsp_plugin.c).
-         * s_d_ext_seed causes kernel failure — do NOT use here. */
-        CUdeviceptr ext_seed_ptr = 0;
+        /* ext_seed for seg0 chunk continuity (uploaded by dsp_plugin.c).
+         * Only seg0 reads it — other segments use NTF init_states only. */
+        CUdeviceptr ext_seed_ptr = s_d_ext_seed;
         CUdeviceptr null_final_seed = 0;
 
         void *args_p1[] = {
