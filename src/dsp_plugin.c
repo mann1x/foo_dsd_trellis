@@ -1832,24 +1832,30 @@ size_t plugin_process(plugin_state_t *s,
                 if (ovl_len > overlap) ovl_len = overlap;
 
                 /* Step 1: Windowed match density — find region of best
-                 * convergence. Fixed window=64 (proven at DSD512 lat=32).
-                 * Window measures local density, doesn't need to scale with lat.
-                 * Larger windows cause O(n²) scan to saturate CPU at high overlap. */
+                 * convergence. Incremental sliding window: O(overlap) instead
+                 * of O(overlap × window). Window=64 samples. */
                 int half_w = 32;
                 if (half_w > (int)ovl_len / 2) half_w = (int)ovl_len / 2;
                 if (half_w < 4) half_w = 4;
 
                 int best_density = 0, best_density_pos = 0;
-                for (size_t p = 0; p < ovl_len; p++) {
-                    int start = (int)p - half_w;
-                    int end   = (int)p + half_w;
-                    if (start < 0) start = 0;
-                    if (end > (int)ovl_len) end = (int)ovl_len;
-                    int matches = 0;
-                    for (int w = start; w < end; w++) {
-                        if (prev_ovl[w] == this_ovl[w])
-                            matches++;
-                    }
+                /* Initialize window at position 0 */
+                int matches = 0;
+                int w_end = half_w < (int)ovl_len ? half_w : (int)ovl_len;
+                for (int w = 0; w < w_end; w++)
+                    if (prev_ovl[w] == this_ovl[w]) matches++;
+                best_density = matches;
+                best_density_pos = 0;
+
+                for (size_t p = 1; p < ovl_len; p++) {
+                    /* Remove sample leaving the window (at p - 1 - half_w) */
+                    int leaving = (int)p - 1 - half_w;
+                    if (leaving >= 0 && leaving < (int)ovl_len)
+                        if (prev_ovl[leaving] == this_ovl[leaving]) matches--;
+                    /* Add sample entering the window (at p - 1 + half_w) */
+                    int entering = (int)p - 1 + half_w;
+                    if (entering >= 0 && entering < (int)ovl_len)
+                        if (prev_ovl[entering] == this_ovl[entering]) matches++;
                     if (matches > best_density) {
                         best_density = matches;
                         best_density_pos = (int)p;
@@ -1887,12 +1893,14 @@ size_t plugin_process(plugin_state_t *s,
                        copy_count * sizeof(float));
                 write_pos = stitch_at + copy_count;
 
-                if (s->config.debug_log) {
-                    char msg[160];
+                {
+                    char msg[256];
                     snprintf(msg, sizeof(msg),
-                             "stitch seg%d: ovl=%zu density=%d/%d pos=%d match=%s",
+                             "stitch seg%d: ovl=%zu density=%d/%d pos=%d match=%s "
+                             "wp=%zu pov=%zu stitch_at=%zu seg_out=%zu copy=%zu",
                              seg, ovl_len, best_density, half_w * 2,
-                             best_pos, found_match ? "yes" : "no");
+                             best_pos, found_match ? "yes" : "no",
+                             write_pos, prev_ovl_start, stitch_at, seg_out, copy_count);
                     extern void trellis_log_c(const char *);
                     trellis_log_c(msg);
                 }
