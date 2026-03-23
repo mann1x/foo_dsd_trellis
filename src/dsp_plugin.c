@@ -914,7 +914,8 @@ size_t plugin_process(plugin_state_t *s,
     {
         extern volatile LONG g_gpu_sdm_override;
         extern volatile LONG g_gpu_sdm_override_valid;
-        if (InterlockedCompareExchange(&g_gpu_sdm_override_valid, 0, 1)) {
+        if (InterlockedCompareExchange(&g_gpu_sdm_override_valid, 0, 0)) {
+            /* Read override without clearing — stays active until API changes it */
             bool new_val = InterlockedCompareExchange(&g_gpu_sdm_override, 0, 0) ? true : false;
             if (new_val != s->config.gpu_sdm_enabled) {
                 s->config.gpu_sdm_enabled = new_val;
