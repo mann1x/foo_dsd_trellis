@@ -1108,10 +1108,10 @@ size_t plugin_process(plugin_state_t *s,
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
         int max_seg;
-        /* 2 segments: 1 stitch/sec minimizes ultrasonic pops while
-         * still providing 2× speedup. 4 segments had 3 stitches/sec
-         * producing audible tiny pops from noise-pattern discontinuity. */
-        max_seg = 2;
+        /* DSD512: allow more segments — stitch pops less audible at high
+         * rates where ultrasonic noise floor is already elevated.
+         * DSD64-256: 2 segments (1 stitch/sec) minimizes audible pops. */
+        max_seg = (fs_out >= DSD_RATE_512) ? 4 : 2;
         if (segments_per_ch > max_seg) segments_per_ch = max_seg;
 
         /* Ensure minimum segment size (at least 4x overlap) */
