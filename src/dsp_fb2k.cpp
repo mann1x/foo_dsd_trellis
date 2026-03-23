@@ -1686,10 +1686,9 @@ public:
         trellis_log("DSD Trellis v%s (build %s, %s %s)",
                     BUILD_VERSION, BUILD_GIT_HASH, BUILD_DATE, BUILD_TIME);
 
-        const char *sdm_mode_str = m_config.sdm_mode == SDM_MODE_TRELLIS
-                                   ? "Trellis" : "PreCorr";
-        trellis_log("initialized (sdm=%s, fir=%s)",
-                    sdm_mode_str, fir_ipp_kernel_name());
+        trellis_log("initialized (global_sdm=%s, fir=%s) — actual SDM mode resolved per-rate",
+                    m_config.sdm_mode == SDM_MODE_TRELLIS ? "Trellis" : "PreCorr",
+                    fir_ipp_kernel_name());
 
         /* Start REST API server */
         if (m_config.api_port > 0) {
@@ -1911,13 +1910,18 @@ public:
         }
         plugin_set_config(m_state, &chunk_cfg);
 
-        /* Log actual engine config on first few chunks to diagnose cands/depth issues */
+        /* Log actual engine config on first few chunks */
         if (m_chunk_count < 3) {
             const dsd_config_t *ecfg = plugin_get_config(m_state);
             if (ecfg)
-                trellis_log("engine cfg: sdm=%d cands=%d depth=%d lat=%d fir_gain_db=%d",
-                            ecfg->sdm_mode, ecfg->trellis_cands, ecfg->trellis_depth,
-                            ecfg->trellis_lat, (int)ecfg->fir_gain_db);
+                trellis_log("engine cfg: sdm=%s cands=%d depth=%d lat=%d fir_gain=%s%.0fdB fs=%u→%u",
+                            ecfg->sdm_mode == SDM_MODE_TRELLIS ? "Trellis" :
+                            ecfg->sdm_mode == SDM_MODE_PRECORR ? "PreCorr" : "???",
+                            ecfg->trellis_cands, ecfg->trellis_depth,
+                            ecfg->trellis_lat,
+                            ecfg->fir_gain_db == FIR_GAIN_AUTO ? "Auto(" : "",
+                            ecfg->fir_gain_db == FIR_GAIN_AUTO ? -3.0 : (double)ecfg->fir_gain_db,
+                            ecfg->fs_in, ecfg->fs_out);
         }
 
         m_channels = (int)channels;
