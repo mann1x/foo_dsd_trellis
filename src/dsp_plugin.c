@@ -1397,8 +1397,12 @@ size_t plugin_process(plugin_state_t *s,
         /* Upload extended seed (history/path/traceback) from CPU SDM context
          * for full state continuity in GPU segments. Without this, GPU segments
          * start with zeroed history → low stitch density with complex signals. */
-        if (s->gpu && s->config.gpu_sdm_enabled &&
-            s->config.sdm_mode == SDM_MODE_TRELLIS) {
+        if (0 && s->gpu && s->config.gpu_sdm_enabled &&
+            s->config.sdm_mode == SDM_MODE_TRELLIS &&
+            s->channels[0].sdm.pending >= s->channels[0].sdm.trellis_lat) {
+            /* DISABLED: CPU ext_seed diverges from GPU state after first chunk,
+             * causing transients. GPU relies on NTF init_states + convergence
+             * warmup (M samples) instead. */
             sdm_context_t *ctx0 = &s->channels[0].sdm;
             int bank = ctx0->idx & 1;
             sdm_trellis_t *st = &ctx0->trellis[bank];
