@@ -344,8 +344,11 @@ __global__ void trellis_parallel_segments(
          * for seg0 (persistent state already has valid history).
          * Non-last segments output D + overlap samples for DAS scanning.
          * Last segment outputs D samples (no forward extension). */
-        int eff_M = (seg == 0 && all_init_states) ? 0 : M_convergence;
-        if (eff_M < lat) eff_M = lat;  /* ensure history valid */
+        /* All segments use full M warmup for NTF convergence.
+         * Even seg0 with persistent state needs convergence after
+         * the trellis history reset at chunk boundaries. */
+        int eff_M = M_convergence;
+        if (eff_M < lat) eff_M = lat;
         bool hist_ready = (s_pending >= lat);
         if (tid == 0 && hist_ready && s >= eff_M && out_idx < out_cap) {
             /* bit=1 → y=+1.0, bit=0 → y=-1.0 (matches CPU convention) */

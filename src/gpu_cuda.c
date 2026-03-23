@@ -1511,12 +1511,12 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
 
     int D = (int)(count / (size_t)num_segs);
 
-    /* Convergence warmup: 16×lat for NTF state convergence. */
-    int M = 16 * lat;
-    if (M > 4096) M = 4096;
+    /* Convergence warmup: 32×lat for NTF state + history convergence. */
+    int M = 32 * lat;
+    if (M > 8192) M = 8192;
 
-    /* Adaptive overlap: min(32×lat, D/2) */
-    int das_overlap = 32 * lat;
+    /* Adaptive overlap: min(64×lat, D/2) — balanced convergence/density */
+    int das_overlap = 64 * lat;
     if (das_overlap > D / 2) das_overlap = D / 2;
     if (das_overlap < lat) das_overlap = lat;
 
