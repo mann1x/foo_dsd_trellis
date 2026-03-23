@@ -66,7 +66,7 @@
 	.reg .b16 	%rs<107>;
 	.reg .f32 	%f<2>;
 	.reg .b32 	%r<1549>;
-	.reg .f64 	%fd<234>;
+	.reg .f64 	%fd<233>;
 	.reg .b64 	%rd<147>;
 	// demoted variable
 	.shared .align 8 .b8 _ZZ25trellis_parallel_segmentsE7p_state[512];
@@ -450,32 +450,31 @@ $L__BB0_40:
 
 	mov.u32 	%r468, _ZZ25trellis_parallel_segmentsE6p_next;
 	add.s32 	%r61, %r468, %r402;
-	shr.u32 	%r469, %r9, 31;
-	add.s32 	%r470, %r9, %r469;
-	shr.s32 	%r62, %r470, 1;
-	shl.b32 	%r471, %r62, 6;
-	mov.u32 	%r472, _ZZ25trellis_parallel_segmentsE7p_state;
-	add.s32 	%r63, %r472, %r471;
+	and.b32  	%r469, %r9, 1;
+	setp.eq.b32 	%p56, %r469, 1;
+	not.pred 	%p57, %p56;
+	mov.u32 	%r1429, 0;
+	selp.f64 	%fd2, 0d3FF0000000000000, 0dBFF0000000000000, %p56;
+	shr.u32 	%r470, %r9, 31;
+	add.s32 	%r471, %r9, %r470;
+	shr.s32 	%r62, %r471, 1;
+	shl.b32 	%r472, %r62, 6;
+	mov.u32 	%r473, _ZZ25trellis_parallel_segmentsE7p_state;
+	add.s32 	%r63, %r473, %r472;
 	add.s32 	%r64, %r63, 8;
-	shl.b32 	%r473, %r1, 3;
-	add.s32 	%r65, %r63, %r473;
+	shl.b32 	%r474, %r1, 3;
+	add.s32 	%r65, %r63, %r474;
 	add.s32 	%r66, %r1, -1;
 	mul.wide.s32 	%rd77, %r66, 8;
 	add.s64 	%rd9, %rd6, %rd77;
-	and.b32  	%r474, %r9, 1;
-	setp.eq.b32 	%p56, %r474, 1;
-	not.pred 	%p57, %p56;
-	mov.u32 	%r1429, 0;
-	selp.f64 	%fd3, 0dBFF0000000000000, 0d3FF0000000000000, %p56;
 	setp.gt.f64 	%p58, %fd1, 0d0000000000000000;
 	setp.gt.s32 	%p59, %r1, 0;
 	and.pred  	%p1, %p58, %p59;
 	neg.f64 	%fd4, %fd1;
-	ld.const.f64 	%fd39, [c_ntf_a];
-	neg.f64 	%fd40, %fd39;
-	selp.f64 	%fd5, %fd40, %fd39, %p56;
 	shl.b32 	%r475, %r62, 3;
 	add.s32 	%r68, %r401, %r475;
+	ld.const.f64 	%fd39, [c_ntf_a];
+	mul.f64 	%fd5, %fd2, %fd39;
 	mov.u32 	%r478, _ZZ25trellis_parallel_segmentsE6c_cost;
 	add.s32 	%r69, %r478, %r400;
 	selp.u32 	%r70, 1, 0, %p57;
@@ -542,11 +541,11 @@ $L__BB0_115:
 $L__BB0_118:
 	shl.b32 	%r562, %r1458, 3;
 	add.s32 	%r564, %r478, %r562;
-	ld.shared.f64 	%fd117, [%r564];
+	ld.shared.f64 	%fd116, [%r564];
 	shl.b32 	%r565, %r1454, 3;
 	add.s32 	%r566, %r478, %r565;
-	ld.shared.f64 	%fd118, [%r566];
-	setp.lt.f64 	%p110, %fd118, %fd117;
+	ld.shared.f64 	%fd117, [%r566];
+	setp.lt.f64 	%p110, %fd117, %fd116;
 	selp.b32 	%r567, %r1454, %r1458, %p110;
 	shl.b32 	%r568, %r1454, 2;
 	add.s32 	%r570, %r484, %r568;
@@ -558,9 +557,9 @@ $L__BB0_118:
 	add.s32 	%r575, %r1460, %r572;
 	shl.b32 	%r576, %r567, 3;
 	add.s32 	%r577, %r478, %r576;
-	ld.shared.f64 	%fd119, [%r577];
-	ld.shared.f64 	%fd120, [%r566+8];
-	setp.lt.f64 	%p112, %fd120, %fd119;
+	ld.shared.f64 	%fd118, [%r577];
+	ld.shared.f64 	%fd119, [%r566+8];
+	setp.lt.f64 	%p112, %fd119, %fd118;
 	add.s32 	%r578, %r1454, 1;
 	selp.b32 	%r579, %r578, %r567, %p112;
 	ld.shared.u32 	%r580, [%r570+4];
@@ -571,9 +570,9 @@ $L__BB0_118:
 	add.s32 	%r584, %r575, %r581;
 	shl.b32 	%r585, %r579, 3;
 	add.s32 	%r586, %r478, %r585;
-	ld.shared.f64 	%fd121, [%r586];
-	ld.shared.f64 	%fd122, [%r566+16];
-	setp.lt.f64 	%p114, %fd122, %fd121;
+	ld.shared.f64 	%fd120, [%r586];
+	ld.shared.f64 	%fd121, [%r566+16];
+	setp.lt.f64 	%p114, %fd121, %fd120;
 	add.s32 	%r587, %r1454, 2;
 	selp.b32 	%r588, %r587, %r579, %p114;
 	ld.shared.u32 	%r589, [%r570+8];
@@ -584,9 +583,9 @@ $L__BB0_118:
 	add.s32 	%r593, %r584, %r590;
 	shl.b32 	%r594, %r588, 3;
 	add.s32 	%r595, %r478, %r594;
-	ld.shared.f64 	%fd123, [%r595];
-	ld.shared.f64 	%fd124, [%r566+24];
-	setp.lt.f64 	%p116, %fd124, %fd123;
+	ld.shared.f64 	%fd122, [%r595];
+	ld.shared.f64 	%fd123, [%r566+24];
+	setp.lt.f64 	%p116, %fd123, %fd122;
 	add.s32 	%r596, %r1454, 3;
 	selp.b32 	%r1458, %r596, %r588, %p116;
 	ld.shared.u32 	%r597, [%r570+12];
@@ -608,9 +607,9 @@ $L__BB0_119:
 	add.s32 	%r139, %r478, %r600;
 	shl.b32 	%r602, %r1458, 3;
 	add.s32 	%r603, %r478, %r602;
-	ld.shared.f64 	%fd125, [%r603];
-	ld.shared.f64 	%fd126, [%r139];
-	setp.lt.f64 	%p120, %fd126, %fd125;
+	ld.shared.f64 	%fd124, [%r603];
+	ld.shared.f64 	%fd125, [%r139];
+	setp.lt.f64 	%p120, %fd125, %fd124;
 	selp.b32 	%r1458, %r1454, %r1458, %p120;
 	shl.b32 	%r604, %r1454, 2;
 	add.s32 	%r141, %r484, %r604;
@@ -629,9 +628,9 @@ $L__BB0_119:
 	add.s32 	%r1297, %r478, %r1298;
 	shl.b32 	%r609, %r1458, 3;
 	add.s32 	%r611, %r478, %r609;
-	ld.shared.f64 	%fd127, [%r611];
-	ld.shared.f64 	%fd128, [%r1297+8];
-	setp.lt.f64 	%p123, %fd128, %fd127;
+	ld.shared.f64 	%fd126, [%r611];
+	ld.shared.f64 	%fd127, [%r1297+8];
+	setp.lt.f64 	%p123, %fd127, %fd126;
 	add.s32 	%r612, %r1454, 1;
 	selp.b32 	%r1458, %r612, %r1458, %p123;
 	ld.shared.u32 	%r613, [%r1299+4];
@@ -649,9 +648,9 @@ $L__BB0_119:
 	add.s32 	%r1301, %r478, %r1302;
 	shl.b32 	%r616, %r1458, 3;
 	add.s32 	%r618, %r478, %r616;
-	ld.shared.f64 	%fd129, [%r618];
-	ld.shared.f64 	%fd130, [%r1301+16];
-	setp.lt.f64 	%p126, %fd130, %fd129;
+	ld.shared.f64 	%fd128, [%r618];
+	ld.shared.f64 	%fd129, [%r1301+16];
+	setp.lt.f64 	%p126, %fd129, %fd128;
 	add.s32 	%r619, %r1454, 2;
 	selp.b32 	%r1458, %r619, %r1458, %p126;
 	ld.shared.u32 	%r620, [%r1303+8];
@@ -702,11 +701,11 @@ $L__BB0_127:
 
 	shl.b32 	%r1318, %r1465, 3;
 	add.s32 	%r1317, %r478, %r1318;
-	ld.shared.f64 	%fd131, [%r1317];
+	ld.shared.f64 	%fd130, [%r1317];
 	shl.b32 	%r638, %r1467, 3;
 	add.s32 	%r640, %r478, %r638;
-	ld.shared.f64 	%fd132, [%r640];
-	setp.lt.f64 	%p348, %fd131, %fd132;
+	ld.shared.f64 	%fd131, [%r640];
+	setp.lt.f64 	%p348, %fd130, %fd131;
 
 $L__BB0_130:
 	shl.b32 	%r1306, %r1465, 2;
@@ -724,9 +723,9 @@ $L__BB0_130:
 	add.s32 	%r1315, %r478, %r1316;
 	shl.b32 	%r642, %r163, 3;
 	add.s32 	%r644, %r478, %r642;
-	ld.shared.f64 	%fd133, [%r644];
-	ld.shared.f64 	%fd134, [%r1315+8];
-	setp.lt.f64 	%p349, %fd134, %fd133;
+	ld.shared.f64 	%fd132, [%r644];
+	ld.shared.f64 	%fd133, [%r1315+8];
+	setp.lt.f64 	%p349, %fd133, %fd132;
 
 $L__BB0_133:
 	shl.b32 	%r1308, %r1465, 2;
@@ -747,9 +746,9 @@ $L__BB0_133:
 	add.s32 	%r1313, %r478, %r1314;
 	shl.b32 	%r647, %r164, 3;
 	add.s32 	%r649, %r478, %r647;
-	ld.shared.f64 	%fd135, [%r649];
-	ld.shared.f64 	%fd136, [%r1313+16];
-	setp.lt.f64 	%p350, %fd136, %fd135;
+	ld.shared.f64 	%fd134, [%r649];
+	ld.shared.f64 	%fd135, [%r1313+16];
+	setp.lt.f64 	%p350, %fd135, %fd134;
 
 $L__BB0_136:
 	shl.b32 	%r1310, %r1465, 2;
@@ -768,9 +767,9 @@ $L__BB0_136:
 	add.s32 	%r1311, %r478, %r1312;
 	shl.b32 	%r652, %r165, 3;
 	add.s32 	%r654, %r478, %r652;
-	ld.shared.f64 	%fd137, [%r654];
-	ld.shared.f64 	%fd138, [%r1311+24];
-	setp.lt.f64 	%p351, %fd138, %fd137;
+	ld.shared.f64 	%fd136, [%r654];
+	ld.shared.f64 	%fd137, [%r1311+24];
+	setp.lt.f64 	%p351, %fd137, %fd136;
 
 $L__BB0_139:
 	add.s32 	%r655, %r1465, 3;
@@ -797,11 +796,11 @@ $L__BB0_140:
 
 	shl.b32 	%r1328, %r1465, 3;
 	add.s32 	%r1327, %r478, %r1328;
-	ld.shared.f64 	%fd139, [%r1327];
+	ld.shared.f64 	%fd138, [%r1327];
 	shl.b32 	%r661, %r1467, 3;
 	add.s32 	%r663, %r478, %r661;
-	ld.shared.f64 	%fd140, [%r663];
-	setp.lt.f64 	%p352, %fd139, %fd140;
+	ld.shared.f64 	%fd139, [%r663];
+	setp.lt.f64 	%p352, %fd138, %fd139;
 
 $L__BB0_144:
 	selp.b32 	%r1467, %r1465, %r1467, %p352;
@@ -823,9 +822,9 @@ $L__BB0_144:
 	add.s32 	%r1325, %r478, %r1326;
 	shl.b32 	%r665, %r1467, 3;
 	add.s32 	%r667, %r478, %r665;
-	ld.shared.f64 	%fd141, [%r667];
-	ld.shared.f64 	%fd142, [%r1325+8];
-	setp.lt.f64 	%p353, %fd142, %fd141;
+	ld.shared.f64 	%fd140, [%r667];
+	ld.shared.f64 	%fd141, [%r1325+8];
+	setp.lt.f64 	%p353, %fd141, %fd140;
 
 $L__BB0_148:
 	add.s32 	%r668, %r1465, 1;
@@ -848,9 +847,9 @@ $L__BB0_148:
 	add.s32 	%r1323, %r478, %r1324;
 	shl.b32 	%r670, %r1467, 3;
 	add.s32 	%r672, %r478, %r670;
-	ld.shared.f64 	%fd143, [%r672];
-	ld.shared.f64 	%fd144, [%r1323+16];
-	setp.lt.f64 	%p354, %fd144, %fd143;
+	ld.shared.f64 	%fd142, [%r672];
+	ld.shared.f64 	%fd143, [%r1323+16];
+	setp.lt.f64 	%p354, %fd143, %fd142;
 
 $L__BB0_152:
 	add.s32 	%r673, %r1465, 2;
@@ -865,10 +864,10 @@ $L__BB0_153:
 	add.s32 	%r676, %r478, %r674;
 	shl.b32 	%r677, %r1458, 3;
 	add.s32 	%r678, %r478, %r677;
-	ld.shared.f64 	%fd145, [%r678];
-	mul.f64 	%fd146, %fd145, 0d3FF199999999999A;
-	ld.shared.f64 	%fd147, [%r676];
-	setp.lt.f64 	%p355, %fd147, %fd146;
+	ld.shared.f64 	%fd144, [%r678];
+	mul.f64 	%fd145, %fd144, 0d3FF199999999999A;
+	ld.shared.f64 	%fd146, [%r676];
+	setp.lt.f64 	%p355, %fd146, %fd145;
 
 $L__BB0_155:
 	selp.b32 	%r1468, %r1468, %r154, %p355;
@@ -900,11 +899,11 @@ $L__BB0_206:
 	setp.lt.u32 	%p198, %r66, 3;
 	shl.b32 	%r864, %r1487, 3;
 	add.s32 	%r866, %r478, %r864;
-	ld.shared.f64 	%fd156, [%r866];
+	ld.shared.f64 	%fd155, [%r866];
 	mov.u32 	%r1491, 0;
 	shl.b32 	%r867, %r1496, 3;
 	add.s32 	%r868, %r478, %r867;
-	st.shared.f64 	[%r868], %fd156;
+	st.shared.f64 	[%r868], %fd155;
 	add.s32 	%r871, %r479, %r1403;
 	ld.shared.u32 	%r872, [%r871];
 	shl.b32 	%r873, %r1496, 2;
@@ -931,17 +930,17 @@ $L__BB0_210:
 	add.s32 	%r888, %r887, %r886;
 	shl.b32 	%r889, %r1491, 3;
 	add.s32 	%r890, %r888, %r889;
-	ld.shared.f64 	%fd157, [%r890];
+	ld.shared.f64 	%fd156, [%r890];
 	shl.b32 	%r891, %r1496, 6;
 	add.s32 	%r892, %r887, %r891;
 	add.s32 	%r893, %r892, %r889;
-	st.shared.f64 	[%r893], %fd157;
-	ld.shared.f64 	%fd158, [%r890+8];
-	st.shared.f64 	[%r893+8], %fd158;
-	ld.shared.f64 	%fd159, [%r890+16];
-	st.shared.f64 	[%r893+16], %fd159;
-	ld.shared.f64 	%fd160, [%r890+24];
-	st.shared.f64 	[%r893+24], %fd160;
+	st.shared.f64 	[%r893], %fd156;
+	ld.shared.f64 	%fd157, [%r890+8];
+	st.shared.f64 	[%r893+8], %fd157;
+	ld.shared.f64 	%fd158, [%r890+16];
+	st.shared.f64 	[%r893+16], %fd158;
+	ld.shared.f64 	%fd159, [%r890+24];
+	st.shared.f64 	[%r893+24], %fd159;
 	add.s32 	%r1491, %r1491, 4;
 	add.s32 	%r1490, %r1490, -4;
 	setp.ne.s32 	%p199, %r1490, 0;
@@ -957,20 +956,20 @@ $L__BB0_211:
 	add.s32 	%r896, %r895, %r894;
 	shl.b32 	%r897, %r1491, 3;
 	add.s32 	%r236, %r896, %r897;
-	ld.shared.f64 	%fd161, [%r236];
+	ld.shared.f64 	%fd160, [%r236];
 	shl.b32 	%r898, %r1496, 6;
 	add.s32 	%r899, %r895, %r898;
 	add.s32 	%r237, %r899, %r897;
-	st.shared.f64 	[%r237], %fd161;
+	st.shared.f64 	[%r237], %fd160;
 	@%p201 bra 	$L__BB0_215;
 
 	setp.eq.s32 	%p202, %r82, 2;
-	ld.shared.f64 	%fd162, [%r236+8];
-	st.shared.f64 	[%r237+8], %fd162;
+	ld.shared.f64 	%fd161, [%r236+8];
+	st.shared.f64 	[%r237+8], %fd161;
 	@%p202 bra 	$L__BB0_215;
 
-	ld.shared.f64 	%fd163, [%r236+16];
-	st.shared.f64 	[%r237+16], %fd163;
+	ld.shared.f64 	%fd162, [%r236+16];
+	st.shared.f64 	[%r237+16], %fd162;
 
 $L__BB0_215:
 	setp.lt.s32 	%p203, %r391, 1;
@@ -1061,11 +1060,11 @@ $L__BB0_194:
 	setp.lt.u32 	%p190, %r79, 3;
 	shl.b32 	%r824, %r1481, 3;
 	add.s32 	%r826, %r478, %r824;
-	ld.shared.f64 	%fd155, [%r826];
+	ld.shared.f64 	%fd154, [%r826];
 	mov.u32 	%r1485, 0;
 	shl.b32 	%r827, %r1496, 3;
 	add.s32 	%r828, %r478, %r827;
-	st.shared.f64 	[%r828], %fd155;
+	st.shared.f64 	[%r828], %fd154;
 	add.s32 	%r831, %r479, %r1402;
 	ld.shared.u32 	%r832, [%r831];
 	shl.b32 	%r833, %r1496, 2;
@@ -1184,9 +1183,9 @@ $L__BB0_252:
 	add.s32 	%r979, %r478, %r977;
 	shl.b32 	%r980, %r1509, 3;
 	add.s32 	%r981, %r478, %r980;
-	ld.shared.f64 	%fd168, [%r981];
-	ld.shared.f64 	%fd169, [%r979];
-	setp.le.f64 	%p357, %fd169, %fd168;
+	ld.shared.f64 	%fd167, [%r981];
+	ld.shared.f64 	%fd168, [%r979];
+	setp.le.f64 	%p357, %fd168, %fd167;
 
 $L__BB0_254:
 	selp.b32 	%r1509, %r1506, %r1509, %p357;
@@ -1211,13 +1210,13 @@ $L__BB0_255:
 	setp.lt.u32 	%p239, %r66, 3;
 	shl.b32 	%r985, %r1516, 3;
 	add.s32 	%r987, %r478, %r985;
-	ld.shared.f64 	%fd170, [%r987];
+	ld.shared.f64 	%fd169, [%r987];
 	mov.u32 	%r1512, 0;
 	shl.b32 	%r988, %r1509, 3;
 	add.s32 	%r989, %r478, %r988;
-	ld.shared.f64 	%fd171, [%r989];
-	st.shared.f64 	[%r987], %fd171;
-	st.shared.f64 	[%r989], %fd170;
+	ld.shared.f64 	%fd170, [%r989];
+	st.shared.f64 	[%r987], %fd170;
+	st.shared.f64 	[%r989], %fd169;
 	shl.b32 	%r990, %r1516, 2;
 	add.s32 	%r992, %r479, %r990;
 	ld.shared.u32 	%r993, [%r992];
@@ -1252,25 +1251,25 @@ $L__BB0_260:
 	add.s32 	%r1013, %r1012, %r1011;
 	shl.b32 	%r1014, %r1512, 3;
 	add.s32 	%r1015, %r1013, %r1014;
-	ld.shared.f64 	%fd172, [%r1015];
+	ld.shared.f64 	%fd171, [%r1015];
 	shl.b32 	%r1016, %r1509, 6;
 	add.s32 	%r1017, %r1012, %r1016;
 	add.s32 	%r1018, %r1017, %r1014;
-	ld.shared.f64 	%fd173, [%r1018];
-	st.shared.f64 	[%r1015], %fd173;
-	st.shared.f64 	[%r1018], %fd172;
-	ld.shared.f64 	%fd174, [%r1015+8];
-	ld.shared.f64 	%fd175, [%r1018+8];
-	st.shared.f64 	[%r1015+8], %fd175;
-	st.shared.f64 	[%r1018+8], %fd174;
-	ld.shared.f64 	%fd176, [%r1015+16];
-	ld.shared.f64 	%fd177, [%r1018+16];
-	st.shared.f64 	[%r1015+16], %fd177;
-	st.shared.f64 	[%r1018+16], %fd176;
-	ld.shared.f64 	%fd178, [%r1015+24];
-	ld.shared.f64 	%fd179, [%r1018+24];
-	st.shared.f64 	[%r1015+24], %fd179;
-	st.shared.f64 	[%r1018+24], %fd178;
+	ld.shared.f64 	%fd172, [%r1018];
+	st.shared.f64 	[%r1015], %fd172;
+	st.shared.f64 	[%r1018], %fd171;
+	ld.shared.f64 	%fd173, [%r1015+8];
+	ld.shared.f64 	%fd174, [%r1018+8];
+	st.shared.f64 	[%r1015+8], %fd174;
+	st.shared.f64 	[%r1018+8], %fd173;
+	ld.shared.f64 	%fd175, [%r1015+16];
+	ld.shared.f64 	%fd176, [%r1018+16];
+	st.shared.f64 	[%r1015+16], %fd176;
+	st.shared.f64 	[%r1018+16], %fd175;
+	ld.shared.f64 	%fd177, [%r1015+24];
+	ld.shared.f64 	%fd178, [%r1018+24];
+	st.shared.f64 	[%r1015+24], %fd178;
+	st.shared.f64 	[%r1018+24], %fd177;
 	add.s32 	%r1512, %r1512, 4;
 	add.s32 	%r1511, %r1511, -4;
 	setp.ne.s32 	%p240, %r1511, 0;
@@ -1286,26 +1285,26 @@ $L__BB0_261:
 	add.s32 	%r1021, %r1020, %r1019;
 	shl.b32 	%r1022, %r1512, 3;
 	add.s32 	%r286, %r1021, %r1022;
-	ld.shared.f64 	%fd180, [%r286];
+	ld.shared.f64 	%fd179, [%r286];
 	shl.b32 	%r1023, %r1509, 6;
 	add.s32 	%r1024, %r1020, %r1023;
 	add.s32 	%r287, %r1024, %r1022;
-	ld.shared.f64 	%fd181, [%r287];
-	st.shared.f64 	[%r286], %fd181;
-	st.shared.f64 	[%r287], %fd180;
+	ld.shared.f64 	%fd180, [%r287];
+	st.shared.f64 	[%r286], %fd180;
+	st.shared.f64 	[%r287], %fd179;
 	@%p242 bra 	$L__BB0_265;
 
 	setp.eq.s32 	%p243, %r82, 2;
-	ld.shared.f64 	%fd182, [%r286+8];
-	ld.shared.f64 	%fd183, [%r287+8];
-	st.shared.f64 	[%r286+8], %fd183;
-	st.shared.f64 	[%r287+8], %fd182;
+	ld.shared.f64 	%fd181, [%r286+8];
+	ld.shared.f64 	%fd182, [%r287+8];
+	st.shared.f64 	[%r286+8], %fd182;
+	st.shared.f64 	[%r287+8], %fd181;
 	@%p243 bra 	$L__BB0_265;
 
-	ld.shared.f64 	%fd184, [%r286+16];
-	ld.shared.f64 	%fd185, [%r287+16];
-	st.shared.f64 	[%r286+16], %fd185;
-	st.shared.f64 	[%r287+16], %fd184;
+	ld.shared.f64 	%fd183, [%r286+16];
+	ld.shared.f64 	%fd184, [%r287+16];
+	st.shared.f64 	[%r286+16], %fd184;
+	st.shared.f64 	[%r287+16], %fd183;
 
 $L__BB0_265:
 	setp.lt.s32 	%p244, %r391, 1;
@@ -1418,9 +1417,9 @@ $L__BB0_232:
 	add.s32 	%r925, %r478, %r923;
 	shl.b32 	%r926, %r1501, 3;
 	add.s32 	%r927, %r478, %r926;
-	ld.shared.f64 	%fd164, [%r927];
-	ld.shared.f64 	%fd165, [%r925];
-	setp.le.f64 	%p356, %fd165, %fd164;
+	ld.shared.f64 	%fd163, [%r927];
+	ld.shared.f64 	%fd164, [%r925];
+	setp.le.f64 	%p356, %fd164, %fd163;
 
 $L__BB0_234:
 	selp.b32 	%r1501, %r1498, %r1501, %p356;
@@ -1445,12 +1444,12 @@ $L__BB0_235:
 	setp.lt.s32 	%p222, %r391, 1;
 	shl.b32 	%r930, %r1516, 3;
 	add.s32 	%r932, %r478, %r930;
-	ld.shared.f64 	%fd166, [%r932];
+	ld.shared.f64 	%fd165, [%r932];
 	shl.b32 	%r933, %r1501, 3;
 	add.s32 	%r934, %r478, %r933;
-	ld.shared.f64 	%fd167, [%r934];
-	st.shared.f64 	[%r932], %fd167;
-	st.shared.f64 	[%r934], %fd166;
+	ld.shared.f64 	%fd166, [%r934];
+	st.shared.f64 	[%r932], %fd166;
+	st.shared.f64 	[%r934], %fd165;
 	shl.b32 	%r935, %r1516, 2;
 	add.s32 	%r937, %r479, %r935;
 	ld.shared.u32 	%r938, [%r937];
@@ -1685,10 +1684,10 @@ $L__BB0_304:
 	mov.u32 	%r1530, 0;
 	shl.b32 	%r1170, %r1527, 3;
 	add.s32 	%r1172, %r478, %r1170;
-	ld.shared.f64 	%fd202, [%r1172];
-	sub.f64 	%fd203, %fd202, %fd32;
+	ld.shared.f64 	%fd201, [%r1172];
+	sub.f64 	%fd202, %fd201, %fd32;
 	add.s32 	%r1174, %r401, %r1170;
-	st.shared.f64 	[%r1174], %fd203;
+	st.shared.f64 	[%r1174], %fd202;
 	shl.b32 	%r1175, %r1527, 2;
 	add.s32 	%r1177, %r482, %r1175;
 	ld.shared.u32 	%r1178, [%r1177];
@@ -1713,16 +1712,16 @@ $L__BB0_306:
 	add.s32 	%r1193, %r1192, %r1191;
 	shl.b32 	%r1194, %r1530, 3;
 	add.s32 	%r1195, %r1193, %r1194;
-	ld.shared.f64 	%fd204, [%r1195];
-	add.s32 	%r1197, %r472, %r1191;
+	ld.shared.f64 	%fd203, [%r1195];
+	add.s32 	%r1197, %r473, %r1191;
 	add.s32 	%r1198, %r1197, %r1194;
-	st.shared.f64 	[%r1198], %fd204;
-	ld.shared.f64 	%fd205, [%r1195+8];
-	st.shared.f64 	[%r1198+8], %fd205;
-	ld.shared.f64 	%fd206, [%r1195+16];
-	st.shared.f64 	[%r1198+16], %fd206;
-	ld.shared.f64 	%fd207, [%r1195+24];
-	st.shared.f64 	[%r1198+24], %fd207;
+	st.shared.f64 	[%r1198], %fd203;
+	ld.shared.f64 	%fd204, [%r1195+8];
+	st.shared.f64 	[%r1198+8], %fd204;
+	ld.shared.f64 	%fd205, [%r1195+16];
+	st.shared.f64 	[%r1198+16], %fd205;
+	ld.shared.f64 	%fd206, [%r1195+24];
+	st.shared.f64 	[%r1198+24], %fd206;
 	add.s32 	%r1530, %r1530, 4;
 	add.s32 	%r1529, %r1529, -4;
 	setp.ne.s32 	%p282, %r1529, 0;
@@ -1738,19 +1737,19 @@ $L__BB0_307:
 	add.s32 	%r1201, %r1200, %r1199;
 	shl.b32 	%r1202, %r1530, 3;
 	add.s32 	%r340, %r1201, %r1202;
-	ld.shared.f64 	%fd208, [%r340];
-	add.s32 	%r1204, %r472, %r1199;
+	ld.shared.f64 	%fd207, [%r340];
+	add.s32 	%r1204, %r473, %r1199;
 	add.s32 	%r341, %r1204, %r1202;
-	st.shared.f64 	[%r341], %fd208;
+	st.shared.f64 	[%r341], %fd207;
 	@%p284 bra 	$L__BB0_311;
 
 	setp.eq.s32 	%p285, %r82, 2;
-	ld.shared.f64 	%fd209, [%r340+8];
-	st.shared.f64 	[%r341+8], %fd209;
+	ld.shared.f64 	%fd208, [%r340+8];
+	st.shared.f64 	[%r341+8], %fd208;
 	@%p285 bra 	$L__BB0_311;
 
-	ld.shared.f64 	%fd210, [%r340+16];
-	st.shared.f64 	[%r341+16], %fd210;
+	ld.shared.f64 	%fd209, [%r340+16];
+	st.shared.f64 	[%r341+16], %fd209;
 
 $L__BB0_311:
 	setp.lt.s32 	%p286, %r391, 1;
@@ -1826,10 +1825,10 @@ $L__BB0_295:
 	mov.u32 	%r1526, 0;
 	shl.b32 	%r1135, %r1523, 3;
 	add.s32 	%r1137, %r478, %r1135;
-	ld.shared.f64 	%fd200, [%r1137];
-	sub.f64 	%fd201, %fd200, %fd32;
+	ld.shared.f64 	%fd199, [%r1137];
+	sub.f64 	%fd200, %fd199, %fd32;
 	add.s32 	%r1139, %r401, %r1135;
-	st.shared.f64 	[%r1139], %fd201;
+	st.shared.f64 	[%r1139], %fd200;
 	shl.b32 	%r1140, %r1523, 2;
 	add.s32 	%r1142, %r482, %r1140;
 	ld.shared.u32 	%r1143, [%r1142];
@@ -1928,10 +1927,10 @@ $L__BB0_161:
 	add.s32 	%r1355, %r479, %r1358;
 	shl.b32 	%r1354, %r1477, 3;
 	add.s32 	%r1353, %r478, %r1354;
-	ld.shared.f64 	%fd148, [%r1353];
+	ld.shared.f64 	%fd147, [%r1353];
 	shl.b32 	%r694, %r1496, 3;
 	add.s32 	%r696, %r478, %r694;
-	st.shared.f64 	[%r696], %fd148;
+	st.shared.f64 	[%r696], %fd147;
 	ld.shared.u32 	%r697, [%r1355];
 	shl.b32 	%r698, %r1496, 2;
 	add.s32 	%r700, %r479, %r698;
@@ -1965,10 +1964,10 @@ $L__BB0_165:
 	add.s32 	%r1349, %r479, %r1352;
 	shl.b32 	%r1348, %r1477, 3;
 	add.s32 	%r1347, %r478, %r1348;
-	ld.shared.f64 	%fd149, [%r1347+8];
+	ld.shared.f64 	%fd148, [%r1347+8];
 	shl.b32 	%r711, %r1496, 3;
 	add.s32 	%r713, %r478, %r711;
-	st.shared.f64 	[%r713], %fd149;
+	st.shared.f64 	[%r713], %fd148;
 	ld.shared.u32 	%r714, [%r1349+4];
 	shl.b32 	%r715, %r1496, 2;
 	add.s32 	%r717, %r479, %r715;
@@ -2002,10 +2001,10 @@ $L__BB0_169:
 	add.s32 	%r1343, %r479, %r1346;
 	shl.b32 	%r1342, %r1477, 3;
 	add.s32 	%r1341, %r478, %r1342;
-	ld.shared.f64 	%fd150, [%r1341+16];
+	ld.shared.f64 	%fd149, [%r1341+16];
 	shl.b32 	%r728, %r1496, 3;
 	add.s32 	%r730, %r478, %r728;
-	st.shared.f64 	[%r730], %fd150;
+	st.shared.f64 	[%r730], %fd149;
 	ld.shared.u32 	%r731, [%r1343+8];
 	shl.b32 	%r732, %r1496, 2;
 	add.s32 	%r734, %r479, %r732;
@@ -2039,10 +2038,10 @@ $L__BB0_173:
 	add.s32 	%r1337, %r479, %r1340;
 	shl.b32 	%r1336, %r1477, 3;
 	add.s32 	%r1335, %r478, %r1336;
-	ld.shared.f64 	%fd151, [%r1335+24];
+	ld.shared.f64 	%fd150, [%r1335+24];
 	shl.b32 	%r745, %r1496, 3;
 	add.s32 	%r747, %r478, %r745;
-	st.shared.f64 	[%r747], %fd151;
+	st.shared.f64 	[%r747], %fd150;
 	ld.shared.u32 	%r748, [%r1337+12];
 	shl.b32 	%r749, %r1496, 2;
 	add.s32 	%r751, %r479, %r749;
@@ -2084,10 +2083,10 @@ $L__BB0_178:
 	add.s32 	%r1377, %r479, %r1380;
 	shl.b32 	%r1376, %r1477, 3;
 	add.s32 	%r1375, %r478, %r1376;
-	ld.shared.f64 	%fd152, [%r1375];
+	ld.shared.f64 	%fd151, [%r1375];
 	shl.b32 	%r768, %r1496, 3;
 	add.s32 	%r770, %r478, %r768;
-	st.shared.f64 	[%r770], %fd152;
+	st.shared.f64 	[%r770], %fd151;
 	ld.shared.u32 	%r771, [%r1377];
 	shl.b32 	%r772, %r1496, 2;
 	add.s32 	%r774, %r479, %r772;
@@ -2124,10 +2123,10 @@ $L__BB0_183:
 	add.s32 	%r1371, %r479, %r1374;
 	shl.b32 	%r1370, %r1477, 3;
 	add.s32 	%r1369, %r478, %r1370;
-	ld.shared.f64 	%fd153, [%r1369+8];
+	ld.shared.f64 	%fd152, [%r1369+8];
 	shl.b32 	%r785, %r1496, 3;
 	add.s32 	%r787, %r478, %r785;
-	st.shared.f64 	[%r787], %fd153;
+	st.shared.f64 	[%r787], %fd152;
 	ld.shared.u32 	%r788, [%r1371+4];
 	shl.b32 	%r789, %r1496, 2;
 	add.s32 	%r791, %r479, %r789;
@@ -2164,10 +2163,10 @@ $L__BB0_188:
 	add.s32 	%r1365, %r479, %r1368;
 	shl.b32 	%r1364, %r1477, 3;
 	add.s32 	%r1363, %r478, %r1364;
-	ld.shared.f64 	%fd154, [%r1363+16];
+	ld.shared.f64 	%fd153, [%r1363+16];
 	shl.b32 	%r802, %r1496, 3;
 	add.s32 	%r804, %r478, %r802;
-	st.shared.f64 	[%r804], %fd154;
+	st.shared.f64 	[%r804], %fd153;
 	ld.shared.u32 	%r805, [%r1365+8];
 	shl.b32 	%r806, %r1496, 2;
 	add.s32 	%r808, %r479, %r806;
@@ -2198,10 +2197,10 @@ $L__BB0_287:
 $L__BB0_289:
 	shl.b32 	%r1072, %r1522, 3;
 	add.s32 	%r1074, %r478, %r1072;
-	ld.shared.f64 	%fd186, [%r1074];
-	sub.f64 	%fd187, %fd186, %fd32;
+	ld.shared.f64 	%fd185, [%r1074];
+	sub.f64 	%fd186, %fd185, %fd32;
 	add.s32 	%r1076, %r401, %r1072;
-	st.shared.f64 	[%r1076], %fd187;
+	st.shared.f64 	[%r1076], %fd186;
 	shl.b32 	%r1077, %r1522, 2;
 	add.s32 	%r1079, %r482, %r1077;
 	ld.shared.u32 	%r1080, [%r1079];
@@ -2214,9 +2213,9 @@ $L__BB0_289:
 	st.shared.u32 	[%r1082], %r1080;
 	ld.shared.u32 	%r1091, [%r1088];
 	st.shared.u32 	[%r1090], %r1091;
-	ld.shared.f64 	%fd188, [%r1074+8];
-	sub.f64 	%fd189, %fd188, %fd32;
-	st.shared.f64 	[%r1076+8], %fd189;
+	ld.shared.f64 	%fd187, [%r1074+8];
+	sub.f64 	%fd188, %fd187, %fd32;
+	st.shared.f64 	[%r1076+8], %fd188;
 	ld.shared.u32 	%r1092, [%r1079+4];
 	ld.shared.u32 	%r1093, [%r1084+4];
 	shl.b32 	%r1094, %r1093, 2;
@@ -2224,9 +2223,9 @@ $L__BB0_289:
 	st.shared.u32 	[%r1082+4], %r1092;
 	ld.shared.u32 	%r1096, [%r1095];
 	st.shared.u32 	[%r1090+4], %r1096;
-	ld.shared.f64 	%fd190, [%r1074+16];
-	sub.f64 	%fd191, %fd190, %fd32;
-	st.shared.f64 	[%r1076+16], %fd191;
+	ld.shared.f64 	%fd189, [%r1074+16];
+	sub.f64 	%fd190, %fd189, %fd32;
+	st.shared.f64 	[%r1076+16], %fd190;
 	ld.shared.u32 	%r1097, [%r1079+8];
 	st.shared.u32 	[%r1082+8], %r1097;
 	ld.shared.u32 	%r1098, [%r1084+8];
@@ -2234,9 +2233,9 @@ $L__BB0_289:
 	add.s32 	%r1100, %r468, %r1099;
 	ld.shared.u32 	%r1101, [%r1100];
 	st.shared.u32 	[%r1090+8], %r1101;
-	ld.shared.f64 	%fd192, [%r1074+24];
-	sub.f64 	%fd193, %fd192, %fd32;
-	st.shared.f64 	[%r1076+24], %fd193;
+	ld.shared.f64 	%fd191, [%r1074+24];
+	sub.f64 	%fd192, %fd191, %fd32;
+	st.shared.f64 	[%r1076+24], %fd192;
 	ld.shared.u32 	%r1102, [%r1079+12];
 	st.shared.u32 	[%r1082+12], %r1102;
 	ld.shared.u32 	%r1103, [%r1084+12];
@@ -2257,10 +2256,10 @@ $L__BB0_290:
 	and.b32  	%r1407, %r1516, 3;
 	shl.b32 	%r1107, %r1522, 3;
 	add.s32 	%r317, %r478, %r1107;
-	ld.shared.f64 	%fd194, [%r317];
-	sub.f64 	%fd195, %fd194, %fd32;
+	ld.shared.f64 	%fd193, [%r317];
+	sub.f64 	%fd194, %fd193, %fd32;
 	add.s32 	%r318, %r401, %r1107;
-	st.shared.f64 	[%r318], %fd195;
+	st.shared.f64 	[%r318], %fd194;
 	shl.b32 	%r1110, %r1522, 2;
 	add.s32 	%r319, %r482, %r1110;
 	ld.shared.u32 	%r1112, [%r319];
@@ -2277,9 +2276,9 @@ $L__BB0_290:
 	@%p273 bra 	$L__BB0_320;
 
 	and.b32  	%r1408, %r1516, 3;
-	ld.shared.f64 	%fd196, [%r317+8];
-	sub.f64 	%fd197, %fd196, %fd32;
-	st.shared.f64 	[%r318+8], %fd197;
+	ld.shared.f64 	%fd195, [%r317+8];
+	sub.f64 	%fd196, %fd195, %fd32;
+	st.shared.f64 	[%r318+8], %fd196;
 	ld.shared.u32 	%r1121, [%r319+4];
 	st.shared.u32 	[%r320+4], %r1121;
 	ld.shared.u32 	%r1122, [%r321+4];
@@ -2290,9 +2289,9 @@ $L__BB0_290:
 	setp.eq.s32 	%p274, %r1408, 2;
 	@%p274 bra 	$L__BB0_320;
 
-	ld.shared.f64 	%fd198, [%r317+16];
-	sub.f64 	%fd199, %fd198, %fd32;
-	st.shared.f64 	[%r318+16], %fd199;
+	ld.shared.f64 	%fd197, [%r317+16];
+	sub.f64 	%fd198, %fd197, %fd32;
+	st.shared.f64 	[%r318+16], %fd198;
 	ld.shared.u32 	%r1127, [%r319+8];
 	st.shared.u32 	[%r320+8], %r1127;
 	ld.shared.u32 	%r1128, [%r321+8];
@@ -2307,8 +2306,8 @@ $L__BB0_42:
 	add.s64 	%rd85, %rd12, %rd84;
 	shl.b64 	%rd86, %rd85, 3;
 	add.s64 	%rd87, %rd13, %rd86;
-	ld.global.f64 	%fd41, [%rd87];
-	mul.f64 	%fd233, %fd41, 0d3FE0000000000000;
+	ld.global.f64 	%fd40, [%rd87];
+	mul.f64 	%fd232, %fd40, 0d3FE0000000000000;
 	ld.shared.u32 	%r88, [_ZZ25trellis_parallel_segmentsE8s_active];
 	setp.ge.s32 	%p60, %r9, %r88;
 	@%p60 bra 	$L__BB0_46;
@@ -2347,14 +2346,14 @@ $L__BB0_46:
 	setp.ge.s32 	%p62, %r9, %r89;
 	@%p62 bra 	$L__BB0_114;
 
-	ld.const.f64 	%fd225, [c_ntf_g];
+	ld.const.f64 	%fd224, [c_ntf_g];
 	setp.lt.s32 	%p63, %r1, 3;
-	ld.shared.f64 	%fd229, [%r63+8];
-	mul.f64 	%fd42, %fd225, %fd229;
-	ld.shared.f64 	%fd228, [%r63];
-	sub.f64 	%fd43, %fd228, %fd42;
-	add.f64 	%fd44, %fd233, %fd43;
-	st.local.f64 	[%rd6], %fd44;
+	ld.shared.f64 	%fd228, [%r63+8];
+	mul.f64 	%fd41, %fd224, %fd228;
+	ld.shared.f64 	%fd227, [%r63];
+	sub.f64 	%fd42, %fd227, %fd41;
+	add.f64 	%fd43, %fd232, %fd42;
+	st.local.f64 	[%rd6], %fd43;
 	@%p63 bra 	$L__BB0_55;
 
 	add.s32 	%r1291, %r1, -3;
@@ -2371,32 +2370,32 @@ $L__BB0_50:
 	add.s64 	%rd90, %rd89, %rd88;
 	shl.b32 	%r510, %r1433, 3;
 	add.s32 	%r511, %r64, %r510;
-	ld.shared.f64 	%fd45, [%r511];
-	ld.const.f64 	%fd46, [%rd90];
-	mul.f64 	%fd47, %fd46, %fd45;
-	add.f64 	%fd48, %fd229, %fd228;
-	sub.f64 	%fd49, %fd48, %fd47;
+	ld.shared.f64 	%fd44, [%r511];
+	ld.const.f64 	%fd45, [%rd90];
+	mul.f64 	%fd46, %fd45, %fd44;
+	add.f64 	%fd47, %fd228, %fd227;
+	sub.f64 	%fd48, %fd47, %fd46;
 	add.s64 	%rd91, %rd6, %rd88;
-	st.local.f64 	[%rd91], %fd49;
-	add.f64 	%fd50, %fd45, %fd229;
-	ld.shared.f64 	%fd51, [%r511+8];
-	ld.const.f64 	%fd52, [%rd90+8];
-	mul.f64 	%fd53, %fd52, %fd51;
-	sub.f64 	%fd54, %fd50, %fd53;
-	st.local.f64 	[%rd91+8], %fd54;
-	add.f64 	%fd55, %fd51, %fd45;
-	ld.shared.f64 	%fd228, [%r511+16];
-	ld.const.f64 	%fd56, [%rd90+16];
-	mul.f64 	%fd57, %fd56, %fd228;
-	sub.f64 	%fd58, %fd55, %fd57;
-	st.local.f64 	[%rd91+16], %fd58;
-	add.f64 	%fd59, %fd228, %fd51;
+	st.local.f64 	[%rd91], %fd48;
+	add.f64 	%fd49, %fd44, %fd228;
+	ld.shared.f64 	%fd50, [%r511+8];
+	ld.const.f64 	%fd51, [%rd90+8];
+	mul.f64 	%fd52, %fd51, %fd50;
+	sub.f64 	%fd53, %fd49, %fd52;
+	st.local.f64 	[%rd91+8], %fd53;
+	add.f64 	%fd54, %fd50, %fd44;
+	ld.shared.f64 	%fd227, [%r511+16];
+	ld.const.f64 	%fd55, [%rd90+16];
+	mul.f64 	%fd56, %fd55, %fd227;
+	sub.f64 	%fd57, %fd54, %fd56;
+	st.local.f64 	[%rd91+16], %fd57;
+	add.f64 	%fd58, %fd227, %fd50;
 	add.s32 	%r1433, %r1433, 4;
-	ld.shared.f64 	%fd229, [%r511+24];
-	ld.const.f64 	%fd60, [%rd90+24];
-	mul.f64 	%fd61, %fd60, %fd229;
-	sub.f64 	%fd62, %fd59, %fd61;
-	st.local.f64 	[%rd91+24], %fd62;
+	ld.shared.f64 	%fd228, [%r511+24];
+	ld.const.f64 	%fd59, [%rd90+24];
+	mul.f64 	%fd60, %fd59, %fd228;
+	sub.f64 	%fd61, %fd58, %fd60;
+	st.local.f64 	[%rd91+24], %fd61;
 	add.s32 	%r1432, %r1432, -4;
 	setp.ne.s32 	%p65, %r1432, 0;
 	@%p65 bra 	$L__BB0_50;
@@ -2412,12 +2411,12 @@ $L__BB0_51:
 	shl.b32 	%r512, %r1433, 3;
 	add.s32 	%r95, %r64, %r512;
 	ld.shared.f64 	%fd15, [%r95];
-	ld.const.f64 	%fd63, [%rd16];
-	mul.f64 	%fd64, %fd63, %fd15;
-	add.f64 	%fd65, %fd229, %fd228;
-	sub.f64 	%fd66, %fd65, %fd64;
+	ld.const.f64 	%fd62, [%rd16];
+	mul.f64 	%fd63, %fd62, %fd15;
+	add.f64 	%fd64, %fd228, %fd227;
+	sub.f64 	%fd65, %fd64, %fd63;
 	add.s64 	%rd17, %rd6, %rd92;
-	st.local.f64 	[%rd17], %fd66;
+	st.local.f64 	[%rd17], %fd65;
 	@%p67 bra 	$L__BB0_55;
 
 	mul.wide.s32 	%rd134, %r1433, 8;
@@ -2426,30 +2425,30 @@ $L__BB0_51:
 	add.s32 	%r1265, %r64, %r1266;
 	setp.eq.s32 	%p68, %r80, 2;
 	ld.shared.f64 	%fd16, [%r1265+8];
-	ld.const.f64 	%fd67, [%rd16+8];
-	mul.f64 	%fd68, %fd67, %fd16;
-	add.f64 	%fd69, %fd15, %fd229;
-	sub.f64 	%fd70, %fd69, %fd68;
-	st.local.f64 	[%rd133+8], %fd70;
+	ld.const.f64 	%fd66, [%rd16+8];
+	mul.f64 	%fd67, %fd66, %fd16;
+	add.f64 	%fd68, %fd15, %fd228;
+	sub.f64 	%fd69, %fd68, %fd67;
+	st.local.f64 	[%rd133+8], %fd69;
 	@%p68 bra 	$L__BB0_55;
 
 	mul.wide.s32 	%rd136, %r1433, 8;
 	add.s64 	%rd135, %rd6, %rd136;
 	shl.b32 	%r1268, %r1433, 3;
 	add.s32 	%r1267, %r64, %r1268;
-	add.f64 	%fd71, %fd16, %fd15;
-	ld.shared.f64 	%fd72, [%r1267+16];
-	ld.const.f64 	%fd73, [%rd16+16];
-	mul.f64 	%fd74, %fd73, %fd72;
-	sub.f64 	%fd75, %fd71, %fd74;
-	st.local.f64 	[%rd135+16], %fd75;
+	add.f64 	%fd70, %fd16, %fd15;
+	ld.shared.f64 	%fd71, [%r1267+16];
+	ld.const.f64 	%fd72, [%rd16+16];
+	mul.f64 	%fd73, %fd72, %fd71;
+	sub.f64 	%fd74, %fd70, %fd73;
+	st.local.f64 	[%rd135+16], %fd74;
 
 $L__BB0_55:
 	setp.lt.s32 	%p69, %r1, 1;
-	ld.shared.f64 	%fd76, [%r65+-16];
-	ld.shared.f64 	%fd77, [%r65+-8];
-	add.f64 	%fd78, %fd77, %fd76;
-	st.local.f64 	[%rd9], %fd78;
+	ld.shared.f64 	%fd75, [%r65+-16];
+	ld.shared.f64 	%fd76, [%r65+-8];
+	add.f64 	%fd77, %fd76, %fd75;
+	st.local.f64 	[%rd9], %fd77;
 	@%p69 bra 	$L__BB0_63;
 
 	setp.lt.u32 	%p70, %r66, 3;
@@ -2464,16 +2463,16 @@ $L__BB0_58:
 	mov.u64 	%rd95, c_ntf_a;
 	add.s64 	%rd96, %rd95, %rd94;
 	add.s64 	%rd97, %rd6, %rd94;
-	ld.local.v2.f64 	{%fd80, %fd81}, [%rd97];
-	ld.const.f64 	%fd84, [%rd96];
-	fma.rn.f64 	%fd85, %fd84, %fd80, %fd233;
-	ld.const.f64 	%fd86, [%rd96+8];
-	fma.rn.f64 	%fd87, %fd86, %fd81, %fd85;
-	ld.local.v2.f64 	{%fd88, %fd89}, [%rd97+16];
-	ld.const.f64 	%fd92, [%rd96+16];
-	fma.rn.f64 	%fd93, %fd92, %fd88, %fd87;
-	ld.const.f64 	%fd94, [%rd96+24];
-	fma.rn.f64 	%fd233, %fd94, %fd89, %fd93;
+	ld.local.v2.f64 	{%fd79, %fd80}, [%rd97];
+	ld.const.f64 	%fd83, [%rd96];
+	fma.rn.f64 	%fd84, %fd83, %fd79, %fd232;
+	ld.const.f64 	%fd85, [%rd96+8];
+	fma.rn.f64 	%fd86, %fd85, %fd80, %fd84;
+	ld.local.v2.f64 	{%fd87, %fd88}, [%rd97+16];
+	ld.const.f64 	%fd91, [%rd96+16];
+	fma.rn.f64 	%fd92, %fd91, %fd87, %fd86;
+	ld.const.f64 	%fd93, [%rd96+24];
+	fma.rn.f64 	%fd232, %fd93, %fd88, %fd92;
 	add.s32 	%r1436, %r1436, 4;
 	add.s32 	%r1435, %r1435, -4;
 	setp.ne.s32 	%p71, %r1435, 0;
@@ -2488,25 +2487,25 @@ $L__BB0_59:
 	mov.u64 	%rd99, c_ntf_a;
 	add.s64 	%rd18, %rd99, %rd98;
 	add.s64 	%rd19, %rd6, %rd98;
-	ld.local.f64 	%fd95, [%rd19];
-	ld.const.f64 	%fd96, [%rd18];
-	fma.rn.f64 	%fd233, %fd96, %fd95, %fd233;
+	ld.local.f64 	%fd94, [%rd19];
+	ld.const.f64 	%fd95, [%rd18];
+	fma.rn.f64 	%fd232, %fd95, %fd94, %fd232;
 	@%p73 bra 	$L__BB0_63;
 
 	setp.eq.s32 	%p74, %r82, 2;
-	ld.local.f64 	%fd97, [%rd19+8];
-	ld.const.f64 	%fd98, [%rd18+8];
-	fma.rn.f64 	%fd233, %fd98, %fd97, %fd233;
+	ld.local.f64 	%fd96, [%rd19+8];
+	ld.const.f64 	%fd97, [%rd18+8];
+	fma.rn.f64 	%fd232, %fd97, %fd96, %fd232;
 	@%p74 bra 	$L__BB0_63;
 
-	ld.local.f64 	%fd99, [%rd19+16];
-	ld.const.f64 	%fd100, [%rd18+16];
-	fma.rn.f64 	%fd233, %fd100, %fd99, %fd233;
+	ld.local.f64 	%fd98, [%rd19+16];
+	ld.const.f64 	%fd99, [%rd18+16];
+	fma.rn.f64 	%fd232, %fd99, %fd98, %fd232;
 
 $L__BB0_63:
-	ld.local.f64 	%fd101, [%rd6];
-	add.f64 	%fd102, %fd3, %fd101;
-	st.local.f64 	[%rd6], %fd102;
+	ld.local.f64 	%fd100, [%rd6];
+	add.f64 	%fd101, %fd2, %fd100;
+	st.local.f64 	[%rd6], %fd101;
 	@%p75 bra 	$L__BB0_98;
 
 	setp.lt.u32 	%p76, %r66, 3;
@@ -2661,17 +2660,17 @@ $L__BB0_98:
 $L__BB0_101:
 	mul.wide.s32 	%rd101, %r1442, 8;
 	add.s64 	%rd102, %rd6, %rd101;
-	ld.local.v2.f64 	{%fd103, %fd104}, [%rd102];
+	ld.local.v2.f64 	{%fd102, %fd103}, [%rd102];
 	shl.b32 	%r519, %r9, 6;
 	mov.u32 	%r520, _ZZ25trellis_parallel_segmentsE7c_state;
 	add.s32 	%r521, %r520, %r519;
 	shl.b32 	%r522, %r1442, 3;
 	add.s32 	%r523, %r521, %r522;
-	st.shared.f64 	[%r523], %fd103;
-	st.shared.f64 	[%r523+8], %fd104;
-	ld.local.v2.f64 	{%fd107, %fd108}, [%rd102+16];
-	st.shared.f64 	[%r523+16], %fd107;
-	st.shared.f64 	[%r523+24], %fd108;
+	st.shared.f64 	[%r523], %fd102;
+	st.shared.f64 	[%r523+8], %fd103;
+	ld.local.v2.f64 	{%fd106, %fd107}, [%rd102+16];
+	st.shared.f64 	[%r523+16], %fd106;
+	st.shared.f64 	[%r523+24], %fd107;
 	add.s32 	%r1442, %r1442, 4;
 	add.s32 	%r1441, %r1441, -4;
 	setp.ne.s32 	%p97, %r1441, 0;
@@ -2684,29 +2683,29 @@ $L__BB0_102:
 	setp.eq.s32 	%p99, %r82, 1;
 	mul.wide.s32 	%rd103, %r1442, 8;
 	add.s64 	%rd23, %rd6, %rd103;
-	ld.local.f64 	%fd111, [%rd23];
+	ld.local.f64 	%fd110, [%rd23];
 	shl.b32 	%r524, %r9, 6;
 	mov.u32 	%r525, _ZZ25trellis_parallel_segmentsE7c_state;
 	add.s32 	%r526, %r525, %r524;
 	shl.b32 	%r527, %r1442, 3;
 	add.s32 	%r111, %r526, %r527;
-	st.shared.f64 	[%r111], %fd111;
+	st.shared.f64 	[%r111], %fd110;
 	@%p99 bra 	$L__BB0_106;
 
 	setp.eq.s32 	%p100, %r82, 2;
-	ld.local.f64 	%fd112, [%rd23+8];
-	st.shared.f64 	[%r111+8], %fd112;
+	ld.local.f64 	%fd111, [%rd23+8];
+	st.shared.f64 	[%r111+8], %fd111;
 	@%p100 bra 	$L__BB0_106;
 
-	ld.local.f64 	%fd113, [%rd23+16];
-	st.shared.f64 	[%r111+16], %fd113;
+	ld.local.f64 	%fd112, [%rd23+16];
+	st.shared.f64 	[%r111+16], %fd112;
 
 $L__BB0_106:
 	setp.lt.s32 	%p101, %r391, 1;
-	add.f64 	%fd114, %fd233, %fd5;
-	ld.shared.f64 	%fd115, [%r68];
-	fma.rn.f64 	%fd116, %fd114, %fd114, %fd115;
-	st.shared.f64 	[%r69], %fd116;
+	add.f64 	%fd113, %fd232, %fd5;
+	ld.shared.f64 	%fd114, [%r68];
+	fma.rn.f64 	%fd115, %fd113, %fd113, %fd114;
+	st.shared.f64 	[%r69], %fd115;
 	st.shared.u32 	[%r71], %r70;
 	ld.shared.u32 	%r528, [%r72];
 	shl.b32 	%r529, %r528, 1;
@@ -2824,18 +2823,18 @@ $L__BB0_322:
 
 $L__BB0_326:
 	shl.b32 	%r1223, %r1537, 3;
-	add.s32 	%r1225, %r472, %r1223;
-	ld.shared.f64 	%fd211, [%r1225];
+	add.s32 	%r1225, %r473, %r1223;
+	ld.shared.f64 	%fd210, [%r1225];
 	add.s32 	%r1226, %r1537, %r77;
 	mul.wide.s32 	%rd116, %r1226, 8;
 	add.s64 	%rd117, %rd1, %rd116;
-	st.global.f64 	[%rd117], %fd211;
-	ld.shared.f64 	%fd212, [%r1225+8];
-	st.global.f64 	[%rd117+8], %fd212;
-	ld.shared.f64 	%fd213, [%r1225+16];
-	st.global.f64 	[%rd117+16], %fd213;
-	ld.shared.f64 	%fd214, [%r1225+24];
-	st.global.f64 	[%rd117+24], %fd214;
+	st.global.f64 	[%rd117], %fd210;
+	ld.shared.f64 	%fd211, [%r1225+8];
+	st.global.f64 	[%rd117+8], %fd211;
+	ld.shared.f64 	%fd212, [%r1225+16];
+	st.global.f64 	[%rd117+16], %fd212;
+	ld.shared.f64 	%fd213, [%r1225+24];
+	st.global.f64 	[%rd117+24], %fd213;
 	add.s32 	%r1537, %r1537, 4;
 	add.s32 	%r1536, %r1536, -4;
 	setp.ne.s32 	%p310, %r1536, 0;
@@ -2847,29 +2846,29 @@ $L__BB0_327:
 
 	setp.eq.s32 	%p312, %r82, 1;
 	shl.b32 	%r1227, %r1537, 3;
-	add.s32 	%r359, %r472, %r1227;
-	ld.shared.f64 	%fd215, [%r359];
+	add.s32 	%r359, %r473, %r1227;
+	ld.shared.f64 	%fd214, [%r359];
 	add.s32 	%r1229, %r1537, %r77;
 	mul.wide.s32 	%rd118, %r1229, 8;
 	add.s64 	%rd24, %rd1, %rd118;
-	st.global.f64 	[%rd24], %fd215;
+	st.global.f64 	[%rd24], %fd214;
 	@%p312 bra 	$L__BB0_331;
 
 	setp.eq.s32 	%p313, %r82, 2;
-	ld.shared.f64 	%fd216, [%r359+8];
-	st.global.f64 	[%rd24+8], %fd216;
+	ld.shared.f64 	%fd215, [%r359+8];
+	st.global.f64 	[%rd24+8], %fd215;
 	@%p313 bra 	$L__BB0_331;
 
-	ld.shared.f64 	%fd217, [%r359+16];
-	st.global.f64 	[%rd24+16], %fd217;
+	ld.shared.f64 	%fd216, [%r359+16];
+	st.global.f64 	[%rd24+16], %fd216;
 
 $L__BB0_331:
 	ld.param.u64 	%rd143, [trellis_parallel_segments_param_20];
 	setp.eq.s64 	%p314, %rd143, 0;
 	@%p314 bra 	$L__BB0_333;
 
-	ld.shared.f64 	%fd218, [_ZZ25trellis_parallel_segmentsE6p_cost];
-	st.global.f64 	[%rd10], %fd218;
+	ld.shared.f64 	%fd217, [_ZZ25trellis_parallel_segmentsE6p_cost];
+	st.global.f64 	[%rd10], %fd217;
 
 $L__BB0_333:
 	add.s32 	%r1429, %r1429, 1;
@@ -2908,17 +2907,17 @@ $L__BB0_338:
 	add.s32 	%r1236, %r1235, %r1234;
 	shl.b32 	%r1237, %r1541, 3;
 	add.s32 	%r1238, %r1236, %r1237;
-	ld.shared.f64 	%fd219, [%r1238];
+	ld.shared.f64 	%fd218, [%r1238];
 	add.s32 	%r1239, %r1541, %r362;
 	mul.wide.s32 	%rd119, %r1239, 8;
 	add.s64 	%rd120, %rd2, %rd119;
-	st.global.f64 	[%rd120], %fd219;
-	ld.shared.f64 	%fd220, [%r1238+8];
-	st.global.f64 	[%rd120+8], %fd220;
-	ld.shared.f64 	%fd221, [%r1238+16];
-	st.global.f64 	[%rd120+16], %fd221;
-	ld.shared.f64 	%fd222, [%r1238+24];
-	st.global.f64 	[%rd120+24], %fd222;
+	st.global.f64 	[%rd120], %fd218;
+	ld.shared.f64 	%fd219, [%r1238+8];
+	st.global.f64 	[%rd120+8], %fd219;
+	ld.shared.f64 	%fd220, [%r1238+16];
+	st.global.f64 	[%rd120+16], %fd220;
+	ld.shared.f64 	%fd221, [%r1238+24];
+	st.global.f64 	[%rd120+24], %fd221;
 	add.s32 	%r1541, %r1541, 4;
 	add.s32 	%r1540, %r1540, -4;
 	setp.ne.s32 	%p323, %r1540, 0;
@@ -2939,8 +2938,8 @@ $L__BB0_339:
 
 $L__BB0_341:
 	.pragma "nounroll";
-	ld.shared.f64 	%fd223, [%r1542];
-	st.global.f64 	[%rd145], %fd223;
+	ld.shared.f64 	%fd222, [%r1542];
+	st.global.f64 	[%rd145], %fd222;
 	add.s64 	%rd145, %rd145, 8;
 	add.s32 	%r1542, %r1542, 8;
 	add.s32 	%r1543, %r1543, -1;
@@ -2954,11 +2953,11 @@ $L__BB0_342:
 	add.s32 	%r1287, %r1288, %r1289;
 	mov.u32 	%r1286, %ctaid.x;
 	mad.lo.s32 	%r1245, %r1286, %r390, %r9;
-	ld.shared.f64 	%fd224, [%r1287];
+	ld.shared.f64 	%fd223, [%r1287];
 	cvta.to.global.u64 	%rd122, %rd142;
 	mul.wide.s32 	%rd123, %r1245, 8;
 	add.s64 	%rd124, %rd122, %rd123;
-	st.global.f64 	[%rd124], %fd224;
+	st.global.f64 	[%rd124], %fd223;
 
 $L__BB0_343:
 	ld.param.u32 	%r1273, [trellis_parallel_segments_param_10];

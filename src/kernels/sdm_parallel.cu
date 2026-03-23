@@ -186,23 +186,14 @@ __global__ void trellis_parallel_segments(
         /* Phase 1: Parallel candidate expansion */
         if (tid < 2 * ac) {
             int pi = tid / 2;
-            /* Match CPU's sdm_filter_calc2 exactly:
-             * 1. Compute NTF with y=0 to get base d[] and v
-             * 2. Copy d[] for both children
-             * 3. Child 0 (bit=1, y=+1): d[0] -= 1, cost = (v + a[0])^2
-             * 4. Child 1 (bit=0, y=-1): d[0] += 1, cost = (v - a[0])^2
-             * This matches CPU's sqr(v + a[0]) / sqr(v - a[0]). */
+            /* y_b is the NEGATED quantizer output: y_b = -y.
+             * tid&1=0 → y_b=-1.0 (y=+1, bit=1), tid&1=1 → y_b=+1.0 (y=-1, bit=0)
+             * NTF: d[0] = base + y_b (base computed with y=0)
+             * Cost: (v + a[0]*y_b)^2 */
+            double y_b = (tid & 1) ? 1.0 : -1.0;
             double d[8];
             double v = ntf_calc_with_y(p_state[pi], d, order, x, 0.0);
-            /* Apply y adjustment to d[0]: child 0 gets +1 (y=+1→d[0]-=1→+1 state),
-             * child 1 gets -1 (y=-1→d[0]+=1→-1 state).
-             * CPU: dst[0].state[0] += 1.0 (y=-1 child), dst[1].state[0] -= 1.0 (y=+1 child)
-             * GPU tid&1=0 maps to CPU dst[0] (bit=1→y=+1): state += 1
-             * GPU tid&1=1 maps to CPU dst[1] (bit=0→y=-1): state -= 1 */
-            if (tid & 1)
-                d[0] -= 1.0;  /* y=-1 child: same as CPU dst[1].state[0] -= 1.0 */
-            else
-                d[0] += 1.0;  /* y=+1 child: same as CPU dst[0].state[0] += 1.0 */
+            d[0] += y_b;
             if (limit > 0.0) {
                 for (int k = 0; k < order; k++) {
                     if (d[k] > limit) d[k] = limit;
@@ -211,9 +202,7 @@ __global__ void trellis_parallel_segments(
             }
             for (int k = 0; k < order; k++)
                 c_state[tid][k] = d[k];
-            /* Cost: match CPU's sqr(v + a[0]) / sqr(v - a[0]) */
-            double vc = (tid & 1) ? (v - c_ntf_a[0]) : (v + c_ntf_a[0]);
-            c_cost[tid] = p_cost[pi] + vc * vc;
+            c_cost[tid] = p_cost[pi] + (v + c_ntf_a[0]*y_b)*(v + c_ntf_a[0]*y_b);
             /* Bit convention: 1 = y=+1.0, 0 = y=-1.0 (matches CPU).
              * tid&1=0 → y_b=-1.0 → CPU y=+1 → bit=1.
              * tid&1=1 → y_b=+1.0 → CPU y=-1 → bit=0. */
