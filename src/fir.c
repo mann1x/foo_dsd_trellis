@@ -465,62 +465,68 @@ int fir_lowpass_init(fir_lowpass_t *lp, uint32_t dsd_rate) {
     double fc = 50000.0 / ((double)dsd_rate / 2.0);  /* normalized cutoff */
     if (fc > 0.5) fc = 0.5;  /* can't exceed Nyquist/2 */
 
-    float taps[LP_NTAPS];
+    double taps_d[LP_NTAPS];
+    float taps_f[LP_NTAPS];
     int M = LP_NTAPS - 1;
     double I0_beta = bessel_I0(LP_KAISER_BETA);
 
     for (int n = 0; n <= M; n++) {
         double x = (double)n - (double)M / 2.0;
-        /* Sinc */
         double sinc = (fabs(x) < 1e-10) ? 2.0 * fc : sin(2.0 * M_PI * fc * x) / (M_PI * x);
-        /* Kaiser window */
         double arg = 1.0 - (2.0 * n / M - 1.0) * (2.0 * n / M - 1.0);
         double w = bessel_I0(LP_KAISER_BETA * sqrt(fabs(arg))) / I0_beta;
-        taps[n] = (float)(sinc * w);
+        taps_d[n] = sinc * w;
     }
 
-    /* Normalize to unity gain at DC */
-    float sum = 0.0f;
-    for (int n = 0; n < LP_NTAPS; n++) sum += taps[n];
-    if (sum > 0.0f)
-        for (int n = 0; n < LP_NTAPS; n++) taps[n] /= sum;
+    /* Normalize to unity gain at DC (fp64) */
+    double sum = 0.0;
+    for (int n = 0; n < LP_NTAPS; n++) sum += taps_d[n];
+    if (sum > 0.0)
+        for (int n = 0; n < LP_NTAPS; n++) taps_d[n] /= sum;
 
-    /* Create IPP FIRSR spec */
+    /* Keep fp32 copy for GPU upload */
+    for (int n = 0; n < LP_NTAPS; n++) taps_f[n] = (float)taps_d[n];
+
+    /* Create IPP FIRSR spec (fp64) */
     int specSize = 0, bufSize = 0;
-    if (ippsFIRSRGetSize(LP_NTAPS, ipp32f, &specSize, &bufSize) != ippStsNoErr)
+    if (ippsFIRSRGetSize(LP_NTAPS, ipp64f, &specSize, &bufSize) != ippStsNoErr)
         return -1;
 
     lp->spec = ippsMalloc_8u(specSize);
     lp->buf = ippsMalloc_8u(bufSize);
-    lp->dly = ippsMalloc_32f(LP_NTAPS - 1);
+    lp->dly = ippsMalloc_64f(LP_NTAPS - 1);
     if (!lp->spec || !lp->buf || !lp->dly) {
         fir_lowpass_free(lp);
         return -1;
     }
 
-    ippsZero_32f(lp->dly, LP_NTAPS - 1);
+    ippsZero_64f(lp->dly, LP_NTAPS - 1);
 
-    if (ippsFIRSRInit_32f(taps, LP_NTAPS, ippAlgAuto,
-                           (IppsFIRSpec_32f *)lp->spec) != ippStsNoErr) {
+    if (ippsFIRSRInit_64f(taps_d, LP_NTAPS, ippAlgAuto,
+                           (IppsFIRSpec_64f *)lp->spec) != ippStsNoErr) {
         fir_lowpass_free(lp);
         return -1;
     }
 
     lp->coeffs = (float *)malloc(LP_NTAPS * sizeof(float));
     if (lp->coeffs)
-        memcpy(lp->coeffs, taps, LP_NTAPS * sizeof(float));
+        memcpy(lp->coeffs, taps_f, LP_NTAPS * sizeof(float));
+
+    lp->coeffs_d = (double *)malloc(LP_NTAPS * sizeof(double));
+    if (lp->coeffs_d)
+        memcpy(lp->coeffs_d, taps_d, LP_NTAPS * sizeof(double));
 
     lp->taps = LP_NTAPS;
     lp->initialized = true;
     return 0;
 }
 
-size_t fir_lowpass_process(fir_lowpass_t *lp, const float *in, float *out, size_t count) {
+size_t fir_lowpass_process(fir_lowpass_t *lp, const double *in, double *out, size_t count) {
     if (!lp->initialized || count == 0)
         return 0;
 
-    ippsFIRSR_32f(in, out, (int)count,
-                   (IppsFIRSpec_32f *)lp->spec,
+    ippsFIRSR_64f(in, out, (int)count,
+                   (IppsFIRSpec_64f *)lp->spec,
                    lp->dly, lp->dly,
                    (Ipp8u *)lp->buf);
     return count;
@@ -528,7 +534,7 @@ size_t fir_lowpass_process(fir_lowpass_t *lp, const float *in, float *out, size_
 
 void fir_lowpass_reset(fir_lowpass_t *lp) {
     if (lp->initialized && lp->dly)
-        ippsZero_32f(lp->dly, lp->taps - 1);
+        ippsZero_64f(lp->dly, lp->taps - 1);
 }
 
 void fir_lowpass_free(fir_lowpass_t *lp) {
@@ -536,5 +542,6 @@ void fir_lowpass_free(fir_lowpass_t *lp) {
     if (lp->buf)  { ippsFree(lp->buf);  lp->buf = NULL; }
     if (lp->dly)  { ippsFree(lp->dly);  lp->dly = NULL; }
     if (lp->coeffs) { free(lp->coeffs); lp->coeffs = NULL; }
+    if (lp->coeffs_d) { free(lp->coeffs_d); lp->coeffs_d = NULL; }
     lp->initialized = false;
 }

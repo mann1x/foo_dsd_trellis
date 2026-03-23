@@ -61,18 +61,20 @@ void fir_chain_free(fir_chain_t *chain);
 
 /* Same-rate lowpass FIR for DSD-Wide re-encoding.
  * Replaces the boxcar with a proper IPP FIRSR lowpass.
- * Produces smooth multi-bit output for Trellis SDM. */
+ * Produces smooth multi-bit output for Trellis SDM.
+ * Uses fp64 throughout to match the SDM pipeline precision. */
 typedef struct {
-    void   *spec;       /* IppsFIRSpec_32f* */
+    void   *spec;       /* IppsFIRSpec_64f* */
     void   *buf;        /* Ipp8u* work buffer */
-    float  *dly;        /* Delay line */
-    float  *coeffs;     /* Tap coefficients (kept for GPU upload) */
+    double *dly;        /* Delay line (fp64) */
+    float  *coeffs;     /* Tap coefficients fp32 (kept for GPU upload) */
+    double *coeffs_d;   /* Tap coefficients fp64 */
     int     taps;       /* Filter length */
     bool    initialized;
 } fir_lowpass_t;
 
 int fir_lowpass_init(fir_lowpass_t *lp, uint32_t dsd_rate);
-size_t fir_lowpass_process(fir_lowpass_t *lp, const float *in, float *out, size_t count);
+size_t fir_lowpass_process(fir_lowpass_t *lp, const double *in, double *out, size_t count);
 void fir_lowpass_reset(fir_lowpass_t *lp);
 void fir_lowpass_free(fir_lowpass_t *lp);
 

@@ -750,11 +750,20 @@ void sinad_measure_dsd_to_dsd(uint32_t fs_in, uint32_t fs_out,
 
     size_t fir_count;
     if (fs_in == fs_out) {
-        /* Same-rate: FIR lowpass */
+        /* Same-rate: FIR lowpass (fp64) */
         fir_lowpass_t lp;
         memset(&lp, 0, sizeof(lp));
         if (fir_lowpass_init(&lp, fs_in) != 0) { free(dsd_in); free(fir_buf); return; }
-        fir_count = fir_lowpass_process(&lp, dsd_in, fir_buf, enc_n);
+        double *lp_in_d = (double *)malloc(enc_n * sizeof(double));
+        double *lp_out_d = (double *)malloc(enc_n * sizeof(double));
+        if (lp_in_d && lp_out_d) {
+            for (size_t i = 0; i < enc_n; i++)
+                lp_in_d[i] = (double)dsd_in[i];
+            fir_count = fir_lowpass_process(&lp, lp_in_d, lp_out_d, enc_n);
+            for (size_t i = 0; i < fir_count; i++)
+                fir_buf[i] = (float)lp_out_d[i];
+        }
+        free(lp_in_d); free(lp_out_d);
         fir_lowpass_free(&lp);
     } else {
         fir_chain_t fir;

@@ -883,9 +883,11 @@ int cpuset_select(const cpu_topology_t *topo,
 /* ─── Thread pinning ─── */
 
 int cpuset_pin_thread(HANDLE thread, const uint32_t *ids, int count) {
-    if (!pfn_SetThreadCpuSets || count <= 0)
+    if (!pfn_SetThreadCpuSets)
         return -1;
+    if (count < 0) count = 0;
 
+    /* count=0 with NULL ids clears the cpuset (unpins the thread) */
     ULONG *uids = (ULONG *)ids;
     if (pfn_SetThreadCpuSets(thread, uids, (ULONG)count))
         return 0;

@@ -294,23 +294,21 @@ size_t engine_process_block(engine_channel_t *eng,
                 return 0;
 
             if (eng->lowpass.initialized) {
-                /* FIR lowpass — CPU: IPP outputs float, widen to double */
-                static __declspec(thread) float *tls_lp_in = NULL;
-                static __declspec(thread) float *tls_lp_out = NULL;
+                /* FIR lowpass — fp64 throughout to match SDM pipeline */
+                static __declspec(thread) double *tls_lp_in = NULL;
                 static __declspec(thread) size_t tls_lp_sz = 0;
                 if (tls_lp_sz < count) {
-                    free(tls_lp_in); free(tls_lp_out);
-                    tls_lp_in = (float *)malloc(count * sizeof(float));
-                    tls_lp_out = (float *)malloc(count * sizeof(float));
-                    tls_lp_sz = (tls_lp_in && tls_lp_out) ? count : 0;
+                    free(tls_lp_in);
+                    tls_lp_in = (double *)malloc(count * sizeof(double));
+                    tls_lp_sz = tls_lp_in ? count : 0;
                 }
-                if (!tls_lp_in || !tls_lp_out) return 0;
+                if (!tls_lp_in) return 0;
                 for (size_t i = 0; i < count; i++)
-                    tls_lp_in[i] = in[i] >= 0.0f ? 1.0f : -1.0f;
-                fir_lowpass_process(&eng->lowpass, tls_lp_in, tls_lp_out, count);
+                    tls_lp_in[i] = in[i] >= 0.0f ? 1.0 : -1.0;
+                fir_lowpass_process(&eng->lowpass, tls_lp_in, eng->fir_buf, count);
                 double combined = (double)eng->fir_gain * (double)cfg->gain;
                 for (size_t i = 0; i < count; i++)
-                    eng->fir_buf[i] = (double)tls_lp_out[i] * combined;
+                    eng->fir_buf[i] *= combined;
             } else {
                 /* Boxcar: CPU fp64 */
                 boxcar_t *bc = &eng->boxcar;
@@ -472,23 +470,22 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
     uint32_t fs_out_actual = cfg->fs_out ? cfg->fs_out : cfg->fs_in;
     if (cfg->fs_in == fs_out_actual) {
         /* Same-rate: smooth ±1.0 → multi-bit (fp64 pipeline) */
+        double combined = (double)eng->fir_gain * (double)cfg->gain;
         if (eng->lowpass.initialized) {
-            /* FIR lowpass — IPP float, widen to double */
-            static __declspec(thread) float *tls_lp_in2 = NULL;
-            static __declspec(thread) float *tls_lp_out2 = NULL;
+            /* FIR lowpass fp64 */
+            static __declspec(thread) double *tls_lp_in2 = NULL;
             static __declspec(thread) size_t tls_lp_sz2 = 0;
             if (tls_lp_sz2 < count) {
-                free(tls_lp_in2); free(tls_lp_out2);
-                tls_lp_in2 = (float *)malloc(count * sizeof(float));
-                tls_lp_out2 = (float *)malloc(count * sizeof(float));
-                tls_lp_sz2 = (tls_lp_in2 && tls_lp_out2) ? count : 0;
+                free(tls_lp_in2);
+                tls_lp_in2 = (double *)malloc(count * sizeof(double));
+                tls_lp_sz2 = tls_lp_in2 ? count : 0;
             }
-            if (tls_lp_in2 && tls_lp_out2) {
+            if (tls_lp_in2) {
                 for (size_t i = 0; i < count; i++)
-                    tls_lp_in2[i] = in[i] >= 0.0f ? 1.0f : -1.0f;
-                fir_lowpass_process(&eng->lowpass, tls_lp_in2, tls_lp_out2, count);
+                    tls_lp_in2[i] = in[i] >= 0.0f ? 1.0 : -1.0;
+                fir_lowpass_process(&eng->lowpass, tls_lp_in2, eng->fir_buf, count);
                 for (size_t i = 0; i < count; i++)
-                    eng->fir_buf[i] = (double)tls_lp_out2[i];
+                    eng->fir_buf[i] *= combined;
             }
         } else {
             /* Boxcar fp64 */
@@ -500,7 +497,7 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
                 bc->ring[bc->pos] = s;
                 bc->sum += s;
                 bc->pos = (bc->pos + 1) % bc->taps;
-                eng->fir_buf[i] = bc->sum * inv_n;
+                eng->fir_buf[i] = bc->sum * inv_n * combined;
             }
         }
         fir_count = count;

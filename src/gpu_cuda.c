@@ -38,6 +38,7 @@ typedef void          *CUevent;
 
 #define CUDA_SUCCESS   0
 #define CU_CTX_SCHED_AUTO 0
+#define CU_CTX_SCHED_BLOCKING_SYNC 4
 
 /* ─── Delay-loaded function pointers ─── */
 
@@ -417,7 +418,7 @@ gpu_context_t *gpu_cuda_create(void) {
     /* CU_CTX_MAP_HOST enables mapped pinned memory (ReBAR/SAM compatible).
      * Allows cuMemAllocHost buffers to be directly accessible from GPU
      * without explicit HtoD copies on ReBAR-enabled systems. */
-    if (pfn_cuCtxCreate(&c->context, CU_CTX_SCHED_AUTO | 0x08 /* CU_CTX_MAP_HOST */,
+    if (pfn_cuCtxCreate(&c->context, CU_CTX_SCHED_BLOCKING_SYNC | 0x08 /* CU_CTX_MAP_HOST */,
                           dev) != CUDA_SUCCESS)
         goto fail;
 
@@ -883,12 +884,15 @@ int gpu_cuda_boxcar(cuda_context_t *c, const float *in, float *out,
 int gpu_cuda_fir_lowpass_setup(cuda_context_t *c, const float *taps, int ntaps) {
     if (!c || !taps || ntaps <= 0 || ntaps > 128) return -1;
 
-    /* Upload lowpass taps to c_lp_taps constant memory */
+    /* Upload lowpass taps to c_lp_taps_d constant memory (fp64) */
+    double taps_d[128];
+    for (int i = 0; i < ntaps; i++) taps_d[i] = (double)taps[i];
+
     CUdeviceptr d_lp_taps;
     size_t sz;
-    if (pfn_cuModuleGetGlobal(&d_lp_taps, &sz, c->module, "c_lp_taps") != CUDA_SUCCESS)
+    if (pfn_cuModuleGetGlobal(&d_lp_taps, &sz, c->module, "c_lp_taps_d") != CUDA_SUCCESS)
         return -1;
-    if (pfn_cuMemcpyHtoD(d_lp_taps, taps, ntaps * sizeof(float)) != CUDA_SUCCESS)
+    if (pfn_cuMemcpyHtoD(d_lp_taps, taps_d, ntaps * sizeof(double)) != CUDA_SUCCESS)
         return -1;
 
     CUdeviceptr d_lp_ntaps;
@@ -897,21 +901,21 @@ int gpu_cuda_fir_lowpass_setup(cuda_context_t *c, const float *taps, int ntaps) 
     if (pfn_cuMemcpyHtoD(d_lp_ntaps, &ntaps, sizeof(int)) != CUDA_SUCCESS)
         return -1;
 
-    /* Allocate per-channel history buffers (ntaps-1 samples) */
+    /* Allocate per-channel history buffers (ntaps-1 samples, fp64) */
     int hist_len = ntaps - 1;
     if (c->lp_hist_len < hist_len) {
         if (c->d_lp_hist) pfn_cuMemFree(c->d_lp_hist);
         for (int i = 0; i < BOXCAR_MAX_CH; i++) {
             free(c->h_lp_hist[i]);
-            c->h_lp_hist[i] = (float *)malloc((size_t)hist_len * sizeof(float));
+            c->h_lp_hist[i] = (float *)malloc((size_t)hist_len * sizeof(double));
             if (c->h_lp_hist[i]) {
-                /* Pre-fill with DSD silence (alternating ±1.0) */
+                double *hist_d = (double *)c->h_lp_hist[i];
                 for (int j = 0; j < hist_len; j++)
-                    c->h_lp_hist[i][j] = (j & 1) ? -1.0f : 1.0f;
+                    hist_d[j] = (j & 1) ? -1.0 : 1.0;
                 c->lp_hist_valid[i] = true;
             }
         }
-        pfn_cuMemAlloc(&c->d_lp_hist, (size_t)hist_len * sizeof(float));
+        pfn_cuMemAlloc(&c->d_lp_hist, (size_t)hist_len * sizeof(double));
         c->lp_hist_len = hist_len;
     }
     return 0;
@@ -921,48 +925,69 @@ int gpu_cuda_fir_lowpass(cuda_context_t *c, const float *in, float *out,
                           size_t count, float gain) {
     if (!c || count < GPU_MIN_SAMPLES) return -1;
 
-    int s_idx = c->active;
-    CUstream stream = c->streams[s_idx];
+    pfn_cuCtxSetCurrent(c->context);
+    CUstream stream = c->sdm_stream ? c->sdm_stream : c->streams[0];
 
-    if (ensure_d_in(c, count) != 0 || ensure_d_out(c, count) != 0)
-        return -1;
-    if (ensure_h_in(c, count) != 0 || ensure_h_out(c, count) != 0)
-        return -1;
+    /* fp64 device buffers for lowpass */
+    size_t bytes_d = count * sizeof(double);
+    static CUdeviceptr s_d_lp_in = 0, s_d_lp_out = 0;
+    static size_t s_lp_cap = 0;
+    if (s_lp_cap < count) {
+        if (s_d_lp_in)  pfn_cuMemFree(s_d_lp_in);
+        if (s_d_lp_out) pfn_cuMemFree(s_d_lp_out);
+        pfn_cuMemAlloc(&s_d_lp_in, bytes_d);
+        pfn_cuMemAlloc(&s_d_lp_out, bytes_d);
+        s_lp_cap = (s_d_lp_in && s_d_lp_out) ? count : 0;
+    }
+    if (!s_lp_cap) return -1;
 
-    /* Per-channel history (same pattern as boxcar) */
+    /* Host fp64 buffers */
+    static double *s_h_lp_in = NULL, *s_h_lp_out = NULL;
+    static size_t s_h_lp_cap = 0;
+    if (s_h_lp_cap < count) {
+        free(s_h_lp_in); free(s_h_lp_out);
+        s_h_lp_in = (double *)malloc(bytes_d);
+        s_h_lp_out = (double *)malloc(bytes_d);
+        s_h_lp_cap = (s_h_lp_in && s_h_lp_out) ? count : 0;
+    }
+    if (!s_h_lp_cap) return -1;
+
+    /* Widen float input to fp64 */
+    for (size_t i = 0; i < count; i++)
+        s_h_lp_in[i] = (double)in[i];
+    pfn_cuMemcpyHtoDAsync(s_d_lp_in, s_h_lp_in, bytes_d, stream);
+
+    /* Per-channel history (fp64) */
     int ch = c->lp_ch % BOXCAR_MAX_CH;
     c->lp_ch++;
 
-    /* Upload input */
-    memcpy(c->h_in[s_idx], in, count * sizeof(float));
-    pfn_cuMemcpyHtoDAsync(c->d_in[s_idx], c->h_in[s_idx],
-                           count * sizeof(float), stream);
-
-    /* Upload history for this channel */
     CUdeviceptr hist_ptr = (CUdeviceptr)0;
     if (c->lp_hist_valid[ch] && c->h_lp_hist[ch] && c->lp_hist_len > 0) {
         pfn_cuMemcpyHtoDAsync(c->d_lp_hist, c->h_lp_hist[ch],
-                               (size_t)c->lp_hist_len * sizeof(float), stream);
+                               (size_t)c->lp_hist_len * sizeof(double), stream);
         hist_ptr = c->d_lp_hist;
     }
 
     int cnt = (int)count;
-    void *args[] = { &c->d_in[s_idx], &c->d_out[s_idx], &cnt, &gain, &hist_ptr };
+    double gain_d = (double)gain;
+    void *args[] = { &s_d_lp_in, &s_d_lp_out, &cnt, &gain_d, &hist_ptr };
     launch_kernel(c, c->fn_fir_lowpass, args, (int)count);
 
-    pfn_cuMemcpyDtoHAsync(c->h_out[s_idx], c->d_out[s_idx],
-                           count * sizeof(float), stream);
+    pfn_cuMemcpyDtoHAsync(s_h_lp_out, s_d_lp_out, bytes_d, stream);
     pfn_cuStreamSynchronize(stream);
-    memcpy(out, c->h_out[s_idx], count * sizeof(float));
 
-    /* Save last hist_len samples as this channel's history */
+    /* Narrow to float for caller (dsp_plugin widens to double anyway) */
+    for (size_t i = 0; i < count; i++)
+        out[i] = (float)s_h_lp_out[i];
+
+    /* Save last hist_len INPUT samples as fp64 FIR delay line */
     if (count >= (size_t)c->lp_hist_len && c->h_lp_hist[ch]) {
-        memcpy(c->h_lp_hist[ch], in + count - (size_t)c->lp_hist_len,
-               (size_t)c->lp_hist_len * sizeof(float));
+        double *hist_d = (double *)c->h_lp_hist[ch];
+        for (size_t i = 0; i < (size_t)c->lp_hist_len; i++)
+            hist_d[i] = s_h_lp_in[count - (size_t)c->lp_hist_len + i];
         c->lp_hist_valid[ch] = true;
     }
 
-    c->active = (s_idx + 1) % NUM_STREAMS;
     return 0;
 }
 
