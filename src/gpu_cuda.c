@@ -207,8 +207,11 @@ typedef struct {
     bool           trellis_state_valid; /* false until first chunk or after reset */
     /* Persistent trellis seed (history/path/next for chunk continuity) */
     CUdeviceptr    d_persistent_seed;  /* device buffer for final_seed output */
-    unsigned char  h_persistent_seed[1100]; /* host copy (EXT_SEED_SIZE) */
+    unsigned char  h_persistent_seed[1100 * 8]; /* host copy (EXT_SEED_SIZE × max_channels) */
     bool           persistent_seed_valid;
+    int            das_seed_nch;        /* num channels in h_persistent_seed */
+    CUdeviceptr    d_das_final_seed;    /* DAS path final_seed device buffer */
+    int            das_seed_alloc_nch;  /* allocated channels in d_das_final_seed */
     /* PreCorr persistent state on device */
     CUdeviceptr    d_precorr_init;   /* precorr_init_t on device */
     CUdeviceptr    d_precorr_pred;   /* prediction table [256][8] on device */
@@ -525,6 +528,8 @@ void gpu_cuda_destroy(void *ptr) {
     if (c->d_sdm_out) pfn_cuMemFree(c->d_sdm_out);
     if (c->d_trellis_states) pfn_cuMemFree(c->d_trellis_states);
     if (c->d_trellis_costs)  pfn_cuMemFree(c->d_trellis_costs);
+    if (c->d_persistent_seed) pfn_cuMemFree(c->d_persistent_seed);
+    if (c->d_das_final_seed)  pfn_cuMemFree(c->d_das_final_seed);
     if (c->d_precorr_init)   pfn_cuMemFree(c->d_precorr_init);
     if (c->d_precorr_pred)   pfn_cuMemFree(c->d_precorr_pred);
     if (c->d_all_final_states) pfn_cuMemFree(c->d_all_final_states);
@@ -1742,8 +1747,12 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
         int ch_stride_out = (int)total_seg_out;
 
         int D_nominal = D;
-        /* No ext_seed — all segments seed from NTF init_states + M warmup.
-         * Self-seeding via final_seed disabled (kernel fails with non-NULL). */
+
+        /* Self-seeding disabled: stale traceback history from previous chunk's
+         * signal biases NTF convergence during warmup, degrading quality by ~29% RMS.
+         * Zero history (neutral) produces better convergence than stale history.
+         * NTF state continuity is provided by init_states (sufficient for quality).
+         * Chunk boundary pop (~0.0015) from traceback latency gap is acceptable. */
         CUdeviceptr ext_seed_ptr = 0;
         CUdeviceptr null_final_seed = 0;
 
@@ -1761,7 +1770,7 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
             &null_final_seed  /* pass 1: don't save final seed */
         };
 
-        /* Pass 1: all segments from global seed */
+        /* Pass 1: all segments from global seed (seg0 gets ext_seed if valid) */
         pfn_cuLaunchKernel(c->fn_trellis_parallel,
                             (unsigned)num_segs, (unsigned)num_channels, 1,
                             (unsigned)block_size, 1, 1,
@@ -1782,7 +1791,7 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
                 cost_stride, stream);
         }
 
-        /* Pass 2: re-run with chained states, save final seed */
+        /* Pass 2: re-run with chained states, capture final_seed from last seg */
         void *args_p2[] = {
             &c->d_sdm_in, &c->d_das_seg_out,
             &c->d_das_seg_starts, &c->d_das_seg_out_starts,
@@ -1794,7 +1803,7 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
             &c->d_das_seg_counts,
             &D_nominal, &c->d_das_mid_states, &c->d_das_mid_costs,
             &ext_seed_ptr,
-            &null_final_seed  /* no final_seed write */
+            &null_final_seed  /* self-seeding disabled */
         };
 
         pfn_cuLaunchKernel(c->fn_trellis_parallel,

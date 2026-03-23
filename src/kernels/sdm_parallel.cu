@@ -140,13 +140,14 @@ __global__ void trellis_parallel_segments(
             p_cost[tid] = 0.0;
         }
         /* Extended seed: restore full history/path/traceback for seg0 only.
+         * Per-channel: ext_seed is an array [num_channels], indexed by ch.
          * Only seg0 needs chunk-to-chunk continuity. Other segments get
          * their state from 2-pass chaining (NTF states from init_states). */
-        if (ext_seed && seg == 0 && tid < ext_seed[0].num_cands) {
+        if (ext_seed && seg == 0 && tid < ext_seed[ch].num_cands) {
             for (int b = 0; b < hist_bytes; b++)
-                p_hist[tid][b] = ext_seed[0].hist[tid][b];
-            p_path[tid] = ext_seed[0].path[tid];
-            p_next_stored[tid] = ext_seed[0].next_stored[tid];
+                p_hist[tid][b] = ext_seed[ch].hist[tid][b];
+            p_path[tid] = ext_seed[ch].path[tid];
+            p_next_stored[tid] = ext_seed[ch].next_stored[tid];
         } else {
             for (int b = 0; b < hist_bytes; b++)
                 p_hist[tid][b] = 0;
@@ -155,10 +156,10 @@ __global__ void trellis_parallel_segments(
         }
     }
     if (tid == 0) {
-        s_active = (ext_seed && seg == 0) ? ext_seed[0].num_cands : nc;
+        s_active = (ext_seed && seg == 0) ? ext_seed[ch].num_cands : nc;
         if (ext_seed && seg == 0) {
-            s_hist_pos = ext_seed[0].hist_pos;
-            s_pending = ext_seed[0].pending;
+            s_hist_pos = ext_seed[ch].hist_pos;
+            s_pending = ext_seed[ch].pending;
         } else {
             s_hist_pos = 0;
             s_pending = (seg == 0 && all_init_states) ? lat : 0;
@@ -379,9 +380,10 @@ __global__ void trellis_parallel_segments(
     }
 
     /* Save last segment's full trellis state for chunk-to-chunk persistence.
+     * Per-channel: final_seed is an array [num_channels], indexed by ch.
      * Write as raw bytes to avoid struct alignment issues between host/device. */
-    if (ch == 0 && final_seed && seg == num_segs - 1 && tid < nc) {
-        unsigned char *raw = (unsigned char *)final_seed;
+    if (final_seed && seg == num_segs - 1 && tid < nc) {
+        unsigned char *raw = (unsigned char *)&final_seed[ch];
         /* hist[tid][0..hist_bytes-1] at offset tid*128 */
         for (int b = 0; b < hist_bytes; b++)
             raw[tid * 128 + b] = p_hist[tid][b];
