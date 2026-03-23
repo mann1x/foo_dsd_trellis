@@ -47,6 +47,7 @@ typedef struct {
 #define BLOCK_MODE_FIR     2   /* FIR + gain only (parallel path) */
 #define BLOCK_MODE_UNPACK  3   /* DoP unpack only (parallel unpack) */
 #define BLOCK_MODE_PACK    4   /* DoP pack only (parallel pack) */
+#define BLOCK_MODE_ESTIMATE 5  /* State estimation (nc=1 greedy pre-pass) */
 
 /* Work item dispatched to thread pool */
 typedef struct {
@@ -69,6 +70,13 @@ typedef struct {
     float              *pcm_temp;        /* [PACK] temp buffer for dop_pack */
     size_t              pcm_frames;      /* [UNPACK/PACK] PCM frame count */
     int                 num_channels;    /* [UNPACK/PACK] total channel count */
+    /* State estimation mode fields */
+    const ntf_filter_t *est_filter;    /* [ESTIMATE] NTF filter */
+    double              est_init[MAX_NTF_ORDER]; /* [ESTIMATE] initial state */
+    double              est_result[8][MAX_NTF_ORDER]; /* [ESTIMATE] output per boundary */
+    size_t              est_boundaries[8]; /* [ESTIMATE] boundary positions */
+    double              est_state_limit;   /* [ESTIMATE] state limiter */
+    int                 est_num_segs;      /* [ESTIMATE] segments_per_ch */
     /* RT headroom monitoring (set by worker, read by engine) */
     double              rt_ratio;    /* processing_time / audio_duration (0=instant, 1=realtime limit) */
     bool                stressed;    /* true if rt_ratio > threshold */

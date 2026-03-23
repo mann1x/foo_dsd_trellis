@@ -826,6 +826,57 @@ double sdm_state_distance(const sdm_context_t *a, const sdm_context_t *b) {
     return dist;
 }
 
+/* Lightweight nc=1 greedy SDM estimator.
+ * Runs the NTF filter forward from init_state, making greedy ±1.0 decisions.
+ * ~16 flops/sample for order 8 — ~10ms for 1.4M DSD128 samples.
+ * Used to estimate integrator state at segment boundaries for parallel seeding. */
+void sdm_estimate_state(const ntf_filter_t *filter, const double *init_state,
+                        const double *in, size_t count, double state_limit,
+                        double *out_state) {
+    const int order = filter->order;
+    const double *a = filter->a;
+    const double *g = filter->g;
+    double state[MAX_NTF_ORDER];
+    double new_state[MAX_NTF_ORDER];
+
+    for (int i = 0; i < order; i++)
+        state[i] = init_state[i];
+
+    for (size_t n = 0; n < count; n++) {
+        double x = in[n] * 0.5;  /* same scale as sdm_process_block */
+
+        /* NTF filter calc with y=0 (generic order) */
+        new_state[0] = state[0] - g[0] * state[1] + x;
+        double v = x + a[0] * new_state[0];
+
+        for (int i = 1; i < order - 1; i++) {
+            new_state[i] = state[i] + state[i - 1] - g[i] * state[i + 1];
+            v += a[i] * new_state[i];
+        }
+        new_state[order - 1] = state[order - 1] + state[order - 2];
+        v += a[order - 1] * new_state[order - 1];
+
+        /* Greedy quantizer: pick y that minimizes (v + y*a[0])²
+         * y=+1 when v*a[0] < 0, y=-1 otherwise */
+        double y = (v * a[0] < 0.0) ? 1.0 : -1.0;
+        new_state[0] += y;
+
+        /* State limit clamping */
+        if (state_limit > 0.0) {
+            for (int i = 0; i < order; i++) {
+                if (new_state[i] > state_limit) new_state[i] = state_limit;
+                else if (new_state[i] < -state_limit) new_state[i] = -state_limit;
+            }
+        }
+
+        for (int i = 0; i < order; i++)
+            state[i] = new_state[i];
+    }
+
+    for (int i = 0; i < order; i++)
+        out_state[i] = state[i];
+}
+
 void sdm_context_reset(sdm_context_t *ctx) {
     if (!ctx->filter)
         return;

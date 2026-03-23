@@ -342,6 +342,16 @@ static int launch_kernel(cuda_context_t *c, CUfunction fn,
            == CUDA_SUCCESS ? 0 : -1;
 }
 
+/* Launch kernel on a specific stream (for functions that use sdm_stream
+ * for transfers — must match stream to avoid reading uninitialized memory) */
+static int launch_kernel_on(cuda_context_t *c, CUfunction fn,
+                             void **args, int num_elements, CUstream stream) {
+    unsigned grid = (unsigned)((num_elements + 255) / 256);
+    return pfn_cuLaunchKernel(fn, grid, 1, 1, 256, 1, 1, 0,
+                               stream, args, NULL)
+           == CUDA_SUCCESS ? 0 : -1;
+}
+
 /* ─── Probe ─── */
 
 bool gpu_cuda_probe(void) {
@@ -947,71 +957,21 @@ int gpu_cuda_fir_lowpass_setup(cuda_context_t *c, const float *taps, int ntaps) 
 
 int gpu_cuda_fir_lowpass(cuda_context_t *c, const float *in, float *out,
                           size_t count, float gain) {
-    if (!c || count < GPU_MIN_SAMPLES) return -1;
-
-    pfn_cuCtxSetCurrent(c->context);
-    CUstream stream = c->sdm_stream ? c->sdm_stream : c->streams[0];
-
-    /* fp64 device buffers for lowpass */
-    size_t bytes_d = count * sizeof(double);
-    static CUdeviceptr s_d_lp_in = 0, s_d_lp_out = 0;
-    static size_t s_lp_cap = 0;
-    if (s_lp_cap < count) {
-        if (s_d_lp_in)  pfn_cuMemFree(s_d_lp_in);
-        if (s_d_lp_out) pfn_cuMemFree(s_d_lp_out);
-        pfn_cuMemAlloc(&s_d_lp_in, bytes_d);
-        pfn_cuMemAlloc(&s_d_lp_out, bytes_d);
-        s_lp_cap = (s_d_lp_in && s_d_lp_out) ? count : 0;
+    /* Delegate to fp64 variant with TLS narrowing buffer */
+    static __declspec(thread) double *tls_f64 = NULL;
+    static __declspec(thread) size_t tls_cap = 0;
+    if (tls_cap < count) {
+        free(tls_f64);
+        tls_f64 = (double *)malloc(count * sizeof(double));
+        tls_cap = tls_f64 ? count : 0;
     }
-    if (!s_lp_cap) return -1;
+    if (!tls_f64) return -1;
 
-    /* Host fp64 buffers */
-    static double *s_h_lp_in = NULL, *s_h_lp_out = NULL;
-    static size_t s_h_lp_cap = 0;
-    if (s_h_lp_cap < count) {
-        free(s_h_lp_in); free(s_h_lp_out);
-        s_h_lp_in = (double *)malloc(bytes_d);
-        s_h_lp_out = (double *)malloc(bytes_d);
-        s_h_lp_cap = (s_h_lp_in && s_h_lp_out) ? count : 0;
-    }
-    if (!s_h_lp_cap) return -1;
+    int r = gpu_cuda_fir_lowpass_f64(c, in, tls_f64, count, (double)gain);
+    if (r != 0) return r;
 
-    /* Widen float input to fp64 */
     for (size_t i = 0; i < count; i++)
-        s_h_lp_in[i] = (double)in[i];
-    pfn_cuMemcpyHtoDAsync(s_d_lp_in, s_h_lp_in, bytes_d, stream);
-
-    /* Per-channel history (fp64) */
-    int ch = c->lp_ch % BOXCAR_MAX_CH;
-    c->lp_ch++;
-
-    CUdeviceptr hist_ptr = (CUdeviceptr)0;
-    if (c->lp_hist_valid[ch] && c->h_lp_hist[ch] && c->lp_hist_len > 0) {
-        pfn_cuMemcpyHtoDAsync(c->d_lp_hist, c->h_lp_hist[ch],
-                               (size_t)c->lp_hist_len * sizeof(double), stream);
-        hist_ptr = c->d_lp_hist;
-    }
-
-    int cnt = (int)count;
-    double gain_d = (double)gain;
-    void *args[] = { &s_d_lp_in, &s_d_lp_out, &cnt, &gain_d, &hist_ptr };
-    launch_kernel(c, c->fn_fir_lowpass, args, (int)count);
-
-    pfn_cuMemcpyDtoHAsync(s_h_lp_out, s_d_lp_out, bytes_d, stream);
-    pfn_cuStreamSynchronize(stream);
-
-    /* Narrow to float for caller (dsp_plugin widens to double anyway) */
-    for (size_t i = 0; i < count; i++)
-        out[i] = (float)s_h_lp_out[i];
-
-    /* Save last hist_len INPUT samples as fp64 FIR delay line */
-    if (count >= (size_t)c->lp_hist_len && c->h_lp_hist[ch]) {
-        double *hist_d = (double *)c->h_lp_hist[ch];
-        for (size_t i = 0; i < (size_t)c->lp_hist_len; i++)
-            hist_d[i] = s_h_lp_in[count - (size_t)c->lp_hist_len + i];
-        c->lp_hist_valid[ch] = true;
-    }
-
+        out[i] = (float)tls_f64[i];
     return 0;
 }
 
@@ -1068,7 +1028,7 @@ int gpu_cuda_fir_lowpass_f64(cuda_context_t *c, const float *in, double *out,
 
     int cnt = (int)count;
     void *args[] = { &c->d_lp_f64_in, &c->d_lp_f64_out, &cnt, &gain, &hist_ptr };
-    launch_kernel(c, c->fn_fir_lowpass, args, (int)count);
+    launch_kernel_on(c, c->fn_fir_lowpass, args, (int)count, stream);
 
     /* Download fp64 output directly to caller's double buffer */
     rc = pfn_cuMemcpyDtoHAsync(out, c->d_lp_f64_out, bytes_d, stream);

@@ -593,7 +593,7 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                 gpu_info_t ginfo;
                 gpu_get_info(&ginfo);
                 const char *be_name =
-                    s->config.gpu_backend == 2 ? "CUDA" :
+                    ginfo.backend == GPU_BACKEND_CUDA ? "CUDA" :
                     gpu_dx12_probe() ? "DX12 Async Compute" : "DX11";
                 char gmsg[256];
                 sprintf_s(gmsg, sizeof(gmsg),
@@ -1127,10 +1127,6 @@ size_t plugin_process(plugin_state_t *s,
     if (segments_per_ch > 1) {
         /* === Parallel SDM path: FIR+gain, then state-seeded SDM === */
 
-        /* Reset GPU per-chunk state (channel counters for boxcar/lowpass history) */
-        if (s->gpu)
-            gpu_reset_chunk(s->gpu);
-
         /* Reset GPU per-chunk state BEFORE FIR phase — the lp_ch counter
          * is shared between FIR lowpass and boxcar/SDM. Without reset here,
          * chunk 2+ uses wrong history channel for FIR lowpass. */
@@ -1148,9 +1144,7 @@ size_t plugin_process(plugin_state_t *s,
          * Falls back to threadpool FIR on GPU failure or small buffers.
          * TEMP: force CPU FIR to isolate GPU SDM noise source. */
         bool gpu_fir_ok = false;
-        /* GPU FIR lowpass produces zeros/wrong values (CUDA kernel bug).
-         * Force CPU FIR until the kernel is fixed. */
-        bool force_cpu_fir = true;
+        bool force_cpu_fir = false;
 
         /* GPU FIR lowpass for same-rate path (no rate conversion stages).
          * Runs on main thread (GPU not thread-safe).
@@ -1757,6 +1751,43 @@ size_t plugin_process(plugin_state_t *s,
             }
         }
 
+        /* ── Phase 2a½: State-estimation pass ──
+         * Run nc=1 greedy SDM pre-pass to estimate integrator state at segment
+         * boundaries. Channels dispatched in parallel on threadpool. */
+        double est_states[32][MAX_NTF_ORDER];
+        memset(est_states, 0, sizeof(est_states));
+        if (segments_per_ch > 1) {
+            channel_block_t est_blocks[8];
+            memset(est_blocks, 0, sizeof(est_blocks));
+            for (int ch = 0; ch < num_channels; ch++) {
+                const sdm_context_t *sdm = &s->channels[ch].sdm;
+                est_blocks[ch].mode = BLOCK_MODE_ESTIMATE;
+                est_blocks[ch].in = fir_data[ch];
+                est_blocks[ch].count = fir_counts[ch];
+                est_blocks[ch].channel = ch;
+                est_blocks[ch].cfg = &s->config;
+                est_blocks[ch].est_filter = sdm->filter;
+                est_blocks[ch].est_state_limit = sdm->state_limit;
+                est_blocks[ch].est_num_segs = segments_per_ch;
+                if (sdm->filter) {
+                    int bank = sdm->idx & 1;
+                    for (int i = 0; i < sdm->filter->order; i++)
+                        est_blocks[ch].est_init[i] = sdm->trellis[bank].act[0]->state[i];
+                }
+                for (int seg = 1; seg < segments_per_ch; seg++)
+                    est_blocks[ch].est_boundaries[seg] = seg_nominal_start[ch][seg];
+                threadpool_submit(s->pool, &est_blocks[ch]);
+            }
+            threadpool_wait(s->pool);
+
+            /* Copy results to est_states */
+            for (int ch = 0; ch < num_channels; ch++)
+                for (int seg = 1; seg < segments_per_ch; seg++)
+                    for (int i = 0; i < MAX_NTF_ORDER; i++)
+                        est_states[ch * segments_per_ch + seg][i] =
+                            est_blocks[ch].est_result[seg][i];
+        }
+
         /* ── Phase 2b: Configure CPU segment blocks ── */
         channel_block_t all_blocks[32];
         int all_block_count = 0;
@@ -1792,6 +1823,20 @@ size_t plugin_process(plugin_state_t *s,
                 } else {
                     int temp_idx = ch * temps_per_ch + (seg - 1);
                     sdm_context_copy_state(&temp_sdms[temp_idx], &s->channels[ch].sdm);
+                    /* Overlay estimated integrator state from the pre-pass.
+                     * All candidates get the estimated state; costs reset to 0.
+                     * The overlap warmup lets candidates re-diverge before output. */
+                    int est_idx = ch * segments_per_ch + seg;
+                    int bank = temp_sdms[temp_idx].idx & 1;
+                    int order = temp_sdms[temp_idx].filter->order;
+                    for (unsigned c = 0; c < temp_sdms[temp_idx].num_cands; c++) {
+                        sdm_state_t *st = temp_sdms[temp_idx].trellis[bank].act[c];
+                        if (st) {
+                            for (int k = 0; k < order; k++)
+                                st->state[k] = est_states[est_idx][k];
+                            st->cost = 0.0;
+                        }
+                    }
                     ctx = &temp_sdms[temp_idx];
                 }
 

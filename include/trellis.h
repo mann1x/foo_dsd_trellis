@@ -84,4 +84,13 @@ void sdm_context_reset(sdm_context_t *ctx);
 /* Free any internal allocations (context itself is caller-owned). */
 void sdm_context_free(sdm_context_t *ctx);
 
+/* Lightweight nc=1 greedy estimator: runs the NTF filter forward through
+ * `count` input samples starting from `init_state`, returns estimated
+ * integrator state at sample `count`.  Used for seeding parallel segments
+ * with better initial conditions than replicating persistent state.
+ * Input is pre-FIR (fp64, same scale as sdm_process_block input × 0.5). */
+void sdm_estimate_state(const ntf_filter_t *filter, const double *init_state,
+                        const double *in, size_t count, double state_limit,
+                        double *out_state);
+
 #endif /* TRELLIS_H */

@@ -143,16 +143,19 @@ static int grow_buf(dx12_t *c, ID3D12Resource **b, size_t *cap, size_t need,
 #define GR_RB(c,n)  grow_buf(c,&(c)->b_rb, &(c)->cap_rb, n, D3D12_HEAP_TYPE_READBACK, \
     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE)
 
-/* Upload host → upload heap → default heap buf */
+/* Upload host → upload heap → default heap buf.
+ * IMPORTANT: Only ONE upload() per begin_cmd/exec_cmd pair because
+ * b_up is shared — a second upload overwrites the first's staging data
+ * before the GPU copy executes. Callers must exec_cmd between uploads. */
 static void upload(dx12_t *c, ID3D12Resource *dst, const void *data, size_t bytes) {
     void *m = NULL;
     D3D12_RANGE r0 = {0,0};
     ID3D12Resource_Map(c->b_up, 0, &r0, &m);
+    if (!m) return;
     memcpy(m, data, bytes);
     D3D12_RANGE w = {0, bytes};
     ID3D12Resource_Unmap(c->b_up, 0, &w);
     ID3D12GraphicsCommandList_CopyBufferRegion(c->cmd, dst, 0, c->b_up, 0, bytes);
-    /* UAV barrier after copy */
     D3D12_RESOURCE_BARRIER bar = {0};
     bar.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     bar.UAV.pResource = dst;
@@ -529,12 +532,10 @@ int gpu_dx12_fir_chain(dx12_t *c, const float *in, float *out,
         GR_UP(c, max_sz > taps_sz ? max_sz : taps_sz) || GR_RB(c, max_sz))
         return -1;
 
-    /* Upload input data */
+    /* Upload input data and taps (one upload per cmd — b_up is shared) */
     begin_cmd(c);
     upload(c, c->b_in, in, in_count * sizeof(float));
     exec_cmd(c);
-
-    /* Upload taps separately (b_up is shared, can't do two uploads in one cmd) */
     begin_cmd(c);
     upload(c, c->b_aux, c->fir_taps, taps_sz);
     exec_cmd(c);
@@ -605,7 +606,6 @@ int gpu_dx12_gain(dx12_t *c, float *buf, size_t count, float gain) {
         struct { UINT cnt; float gv; UINT p0, p1; } p = {(UINT)count, gain, 0, 0};
         memcpy(c->cb_map, &p, sizeof(p));
     }
-    /* u0=buf (in-place via b_in) */
     dispatch(c, PSO_GAIN, (UINT)((count+255)/256), 1);
     exec_cmd(c);
 
@@ -720,22 +720,25 @@ int gpu_dx12_fir_lowpass(dx12_t *c, const float *in, float *out,
     params.hv = (c->lp_hist_valid[ch] && c->h_lp_hist[ch]) ? 1 : 0;
     memcpy(c->cb_map, &params, sizeof(params));
 
+    /* Upload input, history, and taps — one upload per cmd (b_up shared) */
     begin_cmd(c);
-
-    /* Upload input to b_in (u0) */
     upload(c, c->b_in, in, bytes);
+    exec_cmd(c);
 
-    /* Upload history to b_lp_hist */
-    if (params.hv && c->h_lp_hist[ch])
+    if (params.hv && c->h_lp_hist[ch]) {
+        begin_cmd(c);
         upload(c, c->b_lp_hist, c->h_lp_hist[ch],
                (size_t)c->lp_hist_len * sizeof(float));
+        exec_cmd(c);
+    }
 
-    /* Upload taps to b_aux (u3) */
     if (GR_AUX(c, (size_t)c->lp_ntaps * sizeof(float)) != 0) return -1;
+    begin_cmd(c);
     upload(c, c->b_aux, c->lp_taps_store, (size_t)c->lp_ntaps * sizeof(float));
+    exec_cmd(c);
 
-    /* Dispatch: u0=b_in, u1=b_out, u2=b_lp_hist, u3=b_aux(taps)
-     * Root sig has 5 params: [0]=CBV, [1-4]=UAV u0-u3 */
+    /* Dispatch: u0=b_in, u1=b_out, u2=b_lp_hist, u3=b_aux(taps) */
+    begin_cmd(c);
     ID3D12GraphicsCommandList_SetComputeRootSignature(c->cmd, c->rs);
     ID3D12GraphicsCommandList_SetPipelineState(c->cmd, c->pso[PSO_FIR_LP]);
     ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(c->cmd, 0,
@@ -846,54 +849,28 @@ int gpu_dx12_trellis_full(dx12_t *c, const float *in, float *out,
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
 
+    /* Upload input and segment descriptors — one upload per cmd */
     begin_cmd(c);
     upload(c, c->b_in, in, in_bytes);
-    /* Upload both seg arrays to b_aux */
+    exec_cmd(c);
+    begin_cmd(c);
     upload(c, c->b_aux, segs, seg_bytes * 2);
+    exec_cmd(c);
+
+    /* Need separate UAV for u3 (seg_out_starts).
+     * Root UAVs don't support offsets — need a 4th buffer. */
+    ID3D12Resource *b_seg_out = mk_buf(c->dev, seg_bytes, D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    if (!b_seg_out) { free(segs); return -1; }
+
+    /* Upload seg_out_starts to separate buffer */
+    begin_cmd(c);
+    upload(c, b_seg_out, segs + num_segs, seg_bytes);
     exec_cmd(c);
     free(segs);
 
-    /* Need separate UAV for u3 (seg_out_starts).
-     * b_aux contains both packed. Create u2 at offset 0, u3 at offset seg_bytes.
-     * But root UAVs don't support offsets — need a separate buffer.
-     * Workaround: create a temporary buffer for seg_out_starts. */
-    /* Actually, we need to split b_aux or use a 4th buffer.
-     * For simplicity, create b_seg_out as a 4th default-heap buffer. */
-    ID3D12Resource *b_seg_out = mk_buf(c->dev, seg_bytes, D3D12_HEAP_TYPE_DEFAULT,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    if (!b_seg_out) return -1;
-
-    /* Upload seg_out_starts separately */
+    /* Dispatch trellis */
     begin_cmd(c);
-    {
-        void *m = NULL;
-        D3D12_RANGE r = {0,0};
-        ID3D12Resource_Map(c->b_up, 0, &r, &m);
-        memcpy(m, seg_out_starts, seg_bytes);
-        D3D12_RANGE w = {0, seg_bytes};
-        ID3D12Resource_Unmap(c->b_up, 0, &w);
-        /* Wait, seg_out_starts was freed with segs. Need to rebuild. */
-    }
-    /* Oops — segs was freed. Let me recalculate */
-    {
-        int *sout = (int*)malloc(seg_bytes);
-        for (int i = 0; i < num_segs; i++)
-            sout[i] = (int)((size_t)i * base_seg);
-        void *m = NULL;
-        D3D12_RANGE r = {0,0};
-        ID3D12Resource_Map(c->b_up, 0, &r, &m);
-        memcpy(m, sout, seg_bytes);
-        D3D12_RANGE w = {0, seg_bytes};
-        ID3D12Resource_Unmap(c->b_up, 0, &w);
-        free(sout);
-    }
-    ID3D12GraphicsCommandList_CopyBufferRegion(c->cmd, b_seg_out, 0, c->b_up, 0, seg_bytes);
-    D3D12_RESOURCE_BARRIER ubar = {0};
-    ubar.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    ubar.UAV.pResource = NULL;
-    ID3D12GraphicsCommandList_ResourceBarrier(c->cmd, 1, &ubar);
-
-    /* Dispatch trellis: u0=in, u1=out, u2=seg_starts(b_aux), u3=seg_out_starts(b_seg_out) */
     ID3D12GraphicsCommandList_SetComputeRootSignature(c->cmd, c->rs);
     ID3D12GraphicsCommandList_SetPipelineState(c->cmd, c->pso[PSO_TRELLIS]);
     ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(c->cmd, 0,
@@ -907,7 +884,12 @@ int gpu_dx12_trellis_full(dx12_t *c, const float *in, float *out,
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(c->cmd, 4,
         ID3D12Resource_GetGPUVirtualAddress(b_seg_out));
     ID3D12GraphicsCommandList_Dispatch(c->cmd, (UINT)num_segs, 1, 1);
-    ID3D12GraphicsCommandList_ResourceBarrier(c->cmd, 1, &ubar);
+    {
+        D3D12_RESOURCE_BARRIER bar = {0};
+        bar.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        bar.UAV.pResource = NULL;
+        ID3D12GraphicsCommandList_ResourceBarrier(c->cmd, 1, &bar);
+    }
     exec_cmd(c);
 
     QueryPerformanceCounter(&t1);

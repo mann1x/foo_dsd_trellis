@@ -8,6 +8,7 @@
 
 #include "../include/gpu_compute.h"
 #include <string.h>
+#include <stdlib.h>
 
 /* ─── Probe cache ─── */
 
@@ -23,6 +24,13 @@ bool gpu_available(gpu_backend_t preferred) {
         g_dx12_available = gpu_dx12_probe();     /* prefer DX12 over DX11 */
         g_dx11_available = gpu_dx11_probe();
         g_probed = true;
+        {
+            extern void trellis_log_c(const char *);
+            char msg[128];
+            sprintf_s(msg, sizeof(msg), "GPU probe: cuda=%d dx12=%d dx11=%d",
+                      g_cuda_available, g_dx12_available, g_dx11_available);
+            trellis_log_c(msg);
+        }
     }
 
     switch (preferred) {
@@ -84,6 +92,13 @@ static gpu_backend_t resolve_backend(gpu_backend_t preferred) {
 
 gpu_context_t *gpu_create(gpu_backend_t backend) {
     gpu_backend_t resolved = resolve_backend(backend);
+    {
+        extern void trellis_log_c(const char *);
+        char msg[128];
+        sprintf_s(msg, sizeof(msg), "gpu_create: requested=%d resolved=%d cuda_avail=%d",
+                  backend, resolved, g_cuda_available);
+        trellis_log_c(msg);
+    }
 
     switch (resolved) {
     case GPU_BACKEND_CUDA:

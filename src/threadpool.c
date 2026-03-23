@@ -210,7 +210,8 @@ static DWORD WINAPI worker_func(LPVOID param) {
                 case BLOCK_MODE_FIR:    job = "FIR";     break;
                 case BLOCK_MODE_UNPACK: job = "Unpack";  break;
                 case BLOCK_MODE_PACK:   job = "Pack";    break;
-                case BLOCK_MODE_FULL:   job = "Full";    break;
+                case BLOCK_MODE_FULL:     job = "Full";     break;
+                case BLOCK_MODE_ESTIMATE: job = "Estimate"; break;
                 }
                 char msg[128];
                 sprintf_s(msg, sizeof(msg),
@@ -270,6 +271,28 @@ static DWORD WINAPI worker_func(LPVOID param) {
                 out_i24[dst + 2] = i24_temp[src + 2];
             }
             block->out_count = pcm_frames;
+        } else if (block->mode == BLOCK_MODE_ESTIMATE) {
+            /* State estimation: nc=1 greedy SDM pre-pass */
+            const ntf_filter_t *f = block->est_filter;
+            if (f) {
+                double state[MAX_NTF_ORDER];
+                for (int i = 0; i < f->order; i++)
+                    state[i] = block->est_init[i];
+                const double *data = block->in;
+                size_t pos = 0;
+                for (int seg = 1; seg < block->est_num_segs; seg++) {
+                    size_t boundary = block->est_boundaries[seg];
+                    if (boundary > pos && boundary <= block->count) {
+                        sdm_estimate_state(f, state, data + pos,
+                                           boundary - pos,
+                                           block->est_state_limit, state);
+                        pos = boundary;
+                    }
+                    for (int i = 0; i < f->order; i++)
+                        block->est_result[seg][i] = state[i];
+                }
+            }
+            block->out_count = 0;
         } else {
             block->out_count = engine_process_block(block->eng, block->in,
                                                      block->out, block->count,
