@@ -79,7 +79,8 @@ __global__ void trellis_parallel_segments(
     int D_nominal,                 /* snapshot trigger: save state at this output count */
     double *all_mid_states,        /* [num_segs * nc * 8] state at output[D] (NULL=skip) */
     double *all_mid_costs,         /* [num_segs * nc] cost at output[D] (NULL=skip) */
-    const struct sdm_ext_seed *ext_seed)  /* extended seed with history (NULL=zero-init) */
+    const struct sdm_ext_seed *ext_seed,  /* extended seed with history (NULL=zero-init) */
+    struct sdm_ext_seed *final_seed)      /* output: last segment's trellis state (NULL=skip) */
 {
     int seg = blockIdx.x;
     int ch  = blockIdx.y;
@@ -374,6 +375,21 @@ __global__ void trellis_parallel_segments(
         for (int k = 0; k < order; k++)
             all_final_states[seg * nc * 8 + tid * 8 + k] = p_state[tid][k];
         all_final_costs[seg * nc + tid] = p_cost[tid];
+    }
+
+    /* Save last segment's full trellis state for chunk-to-chunk persistence.
+     * This includes history, path, next_stored, hist_pos, pending —
+     * everything needed to continue the trellis seamlessly next chunk. */
+    if (ch == 0 && final_seed && seg == num_segs - 1 && tid < nc) {
+        for (int b = 0; b < hist_bytes; b++)
+            final_seed[0].hist[tid][b] = p_hist[tid][b];
+        final_seed[0].path[tid] = p_path[tid];
+        final_seed[0].next_stored[tid] = p_next_stored[tid];
+        if (tid == 0) {
+            final_seed[0].hist_pos = s_hist_pos;
+            final_seed[0].pending = s_pending;
+            final_seed[0].num_cands = s_active;
+        }
     }
 
     /* Report actual output count per segment per channel */

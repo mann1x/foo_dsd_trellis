@@ -1120,20 +1120,13 @@ size_t plugin_process(plugin_state_t *s,
         bool force_cpu_fir = false;
 
         /* GPU FIR lowpass for same-rate path (no rate conversion stages).
-         * Runs on main thread (GPU not thread-safe). */
+         * Runs on main thread (GPU not thread-safe).
+         * GPU kernel processes in fp64; output goes directly to fir_buf (double). */
         if (!force_cpu_fir && s->gpu && dsd_in_count >= GPU_MIN_SAMPLES &&
             s->channels[0].fir.num_stages == 0 &&
             s->channels[0].lowpass.initialized) {
             float combined = s->channels[0].fir_gain * s->config.gain;
-            /* GPU outputs float — use TLS buffer, widen to double fir_buf */
-            static float *s_gpu_lp_tmp = NULL;
-            static size_t s_gpu_lp_sz = 0;
-            if (s_gpu_lp_sz < dsd_in_count) {
-                free(s_gpu_lp_tmp);
-                s_gpu_lp_tmp = (float *)malloc(dsd_in_count * sizeof(float));
-                s_gpu_lp_sz = s_gpu_lp_tmp ? dsd_in_count : 0;
-            }
-            gpu_fir_ok = (s_gpu_lp_tmp != NULL);
+            gpu_fir_ok = true;
             for (int ch = 0; ch < num_channels && gpu_fir_ok; ch++) {
                 /* Ensure double fir_buf */
                 if (s->channels[ch].fir_buf_sz < dsd_in_count * sizeof(double)) {
@@ -1142,13 +1135,11 @@ size_t plugin_process(plugin_state_t *s,
                     s->channels[ch].fir_buf_sz = s->channels[ch].fir_buf ? dsd_in_count * sizeof(double) : 0;
                 }
                 if (!s->channels[ch].fir_buf) { gpu_fir_ok = false; break; }
-                if (gpu_fir_lowpass(s->gpu, s->ch_in[ch], s_gpu_lp_tmp,
-                                     dsd_in_count, combined) != 0) {
+                if (gpu_cuda_fir_lowpass_f64(s->gpu, s->ch_in[ch],
+                                              s->channels[ch].fir_buf,
+                                              dsd_in_count, (double)combined) != 0) {
                     gpu_fir_ok = false; break;
                 }
-                /* Widen float GPU output to double */
-                for (size_t i = 0; i < dsd_in_count; i++)
-                    s->channels[ch].fir_buf[i] = (double)s_gpu_lp_tmp[i];
                 fir_counts[ch] = dsd_in_count;
                 fir_data[ch] = s->channels[ch].fir_buf;
             }

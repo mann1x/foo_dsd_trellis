@@ -186,6 +186,8 @@ int gpu_dx11_boxcar(void *ctx, const float *in, float *out,
 int gpu_cuda_fir_lowpass_setup(void *ctx, const float *taps, int ntaps);
 int gpu_cuda_fir_lowpass(void *ctx, const float *in, float *out,
                           size_t count, float gain);
+int gpu_cuda_fir_lowpass_f64(void *ctx, const float *in, double *out,
+                               size_t count, double gain);
 
 int gpu_cuda_fir_setup(void *ctx, const float *taps, int ntaps,
                         int num_stages, bool upsample);
