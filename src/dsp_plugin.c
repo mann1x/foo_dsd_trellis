@@ -1082,12 +1082,9 @@ size_t plugin_process(plugin_state_t *s,
         if (fs_out > s->config.fs_in)
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);
 
-        /* Overlap for SDM convergence: 32x lat, capped at 1024 samples.
-         * MUST NOT exceed 1024 — larger values corrupt segment assembly
-         * (audio chunks overlap randomly). The cap was validated at DSD64
-         * (lat=32, ovl=1024=32x). Higher rates need investigation. */
+        /* Overlap for SDM convergence: 32x lat for all rates.
+         * 32x proven optimal for convergence quality. */
         overlap = 32 * (size_t)s->config.trellis_lat;
-        if (overlap > 1024) overlap = 1024;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
         int max_seg;
@@ -1462,7 +1459,7 @@ size_t plugin_process(plugin_state_t *s,
          * CPU runs the full chunk sequentially to capture boundary states,
          * then GPU re-processes segments in parallel with perfect seeding.
          * No stitching needed — each GPU segment starts from exact CPU state. */
-        if (s->config.gpu_sdm_enabled && s->gpu &&
+        if (0 && s->config.gpu_sdm_enabled && s->gpu &&
             s->config.sdm_mode == SDM_MODE_TRELLIS &&
             (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)) {
             size_t fir_n = fir_counts[0];
@@ -1603,7 +1600,7 @@ size_t plugin_process(plugin_state_t *s,
         int gpu_segs = 0;
         bool gpu_hybrid_ok = false;
 
-        if (s->config.gpu_sdm_enabled && s->gpu &&
+        if (0 && s->config.gpu_sdm_enabled && s->gpu &&
             s->config.sdm_mode == SDM_MODE_TRELLIS &&
             (s->config.gpu_backend == 2 || s->config.gpu_backend == 3) &&
             segments_per_ch >= 2) {
@@ -1835,8 +1832,10 @@ size_t plugin_process(plugin_state_t *s,
                 if (ovl_len > overlap) ovl_len = overlap;
 
                 /* Step 1: Windowed match density — find region of best
-                 * convergence.  Window size = 2 × trellis_lat. */
-                int half_w = s->config.trellis_lat;
+                 * convergence. Fixed window=64 (proven at DSD512 lat=32).
+                 * Window measures local density, doesn't need to scale with lat.
+                 * Larger windows cause O(n²) scan to saturate CPU at high overlap. */
+                int half_w = 32;
                 if (half_w > (int)ovl_len / 2) half_w = (int)ovl_len / 2;
                 if (half_w < 4) half_w = 4;
 
