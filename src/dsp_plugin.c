@@ -1859,20 +1859,39 @@ size_t plugin_process(plugin_state_t *s,
                 if (half_w > (int)ovl_len / 2) half_w = (int)ovl_len / 2;
                 if (half_w < 4) half_w = 4;
 
+                /* O(n) sliding window: initialize window [0, min(2*half_w, ovl_len)),
+                 * then slide right, adding one sample and removing one. */
                 int best_density = 0, best_density_pos = 0;
-                for (size_t p = 0; p < ovl_len; p++) {
-                    int start = (int)p - half_w;
-                    int end   = (int)p + half_w;
-                    if (start < 0) start = 0;
-                    if (end > (int)ovl_len) end = (int)ovl_len;
-                    int matches = 0;
-                    for (int w = start; w < end; w++) {
-                        if (prev_ovl[w] == this_ovl[w])
-                            matches++;
+                int win = half_w * 2;
+                if (win > (int)ovl_len) win = (int)ovl_len;
+                /* Seed: count matches in initial window [0, win) */
+                int cur_matches = 0;
+                for (int w = 0; w < win && w < (int)ovl_len; w++) {
+                    if (prev_ovl[w] == this_ovl[w])
+                        cur_matches++;
+                }
+                /* Position 0: window center at 0, covers [0, win) */
+                best_density = cur_matches;
+                best_density_pos = 0;
+                /* Slide window across all positions */
+                for (int p = 1; p < (int)ovl_len; p++) {
+                    /* Window for position p: [p - half_w, p + half_w)
+                     * clamped to [0, ovl_len). As p advances by 1:
+                     * - add sample at right edge (p + half_w - 1) if in range
+                     * - remove sample at left edge (p - half_w - 1) if was in range */
+                    int add_idx = p + half_w - 1;
+                    int rem_idx = p - half_w - 1;
+                    if (add_idx >= 0 && add_idx < (int)ovl_len) {
+                        if (prev_ovl[add_idx] == this_ovl[add_idx])
+                            cur_matches++;
                     }
-                    if (matches > best_density) {
-                        best_density = matches;
-                        best_density_pos = (int)p;
+                    if (rem_idx >= 0 && rem_idx < (int)ovl_len) {
+                        if (prev_ovl[rem_idx] == this_ovl[rem_idx])
+                            cur_matches--;
+                    }
+                    if (cur_matches > best_density) {
+                        best_density = cur_matches;
+                        best_density_pos = p;
                     }
                 }
 
@@ -1950,7 +1969,10 @@ size_t plugin_process(plugin_state_t *s,
             }
         }
 
-        /* Copy last segment's final state back into persistent SDM */
+        /* Copy last segment's final state back into persistent SDM.
+         * seg0 uses persistent directly, seg1+ use temps at index (seg-1).
+         * Last segment = segments_per_ch-1, its temp index = segments_per_ch-2.
+         * This is correct regardless of use_fir_tail (extra temps are unused). */
         if (segments_per_ch > 1) {
             for (int ch = 0; ch < num_channels; ch++) {
                 int last_temp = ch * temps_per_ch + (segments_per_ch - 2);
