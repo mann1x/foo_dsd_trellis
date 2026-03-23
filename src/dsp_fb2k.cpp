@@ -2194,31 +2194,31 @@ public:
             }
         }
 
-        /* ─── Anti-pop lead-in: rate-switch trick ───
-         * On first chunk after stop→play, insert DoP silence at an alternate
-         * rate then at the target rate. The rate change triggers the DAC's
-         * hardware mute circuit, so by the time real audio arrives the DAC
-         * is already in DSD mode at the correct rate with mute released.
-         * Uses proper 0x69 DSD silence with DoP markers throughout.
-         * Skip if trailing silence was just inserted (stop→play < few seconds)
-         * — the trail already muted the DAC, and rapid rate changes crash. */
-        if (m_config.antipop && m_antipop_pending && out_frames > 0
-            && is_dop && out_pcm_rate > 0) {
+        /* ─── DSD stream entry + anti-pop lead-in ───
+         * Always insert DSD priming silence on first chunk for clean XMOS
+         * marker detection (32 consecutive markers needed). Anti-pop adds
+         * the rate-switch trick to trigger DAC hardware mute for pop suppression. */
+        if (m_antipop_pending && out_frames > 0 && is_dop && out_pcm_rate > 0) {
             m_antipop_pending = false;
 
-            if (m_trail_inserted) {
-                int post_trail_ms = ANTIPOP_LEADIN_MS + 5;
-                trellis_log("anti-pop lead-in: %dms at %u Hz (trail active, skip rate switch)",
-                            post_trail_ms, out_pcm_rate);
-                insert_silence_chunk(channels, out_pcm_rate, true, post_trail_ms);
-            } else {
-                int half_ms = ANTIPOP_LEADIN_MS / 2;
-                uint32_t alt_rate = (out_pcm_rate == 176400) ? 352800 : 176400;
-                trellis_log("anti-pop lead-in: %dms at %u Hz + %dms at %u Hz",
-                            half_ms, alt_rate, half_ms, out_pcm_rate);
-                insert_silence_chunk(channels, alt_rate, true, half_ms);
-                insert_silence_chunk(channels, out_pcm_rate, true, half_ms);
+            if (m_config.antipop) {
+                /* Full anti-pop: rate-switch trick */
+                if (m_trail_inserted) {
+                    int post_trail_ms = ANTIPOP_LEADIN_MS + 5;
+                    trellis_log("anti-pop lead-in: %dms at %u Hz (trail active, skip rate switch)",
+                                post_trail_ms, out_pcm_rate);
+                    insert_silence_chunk(channels, out_pcm_rate, true, post_trail_ms);
+                } else {
+                    int half_ms = ANTIPOP_LEADIN_MS / 2;
+                    uint32_t alt_rate = (out_pcm_rate == 176400) ? 352800 : 176400;
+                    trellis_log("anti-pop lead-in: %dms at %u Hz + %dms at %u Hz",
+                                half_ms, alt_rate, half_ms, out_pcm_rate);
+                    insert_silence_chunk(channels, alt_rate, true, half_ms);
+                    insert_silence_chunk(channels, out_pcm_rate, true, half_ms);
+                }
             }
+            /* Without anti-pop: no lead-in. Pop at start is an ASIO+DSD
+             * output driver limitation (also affects foo_dsd_processor). */
             m_trail_inserted = false;
         }
 
@@ -2304,7 +2304,7 @@ public:
                 chunk->set_data(pcm_as.get_ptr(), out_frames, channels, out_pcm_rate);
             }
         } else {
-            /* DoP output: data is 24-bit signed LE, pass directly */
+            /* DoP output: 24-bit signed LE, pass directly to output */
             chunk->set_data_fixedpoint_ex(
                 out_buf.get_ptr(), total_out * 3,
                 out_pcm_rate, channels, 24,
@@ -2362,12 +2362,21 @@ public:
             }
         }
 
-        /* Anti-pop: insert DSD silence (0x69 idle pattern with DoP markers)
-         * to let the DAC's analog output settle to zero before the stream
-         * stops. Without this, the DAC reverts from DSD→PCM mode on stream
-         * stop and the mode switch produces an audible pop. */
-        if (m_config.antipop && m_last_is_dop_input) {
-            insert_antipop_trail();
+        /* DSD stream exit: always insert trailing DSD silence for clean
+         * XMOS/Thesycon USB driver transition out of DSD mode.
+         * Without this, the abrupt stream stop can leave the driver in a
+         * bad state where DSD128+ produces no audio on next play.
+         * Anti-pop adds the rate-switch trick on top for pop suppression. */
+        if (m_last_is_dop_input && m_last_out_pcm_rate > 0) {
+            if (m_config.antipop) {
+                insert_antipop_trail();
+            } else {
+                /* Minimal trail: DSD silence at current rate for clean exit */
+                trellis_log("DSD stream exit: %dms silence at %u Hz",
+                            DSD_STREAM_MS, m_last_out_pcm_rate);
+                insert_silence_chunk(m_last_channels, m_last_out_pcm_rate,
+                                      true, DSD_STREAM_MS);
+            }
             m_trail_inserted = true;
         }
     }
@@ -2375,8 +2384,6 @@ public:
     void on_endoftrack(abort_callback & /*abort*/) override {}
 
     void flush() override {
-        /* Cannot insert_chunk here — output pipeline may be torn down.
-         * The first-chunk mute (in plugin_process) handles the pop instead. */
         plugin_flush(m_state);
         m_logged_passthrough = false;
         m_logged_processing = false;
@@ -2475,6 +2482,7 @@ public:
 private:
     static const int ANTIPOP_MS = 150;       /* ms of DSD silence for trail */
     static const int ANTIPOP_LEADIN_MS = 70; /* ms of DSD silence for lead-in */
+    static const int DSD_STREAM_MS = 50;     /* ms of DSD silence for clean stream entry/exit */
 
     /* Insert a silence chunk directly (no engine needed).
      * For DoP: generates DSD idle pattern via dop_pack.

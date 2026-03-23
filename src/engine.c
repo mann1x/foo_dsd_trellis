@@ -516,11 +516,16 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
             eng->fir_buf[i] = (double)tls_fir_f2[i];
     }
 
-    /* Apply gain in double precision */
-    double combined_gain = (double)eng->fir_gain * (double)cfg->gain;
-    if (combined_gain != 1.0) {
-        for (size_t i = 0; i < fir_count; i++)
-            eng->fir_buf[i] *= combined_gain;
+    /* Apply gain in double precision — rate-conversion path only.
+     * Same-rate path already applied gain inside the lowpass/boxcar block.
+     * Previously applied twice for same-rate, but this overdrives the SDM.
+     * Sequential path (engine_process_block) applies gain once. */
+    if (cfg->fs_in != fs_out_actual) {
+        double combined_gain = (double)eng->fir_gain * (double)cfg->gain;
+        if (combined_gain != 1.0) {
+            for (size_t i = 0; i < fir_count; i++)
+                eng->fir_buf[i] *= combined_gain;
+        }
     }
 
     *fir_out_ptr = eng->fir_buf;

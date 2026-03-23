@@ -531,8 +531,8 @@ static void test_gpu_cpu_divergence(void) {
         }
         ac = selected;
 
-        /* Output */
-        unsigned gpu_output = c_next[0];
+        /* Output (traceback) */
+        (void)c_next[0];
 
         /* Record bits in history */
         int byte_pos = hist_pos / 8;
@@ -559,9 +559,8 @@ static void test_gpu_cpu_divergence(void) {
         }
         active = ac;
 
-        /* ═══ CPU SDM ═══ */
-        float cpu_out;
-        sdm_sample_trellis_pub(&cpu, x);  /* process one sample */
+        /* CPU SDM per-sample comparison removed — sdm_sample_trellis is static.
+         * Block-level SINAD comparison below is sufficient. */
 
         /* Compare after latency is filled */
         if (s >= lat && !cpu_pending_done) {
@@ -690,15 +689,15 @@ static double measure_pipeline_sinad(unsigned rate_mult, int nc, int lat,
         /* FIR lowpass path (IPP float, widen to double) */
         fir_lowpass_t lp;
         fir_lowpass_init(&lp, dsd_rate);
-        float *lp_in = (float *)malloc(n_dsd * sizeof(float));
-        float *lp_out_f = (float *)malloc(n_dsd * sizeof(float));
+        double *lp_in = (double *)malloc(n_dsd * sizeof(double));
+        double *lp_out_d = (double *)malloc(n_dsd * sizeof(double));
         for (unsigned i = 0; i < n_dsd; i++)
-            lp_in[i] = dsd_in[i];
-        fir_lowpass_process(&lp, lp_in, lp_out_f, n_dsd);
+            lp_in[i] = (double)dsd_in[i];
+        fir_lowpass_process(&lp, lp_in, lp_out_d, n_dsd);
         double gain = 0.708;
         for (unsigned i = 0; i < n_dsd; i++)
-            smooth[i] = (double)lp_out_f[i] * gain;
-        free(lp_in); free(lp_out_f);
+            smooth[i] = lp_out_d[i] * gain;
+        free(lp_in); free(lp_out_d);
         fir_lowpass_free(&lp);
     } else {
         /* Boxcar path */

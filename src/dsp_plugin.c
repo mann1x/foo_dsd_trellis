@@ -472,18 +472,33 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     /* No silence warmup — real audio warmup happens on first chunk
      * via engine_channel_warmup() (needs_warmup flag). */
 
-    /* Detect CPU topology if not already done */
-    if (!s->topology_detected) {
-        cpuset_detect(&s->topology);
-        cpuset_benchmark(&s->topology);
-        /* Seed per-core load data during first-time topology detection.
-         * 5 reads at 100ms intervals — happens once per plugin lifetime,
-         * NOT on every track/rate change. */
-        for (int i = 0; i < 5; i++) {
-            cpuset_update_load(&s->topology);
-            Sleep(100);
+    /* Detect CPU topology if not already done.
+     * Use static cache so topology survives DSP instance destroy/recreate
+     * (fb2k destroys DSP on stop, recreates on play). Without caching,
+     * the 500ms load seeding blocks the audio thread on every play → pop. */
+    {
+        static cpu_topology_t s_cached_topology = {0};
+        static bool s_topology_cached = false;
+
+        if (!s->topology_detected) {
+            if (s_topology_cached) {
+                /* Reuse cached topology — no blocking */
+                memcpy(&s->topology, &s_cached_topology, sizeof(cpu_topology_t));
+                /* Re-seed monitor pointer (not transferable) */
+                s->topology.initialized = s_cached_topology.initialized;
+            } else {
+                /* First-ever detection: full init + load seeding */
+                cpuset_detect(&s->topology);
+                cpuset_benchmark(&s->topology);
+                for (int i = 0; i < 5; i++) {
+                    cpuset_update_load(&s->topology);
+                    Sleep(100);
+                }
+                memcpy(&s_cached_topology, &s->topology, sizeof(cpu_topology_t));
+                s_topology_cached = true;
+            }
+            s->topology_detected = true;
         }
-        s->topology_detected = true;
     }
 
     /* Start background CPU monitor (load + CPUSET refresh on dedicated thread).
@@ -1084,17 +1099,17 @@ size_t plugin_process(plugin_state_t *s,
         if (fs_out > s->config.fs_in)
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);
 
-        /* Overlap for SDM convergence: 32x lat, capped at 1024 samples.
-         * Uncapped overlap (>1024) causes audio crackling and broken restart
-         * at DSD128+ — root cause unknown, needs investigation. */
+        /* Overlap for SDM convergence: 32x lat.
+         * DSD128 lat=128 → overlap=4096 (32×lat, optimal density).
+         * Previously capped at 1024, causing low DAS density at DSD128+. */
         overlap = 32 * (size_t)s->config.trellis_lat;
-        if (overlap > 1024) overlap = 1024;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
         int max_seg;
-        /* Use 4 segments for both GPU and CPU Trellis SDM.
-         * Ensures fair comparison when toggling GPU on/off at runtime. */
-        max_seg = (fs_out >= DSD_RATE_512) ? 8 : 4;
+        /* 2 segments: 1 stitch/sec minimizes ultrasonic pops while
+         * still providing 2× speedup. 4 segments had 3 stitches/sec
+         * producing audible tiny pops from noise-pattern discontinuity. */
+        max_seg = 2;
         if (segments_per_ch > max_seg) segments_per_ch = max_seg;
 
         /* Ensure minimum segment size (at least 4x overlap) */
@@ -1136,7 +1151,8 @@ size_t plugin_process(plugin_state_t *s,
         /* GPU FIR lowpass for same-rate path (no rate conversion stages).
          * Runs on main thread (GPU not thread-safe).
          * GPU kernel processes in fp64; output goes directly to fir_buf (double). */
-        if (!force_cpu_fir && s->gpu && dsd_in_count >= GPU_MIN_SAMPLES &&
+        if (!force_cpu_fir && s->gpu && s->config.gpu_enabled &&
+            dsd_in_count >= GPU_MIN_SAMPLES &&
             s->channels[0].fir.num_stages == 0 &&
             s->channels[0].lowpass.initialized) {
             float combined = s->channels[0].fir_gain * s->config.gain;
@@ -1725,12 +1741,18 @@ size_t plugin_process(plugin_state_t *s,
                         input_count += overlap;
                     warmup_discard = 0;
                 } else {
-                    input_start = (nom_start >= overlap) ? nom_start - overlap : 0;
+                    /* Extended warmup: start 2× overlap before nominal start
+                     * for better SDM convergence. Extra warmup beyond overlap
+                     * is discarded but improves noise-shaping pattern alignment
+                     * at the stitch point (reduces ultrasonic discontinuity). */
+                    size_t warmup_extend = overlap * 2;
+                    input_start = (nom_start >= warmup_extend) ? nom_start - warmup_extend : 0;
                     input_count = nom_start + nom_size - input_start;
                     if (extend_fwd && nom_start + nom_size + overlap <= fir_count)
                         input_count += overlap;
-                    warmup_discard = (nom_start >= overlap) ?
-                        overlap - (size_t)s->config.trellis_lat : 0;
+                    size_t actual_back = nom_start - input_start;
+                    warmup_discard = (actual_back > (size_t)s->config.trellis_lat) ?
+                        actual_back - (size_t)s->config.trellis_lat : 0;
                 }
 
                 sdm_context_t *ctx;
@@ -1859,24 +1881,29 @@ size_t plugin_process(plugin_state_t *s,
                 }
 
                 /* Step 2: Within the best-density region, find nearest
-                 * exact bit-match for a clean stitch transition. */
+                 * run of consecutive matching samples. Longer runs produce
+                 * smoother transitions between different noise-shaping patterns.
+                 * Try min_run=8, then 4, then 2, then 1 (single match). */
                 int best_pos = best_density_pos;  /* fallback: density peak */
                 int search_r = half_w;
                 int found_match = 0;
-                for (int r = 0; r <= search_r; r++) {
-                    int lo = best_density_pos - r;
-                    int hi = best_density_pos + r;
-                    if (lo >= 0 && lo < (int)ovl_len &&
-                        prev_ovl[lo] == this_ovl[lo]) {
-                        best_pos = lo;
-                        found_match = 1;
-                        break;
-                    }
-                    if (hi != lo && hi >= 0 && hi < (int)ovl_len &&
-                        prev_ovl[hi] == this_ovl[hi]) {
-                        best_pos = hi;
-                        found_match = 1;
-                        break;
+                for (int min_run = 8; min_run >= 1 && !found_match; min_run >>= 1) {
+                    for (int r = 0; r <= search_r && !found_match; r++) {
+                        int candidates[2] = { best_density_pos - r, best_density_pos + r };
+                        for (int c = 0; c < 2 && !found_match; c++) {
+                            int p = candidates[c];
+                            if (c == 1 && p == candidates[0]) continue;
+                            if (p < 0 || p + min_run > (int)ovl_len) continue;
+                            int run = 0;
+                            for (int k = 0; k < min_run; k++) {
+                                if (prev_ovl[p + k] == this_ovl[p + k]) run++;
+                                else break;
+                            }
+                            if (run >= min_run) {
+                                best_pos = p;
+                                found_match = min_run;
+                            }
+                        }
                     }
                 }
 
@@ -1892,11 +1919,11 @@ size_t plugin_process(plugin_state_t *s,
                 {
                     char msg[256];
                     snprintf(msg, sizeof(msg),
-                             "stitch seg%d: ovl=%zu density=%d/%d pos=%d match=%s "
-                             "wp=%zu pov=%zu stitch_at=%zu seg_out=%zu copy=%zu",
+                             "stitch seg%d: ovl=%zu density=%d/%d pos=%d run=%d "
+                             "wp=%zu stitch_at=%zu",
                              seg, ovl_len, best_density, half_w * 2,
-                             best_pos, found_match ? "yes" : "no",
-                             write_pos, prev_ovl_start, stitch_at, seg_out, copy_count);
+                             best_pos, found_match,
+                             write_pos, stitch_at);
                     extern void trellis_log_c(const char *);
                     trellis_log_c(msg);
                 }
@@ -1941,14 +1968,36 @@ size_t plugin_process(plugin_state_t *s,
 
         dsd_out_count = seg0_outs[0];
 
-        if (s->config.debug_log) {
-            extern void trellis_log_c(const char *);
-            char msg[128];
-            snprintf(msg, sizeof(msg),
-                "DAS output: %zu samples (fir_in=%zu, expected=%zu, diff=%d)",
-                dsd_out_count, fir_counts[0], fir_counts[0],
-                (int)((long long)dsd_out_count - (long long)fir_counts[0]));
-            trellis_log_c(msg);
+        /* Always-on DAS output verification:
+         * - Normal chunks: dsd_out_count == fir_counts[0]
+         * - First chunk after flush: dsd_out_count == fir_counts[0] - trellis_lat
+         *   (seg0 loses trellis_lat samples to latency buffer fill)
+         * - dsd_out_count must be multiple of 16 (DoP frame alignment)
+         * - Marker phase: (dsd_out_count/16) parity must be predictable */
+        {
+            long long diff = (long long)dsd_out_count - (long long)fir_counts[0];
+            int lat = s->config.trellis_lat;
+            bool count_ok = (diff == 0 || diff == -(long long)lat);
+            bool align_ok = (dsd_out_count % 16 == 0);
+            int marker_frames = (int)(dsd_out_count / 16);
+            int marker_phase_delta = marker_frames & 1;
+
+            if (!count_ok || !align_ok) {
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                    "WARNING DAS output: %zu samples (fir_in=%zu, diff=%lld, "
+                    "lat=%d, align16=%s, marker_phase=%d+%d)",
+                    dsd_out_count, fir_counts[0], diff, lat,
+                    align_ok ? "ok" : "FAIL",
+                    s->dop_marker_phase, marker_phase_delta);
+                trellis_log_c(msg);
+            } else if (s->config.debug_log) {
+                char msg[128];
+                snprintf(msg, sizeof(msg),
+                    "DAS output: %zu samples (diff=%lld, phase=%d)",
+                    dsd_out_count, diff, s->dop_marker_phase);
+                trellis_log_c(msg);
+            }
         }
 
         /* seg_bufs are cached — no per-chunk cleanup needed */
@@ -2014,6 +2063,23 @@ sdm_done:
     if (dsd_out_count == 0)
         return 0;
 
+    /* Warmup mute: on first chunk after flush, replace output with DSD silence.
+     * The SDM has processed real audio (integrators are warm), but the output
+     * contains a DC startup transient. Muting hides the pop; subsequent chunks
+     * start with warm SDM state → clean audio. */
+    if (s->needs_warmup) {
+        s->needs_warmup = false;
+        static const float dsd_0x69[8] = {
+            -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f
+        };
+        for (int ch = 0; ch < num_channels; ch++) {
+            for (size_t i = 0; i < dsd_out_count; i++)
+                s->ch_out[ch][i] = dsd_0x69[i & 7];
+        }
+        trellis_log_c("warmup mute: replaced first chunk with DSD silence");
+    }
+
+
     /* On-demand raw DSD capture (mode=0): grab ±1.0 before DoP packing */
     if (g_audio_capture.mode == 0 &&
         (g_audio_capture.state == CAPTURE_RECORDING || capture_check_armed())) {
@@ -2042,6 +2108,16 @@ sdm_done:
 
     /* Pack DSD to DoP and interleave. ASIO+DSD output plugin detects
      * DoP markers and sends native DSD to the driver. */
+    if (dsd_out_count % DOP_BITS_PER_FRAME != 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+            "WARNING DoP align: dsd_out_count=%zu not multiple of %d, "
+            "truncating %zu samples",
+            dsd_out_count, DOP_BITS_PER_FRAME,
+            dsd_out_count % DOP_BITS_PER_FRAME);
+        trellis_log_c(msg);
+        dsd_out_count -= dsd_out_count % DOP_BITS_PER_FRAME;
+    }
     size_t out_pcm_frames = dsd_out_count / DOP_BITS_PER_FRAME;
     if (out_pcm_frames == 0)
         return 0;
