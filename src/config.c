@@ -395,12 +395,12 @@ void config_validate(dsd_config_t *cfg) {
     if (cfg->gain < 0.0f) cfg->gain = 0.0f;
     if (cfg->gain > 1.0f) cfg->gain = 1.0f;
 
-    /* Trellis depth must be power of 2 in [4, 32] */
-    if (cfg->trellis_depth < 4)  cfg->trellis_depth = 4;
+    /* Trellis depth must be power of 2 in [8, 32].
+     * 8-bit minimum for better path dedup granularity (both CPU and GPU). */
+    if (cfg->trellis_depth < 8)  cfg->trellis_depth = 8;
     if (cfg->trellis_depth > 32) cfg->trellis_depth = 32;
     /* Snap to nearest power of 2 */
-    if (cfg->trellis_depth <= 4)       cfg->trellis_depth = 4;
-    else if (cfg->trellis_depth <= 8)  cfg->trellis_depth = 8;
+    if (cfg->trellis_depth <= 8)       cfg->trellis_depth = 8;
     else if (cfg->trellis_depth <= 16) cfg->trellis_depth = 16;
     else                               cfg->trellis_depth = 32;
 

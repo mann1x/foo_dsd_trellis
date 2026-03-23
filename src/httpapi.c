@@ -921,6 +921,45 @@ static void handle_request(httpapi_t *api, SOCKET client) {
             send_method_not_allowed(client);
         }
 
+    } else if (strncmp(path, "/api/gpu_sdm", 12) == 0) {
+        /* GET /api/gpu_sdm — returns current GPU SDM state
+         * POST /api/gpu_sdm?enabled=0|1 — toggle GPU SDM at runtime */
+        if (_stricmp(method, "POST") == 0) {
+            const char *q = strchr(path, '?');
+            int enabled = -1;
+            if (q) {
+                const char *ep = strstr(q, "enabled=");
+                if (ep) enabled = atoi(ep + 8);
+            }
+            if (enabled >= 0) {
+                AcquireSRWLockExclusive(&api->pending_lock);
+                dsd_config_t cfg;
+                AcquireSRWLockShared(&api->lock);
+                cfg = api->config;
+                ReleaseSRWLockShared(&api->lock);
+                cfg.gpu_sdm_enabled = enabled ? true : false;
+                api->pending_config = cfg;
+                InterlockedExchange(&api->has_pending, 1);
+                ReleaseSRWLockExclusive(&api->pending_lock);
+                char json[128];
+                int len = sprintf_s(json, sizeof(json),
+                    "{\"gpu_sdm_enabled\":%s}", enabled ? "true" : "false");
+                send_json(client, 200, "OK", json, len);
+            } else {
+                send_json(client, 400, "Bad Request",
+                          "{\"error\":\"use ?enabled=0 or ?enabled=1\"}", 39);
+            }
+        } else if (_stricmp(method, "GET") == 0) {
+            AcquireSRWLockShared(&api->lock);
+            int en = api->config.gpu_sdm_enabled ? 1 : 0;
+            ReleaseSRWLockShared(&api->lock);
+            char json[64];
+            int len = sprintf_s(json, sizeof(json), "{\"gpu_sdm_enabled\":%s}", en ? "true" : "false");
+            send_json(client, 200, "OK", json, len);
+        } else {
+            send_method_not_allowed(client);
+        }
+
     } else if (strncmp(path, "/api/capture", 12) == 0) {
         if (_stricmp(method, "POST") == 0) {
             /* POST /api/capture?duration=1&rate=2822400

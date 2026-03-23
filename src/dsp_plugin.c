@@ -1072,17 +1072,10 @@ size_t plugin_process(plugin_state_t *s,
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
         int max_seg;
-        if (s->config.gpu_sdm_enabled && s->gpu &&
-            s->config.sdm_mode == SDM_MODE_TRELLIS &&
-            (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)) {
-            /* Hybrid CPU+GPU: allow many segments. CPU takes 1, GPU takes
-             * the rest in parallel across SMs. Cap by D≥64K density rule. */
-            max_seg = (fs_out >= DSD_RATE_512) ? 4 : 2;
-            if (segments_per_ch > max_seg) segments_per_ch = max_seg;
-        } else {
-            max_seg = (fs_out >= DSD_RATE_512) ? 4 : 2;
-            if (segments_per_ch > max_seg) segments_per_ch = max_seg;
-        }
+        /* Use 4 segments for both GPU and CPU Trellis SDM.
+         * Ensures fair comparison when toggling GPU on/off at runtime. */
+        max_seg = (fs_out >= DSD_RATE_512) ? 8 : 4;
+        if (segments_per_ch > max_seg) segments_per_ch = max_seg;
 
         /* Ensure minimum segment size (at least 4x overlap) */
         size_t min_seg = overlap * 4;

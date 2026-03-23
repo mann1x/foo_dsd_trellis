@@ -627,17 +627,8 @@ int gpu_cuda_trellis_setup(cuda_context_t *c, int num_cands, int order,
     c->trellis_order = order;
     c->trellis_lat = trellis_lat;
 
-    c->trellis_depth = trellis_depth > 0 ? trellis_depth : 4;
-
-    /* Upload path mask to parallel SDM module.
-     * Must match CPU's trellis_mask = (1 << trellis_depth) - 1. */
-    {
-        unsigned path_mask = ((1u << c->trellis_depth) - 1);
-        CUdeviceptr d_pm;
-        size_t pm_sz;
-        if (pfn_cuModuleGetGlobal(&d_pm, &pm_sz, c->mod_sdm_parallel, "c_path_mask") == CUDA_SUCCESS)
-            pfn_cuMemcpyHtoD(d_pm, &path_mask, sizeof(unsigned));
-    }
+    c->trellis_depth = trellis_depth > 0 ? trellis_depth : 8;
+    /* Path mask: both CPU and GPU use 8-bit (0xFF) for consistent dedup. */
     memcpy(c->trellis_ntf_a, ntf_a, (size_t)order * sizeof(double));
     memcpy(c->trellis_ntf_g, ntf_g, (size_t)order * sizeof(double));
     c->trellis_state_valid = false;

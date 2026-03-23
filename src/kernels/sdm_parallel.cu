@@ -13,7 +13,9 @@ __constant__ double c_ntf_a[8];
 __constant__ double c_ntf_g[8];
 __constant__ int    c_ntf_order;
 __constant__ double c_state_limit;
-__constant__ unsigned c_path_mask;  /* (1 << trellis_depth) - 1 */
+/* Path mask: 0xFF (8-bit) matches CPU when trellis_depth=8.
+ * Wider paths = fewer dedup collisions = better candidate diversity. */
+#define PATH_MASK 0xFF
 
 __device__ double ntf_calc(const double *s, double *d,
                             int order, double x) {
@@ -206,7 +208,7 @@ __global__ void trellis_parallel_segments(
             /* Path register for dedup + inherit parent's STORED traceback
              * (1-step pipeline delay matching CPU: children inherit the value
              * from BEFORE the current history read, not after). */
-            c_path[tid] = (p_path[pi] << 1 | c_bit[tid]) & c_path_mask;
+            c_path[tid] = (p_path[pi] << 1 | c_bit[tid]) & PATH_MASK;
             c_next[tid] = p_next_stored[pi];
             c_pi[tid] = pi;
             /* Copy parent history to child */
