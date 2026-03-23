@@ -626,7 +626,8 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                 rc = gpu_cuda_trellis_setup(s->gpu,
                         actual_cands, f->order,
                         actual_lat, f->a, f->g,
-                        s->channels[0].sdm.state_limit);
+                        s->channels[0].sdm.state_limit,
+                        s->config.trellis_depth);
             else {
                 rc = gpu_dx12_trellis_setup_full(s->gpu,
                         actual_cands, f->order,
@@ -1461,7 +1462,8 @@ size_t plugin_process(plugin_state_t *s,
                 int cur_lat   = (int)s->channels[0].sdm.trellis_lat;
                 if (f)
                     gpu_cuda_trellis_setup(s->gpu, cur_cands, f->order,
-                        cur_lat, f->a, f->g, s->channels[0].sdm.state_limit);
+                        cur_lat, f->a, f->g, s->channels[0].sdm.state_limit,
+                        s->config.trellis_depth);
             }
 
             /* GPU Trellis SDM: 2-pass DAS with internal stitching.

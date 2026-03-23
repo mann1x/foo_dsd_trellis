@@ -310,7 +310,7 @@ void test_dsf_compare(void) {
     {
         gpu_context_t *ctx = gpu_create(GPU_BACKEND_CUDA);
         if (!ctx) { printf("  GPU create failed\n"); goto cleanup; }
-        gpu_cuda_trellis_setup(ctx, nc, f->order, lat, f->a, f->g, 0.0);
+        gpu_cuda_trellis_setup(ctx, nc, f->order, lat, f->a, f->g, 0.0, 4);
 
         /* Process in chunks (~0.5s each) to simulate live playback */
         size_t chunk_size = (size_t)(dsd_rate * 0.5);

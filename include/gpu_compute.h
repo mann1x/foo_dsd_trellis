@@ -207,7 +207,8 @@ int gpu_dx11_trellis_setup(void *ctx, int num_cands, int order,
 
 int gpu_cuda_trellis_setup(void *ctx, int num_cands, int order,
                             int trellis_lat, const double *ntf_a,
-                            const double *ntf_g, double state_limit);
+                            const double *ntf_g, double state_limit,
+                            int trellis_depth);
 int gpu_cuda_precorr_setup(void *ctx, int order,
                             const float *ntf_a, const float *ntf_g,
                             const float *pred_table, float state_limit);

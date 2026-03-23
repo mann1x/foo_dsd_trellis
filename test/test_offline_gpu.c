@@ -66,12 +66,12 @@ int gpu_trellis_offline(int argc, char **argv) {
 
     if (hawk_nc > 0) {
         extern int gpu_cuda_trellis_hawksford(void *, const float *, float *, size_t);
-        gpu_cuda_trellis_setup(ctx, hawk_nc, f->order, 256, f->a, f->g, 0.0);
+        gpu_cuda_trellis_setup(ctx, hawk_nc, f->order, 256, f->a, f->g, 0.0, 4);
         printf("Processing %zu samples through Hawksford (nc=%d)...\n", n_samples, hawk_nc);
         int rc = gpu_cuda_trellis_hawksford(ctx, smoothed, output, n_samples);
         printf("Done, rc=%d\n", rc);
     } else {
-        gpu_cuda_trellis_setup(ctx, 4, f->order, 256, f->a, f->g, 0.0);
+        gpu_cuda_trellis_setup(ctx, 4, f->order, 256, f->a, f->g, 0.0, 4);
         printf("Processing %zu samples through GPU Trellis...\n", n_samples);
         int rc = gpu_trellis_process(ctx, smoothed, output, n_samples,
                                       NULL, NULL, 4, f->order, f->a, f->g);

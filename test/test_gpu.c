@@ -379,7 +379,7 @@ static void test_gpu_trellis_sinad(void) {
 
     /* Setup persistent Trellis state on GPU */
     gpu_cuda_trellis_setup(ctx, num_cands, f->order, trellis_lat,
-                            f->a, f->g, 0.0);
+                            f->a, f->g, 0.0, 4);
 
     /* Generate test input: low-amplitude sine */
     float *in = (float *)malloc(count * sizeof(float));
@@ -568,7 +568,7 @@ static void test_gpu_vs_cpu_trellis(void) {
     if (!ctx) { printf("    (skipped)\n"); g_tests_run++; g_tests_passed++; return; }
 
     const ntf_filter_t *f = ntf_auto_select(2822400);
-    gpu_cuda_trellis_setup(ctx, 4, f->order, 128, f->a, f->g, 0.0);
+    gpu_cuda_trellis_setup(ctx, 4, f->order, 128, f->a, f->g, 0.0, 4);
 
     size_t count = 65536;
     float *in = (float *)malloc(count * sizeof(float));

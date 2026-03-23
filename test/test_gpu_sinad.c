@@ -150,7 +150,7 @@ static void run_sinad_test_rate(gpu_backend_t backend, const char *label,
 
     /* Setup trellis for this backend */
     if (backend == GPU_BACKEND_CUDA) {
-        gpu_cuda_trellis_setup(ctx, cands, f->order, lat, f->a, f->g, 0.0);
+        gpu_cuda_trellis_setup(ctx, cands, f->order, lat, f->a, f->g, 0.0, 4);
     } else {
         gpu_dx12_trellis_setup_full(ctx, cands, f->order, lat, f->a, f->g, 0.0);
     }
@@ -279,7 +279,7 @@ static void test_gpu_das_sinad(void) {
         free(smoothed); free(cpu_out); free(smoothed_d); free(gpu_out);
         return;
     }
-    gpu_cuda_trellis_setup(ctx, nc, f->order, lat, f->a, f->g, 0.0);
+    gpu_cuda_trellis_setup(ctx, nc, f->order, lat, f->a, f->g, 0.0, 4);
 
     /* DAS path: 1 channel (fp64 input) */
     double *smoothed_d_das = (double *)malloc(enc_n * sizeof(double));
@@ -305,7 +305,7 @@ static void test_gpu_das_sinad(void) {
     float *old_out = (float *)calloc(enc_n, sizeof(float));
     double old_sinad = -999.0;
     if (ctx2 && old_out) {
-        gpu_cuda_trellis_setup(ctx2, nc, f->order, lat, f->a, f->g, 0.0);
+        gpu_cuda_trellis_setup(ctx2, nc, f->order, lat, f->a, f->g, 0.0, 4);
         /* Convert fp32 input to fp64 for trellis kernel */
         double *smoothed_d2 = (double *)malloc(enc_n * sizeof(double));
         if (smoothed_d2) {
@@ -392,7 +392,7 @@ static void test_gpu_das_multi_chunk(void) {
         free(smoothed); free(cpu_out); free(smoothed_d); free(das_out);
         return;
     }
-    gpu_cuda_trellis_setup(ctx, nc, f->order, lat, f->a, f->g, 0.0);
+    gpu_cuda_trellis_setup(ctx, nc, f->order, lat, f->a, f->g, 0.0, 4);
 
     size_t out_pos = 0;
     for (int c = 0; c < num_chunks; c++) {
