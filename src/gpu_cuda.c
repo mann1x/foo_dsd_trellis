@@ -1837,6 +1837,12 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
         if (!h_seg_out) { free(h_seg_starts); free(h_seg_out_starts); free(h_seg_totals); free(h_seg_out_caps); return -1; }
         pfn_cuMemcpyDtoH(h_seg_out, c->d_das_seg_out, seg_out_bytes);
 
+        /* Download actual segment output counts */
+        int *h_seg_actual = (int *)calloc((size_t)num_segs * (size_t)num_channels, sizeof(int));
+        if (h_seg_actual)
+            pfn_cuMemcpyDtoH(h_seg_actual, c->d_das_seg_counts,
+                              (size_t)num_segs * (size_t)num_channels * sizeof(int));
+
         /* Download mid-states for Viterbi re-encoding */
         if (c->h_das_mid_states)
             pfn_cuMemcpyDtoH(c->h_das_mid_states, c->d_das_mid_states,
@@ -1858,13 +1864,16 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
         /* Pass 1: find stitch positions on channel 0 */
         {
             float *ch0_segs = h_seg_out;
-            size_t write_pos = (size_t)h_seg_out_caps[0];  /* seg0 output count */
+            /* Use actual output count (from kernel), not capacity */
+            size_t write_pos = h_seg_actual ? (size_t)h_seg_actual[0] : (size_t)h_seg_out_caps[0];
+            if (write_pos > (size_t)h_seg_out_caps[0]) write_pos = (size_t)h_seg_out_caps[0];
             /* Copy seg0 to final output */
             memcpy(out, ch0_segs + h_seg_out_starts[0], write_pos * sizeof(float));
 
             for (int seg = 1; seg < num_segs; seg++) {
                 float *seg_data = ch0_segs + h_seg_out_starts[seg];
-                size_t seg_out_n = (size_t)h_seg_out_caps[seg];
+                size_t seg_out_n = h_seg_actual ? (size_t)h_seg_actual[seg] : (size_t)h_seg_out_caps[seg];
+                if (seg_out_n > (size_t)h_seg_out_caps[seg]) seg_out_n = (size_t)h_seg_out_caps[seg];
                 if (seg_out_n == 0) { stitch_positions[seg] = 0; continue; }
 
                 size_t prev_ovl_start = (write_pos >= (size_t)das_overlap) ?
@@ -2009,13 +2018,19 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
         for (int ch = 1; ch < num_channels; ch++) {
             float *ch_segs = h_seg_out + ch * (int)total_seg_out;
             float *ch_out_ptr = out + ch * (int)total_final;
-            size_t write_pos = (size_t)h_seg_out_caps[0];
+            /* Use actual counts for this channel */
+            size_t seg0_actual = h_seg_actual ?
+                (size_t)h_seg_actual[ch * num_segs + 0] : (size_t)h_seg_out_caps[0];
+            if (seg0_actual > (size_t)h_seg_out_caps[0]) seg0_actual = (size_t)h_seg_out_caps[0];
+            size_t write_pos = seg0_actual;
             memcpy(ch_out_ptr, ch_segs + h_seg_out_starts[0],
                    write_pos * sizeof(float));
 
             for (int seg = 1; seg < num_segs; seg++) {
                 float *seg_data = ch_segs + h_seg_out_starts[seg];
-                size_t seg_out_n = (size_t)h_seg_out_caps[seg];
+                size_t seg_out_n = h_seg_actual ?
+                    (size_t)h_seg_actual[ch * num_segs + seg] : (size_t)h_seg_out_caps[seg];
+                if (seg_out_n > (size_t)h_seg_out_caps[seg]) seg_out_n = (size_t)h_seg_out_caps[seg];
                 if (seg_out_n == 0) continue;
 
                 size_t prev_ovl_start = (write_pos >= (size_t)das_overlap) ?
@@ -2030,6 +2045,7 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
         }
 
         free(h_seg_out);
+        free(h_seg_actual);
     }
     QueryPerformanceCounter(&t_k2);
     QueryPerformanceCounter(&t_k3);
