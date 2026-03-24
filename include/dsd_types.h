@@ -384,6 +384,7 @@ typedef struct {
     int8_t    rate_fir_mode[RATE_MAP_COUNT]; /* Per-input-rate pre-SDM filter: -1=Auto, 0=Boxcar, 1=FIR */
     int16_t   rate_lat[RATE_MAP_COUNT];    /* Per-input-rate trellis latency: 0=Auto, >0=explicit */
     int       fir_mode;      /* Runtime: resolved pre-SDM filter mode (-1=Auto, 0=Boxcar, 1=FIR). Not serialized. */
+    int       fir_prec;      /* Runtime: resolved FIR precision (-1=Auto(fp64), 0=FP32, 1=FP64). Not serialized. */
     float     state_limit;   /* Runtime: resolved state limiter (0=off, >0=limit). Set per-chunk. */
     /* v16: PCM encoding */
     int8_t    pcm_bit_depth;     /* Global PCM bit depth: PCM_BIT_AUTO(-1), 16/24/32/float */

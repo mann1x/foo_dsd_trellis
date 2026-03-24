@@ -523,7 +523,7 @@ private:
         m_listRate.SetExtendedListViewStyle(
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
         ensure_reverse_map();
-        int cw[] = { 66, 66, 50, 46, 42, 42, 46, 34, 32, 38, 32 };
+        int cw[] = { 66, 66, 50, 46, 42, 42, 46, 34, 32, 38, 32, 32 };
         m_listRate.InsertColumn(0, L"Input", LVCFMT_LEFT, cw[0]);
         m_listRate.InsertColumn(1, L"Output", LVCFMT_LEFT, cw[1]);
         m_listRate.InsertColumn(2, L"NTF", LVCFMT_LEFT, cw[2]);
@@ -535,16 +535,17 @@ private:
         m_listRate.InsertColumn(8, L"GPU", LVCFMT_LEFT, cw[8]);
         m_listRate.InsertColumn(9, L"FIR", LVCFMT_LEFT, cw[9]);
         m_listRate.InsertColumn(10, L"Par", LVCFMT_LEFT, cw[10]);
+        m_listRate.InsertColumn(11, L"Lat", LVCFMT_LEFT, cw[11]);
         /* Last column: fill remaining width to avoid horizontal scrollbar */
         {
             CRect rc;
             m_listRate.GetClientRect(&rc);
             int used = 0;
-            for (int c = 0; c < 11; c++) used += cw[c];
+            for (int c = 0; c < 12; c++) used += cw[c];
             int vscroll = GetSystemMetrics(SM_CXVSCROLL);
             int remain = rc.Width() - used - vscroll - 4;
-            if (remain < 30) remain = 30;
-            m_listRate.InsertColumn(11, L"Lat", LVCFMT_LEFT, remain);
+            if (remain < 36) remain = 36;
+            m_listRate.InsertColumn(12, L"Prec", LVCFMT_LEFT, remain);
         }
 
         for (int row = 0; row < RATE_MAP_COUNT; row++) {
@@ -593,6 +594,10 @@ private:
                 if (m_cfg.rate_lat[i] > 0) {
                     _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", m_cfg.rate_lat[i]);
                     m_listRate.SetItemText(row, 11, buf);
+                }
+                if (m_cfg.rate_fir_prec[i] >= 0) {
+                    wcscpy_s(buf, m_cfg.rate_fir_prec[i] == FIR_PREC_FP32 ? L"FP32" : L"FP64");
+                    m_listRate.SetItemText(row, 12, buf);
                 }
             }
             /* Resolve Auto values using path-optimal defaults */
@@ -851,7 +856,7 @@ private:
             ShowOutputCombo(nm->iItem);
         } else if (nm->iSubItem == 2) {
             ShowNtfCombo(nm->iItem);
-        } else if (nm->iSubItem >= 3 && nm->iSubItem <= 11) {
+        } else if (nm->iSubItem >= 3 && nm->iSubItem <= 12) {
             ShowPerRateCombo(nm->iItem, nm->iSubItem);
         }
 
@@ -1007,6 +1012,13 @@ private:
             else if (cur == 64) sel = 3; else if (cur == 128) sel = 4;
             else if (cur == 256) sel = 5; else if (cur == 512) sel = 6;
             m_ntfCombo.SetCurSel(sel);
+        } else if (col == 12) {
+            /* FIR precision: Auto(fp64), FP32, FP64 */
+            m_ntfCombo.AddString(L"Auto");
+            m_ntfCombo.AddString(L"FP32");
+            m_ntfCombo.AddString(L"FP64");
+            int cur = m_cfg.rate_fir_prec[rowToIdx(row)];
+            m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
         }
 
         m_editRow = row;
@@ -1110,6 +1122,12 @@ private:
                 _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", val);
                 m_listRate.SetItemText(m_editRow, 11, buf);
             }
+        } else if (m_editCol == 12) {
+            /* FIR precision: 0=Auto(-1), 1=FP32(0), 2=FP64(1) */
+            int8_t val = (int8_t)(sel == 0 ? -1 : sel - 1);
+            m_cfg.rate_fir_prec[idx] = val;
+            const wchar_t *names[] = { L"Auto", L"FP32", L"FP64" };
+            m_listRate.SetItemText(m_editRow, 12, names[sel < 3 ? sel : 0]);
         }
 
         RefreshAutoText(m_editRow);
@@ -1278,6 +1296,14 @@ private:
                 else
                     fir_name = (sdm_mode == SDM_MODE_TRELLIS) ? "FIR Lowpass (auto)" : "Boxcar (auto)";
                 info << "\nPre-SDM: " << fir_name;
+            }
+
+            /* FIR precision */
+            {
+                int prec = m_cfg.rate_fir_prec[rowToIdx(row)];
+                const char *prec_name = (prec == FIR_PREC_FP32) ? "FP32" :
+                                        (prec == FIR_PREC_FP64) ? "FP64" : "FP64 (auto)";
+                info << "\nFIR precision: " << prec_name;
             }
 
             /* GPU FIR status */
@@ -1570,6 +1596,8 @@ private:
             m_listRate.SetItemText(row, 10, L"Auto");
         if (m_cfg.rate_lat[idx] <= 0)
             m_listRate.SetItemText(row, 11, L"Auto");
+        if (m_cfg.rate_fir_prec[idx] < 0)
+            m_listRate.SetItemText(row, 12, L"Auto");
     }
 
     void UpdatePreset() {
@@ -1846,6 +1874,7 @@ public:
 
         /* Per-rate pre-SDM filter mode: -1=Auto, 0=Boxcar, 1=FIR */
         chunk_cfg.fir_mode = (int)m_config.rate_fir_mode[map_idx];
+        chunk_cfg.fir_prec = (int)m_config.rate_fir_prec[map_idx];
 
         /* Per-rate state limiter: -1=Auto (engine uses path_config), 0=Off, >0=value */
         if (m_config.rate_limiter[map_idx] >= 0)

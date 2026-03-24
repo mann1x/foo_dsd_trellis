@@ -146,15 +146,19 @@ int engine_channel_init(engine_channel_t *eng, int channel,
     /* DSD→PCM decimation: FIR only, no SDM */
     eng->fir_only = (fs_out < DSD_RATE_64 && cfg->fs_in >= DSD_RATE_64);
 
+    /* Resolve FIR precision: Auto defaults to fp64 */
+    bool use_fp64 = true;
+    if (cfg->fir_prec == FIR_PREC_FP32)
+        use_fp64 = false;
+
     if (eng->fir_only && !cfg->mute) {
-        if (fir_chain_init_ex(&eng->fir, cfg->fs_in, fs_out, true) != 0)
+        if (fir_chain_init_ex(&eng->fir, cfg->fs_in, fs_out, use_fp64) != 0)
             return -1;
         return 0;
     }
 
     if (!cfg->mute) {
-        /* Init FIR chain (fp64 for native double precision throughout) */
-        if (fir_chain_init_ex(&eng->fir, cfg->fs_in, fs_out, true) != 0)
+        if (fir_chain_init_ex(&eng->fir, cfg->fs_in, fs_out, use_fp64) != 0)
             return -1;
 
         /* Path-adaptive lookup — always look up for gain/limiter.
