@@ -269,11 +269,15 @@ plugin_state_t *plugin_create(void) {
     /* Eagerly detect topology + create threadpool at plugin load time.
      * This avoids 150-580ms cold start on first audio chunk. */
     cpuset_detect(&s->topology);
+
+    /* Measure OS load BEFORE benchmark — benchmark runs on all cores and
+     * would mask the real OS background load. Prime counters, wait 50ms
+     * for a clean OS-only window, then measure. */
+    cpuset_update_load(&s->topology);
+    Sleep(50);
+    cpuset_update_load(&s->topology);
+
     cpuset_benchmark(&s->topology);
-    for (int i = 0; i < 5; i++) {
-        cpuset_update_load(&s->topology);
-        Sleep(100);
-    }
     s->topology_detected = true;
 
     s->cpu_monitor = cpuset_monitor_create(&s->topology, 750, 30);
@@ -484,10 +488,7 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                 /* First-ever detection: full init + load seeding */
                 cpuset_detect(&s->topology);
                 cpuset_benchmark(&s->topology);
-                for (int i = 0; i < 5; i++) {
-                    cpuset_update_load(&s->topology);
-                    Sleep(100);
-                }
+                cpuset_update_load(&s->topology);
                 memcpy(&s_cached_topology, &s->topology, sizeof(cpu_topology_t));
                 s_topology_cached = true;
             }
@@ -1255,32 +1256,48 @@ size_t plugin_process(plugin_state_t *s,
             if (s_gpu_fir_tmp) {
                 double combined_gain = (double)s->channels[0].fir_gain
                                      * (double)s->config.gain;
+                bool use_fp64 = s->channels[0].fir.use_fp64;
                 for (int ch = 0; ch < num_channels; ch++) {
                     size_t gpu_out = 0;
-                    if (gpu_fir_chain_process(s->gpu, s->ch_in[ch],
-                            s_gpu_fir_tmp, dsd_in_count,
-                            &gpu_out, NULL, NULL) == 0) {
-                        /* Ensure fir_buf is large enough */
-                        size_t need = gpu_out * sizeof(double);
-                        if (s->channels[ch].fir_buf_sz < need) {
-                            free(s->channels[ch].fir_buf);
-                            s->channels[ch].fir_buf = (double *)malloc(need);
-                            s->channels[ch].fir_buf_sz =
-                                s->channels[ch].fir_buf ? need : 0;
-                        }
-                        if (!s->channels[ch].fir_buf) {
+                    /* Ensure fir_buf is large enough */
+                    size_t need = est_out * sizeof(double);
+                    if (s->channels[ch].fir_buf_sz < need) {
+                        free(s->channels[ch].fir_buf);
+                        s->channels[ch].fir_buf = (double *)malloc(need);
+                        s->channels[ch].fir_buf_sz =
+                            s->channels[ch].fir_buf ? need : 0;
+                    }
+                    if (!s->channels[ch].fir_buf) {
+                        gpu_fir_ok = false; break;
+                    }
+
+                    if (use_fp64) {
+                        /* GPU fp64 FIR: direct double output, apply gain */
+                        if (gpu_fir_chain_process_f64(s->gpu, s->ch_in[ch],
+                                s->channels[ch].fir_buf, dsd_in_count,
+                                &gpu_out) == 0) {
+                            for (size_t i = 0; i < gpu_out; i++)
+                                s->channels[ch].fir_buf[i] *= combined_gain;
+                            fir_counts[ch] = gpu_out;
+                            fir_data[ch] = s->channels[ch].fir_buf;
+                            gpu_fir_ok = true;
+                        } else {
                             gpu_fir_ok = false; break;
                         }
-                        /* Widen float→double + apply gain in one pass */
-                        for (size_t i = 0; i < gpu_out; i++)
-                            s->channels[ch].fir_buf[i] =
-                                (double)s_gpu_fir_tmp[i] * combined_gain;
-                        fir_counts[ch] = gpu_out;
-                        fir_data[ch] = s->channels[ch].fir_buf;
-                        gpu_fir_ok = true;
                     } else {
-                        gpu_fir_ok = false;
-                        break;
+                        /* GPU fp32 FIR: float output, widen + gain */
+                        if (gpu_fir_chain_process(s->gpu, s->ch_in[ch],
+                                s_gpu_fir_tmp, dsd_in_count,
+                                &gpu_out, NULL, NULL) == 0) {
+                            for (size_t i = 0; i < gpu_out; i++)
+                                s->channels[ch].fir_buf[i] =
+                                    (double)s_gpu_fir_tmp[i] * combined_gain;
+                            fir_counts[ch] = gpu_out;
+                            fir_data[ch] = s->channels[ch].fir_buf;
+                            gpu_fir_ok = true;
+                        } else {
+                            gpu_fir_ok = false; break;
+                        }
                     }
                 }
             }

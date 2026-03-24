@@ -73,6 +73,11 @@ int gpu_fir_chain_process(gpu_context_t *ctx, const float *in, float *out,
                           size_t in_count, size_t *out_count,
                           const float *delay_in, float *delay_out);
 
+/* Process FIR chain in fp64. Input is float (DSD ±1.0), widened to double
+ * internally. Output is double. CUDA only — DX11/DX12 fall back to fp32+widen. */
+int gpu_fir_chain_process_f64(gpu_context_t *ctx, const float *in, double *out,
+                               size_t in_count, size_t *out_count);
+
 /* Batched FIR: process all channels in one kernel launch.
  * in_batch/out_batch: contiguous buffers [ch0_data | ch1_data | ...]. */
 int gpu_fir_batch_process(gpu_context_t *ctx, const float *in_batch,
@@ -198,6 +203,8 @@ int gpu_cuda_fir_setup(void *ctx, const float *taps, int ntaps,
                         int num_stages, bool upsample);
 int gpu_cuda_fir_chain(void *ctx, const float *in, float *out,
                         size_t in_count, size_t *out_count);
+int gpu_cuda_fir_chain_f64(void *ctx, const float *in, double *out,
+                            size_t in_count, size_t *out_count);
 int gpu_cuda_gain(void *ctx, float *buf, size_t count, float gain);
 int gpu_cuda_boxcar(void *ctx, const float *in, float *out,
                      size_t count, int taps, float gain);

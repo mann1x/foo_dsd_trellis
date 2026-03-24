@@ -799,6 +799,15 @@ int cpuset_select(const cpu_topology_t *topo,
         if (e->logical_index == 0 && available_count > 4)
             continue;
 
+        /* F2b: OS-hot cores with low perf — hard reject when >8 cores.
+         * These cores (sched>=12, perf<80%) are OS-preferred and sporadically
+         * loaded. Load detection can't reliably catch their bursty activity.
+         * Excluding them avoids stuttering from OS preemption.
+         * Only applied on systems with >8 cores to avoid over-restricting
+         * small systems (4-6 core). */
+        if (e->scheduling_class >= 12 && e->perf_score < 0.80 && available_count > 8)
+            continue;
+
         /* F3: SMT filter */
         if (smt_mode == SMT_T0_ONLY && e->smt_thread != 0)
             continue;

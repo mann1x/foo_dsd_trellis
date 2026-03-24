@@ -196,6 +196,19 @@ typedef struct {
      * Prepended to input for continuity across chunk boundaries. */
     float         *delay_buf;       /* [ntaps-1] floats, host memory */
     bool           delay_valid;     /* true after first chunk */
+    /* FP64 FIR rate conversion */
+    CUfunction     fn_fir_up_f64;
+    CUfunction     fn_fir_down_f64;
+    CUfunction     fn_gain_f64;
+    CUdeviceptr    d_f64_a;          /* device buffer A (ping-pong) */
+    CUdeviceptr    d_f64_b;          /* device buffer B */
+    size_t         cap_f64;          /* capacity in doubles */
+    double        *h_f64_in;         /* host staging input */
+    double        *h_f64_out;        /* host staging output */
+    size_t         cap_h_f64_in;
+    size_t         cap_h_f64_out;
+    double        *delay_buf_d;      /* [ntaps-1] doubles, host memory */
+    bool           delay_valid_d;
     /* ─── Persistent SDM state (pre-allocated, no per-chunk alloc) ─── */
     CUdeviceptr    d_sdm_in;        /* SDM input buffer (device) */
     CUdeviceptr    d_sdm_out;       /* SDM output buffer (device) */
@@ -474,6 +487,13 @@ gpu_context_t *gpu_cuda_create(void) {
         goto fail;
     if (pfn_cuModuleGetFunction(&c->fn_gain_batch, c->module, "gain_apply_batch") != CUDA_SUCCESS)
         goto fail;
+    /* FP64 FIR kernels */
+    if (pfn_cuModuleGetFunction(&c->fn_fir_up_f64, c->module, "fir_upsample_2x_f64") != CUDA_SUCCESS)
+        goto fail;
+    if (pfn_cuModuleGetFunction(&c->fn_fir_down_f64, c->module, "fir_downsample_2x_f64") != CUDA_SUCCESS)
+        goto fail;
+    if (pfn_cuModuleGetFunction(&c->fn_gain_f64, c->module, "gain_apply_f64") != CUDA_SUCCESS)
+        goto fail;
 
     /* Load SDM PTX module */
     if (pfn_cuModuleLoadData(&c->mod_sdm, g_ptx_sdm_kernels) != CUDA_SUCCESS)
@@ -550,6 +570,12 @@ void gpu_cuda_destroy(void *ptr) {
     }
     if (c->d_inter) pfn_cuMemFree(c->d_inter);
     free(c->delay_buf);
+    /* FP64 FIR buffers */
+    if (c->d_f64_a) pfn_cuMemFree(c->d_f64_a);
+    if (c->d_f64_b) pfn_cuMemFree(c->d_f64_b);
+    free(c->h_f64_in);
+    free(c->h_f64_out);
+    free(c->delay_buf_d);
     /* Persistent SDM buffers */
     if (c->d_sdm_in)  pfn_cuMemFree(c->d_sdm_in);
     if (c->d_sdm_out) pfn_cuMemFree(c->d_sdm_out);
@@ -604,10 +630,24 @@ int gpu_cuda_fir_setup(cuda_context_t *c, const float *taps, int ntaps,
     if (pfn_cuMemcpyHtoD(d_ntaps, &ntaps, sizeof(int)) != CUDA_SUCCESS)
         return -1;
 
-    /* Allocate delay buffer for continuity across chunks */
+    /* Upload fp64 taps to constant memory (for fp64 FIR chain) */
+    CUdeviceptr d_taps_d;
+    size_t taps_d_size;
+    if (pfn_cuModuleGetGlobal(&d_taps_d, &taps_d_size, c->module, "c_taps_d") == CUDA_SUCCESS) {
+        double taps_d[64];
+        for (int i = 0; i < ntaps; i++)
+            taps_d[i] = (double)taps[i];
+        pfn_cuMemcpyHtoD(d_taps_d, taps_d, (size_t)ntaps * sizeof(double));
+    }
+
+    /* Allocate delay buffers for continuity across chunks */
     free(c->delay_buf);
     c->delay_buf = (float *)calloc((size_t)(ntaps - 1), sizeof(float));
     c->delay_valid = false;
+
+    free(c->delay_buf_d);
+    c->delay_buf_d = (double *)calloc((size_t)(ntaps - 1), sizeof(double));
+    c->delay_valid_d = false;
 
     return 0;
 }
@@ -817,6 +857,139 @@ int gpu_cuda_fir_chain(cuda_context_t *c, const float *in, float *out,
 
     /* Rotate stream for next call (triple-buffering) */
     c->active = (s_idx + 1) % NUM_STREAMS;
+
+    *out_count = final_out;
+    return 0;
+}
+
+/* ─── FP64 FIR Chain Process ───
+ * Same algorithm as gpu_cuda_fir_chain but with double precision.
+ * Uses separate fp64 device/host buffers. Simple synchronous path
+ * since GPU FIR load is <5%. Input is float (DSD ±1.0), widened to
+ * double on host before upload. Output is double. */
+
+static int ensure_f64_bufs(cuda_context_t *c, size_t doubles) {
+    if (c->cap_f64 >= doubles) return 0;
+    if (c->d_f64_a) pfn_cuMemFree(c->d_f64_a);
+    if (c->d_f64_b) pfn_cuMemFree(c->d_f64_b);
+    c->d_f64_a = 0; c->d_f64_b = 0;
+    if (pfn_cuMemAlloc(&c->d_f64_a, doubles * sizeof(double)) != CUDA_SUCCESS)
+        return -1;
+    if (pfn_cuMemAlloc(&c->d_f64_b, doubles * sizeof(double)) != CUDA_SUCCESS) {
+        pfn_cuMemFree(c->d_f64_a); c->d_f64_a = 0;
+        return -1;
+    }
+    c->cap_f64 = doubles;
+    return 0;
+}
+
+static int ensure_h_f64_in(cuda_context_t *c, size_t doubles) {
+    if (c->cap_h_f64_in >= doubles) return 0;
+    free(c->h_f64_in);
+    c->h_f64_in = (double *)malloc(doubles * sizeof(double));
+    c->cap_h_f64_in = c->h_f64_in ? doubles : 0;
+    return c->h_f64_in ? 0 : -1;
+}
+
+static int ensure_h_f64_out(cuda_context_t *c, size_t doubles) {
+    if (c->cap_h_f64_out >= doubles) return 0;
+    free(c->h_f64_out);
+    c->h_f64_out = (double *)malloc(doubles * sizeof(double));
+    c->cap_h_f64_out = c->h_f64_out ? doubles : 0;
+    return c->h_f64_out ? 0 : -1;
+}
+
+int gpu_cuda_fir_chain_f64(cuda_context_t *c, const float *in, double *out,
+                            size_t in_count, size_t *out_count) {
+    if (!c || in_count < GPU_MIN_SAMPLES) return -1;
+
+    CUresult cr = pfn_cuCtxSetCurrent(c->context);
+    if (cr != CUDA_SUCCESS) return -1;
+
+    int stages = c->num_stages;
+    if (stages <= 0) return -1;
+
+    int dly_len = c->ntaps - 1;
+    size_t ext_in = in_count + (size_t)dly_len;
+
+    /* Calculate final output size (from original in_count) */
+    size_t cur = in_count;
+    for (int s = 0; s < stages; s++)
+        cur = c->upsample ? cur * 2 : cur / 2;
+    size_t final_out = cur;
+
+    /* Extended output (includes delay prefix) */
+    size_t ext_out = ext_in;
+    for (int s = 0; s < stages; s++)
+        ext_out = c->upsample ? ext_out * 2 : ext_out / 2;
+
+    /* Max intermediate size for buffer allocation */
+    size_t max_size = ext_in;
+    cur = ext_in;
+    for (int s = 0; s < stages; s++) {
+        cur = c->upsample ? cur * 2 : cur / 2;
+        if (cur > max_size) max_size = cur;
+    }
+
+    if (ensure_f64_bufs(c, max_size) != 0) return -1;
+    if (ensure_h_f64_in(c, ext_in) != 0) return -1;
+    if (ensure_h_f64_out(c, ext_out) != 0) return -1;
+
+    /* Build extended input: [delay | in], widened float→double */
+    if (c->delay_valid_d && c->delay_buf_d)
+        memcpy(c->h_f64_in, c->delay_buf_d, (size_t)dly_len * sizeof(double));
+    else
+        memset(c->h_f64_in, 0, (size_t)dly_len * sizeof(double));
+    for (size_t i = 0; i < in_count; i++)
+        c->h_f64_in[dly_len + i] = (double)in[i];
+
+    /* Save delay for next chunk */
+    if (c->delay_buf_d) {
+        if (in_count >= (size_t)dly_len) {
+            for (size_t i = 0; i < (size_t)dly_len; i++)
+                c->delay_buf_d[i] = (double)in[in_count - dly_len + i];
+        }
+        c->delay_valid_d = true;
+    }
+
+    CUstream stream = c->streams[0]; /* Use stream 0 (synchronous) */
+
+    pfn_cuMemcpyHtoDAsync(c->d_f64_a, c->h_f64_in,
+                           ext_in * sizeof(double), stream);
+
+    /* Multi-stage FIR dispatch */
+    cur = ext_in;
+    for (int s = 0; s < stages; s++) {
+        size_t next = c->upsample ? cur * 2 : cur / 2;
+
+        CUdeviceptr src = (s & 1) ? c->d_f64_b : c->d_f64_a;
+        CUdeviceptr dst = (s & 1) ? c->d_f64_a : c->d_f64_b;
+        if (s == 0) src = c->d_f64_a;
+
+        CUfunction fn = c->upsample ? c->fn_fir_up_f64 : c->fn_fir_down_f64;
+        int ic = (int)cur, oc = (int)next;
+        void *args[] = { &src, &dst, &ic, &oc };
+        launch_kernel(c, fn, args, oc);
+
+        cur = next;
+        /* After stage 0, alternate between a and b */
+        if (s == 0 && !(stages & 1)) {
+            /* Ensure final result ends up in d_f64_b for even stages,
+             * d_f64_a for odd stages */
+        }
+    }
+
+    /* Determine which buffer has the final result */
+    CUdeviceptr d_result = (stages & 1) ? c->d_f64_b : c->d_f64_a;
+    if (stages == 1) d_result = c->d_f64_b; /* stage 0: a→b */
+
+    pfn_cuMemcpyDtoHAsync(c->h_f64_out, d_result,
+                           ext_out * sizeof(double), stream);
+    pfn_cuStreamSynchronize(stream);
+
+    /* Strip delay prefix */
+    size_t out_skip = ext_out - final_out;
+    memcpy(out, c->h_f64_out + out_skip, final_out * sizeof(double));
 
     *out_count = final_out;
     return 0;

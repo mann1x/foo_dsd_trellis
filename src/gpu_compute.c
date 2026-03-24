@@ -189,6 +189,29 @@ int gpu_fir_chain_process(gpu_context_t *ctx, const float *in, float *out,
     }
 }
 
+int gpu_fir_chain_process_f64(gpu_context_t *ctx, const float *in, double *out,
+                               size_t in_count, size_t *out_count) {
+    if (!ctx) return -1;
+    switch (ctx_backend(ctx)) {
+    case GPU_BACKEND_CUDA:
+        return gpu_cuda_fir_chain_f64(ctx, in, out, in_count, out_count);
+    default: {
+        /* DX11/DX12 fallback: fp32 chain + widen to fp64 */
+        float *tmp = (float *)malloc(in_count * 8 * sizeof(float));
+        if (!tmp) return -1;
+        size_t n = 0;
+        int r = gpu_fir_chain_process(ctx, in, tmp, in_count, &n, NULL, NULL);
+        if (r == 0) {
+            for (size_t i = 0; i < n; i++)
+                out[i] = (double)tmp[i];
+            *out_count = n;
+        }
+        free(tmp);
+        return r;
+    }
+    }
+}
+
 int gpu_fir_batch_process(gpu_context_t *ctx, const float *in_batch,
                           float *out_batch, size_t samples_per_ch,
                           int num_channels, size_t *out_count_per_ch) {

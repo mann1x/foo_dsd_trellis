@@ -1676,7 +1676,7 @@ static void test_weak_paths_sweep(void) {
     static const int cands_vals[] = { 2, 4, 8 };
     static const int n_cands = sizeof(cands_vals) / sizeof(cands_vals[0]);
 
-    static const int depth_vals[] = { 4, 8 };
+    static const int depth_vals[] = { 4, 8, 16 };
     static const int n_depths = sizeof(depth_vals) / sizeof(depth_vals[0]);
 
     const float gain = 0.708f;
@@ -1909,6 +1909,97 @@ void test_rate_sinad_suite(void) {
     TEST_RUN(test_sinad_dsd128_48_pcm96);
 }
 
+/* ─── Quick depth+NTF+nc sweep for weak rate conversion paths ─── */
+static void test_depth16_spot_check(void) {
+    typedef struct {
+        uint32_t fs_in, fs_out;
+        double limit;
+        const char *name;
+    } spot_t;
+
+    /* Rate conversion paths to re-sweep */
+    static const spot_t spots[] = {
+        /* Downsample → DSD64 (weakest, ~85 dB) */
+        { DSD_RATE_128, DSD_RATE_64,  0.0,  "DSD128->64"  },
+        { DSD_RATE_256, DSD_RATE_64,  0.0,  "DSD256->64"  },
+        { DSD_RATE_512, DSD_RATE_64,  0.0,  "DSD512->64"  },
+        /* Downsample → DSD128 */
+        { DSD_RATE_256, DSD_RATE_128, 0.0,  "DSD256->128" },
+        { DSD_RATE_512, DSD_RATE_128, 16.0, "DSD512->128" },
+        /* Upsample (weaker ones) */
+        { DSD_RATE_64,  DSD_RATE_128, 0.0,  "DSD64->128"  },
+    };
+    int n_spots = sizeof(spots) / sizeof(spots[0]);
+
+    /* NTFs to test */
+    static const ntf_filter_id_t test_ntfs[] = {
+        NTF_CLANS_4, NTF_CLANS_5, NTF_CLANS_6, NTF_SDM_4, NTF_SDM_6,
+    };
+    static const char *ntf_names[] = {
+        "clans-4", "clans-5", "clans-6", "sdm-4", "sdm-6",
+    };
+    int n_ntfs = sizeof(test_ntfs) / sizeof(test_ntfs[0]);
+
+    static const int depths[] = { 4, 8, 16 };
+    int n_depths = 3;
+
+    /* nc values: nc=2 (same-rate optimal for DSD64) + nc=4/8 */
+    static const int nc_vals[] = { 2, 4, 8 };
+    int n_nc = 3;
+
+    int total = n_spots * n_ntfs * n_depths * n_nc;
+    printf("\n    ╔══════════════════════════════════════════════════════╗\n");
+    printf("    ║  Depth+NTF+nc Sweep (DSD-level Goertzel)            ║\n");
+    printf("    ║  %d paths × %d NTFs × %d depths × %d nc = %d meas   ║\n",
+           n_spots, n_ntfs, n_depths, n_nc, total);
+    printf("    ╚══════════════════════════════════════════════════════╝\n");
+
+    for (int s = 0; s < n_spots; s++) {
+        const spot_t *sp = &spots[s];
+        printf("\n    --- %s (lim=%.0f) ---\n", sp->name, sp->limit);
+
+        double path_best = -999.0;
+        const char *best_ntf = "?";
+        int best_depth = 0, best_nc = 0;
+
+        for (int ci = 0; ci < n_nc; ci++) {
+            int nc = nc_vals[ci];
+            int lat = nc * 8;
+            if (lat < 32) lat = 32;
+
+            printf("    nc=%-2d %-10s  d=4     d=8     d=16\n", nc, "NTF");
+            for (int f = 0; f < n_ntfs; f++) {
+                printf("    nc=%-2d %-10s", nc, ntf_names[f]);
+
+                for (int d = 0; d < n_depths; d++) {
+                    double sinad = measure_weak_path_sinad(
+                        sp->fs_in, sp->fs_out, test_ntfs[f],
+                        0.708f, sp->limit, nc, depths[d], lat);
+                    printf("  %6.1f", sinad);
+
+                    if (sinad > path_best) {
+                        path_best = sinad;
+                        best_ntf = ntf_names[f];
+                        best_depth = depths[d];
+                        best_nc = nc;
+                    }
+                }
+                printf("\n");
+            }
+        }
+
+        printf("    >>> BEST: %s nc=%d d=%d → %.1f dB\n",
+               best_ntf, best_nc, best_depth, path_best);
+    }
+
+    TEST_ASSERT_TRUE(1, "Depth+NTF+nc sweep completed");
+}
+
+void test_depth16_suite(void) {
+    TEST_SUITE("Depth-16 Rate Conv Spot Check");
+    TEST_RUN(test_depth16_spot_check);
+}
+
 void test_rate_sweep_suite(void) {
     TEST_SUITE("Rate Conversion Sweep");
 
@@ -1920,4 +2011,5 @@ void test_rate_sweep_suite(void) {
     TEST_RUN(test_cands_latency_sweep);
     TEST_RUN(test_gain_sweep);
     TEST_RUN(test_weak_paths_sweep);
+    TEST_RUN(test_depth16_spot_check);
 }

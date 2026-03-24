@@ -1,10 +1,11 @@
 /*
  * foo_dsd_trellis — FIR half-band filter for DSD rate conversion
  *
- * Uses Intel IPP ippsFIRSR_32f with a 63-tap Kaiser half-band filter.
- * Multi-stage 2x up/down-sampling:
- *   Upsample:   zero-stuff → FIR → scale by 2
- *   Downsample: FIR → decimate (keep every other sample)
+ * Uses Intel IPP ippsFIRMR (multi-rate polyphase) with a 63-tap Kaiser
+ * half-band filter. Multi-stage 2x up/down-sampling without zero-stuffing.
+ * Polyphase decomposition only computes needed output samples (~2x faster
+ * than zero-stuff + single-rate FIR for upsample, and filter-all + decimate
+ * for downsample).
  */
 
 #include "../include/fir.h"
@@ -67,10 +68,11 @@ static void design_halfband_kaiser(double *h, int ntaps, double beta) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- * IPP FIRSR per-stage init/free
+ * IPP FIRMR per-stage init/free (polyphase multi-rate)
  * ═══════════════════════════════════════════════════════════════════════ */
 
-static int ipp_firsr_stage_init(fir_chain_t *chain, int stage_idx) {
+static int ipp_firmr_stage_init(fir_chain_t *chain, int stage_idx,
+                                 bool upsample) {
     double hd[IPP_HB_NTAPS];
     design_halfband_kaiser(hd, IPP_HB_NTAPS, IPP_HB_KAISER_BETA);
 
@@ -85,8 +87,18 @@ static int ipp_firsr_stage_init(fir_chain_t *chain, int stage_idx) {
         g_hb_taps_initialized = true;
     }
 
+    /* Upsample: pre-scale taps by 2 to compensate for polyphase energy split */
+    if (upsample) {
+        for (int i = 0; i < IPP_HB_NTAPS; i++)
+            taps[i] *= 2.0f;
+    }
+
+    int upFactor   = upsample ? 2 : 1;
+    int downFactor = upsample ? 1 : 2;
+
     int specSize = 0, bufSize = 0;
-    IppStatus st = ippsFIRSRGetSize(IPP_HB_NTAPS, ipp32f, &specSize, &bufSize);
+    IppStatus st = ippsFIRMRGetSize(IPP_HB_NTAPS, upFactor, downFactor,
+                                     ipp32f, &specSize, &bufSize);
     if (st != ippStsNoErr)
         return -1;
 
@@ -94,7 +106,8 @@ static int ipp_firsr_stage_init(fir_chain_t *chain, int stage_idx) {
     if (!spec)
         return -1;
 
-    st = ippsFIRSRInit_32f(taps, IPP_HB_NTAPS, ippAlgDirect, spec);
+    st = ippsFIRMRInit_32f(taps, IPP_HB_NTAPS, upFactor, 0, downFactor, 0,
+                            spec);
     if (st != ippStsNoErr) {
         ippsFree(spec);
         return -1;
@@ -123,7 +136,7 @@ static int ipp_firsr_stage_init(fir_chain_t *chain, int stage_idx) {
     return 0;
 }
 
-static void ipp_firsr_stage_free(fir_chain_t *chain, int stage_idx) {
+static void ipp_firmr_stage_free(fir_chain_t *chain, int stage_idx) {
     if (chain->ipp_spec[stage_idx]) {
         ippsFree(chain->ipp_spec[stage_idx]);
         chain->ipp_spec[stage_idx] = NULL;
@@ -211,67 +224,38 @@ static int ensure_demod_tmp(fir_chain_t *chain, size_t need) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- * Zero-stuff temp buffer
- * ═══════════════════════════════════════════════════════════════════════ */
-
-static int ipp_ensure_zerostuff(fir_chain_t *chain, size_t need) {
-    if (chain->ipp_zerostuff_sz >= need)
-        return 0;
-    if (chain->ipp_zerostuff)
-        ippsFree(chain->ipp_zerostuff);
-    chain->ipp_zerostuff = ippsMalloc_32f((int)need);
-    chain->ipp_zerostuff_sz = chain->ipp_zerostuff ? need : 0;
-    return chain->ipp_zerostuff ? 0 : -1;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════
- * Upsample / Downsample 2x via IPP FIRSR
+ * Upsample / Downsample 2x via IPP FIRMR (polyphase)
+ *
+ * No zero-stuffing or decimation needed — FIRMR handles polyphase
+ * decomposition internally, only computing the output samples needed.
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static size_t ipp_upsample2(fir_chain_t *chain, int stage_idx,
                              const float *in, float *out, size_t count) {
-    size_t out_count = count * 2;
-
-    if (ipp_ensure_zerostuff(chain, out_count) != 0)
-        return 0;
-
-    /* Zero-stuff: in[i] → tmp[2i], 0 → tmp[2i+1] */
-    ippsZero_32f(chain->ipp_zerostuff, (int)out_count);
-    for (size_t i = 0; i < count; i++)
-        chain->ipp_zerostuff[2 * i] = in[i];
-
+    /* FIRMR: numIters = input_count / downFactor = count / 1 = count.
+     * Each iteration consumes 1 input, produces 2 outputs. */
     IppsFIRSpec_32f *spec = (IppsFIRSpec_32f *)chain->ipp_spec[stage_idx];
     Ipp32f *dly = chain->ipp_dly[stage_idx];
     Ipp8u *buf = (Ipp8u *)chain->ipp_buf[stage_idx];
 
-    ippsFIRSR_32f(chain->ipp_zerostuff, out, (int)out_count,
-                  spec, dly, dly, buf);
+    ippsFIRMR_32f(in, out, (int)count, spec, dly, dly, buf);
 
-    /* Scale by 2 to compensate for zero insertion */
-    ippsMulC_32f_I(2.0f, out, (int)out_count);
-
-    return out_count;
+    return count * 2;
 }
 
 static size_t ipp_downsample2(fir_chain_t *chain, int stage_idx,
                                const float *in, float *out, size_t in_count) {
-    size_t out_count = in_count / 2;
-
-    if (ipp_ensure_zerostuff(chain, in_count) != 0)
-        return 0;
+    /* FIRMR: numIters = input_count / downFactor = in_count / 2.
+     * Each iteration consumes 2 inputs, produces 1 output. */
+    size_t numIters = in_count / 2;
 
     IppsFIRSpec_32f *spec = (IppsFIRSpec_32f *)chain->ipp_spec[stage_idx];
     Ipp32f *dly = chain->ipp_dly[stage_idx];
     Ipp8u *buf = (Ipp8u *)chain->ipp_buf[stage_idx];
 
-    ippsFIRSR_32f(in, chain->ipp_zerostuff, (int)in_count,
-                  spec, dly, dly, buf);
+    ippsFIRMR_32f(in, out, (int)numIters, spec, dly, dly, buf);
 
-    /* Decimate: keep every other sample */
-    for (size_t i = 0; i < out_count; i++)
-        out[i] = chain->ipp_zerostuff[2 * i];
-
-    return out_count;
+    return numIters;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -292,15 +276,26 @@ static void ensure_hb_taps_d(void) {
     }
 }
 
-static int ipp_firsr_stage_init_d(fir_chain_t *chain, int stage_idx) {
+static int ipp_firmr_stage_init_d(fir_chain_t *chain, int stage_idx,
+                                   bool upsample) {
     ensure_hb_taps_d();
 
     Ipp64f taps[IPP_HB_NTAPS];
     for (int i = 0; i < IPP_HB_NTAPS; i++)
         taps[i] = g_hb_taps_d[i];
 
+    /* Upsample: pre-scale taps by 2 to compensate for polyphase energy split */
+    if (upsample) {
+        for (int i = 0; i < IPP_HB_NTAPS; i++)
+            taps[i] *= 2.0;
+    }
+
+    int upFactor   = upsample ? 2 : 1;
+    int downFactor = upsample ? 1 : 2;
+
     int specSize = 0, bufSize = 0;
-    IppStatus st = ippsFIRSRGetSize(IPP_HB_NTAPS, ipp64f, &specSize, &bufSize);
+    IppStatus st = ippsFIRMRGetSize(IPP_HB_NTAPS, upFactor, downFactor,
+                                     ipp64f, &specSize, &bufSize);
     if (st != ippStsNoErr)
         return -1;
 
@@ -308,7 +303,8 @@ static int ipp_firsr_stage_init_d(fir_chain_t *chain, int stage_idx) {
     if (!spec)
         return -1;
 
-    st = ippsFIRSRInit_64f(taps, IPP_HB_NTAPS, ippAlgDirect, spec);
+    st = ippsFIRMRInit_64f(taps, IPP_HB_NTAPS, upFactor, 0, downFactor, 0,
+                            spec);
     if (st != ippStsNoErr) {
         ippsFree(spec);
         return -1;
@@ -337,7 +333,7 @@ static int ipp_firsr_stage_init_d(fir_chain_t *chain, int stage_idx) {
     return 0;
 }
 
-static void ipp_firsr_stage_free_d(fir_chain_t *chain, int stage_idx) {
+static void ipp_firmr_stage_free_d(fir_chain_t *chain, int stage_idx) {
     if (chain->ipp_spec_d[stage_idx]) {
         ippsFree(chain->ipp_spec_d[stage_idx]);
         chain->ipp_spec_d[stage_idx] = NULL;
@@ -353,67 +349,31 @@ static void ipp_firsr_stage_free_d(fir_chain_t *chain, int stage_idx) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- * FP64 zero-stuff temp buffer
- * ═══════════════════════════════════════════════════════════════════════ */
-
-static int ipp_ensure_zerostuff_d(fir_chain_t *chain, size_t need) {
-    if (chain->ipp_zerostuff_d_sz >= need)
-        return 0;
-    if (chain->ipp_zerostuff_d)
-        ippsFree(chain->ipp_zerostuff_d);
-    chain->ipp_zerostuff_d = ippsMalloc_64f((int)need);
-    chain->ipp_zerostuff_d_sz = chain->ipp_zerostuff_d ? need : 0;
-    return chain->ipp_zerostuff_d ? 0 : -1;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════
- * FP64 Upsample / Downsample 2x via IPP FIRSR
+ * FP64 Upsample / Downsample 2x via IPP FIRMR (polyphase)
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static size_t ipp_upsample2_d(fir_chain_t *chain, int stage_idx,
                                const double *in, double *out, size_t count) {
-    size_t out_count = count * 2;
-
-    if (ipp_ensure_zerostuff_d(chain, out_count) != 0)
-        return 0;
-
-    /* Zero-stuff: in[i] -> tmp[2i], 0 -> tmp[2i+1] */
-    ippsZero_64f(chain->ipp_zerostuff_d, (int)out_count);
-    for (size_t i = 0; i < count; i++)
-        chain->ipp_zerostuff_d[2 * i] = in[i];
-
     IppsFIRSpec_64f *spec = (IppsFIRSpec_64f *)chain->ipp_spec_d[stage_idx];
     Ipp64f *dly = chain->ipp_dly_d[stage_idx];
     Ipp8u *buf = (Ipp8u *)chain->ipp_buf_d[stage_idx];
 
-    ippsFIRSR_64f(chain->ipp_zerostuff_d, out, (int)out_count,
-                  spec, dly, dly, buf);
+    ippsFIRMR_64f(in, out, (int)count, spec, dly, dly, buf);
 
-    /* Scale by 2 to compensate for zero insertion */
-    ippsMulC_64f_I(2.0, out, (int)out_count);
-
-    return out_count;
+    return count * 2;
 }
 
 static size_t ipp_downsample2_d(fir_chain_t *chain, int stage_idx,
                                  const double *in, double *out, size_t in_count) {
-    size_t out_count = in_count / 2;
-
-    if (ipp_ensure_zerostuff_d(chain, in_count) != 0)
-        return 0;
+    size_t numIters = in_count / 2;
 
     IppsFIRSpec_64f *spec = (IppsFIRSpec_64f *)chain->ipp_spec_d[stage_idx];
     Ipp64f *dly = chain->ipp_dly_d[stage_idx];
     Ipp8u *buf = (Ipp8u *)chain->ipp_buf_d[stage_idx];
 
-    ippsFIRSR_64f(in, chain->ipp_zerostuff_d, (int)in_count,
-                  spec, dly, dly, buf);
+    ippsFIRMR_64f(in, out, (int)numIters, spec, dly, dly, buf);
 
-    /* Decimate: keep every other sample */
-    for (size_t i = 0; i < out_count; i++)
-        out[i] = chain->ipp_zerostuff_d[2 * i];
-
-    return out_count;
+    return numIters;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -487,20 +447,20 @@ int fir_chain_init_ex(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out,
 
     chain->num_stages = stages;
 
-    /* Init per-stage IPP FIRSR specs */
+    /* Init per-stage IPP FIRMR specs (polyphase multi-rate) */
     if (use_fp64) {
         for (int i = 0; i < stages; i++) {
-            if (ipp_firsr_stage_init_d(chain, i) != 0) {
+            if (ipp_firmr_stage_init_d(chain, i, chain->upsample) != 0) {
                 for (int j = 0; j < i; j++)
-                    ipp_firsr_stage_free_d(chain, j);
+                    ipp_firmr_stage_free_d(chain, j);
                 return -1;
             }
         }
     } else {
         for (int i = 0; i < stages; i++) {
-            if (ipp_firsr_stage_init(chain, i) != 0) {
+            if (ipp_firmr_stage_init(chain, i, chain->upsample) != 0) {
                 for (int j = 0; j < i; j++)
-                    ipp_firsr_stage_free(chain, j);
+                    ipp_firmr_stage_free(chain, j);
                 return -1;
             }
         }
@@ -643,20 +603,8 @@ void fir_chain_free(fir_chain_t *chain) {
     ipp_firsr_demod_free(chain);
 
     for (int i = 0; i < FIR_MAX_STAGES; i++) {
-        ipp_firsr_stage_free(chain, i);
-        ipp_firsr_stage_free_d(chain, i);
-    }
-
-    if (chain->ipp_zerostuff) {
-        ippsFree(chain->ipp_zerostuff);
-        chain->ipp_zerostuff = NULL;
-        chain->ipp_zerostuff_sz = 0;
-    }
-
-    if (chain->ipp_zerostuff_d) {
-        ippsFree(chain->ipp_zerostuff_d);
-        chain->ipp_zerostuff_d = NULL;
-        chain->ipp_zerostuff_d_sz = 0;
+        ipp_firmr_stage_free(chain, i);
+        ipp_firmr_stage_free_d(chain, i);
     }
 
     free(chain->scratch);

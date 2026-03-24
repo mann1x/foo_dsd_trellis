@@ -42,6 +42,7 @@ static const suite_entry_t suites[] = {
     { "hardening", "Hardening",         test_hardening_suite,  0 },
     { "threadpool","Thread Pool",       test_threadpool_suite,  0 },
     { "sweep",     "Rate Conv Sweep",   test_rate_sweep_suite, 1 },
+    { "depth16",   "Depth-16 Spot Check", test_depth16_suite,  1 },
     { "onnx",      "ONNX Filter",       test_onnx_filter_suite, 0 },
     { "gpu",       "GPU Compute",       test_gpu_suite,         0 },
     { "gpusinad",  "GPU SINAD Compare", test_gpu_sinad_comparison, 1 },

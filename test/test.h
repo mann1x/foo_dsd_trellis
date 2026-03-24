@@ -79,6 +79,7 @@ void test_config_suite(void);
 void test_simd_suite(void);
 void test_rate_sinad_suite(void);
 void test_rate_sweep_suite(void);
+void test_depth16_suite(void);
 void test_precorr_suite(void);
 void test_sinad_diag_suite(void);
 void test_onnx_filter_suite(void);

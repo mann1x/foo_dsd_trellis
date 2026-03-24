@@ -1,8 +1,8 @@
 /*
  * foo_dsd_trellis — FIR half-band filter for DSD rate conversion
  *
- * Uses Intel IPP ippsFIRSR_32f with a 63-tap Kaiser half-band filter.
- * Multi-stage 2x up/down-sampling via zero-stuffing + FIR + scaling.
+ * Uses Intel IPP ippsFIRMR (multi-rate polyphase) with a 63-tap Kaiser
+ * half-band filter. Multi-stage 2x up/down-sampling without zero-stuffing.
  */
 
 #ifndef FIR_H
@@ -36,20 +36,16 @@ typedef struct {
     float      *demod_tmp;      /* Temp output buffer (same size as input) */
     size_t      demod_tmp_sz;
 
-    /* IPP FIRSR state — fp32 (per stage) */
+    /* IPP FIRMR state — fp32 (per stage, polyphase multi-rate) */
     void       *ipp_spec[FIR_MAX_STAGES];   /* IppsFIRSpec_32f* */
     void       *ipp_buf[FIR_MAX_STAGES];    /* Ipp8u* work buffer */
     float      *ipp_dly[FIR_MAX_STAGES];    /* Delay lines (tapsLen-1 floats) */
-    float      *ipp_zerostuff;              /* Temp buffer for zero-stuffing */
-    size_t      ipp_zerostuff_sz;
     int         ipp_taps_len;               /* Actual filter length */
 
-    /* IPP FIRSR state — fp64 (per stage) */
+    /* IPP FIRMR state — fp64 (per stage, polyphase multi-rate) */
     void       *ipp_spec_d[FIR_MAX_STAGES]; /* IppsFIRSpec_64f* */
     void       *ipp_buf_d[FIR_MAX_STAGES];  /* Ipp8u* work buffer */
     double     *ipp_dly_d[FIR_MAX_STAGES];  /* Delay lines (tapsLen-1 doubles) */
-    double     *ipp_zerostuff_d;            /* Temp buffer for zero-stuffing (fp64) */
-    size_t      ipp_zerostuff_d_sz;
     double     *scratch_d;                  /* Intermediate buffer (fp64 path) */
     size_t      scratch_d_size;
 } fir_chain_t;

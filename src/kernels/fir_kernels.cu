@@ -147,6 +147,96 @@ __global__ void gain_apply_batch(float *buf, int total_count, float gain) {
         buf[i] *= gain;
 }
 
+/* ─── FP64 FIR 2x Upsample ───
+ * Polyphase-style: skip zero taps, scale by 2.
+ * Matches CPU ippsFIRMR_64f behavior. */
+__constant__ double c_taps_d[64];
+
+__global__ void fir_upsample_2x_f64(const double *in, double *out,
+                                     int in_count, int out_count) {
+    int oi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (oi >= out_count) return;
+
+    double acc = 0.0;
+    for (int k = 0; k < c_ntaps; k++) {
+        int zsi = oi - k;
+        if (zsi >= 0 && zsi < in_count * 2) {
+            if ((zsi & 1) == 0)
+                acc += c_taps_d[k] * in[zsi >> 1];
+        }
+    }
+    out[oi] = acc * 2.0;
+}
+
+/* ─── FP64 FIR 2x Downsample ───
+ * Convolve with FIR, decimate by 2. */
+__global__ void fir_downsample_2x_f64(const double *in, double *out,
+                                       int in_count, int out_count) {
+    int oi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (oi >= out_count) return;
+
+    int ii = oi * 2;
+    double acc = 0.0;
+    for (int k = 0; k < c_ntaps; k++) {
+        int si = ii - k;
+        if (si >= 0 && si < in_count)
+            acc += c_taps_d[k] * in[si];
+    }
+    out[oi] = acc;
+}
+
+/* ─── FP64 Batched FIR 2x Upsample (multi-channel) ─── */
+__global__ void fir_upsample_2x_batch_f64(const double *in, double *out,
+                                            int in_per_ch, int out_per_ch,
+                                            int num_channels) {
+    int ch = blockIdx.y;
+    if (ch >= num_channels) return;
+    int oi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (oi >= out_per_ch) return;
+
+    const double *ch_in = in + ch * in_per_ch;
+    double *ch_out = out + ch * out_per_ch;
+
+    double acc = 0.0;
+    for (int k = 0; k < c_ntaps; k++) {
+        int zsi = oi - k;
+        if (zsi >= 0 && zsi < in_per_ch * 2) {
+            if ((zsi & 1) == 0)
+                acc += c_taps_d[k] * ch_in[zsi >> 1];
+        }
+    }
+    ch_out[oi] = acc * 2.0;
+}
+
+/* ─── FP64 Batched FIR 2x Downsample (multi-channel) ─── */
+__global__ void fir_downsample_2x_batch_f64(const double *in, double *out,
+                                              int in_per_ch, int out_per_ch,
+                                              int num_channels) {
+    int ch = blockIdx.y;
+    if (ch >= num_channels) return;
+    int oi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (oi >= out_per_ch) return;
+
+    const double *ch_in = in + ch * in_per_ch;
+    double *ch_out = out + ch * out_per_ch;
+
+    int ii = oi * 2;
+    double acc = 0.0;
+    for (int k = 0; k < c_ntaps; k++) {
+        int si = ii - k;
+        if (si >= 0 && si < in_per_ch)
+            acc += c_taps_d[k] * ch_in[si];
+    }
+    ch_out[oi] = acc;
+}
+
+/* ─── FP64 Gain multiply (in-place) ─── */
+__global__ void gain_apply_f64(double *buf, int count, double gain) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+        buf[i] *= gain;
+}
+
 /* ─── FIR Lowpass (same-rate pre-SDM filter) ───
  * Direct-form FIR with separate taps from rate conversion.
  * Input is ±1.0 DSD, output is multi-bit smoothed signal.
