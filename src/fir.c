@@ -16,6 +16,22 @@
 #include <ipps.h>
 #include <ippcore.h>
 
+/* Force IPP to use AVX2+FMA dispatch on AMD CPUs.
+ * Without this, IPP's auto-dispatcher may select SSE4 on AMD,
+ * leaving up to 2x performance on the table. */
+static void ipp_force_avx2(void) {
+    Ipp64u mask = 0;
+    ippGetCpuFeatures(&mask, NULL);
+    if (!(mask & ippCPUID_AVX2)) {
+        /* IPP didn't detect AVX2 — force it if CPU supports it */
+        int cpuInfo[4] = {0};
+        __cpuidex(cpuInfo, 7, 0);
+        if (cpuInfo[1] & (1 << 5)) {  /* EBX bit 5 = AVX2 */
+            ippSetCpuFeatures(mask | ippCPUID_AVX2);
+        }
+    }
+}
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -82,6 +98,7 @@ static int ipp_firmr_stage_init(fir_chain_t *chain, int stage_idx,
 
     /* Cache taps globally for GPU backend */
     if (!g_hb_taps_initialized) {
+        ipp_force_avx2();
         memcpy(g_hb_taps, taps, sizeof(g_hb_taps));
         memcpy(g_hb_taps_d, hd, sizeof(g_hb_taps_d));
         g_hb_taps_initialized = true;

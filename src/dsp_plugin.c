@@ -1614,9 +1614,14 @@ size_t plugin_process(plugin_state_t *s,
                         tls_trash = (float *)malloc(fir_n * sizeof(float));
                         tls_trash_sz = tls_trash ? fir_n : 0;
                     }
-                    if (tls_trash)
-                        sdm_process_block(&s->channels[ch].sdm,
-                                           fir_data[ch], tls_trash, fir_n);
+                    if (tls_trash) {
+                        if (s->channels[ch].sdm_fast)
+                            sdm_process_block_fast(&s->channels[ch].sdm,
+                                                    fir_data[ch], tls_trash, fir_n);
+                        else
+                            sdm_process_block(&s->channels[ch].sdm,
+                                               fir_data[ch], tls_trash, fir_n);
+                    }
                 }
                 QueryPerformanceCounter(&t_sdm_end);
                 s->time_sdm_ms = perf_ms(t_sdm_start, t_sdm_end);

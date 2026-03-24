@@ -212,9 +212,13 @@ int engine_channel_init(engine_channel_t *eng, int channel,
         } else {
             int cands = cfg->trellis_cands;
             int lat   = cfg->trellis_lat;
-            if (sdm_context_init(&eng->sdm, filter,
-                                 cfg->trellis_depth,
-                                 cands, lat) != 0)
+            eng->sdm_fast = (cfg->fir_prec == FIR_PREC_FP32);
+            int rc = eng->sdm_fast
+                ? sdm_context_init_fast(&eng->sdm, filter,
+                                         cfg->trellis_depth, cands, lat)
+                : sdm_context_init(&eng->sdm, filter,
+                                    cfg->trellis_depth, cands, lat);
+            if (rc != 0)
                 return -1;
             if (resolved_limit > 0.0)
                 eng->sdm.state_limit = resolved_limit;
@@ -263,7 +267,7 @@ void engine_channel_warmup(engine_channel_t *eng, const float *in,
         if (eng->sdm_mode == SDM_MODE_PRECORR)
             precorr_process_block(&eng->precorr, tmp, trash, warmup);
         else
-            sdm_process_block(&eng->sdm, tmp, trash, warmup);
+            (eng->sdm_fast ? sdm_process_block_fast : sdm_process_block)(&eng->sdm, tmp, trash, warmup);
         free(trash);
     }
     free(tmp);
@@ -331,7 +335,7 @@ size_t engine_process_block(engine_channel_t *eng,
             if (eng->sdm_mode == SDM_MODE_PRECORR)
                 sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
             else
-                sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, count);
+                sdm_out = (eng->sdm_fast ? sdm_process_block_fast : sdm_process_block)(&eng->sdm, eng->fir_buf, out, count);
             if (eng->ml_filter)
                 onnx_filter_process(eng->ml_filter, out, sdm_out);
             return sdm_out;
@@ -419,7 +423,7 @@ size_t engine_process_block(engine_channel_t *eng,
     if (eng->sdm_mode == SDM_MODE_PRECORR)
         sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, fir_out);
     else
-        sdm_out = sdm_process_block(&eng->sdm, eng->fir_buf, out, fir_out);
+        sdm_out = (eng->sdm_fast ? sdm_process_block_fast : sdm_process_block)(&eng->sdm, eng->fir_buf, out, fir_out);
     if (eng->ml_filter)
         onnx_filter_process(eng->ml_filter, out, sdm_out);
     return sdm_out;

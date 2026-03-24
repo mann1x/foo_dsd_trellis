@@ -192,6 +192,9 @@
     <ClCompile Include="src\trellis.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\trellis_fast.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\ntf.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>

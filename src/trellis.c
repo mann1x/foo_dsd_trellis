@@ -5,11 +5,13 @@
  * Adapted for float32 I/O and foobar2000 DSP context.
  */
 
-/* Force /fp:precise for this file even when project uses /fp:fast.
- * The trellis cost computation is extremely sensitive to FP operation
- * ordering — FMA causes up to 13 dB quality variation (same root
- * cause as CUDA --fmad=false). */
-#ifdef _MSC_VER
+/* Force /fp:precise for quality-critical trellis computation.
+ * The cost computation is extremely sensitive to FP operation ordering —
+ * FMA causes up to 13 dB quality variation (same root cause as CUDA --fmad=false).
+ *
+ * When SDM_FAST_MODE is defined (by trellis_fast.c), the pragma is skipped
+ * and public functions get _fast suffix for runtime selection. */
+#if defined(_MSC_VER) && !defined(SDM_FAST_MODE)
 #pragma float_control(precise, on, push)
 #endif
 
@@ -56,9 +58,10 @@ static __forceinline double sdm_filter_calc_generic(const double *s, double *d,
 }
 
 /* Fully unrolled order-4 filter calc */
-static __forceinline double sdm_filter_calc_o4(const double *s, double *d,
-                                                 const double *a, const double *g,
-                                                 double x, double y)
+static __forceinline double sdm_filter_calc_o4(
+    const double * __restrict s, double * __restrict d,
+    const double * __restrict a, const double * __restrict g,
+    double x, double y)
 {
     d[0] = s[0] - g[0] * s[1] + x - y;
     d[1] = s[1] + s[0] - g[1] * s[2];
@@ -68,9 +71,10 @@ static __forceinline double sdm_filter_calc_o4(const double *s, double *d,
 }
 
 /* Fully unrolled order-5 filter calc */
-static __forceinline double sdm_filter_calc_o5(const double *s, double *d,
-                                                 const double *a, const double *g,
-                                                 double x, double y)
+static __forceinline double sdm_filter_calc_o5(
+    const double * __restrict s, double * __restrict d,
+    const double * __restrict a, const double * __restrict g,
+    double x, double y)
 {
     d[0] = s[0] - g[0] * s[1] + x - y;
     d[1] = s[1] + s[0] - g[1] * s[2];
@@ -81,9 +85,10 @@ static __forceinline double sdm_filter_calc_o5(const double *s, double *d,
 }
 
 /* Fully unrolled order-6 filter calc */
-static __forceinline double sdm_filter_calc_o6(const double *s, double *d,
-                                                 const double *a, const double *g,
-                                                 double x, double y)
+static __forceinline double sdm_filter_calc_o6(
+    const double * __restrict s, double * __restrict d,
+    const double * __restrict a, const double * __restrict g,
+    double x, double y)
 {
     d[0] = s[0] - g[0] * s[1] + x - y;
     d[1] = s[1] + s[0] - g[1] * s[2];
@@ -96,9 +101,10 @@ static __forceinline double sdm_filter_calc_o6(const double *s, double *d,
 }
 
 /* Fully unrolled order-7 filter calc */
-static __forceinline double sdm_filter_calc_o7(const double *s, double *d,
-                                                 const double *a, const double *g,
-                                                 double x, double y)
+static __forceinline double sdm_filter_calc_o7(
+    const double * __restrict s, double * __restrict d,
+    const double * __restrict a, const double * __restrict g,
+    double x, double y)
 {
     d[0] = s[0] - g[0] * s[1] + x - y;
     d[1] = s[1] + s[0] - g[1] * s[2];
@@ -112,9 +118,10 @@ static __forceinline double sdm_filter_calc_o7(const double *s, double *d,
 }
 
 /* Fully unrolled order-8 filter calc */
-static __forceinline double sdm_filter_calc_o8(const double *s, double *d,
-                                                 const double *a, const double *g,
-                                                 double x, double y)
+static __forceinline double sdm_filter_calc_o8(
+    const double * __restrict s, double * __restrict d,
+    const double * __restrict a, const double * __restrict g,
+    double x, double y)
 {
     d[0] = s[0] - g[0] * s[1] + x - y;
     d[1] = s[1] + s[0] - g[1] * s[2];
@@ -1220,6 +1227,6 @@ void sdm_context_free(sdm_context_t *ctx) {
     memset(ctx, 0, sizeof(*ctx));
 }
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(SDM_FAST_MODE)
 #pragma float_control(pop)
 #endif

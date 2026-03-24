@@ -163,6 +163,7 @@
     <ClCompile Include="src\engine.c" />
     <ClCompile Include="src\fir.c" />
     <ClCompile Include="src\trellis.c" />
+    <ClCompile Include="src\trellis_fast.c" />
     <ClCompile Include="src\ntf.c" />
     <ClCompile Include="src\threadpool.c" />
     <ClCompile Include="src\resample.c" />

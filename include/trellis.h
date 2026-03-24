@@ -87,6 +87,19 @@ void sdm_context_reset(sdm_context_t *ctx);
 /* Free any internal allocations (context itself is caller-owned). */
 void sdm_context_free(sdm_context_t *ctx);
 
+/* Fast-mode variants: compiled WITHOUT /fp:precise (~2x faster,
+ * up to 13 dB quality variation). Same API, selected at runtime
+ * when FP32 precision is configured. */
+int sdm_context_init_fast(sdm_context_t *ctx, const ntf_filter_t *filter,
+                           int trellis_depth, int num_cands, int trellis_lat);
+size_t sdm_process_block_fast(sdm_context_t *ctx, const double *in,
+                               float *out, size_t count);
+size_t sdm_drain_fast(sdm_context_t *ctx, float *out, size_t max_out);
+void sdm_context_copy_state_fast(sdm_context_t *dst, const sdm_context_t *src);
+double sdm_state_distance_fast(const sdm_context_t *a, const sdm_context_t *b);
+void sdm_context_reset_fast(sdm_context_t *ctx);
+void sdm_context_free_fast(sdm_context_t *ctx);
+
 /* Lightweight nc=1 greedy estimator: runs the NTF filter forward through
  * `count` input samples starting from `init_state`, returns estimated
  * integrator state at sample `count`.  Used for seeding parallel segments

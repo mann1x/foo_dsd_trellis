@@ -74,8 +74,10 @@ static void mmcss_unregister(HANDLE h) {
 #define PER_WORKER_QUEUE_SIZE 8
 #define RT_WINDOW_SIZE 5
 
-/* Per-worker direct queue for targeted task assignment */
-typedef struct {
+/* Per-worker direct queue for targeted task assignment.
+ * Padded to 128 bytes (2 cache lines) to prevent false sharing
+ * between adjacent workers' volatile count fields. */
+typedef struct __declspec(align(128)) {
     channel_block_t *queue[PER_WORKER_QUEUE_SIZE];
     volatile LONG    count;
     HANDLE           wake_event;  /* Auto-reset event for targeted wakeup */

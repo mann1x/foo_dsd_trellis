@@ -35,6 +35,7 @@ typedef struct {
     int              channel;    /* Channel index (0=L, 1=R, ...) */
     float            fir_gain;   /* FIR output attenuation (path-adaptive) */
     int              sdm_mode;   /* Cached sdm_mode_t for dispatch */
+    bool             sdm_fast;   /* true: use fast trellis (no /fp:precise) */
     bool             passthrough;/* true if no processing needed */
     bool             fir_only;   /* true for DSD→PCM decimation (no SDM) */
     onnx_filter_t   *ml_filter;  /* ONNX ML post-filter (NULL if disabled) */
