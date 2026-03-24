@@ -588,7 +588,12 @@ private:
                     m_listRate.SetItemText(row, 9, buf);
                 }
                 if (m_cfg.rate_parallel[i] >= 0) {
-                    wcscpy_s(buf, m_cfg.rate_parallel[i] == TRELLIS_PAR_SEQUENTIAL ? L"Seq" : L"Par");
+                    if (m_cfg.rate_parallel[i] == TRELLIS_PAR_SEQUENTIAL)
+                        wcscpy_s(buf, L"Seq");
+                    else if (m_cfg.rate_parallel[i] >= 2 && m_cfg.rate_parallel[i] <= 8) {
+                        swprintf_s(buf, sizeof(buf)/sizeof(buf[0]), L"Par%d", m_cfg.rate_parallel[i]);
+                    } else
+                        wcscpy_s(buf, L"Par2");
                     m_listRate.SetItemText(row, 10, buf);
                 }
                 if (m_cfg.rate_lat[i] > 0) {
@@ -994,12 +999,22 @@ private:
             int cur = m_cfg.rate_fir_mode[rowToIdx(row)];
             m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
         } else if (col == 10) {
-            /* Parallel mode: Auto/Sequential/Parallel */
+            /* Parallel mode: Auto/Seq/Par2-Par8 (DAS segment count) */
             m_ntfCombo.AddString(L"Auto");
             m_ntfCombo.AddString(L"Seq");
-            m_ntfCombo.AddString(L"Par");
+            m_ntfCombo.AddString(L"Par2");
+            m_ntfCombo.AddString(L"Par3");
+            m_ntfCombo.AddString(L"Par4");
+            m_ntfCombo.AddString(L"Par5");
+            m_ntfCombo.AddString(L"Par6");
+            m_ntfCombo.AddString(L"Par7");
+            m_ntfCombo.AddString(L"Par8");
             int cur = m_cfg.rate_parallel[rowToIdx(row)];
-            m_ntfCombo.SetCurSel(cur < 0 ? 0 : cur + 1);
+            /* Map: -1=Auto→0, 0=Seq→1, 2=Par2→2, 3=Par3→3, ... 8=Par8→8 */
+            int sel_idx = 0;
+            if (cur == 0) sel_idx = 1;
+            else if (cur >= 2 && cur <= 8) sel_idx = cur;
+            m_ntfCombo.SetCurSel(sel_idx);
         } else if (col == 11) {
             /* Trellis latency */
             m_ntfCombo.AddString(L"Auto");
@@ -1108,11 +1123,15 @@ private:
             const wchar_t *names[] = { L"Auto", L"Boxcar", L"FIR" };
             m_listRate.SetItemText(m_editRow, 9, names[sel < 3 ? sel : 0]);
         } else if (m_editCol == 10) {
-            /* Par: 0=Auto, 1=Sequential, 2=Parallel */
-            int8_t val = (int8_t)(sel == 0 ? -1 : sel - 1);
+            /* Par: 0=Auto, 1=Seq, 2=Par2, 3=Par3, ... 8=Par8 */
+            static const int8_t par_vals[] = { -1, 0, 2, 3, 4, 5, 6, 7, 8 };
+            int8_t val = (sel >= 0 && sel < 9) ? par_vals[sel] : -1;
             m_cfg.rate_parallel[idx] = val;
-            const wchar_t *names[] = { L"Auto", L"Seq", L"Par" };
-            m_listRate.SetItemText(m_editRow, 10, names[sel < 3 ? sel : 0]);
+            static const wchar_t *names[] = {
+                L"Auto", L"Seq", L"Par2", L"Par3", L"Par4",
+                L"Par5", L"Par6", L"Par7", L"Par8"
+            };
+            m_listRate.SetItemText(m_editRow, 10, names[sel < 9 ? sel : 0]);
         } else if (m_editCol == 11) {
             static const int16_t lvals[] = { 0, 16, 32, 64, 128, 256, 512 };
             int16_t val = (sel >= 0 && sel < 7) ? lvals[sel] : 0;
@@ -1321,12 +1340,25 @@ private:
                 /* Parallel SDM mode (resolved) */
                 {
                     int par = m_cfg.rate_parallel[idx];
-                    bool par_resolved;
-                    if (par == TRELLIS_PAR_SEQUENTIAL) par_resolved = false;
-                    else if (par == TRELLIS_PAR_PARALLEL) par_resolved = true;
-                    else par_resolved = (fs_out > DSD_RATE_64); /* Auto */
-                    if (sdm_mode == SDM_MODE_TRELLIS)
-                        info << "\nTrellis SDM: " << (par_resolved ? "Parallel" : "Sequential");
+                    if (sdm_mode == SDM_MODE_TRELLIS) {
+                        if (par == TRELLIS_PAR_SEQUENTIAL) {
+                            info << "\nTrellis SDM: Sequential";
+                        } else if (par >= TRELLIS_PAR_PAR2) {
+                            char seg_buf[32];
+                            sprintf_s(seg_buf, sizeof(seg_buf), "Parallel (%d segments)", par);
+                            info << "\nTrellis SDM: " << seg_buf;
+                        } else {
+                            /* Auto */
+                            int auto_segs = (fs_out >= DSD_RATE_512) ? 4 :
+                                            (fs_out > DSD_RATE_64) ? 2 : 1;
+                            char seg_buf[32];
+                            if (auto_segs > 1)
+                                sprintf_s(seg_buf, sizeof(seg_buf), "Parallel (auto %d seg)", auto_segs);
+                            else
+                                sprintf_s(seg_buf, sizeof(seg_buf), "Sequential (auto)");
+                            info << "\nTrellis SDM: " << seg_buf;
+                        }
+                    }
                 }
             }
         }

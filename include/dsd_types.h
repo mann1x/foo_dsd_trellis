@@ -398,10 +398,20 @@ typedef struct {
     int8_t    rate_fir_prec[RATE_MAP_COUNT];   /* Per-rate FIR precision: -1=Auto(fp64), 0=fp32, 1=fp64 */
 } dsd_config_t;
 
-/* Trellis parallel mode */
-#define TRELLIS_PAR_AUTO       (-1)   /* Auto: Sequential for DSD64, Parallel above */
+/* Trellis parallel mode (DAS segment count).
+ * Auto uses rate-dependent defaults. Sequential = 1 segment (no DAS).
+ * Par2-Par8 = explicit segment count for user control. */
+#define TRELLIS_PAR_AUTO       (-1)
 #define TRELLIS_PAR_SEQUENTIAL  0
-#define TRELLIS_PAR_PARALLEL    1
+#define TRELLIS_PAR_PAR2        2
+#define TRELLIS_PAR_PAR3        3
+#define TRELLIS_PAR_PAR4        4
+#define TRELLIS_PAR_PAR5        5
+#define TRELLIS_PAR_PAR6        6
+#define TRELLIS_PAR_PAR7        7
+#define TRELLIS_PAR_PAR8        8
+/* Legacy alias */
+#define TRELLIS_PAR_PARALLEL    2
 
 /* Pre-SDM filter mode */
 #define FIR_MODE_AUTO    (-1)

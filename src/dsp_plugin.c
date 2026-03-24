@@ -1086,7 +1086,7 @@ size_t plugin_process(plugin_state_t *s,
                           !(s->config.gpu_sdm_enabled && s->gpu &&
                             s->config.sdm_mode == SDM_MODE_TRELLIS));
 
-    /* Resolve per-rate parallel mode: Auto/Sequential/Parallel */
+    /* Resolve per-rate parallel mode: Auto/Seq/Par2-Par8 */
     int par_mode = TRELLIS_PAR_AUTO;
     {
         int map_idx = rate_map_index(s->config.fs_in);
@@ -1094,13 +1094,16 @@ size_t plugin_process(plugin_state_t *s,
             par_mode = (int)s->config.rate_parallel[map_idx];
     }
 
-    /* Auto: Sequential for DSD64 same-rate, Parallel for higher rates */
+    /* Auto: Sequential for DSD64 same-rate, Parallel for higher rates.
+     * Par2-Par8: explicit segment count override. */
     bool use_parallel;
+    int par_segments = 0; /* 0 = auto-compute from thread count */
     if (par_mode == TRELLIS_PAR_SEQUENTIAL)
         use_parallel = false;
-    else if (par_mode == TRELLIS_PAR_PARALLEL)
+    else if (par_mode >= TRELLIS_PAR_PAR2) {
         use_parallel = true;
-    else /* Auto */
+        par_segments = par_mode; /* explicit segment count */
+    } else /* Auto */
         use_parallel = (fs_out > DSD_RATE_64) ||
                        (s->config.gpu_sdm_enabled && s->gpu &&
                         s->config.sdm_mode == SDM_MODE_TRELLIS);
@@ -1121,14 +1124,20 @@ size_t plugin_process(plugin_state_t *s,
          * DSD128 lat=128 → overlap=1024 (8×lat). Uncapping to 4096 didn't
          * improve audible quality (pops are ultrasonic, not overlap-related). */
         overlap = 32 * (size_t)s->config.trellis_lat;
-        segments_per_ch = num_threads / num_channels;
-        if (segments_per_ch < 1) segments_per_ch = 1;
-        int max_seg;
-        /* DSD512: allow more segments — stitch pops less audible at high
-         * rates where ultrasonic noise floor is already elevated.
-         * DSD64-256: 2 segments (1 stitch/sec) minimizes audible pops. */
-        max_seg = (fs_out >= DSD_RATE_512) ? 4 : 2;
-        if (segments_per_ch > max_seg) segments_per_ch = max_seg;
+        if (par_segments > 0) {
+            /* Explicit Par2-Par8: user-specified segment count */
+            segments_per_ch = par_segments;
+        } else {
+            /* Auto: compute from thread count, cap by rate */
+            segments_per_ch = num_threads / num_channels;
+            if (segments_per_ch < 1) segments_per_ch = 1;
+            int max_seg;
+            /* DSD512: allow more segments — stitch pops less audible at high
+             * rates where ultrasonic noise floor is already elevated.
+             * DSD64-256: 2 segments (1 stitch/sec) minimizes audible pops. */
+            max_seg = (fs_out >= DSD_RATE_512) ? 4 : 2;
+            if (segments_per_ch > max_seg) segments_per_ch = max_seg;
+        }
 
         /* Ensure minimum segment size (at least 4x overlap) */
         size_t min_seg = overlap * 4;
