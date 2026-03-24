@@ -7,6 +7,7 @@
 #include "../include/trellis.h"
 #include "../include/ntf.h"
 #include "../include/fir.h"
+#include "../include/sinad_measure.h"
 #include <math.h>
 
 #ifndef M_PI
@@ -1076,10 +1077,24 @@ static double measure_pipeline_sinad(unsigned rate_mult, int nc, int lat,
         sdm_context_free(&ctx); return -999.0;
     }
 
-    /* Create DSD input: ±1.0 from sine (hard quantize) */
-    for (unsigned i = 0; i < n_dsd; i++) {
-        double s = 0.5 * sin(2.0 * M_PI * freq * i / dsd_rate);
-        dsd_in[i] = (s >= 0.0) ? 1.0f : -1.0f;
+    /* Create proper noise-shaped DSD input using a reference SDM encoder.
+     * Hard-quantized ±1 sine has no noise shaping and yields ~6 dB SINAD.
+     * A proper SDM-encoded stream gives realistic same-rate re-encoding test. */
+    {
+        sdm_context_t ref;
+        if (sdm_context_init(&ref, f, 8, nc, lat) != 0) {
+            free(dsd_in); free(smooth); free(out);
+            sdm_context_free(&ctx); return -999.0;
+        }
+        double *sine = (double *)malloc(n_dsd * sizeof(double));
+        for (unsigned i = 0; i < n_dsd; i++)
+            sine[i] = 0.5 * sin(2.0 * M_PI * freq * i / dsd_rate);
+        size_t ref_n = sdm_process_block(&ref, sine, dsd_in, n_dsd);
+        free(sine);
+        sdm_context_free(&ref);
+        /* Pad remainder with silence if reference produced fewer samples */
+        for (size_t i = ref_n; i < n_dsd; i++)
+            dsd_in[i] = (i & 1) ? 1.0f : -1.0f;
     }
 
     /* Simulate pipeline: boxcar or FIR lowpass → gain → SDM */
@@ -1149,22 +1164,55 @@ static double measure_pipeline_sinad(unsigned rate_mult, int nc, int lat,
 }
 
 void test_pipeline_sinad(void) {
-    printf("\n=== Pipeline SINAD (boxcar/FIR → gain → SDM, 2s signal) ===\n");
+    printf("\n=== Pipeline SINAD (sinad_measure: sine → SDM, all rates × lat) ===\n");
 
-    /* DSD64 — baseline */
-    measure_pipeline_sinad(64, 2, 32, 0);   /* boxcar */
-    measure_pipeline_sinad(64, 2, 32, 1);   /* FIR */
-    /* DSD128 — compare */
-    measure_pipeline_sinad(128, 2, 128, 0);  /* boxcar */
-    measure_pipeline_sinad(128, 2, 128, 1);  /* FIR */
-    /* DSD128 with DSD64's NTF for isolation */
-    tls_ntf_override = ntf_get_filter(NTF_CLANS_6, DSD_RATE_128);
-    measure_pipeline_sinad(128, 2, 128, 0);
-    measure_pipeline_sinad(128, 2, 128, 1);
-    tls_ntf_override = NULL;
-    /* DSD128 at lat=32 (DSD64's latency) */
-    measure_pipeline_sinad(128, 2, 32, 0);
-    measure_pipeline_sinad(128, 2, 32, 1);
+    /* Comprehensive NTF sweep at depth=4 for all rates.
+     * Find the optimal NTF for each rate. */
+    const char *ntf_names[] = {
+        "CLANS4","SDM4","CLANS5","SDM5","CLANS6",
+        "SDM6","CLANS7","SDM7","CLANS8","SDM8"
+    };
+    struct { unsigned rate; int lat; } rates[] = {
+        { DSD_RATE_64,  64 },
+        { DSD_RATE_128, 128 },
+        { DSD_RATE_256, 128 },
+        { DSD_RATE_512, 32 },
+    };
+    int n_rates = sizeof(rates) / sizeof(rates[0]);
+    for (int ri = 0; ri < n_rates; ri++) {
+        printf("\n  --- DSD%u (lat=%d, depth=4, nc=2) ---\n",
+               rates[ri].rate / 44100, rates[ri].lat);
+        for (int ntf = 0; ntf < 10; ntf++) {
+            if (!ntf_get_filter(ntf, rates[ri].rate)) continue;
+            sinad_result_t r;
+            memset(&r, 0, sizeof(r));
+            sinad_measure(rates[ri].rate, ntf, 2, 4, rates[ri].lat,
+                          1, 0.708f, &r);
+            printf("  %-6s: SINAD=%6.1f  A-wtd=%6.1f  MT=%6.1f  NMod=%5.1f"
+                   "  (fail=%llu coll=%llu drop=%.1f%%)\n",
+                   ntf_names[ntf], r.sinad_theoretical, r.sinad_awtd_theo,
+                   r.multitone_sinad_db, r.noise_mod_db,
+                   (unsigned long long)r.conv_fail,
+                   (unsigned long long)r.cands_collapse, r.drop_pct);
+        }
+    }
+
+    /* Placeholder to keep the test framework happy */
+    struct { unsigned rate; int ntf; int nc; int depth; int lat; const char *label; } configs[] = {
+        { 0, 0, 0, 0, 0, NULL },
+    };
+    int n = 0;
+    for (int i = 0; i < n; i++) {
+        sinad_result_t r;
+        memset(&r, 0, sizeof(r));
+        printf("  %s: SINAD=%.1f dB  A-wtd=%.1f  MT=%.1f  NMod=%.1f"
+               "  (fail=%llu coll=%llu drop=%.1f%%)\n",
+               configs[i].label, r.sinad_theoretical, r.sinad_awtd_theo,
+               r.multitone_sinad_db, r.noise_mod_db,
+               (unsigned long long)r.conv_fail,
+               (unsigned long long)r.cands_collapse,
+               r.drop_pct);
+    }
 
     g_tests_run++; g_tests_passed++;
 }

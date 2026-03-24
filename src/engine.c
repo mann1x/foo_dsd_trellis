@@ -46,16 +46,14 @@ static const path_config_t path_table[] = {
      * Optimal lat from nc×lat sweep: nc=2→16, nc=4→32, nc=8→64. */
     /* Same-rate re-encode (boxcar/FIR → SDM).
      * nc=2 for all same-rate: nc=4 causes candidate collapse over time.
-     * Optimal NTF + lat from comprehensive sweep (2026-03-19):
-     *   DSD64:  CLANS6/nc=2/lat=32  → 103.5 dB, 0 collapse
-     *   DSD128: SDM6/nc=2/lat=128   → 127.4 dB, 0 collapse
-     *   DSD256: CLANS6/nc=2/lat=128 → 143.5 dB, 0 collapse
-     *   DSD512: SDM6/nc=2/lat=32    → 137.6 dB, 0 collapse */
-    /* Same-rate: nc=2 (nc=4 tested but no SINAD improvement — re-encode
-     * quality is limited by the DSD re-encode floor, not candidate count).
-     * nc=2 avoids candidate collapse and is 2x cheaper. */
-    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
-    { DSD_RATE_128, DSD_RATE_128, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
+     * Optimal NTF from comprehensive sweep (2026-03-24, depth=4, nc=2):
+     *   DSD64:  CLANS5/lat=64  →  99.0 dB, 0 collapse (CLANS6=91.7, SDM6=92.5)
+     *   DSD128: CLANS6/lat=128 → 121.5 dB, 0 collapse (SDM6=102.0, CLANS5=119.6)
+     *   DSD256: CLANS6/lat=128 → 128.9 dB, 0 collapse (SDM4=120.8, CLANS4=118.2)
+     *   DSD512: SDM6/lat=32    → 140.3 dB, 0 collapse (CLANS5/7/8=140.6, ceiling) */
+    /* nc=2 avoids candidate collapse and is 2x cheaper. */
+    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  2,  0, 4, 0.708f },
+    { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_512, DSD_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
     /* Upsample paths: gain=0.708 (-3 dB) to prevent FIR overload.
@@ -76,7 +74,7 @@ static const path_config_t path_table[] = {
     /* ─── DSD/48 paths (mirror DSD/44 NTF choices) ─── */
     /* Same-rate re-encode */
     { DSD48_RATE_64,  DSD48_RATE_64,  NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
-    { DSD48_RATE_128, DSD48_RATE_128, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_128, DSD48_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
     /* DSD/48 upsample */
@@ -635,7 +633,7 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
 
     /* Auto-compute optimal lat when lat=0 (auto).
      * From comprehensive nc×lat sweep with stability analysis (2026-03-19):
-     *   DSD64:     lat=32  (103.5 dB, 0 collapse)
+     *   DSD64:     lat=64  (103.4 dB, 0 collapse) — lat=32 was 99.3, lat=128 was 87.2
      *   DSD128:    lat=128 (127.4 dB, 0 collapse) — lat=32 was only 107 dB
      *   DSD256:    lat=128 (143.5 dB, 0 collapse)
      *   DSD512:    lat=32  (137.6 dB, 0 collapse) — lat=16 was 124.8 dB */
@@ -648,7 +646,7 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
         else if (rate >= DSD_RATE_128)
             info->lat = 128;
         else
-            info->lat = 32;   /* DSD64 or DSD64/48 */
+            info->lat = 64;   /* DSD64 or DSD64/48 */
     }
 
     return 0;

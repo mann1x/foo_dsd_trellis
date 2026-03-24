@@ -855,6 +855,28 @@ static void migration_tick(plugin_state_t *s) {
     if (new_count <= 0)
         return;
 
+    /* Remove loaded cores (>60%) from the selection.
+     * cpuset_select deprioritizes but doesn't exclude loaded cores.
+     * Migration must hard-exclude them — the whole point is to flee. */
+    int filtered = 0;
+    for (int i = 0; i < new_count; i++) {
+        bool is_loaded = false;
+        for (int j = 0; j < snap.count; j++) {
+            if (snap.entries[j].id == new_ids[i] && snap.entries[j].load > 0.60) {
+                is_loaded = true;
+                break;
+            }
+        }
+        if (!is_loaded) {
+            new_ids[filtered] = new_ids[i];
+            new_lps[filtered] = new_lps[i];
+            filtered++;
+        }
+    }
+    if (filtered > 0)
+        new_count = filtered;
+    /* else: all cores loaded, keep original selection as last resort */
+
     int pool_count = threadpool_get_thread_count(s->pool);
     int repinned = 0;
     for (int i = 0; i < pool_count; i++) {

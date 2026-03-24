@@ -274,12 +274,12 @@ Parameters: `rate` (DSD rate in Hz), `nc` (candidates), `depth`, `lat` (latency)
 
 | Rate | NTF | Lat | SINAD | A-wtd | Multitone | NMod |
 |------|-----|-----|-------|-------|-----------|------|
-| DSD64 | CLANS-6 | 32 | 84.2 | 89.3 | 109.1 | 12.2 |
-| DSD128 | SDM-6 | 128 | 102.0 | 107.1 | 104.6 | 40.5 |
+| DSD64 | CLANS-5 | 64 | 99.0 | 102.8 | 84.4 | 9.8 |
+| DSD128 | CLANS-6 | 128 | 121.5 | 126.8 | 120.3 | 10.3 |
 | DSD256 | CLANS-6 | 128 | 128.9 | 134.1 | 123.7 | 2.1 |
 | DSD512 | SDM-6 | 32 | 140.5 | 147.7 | 119.8 | 20.0 |
-| DSD64/48 | CLANS-6 | 32 | 101.6 | 105.2 | 95.9 | 15.2 |
-| DSD128/48 | SDM-6 | 128 | 100.8 | 105.9 | 113.2 | 18.8 |
+| DSD64/48 | CLANS-6 | 64 | 103.0 | 107.3 | 105.3 | 13.5 |
+| DSD128/48 | CLANS-6 | 128 | 100.8 | 105.9 | 113.2 | 18.8 |
 | DSD256/48 | CLANS-6 | 128 | 120.1 | 125.2 | 117.2 | 17.6 |
 | DSD512/48 | SDM-6 | 32 | 127.6 | 132.7 | 123.3 | 24.5 |
 
@@ -303,16 +303,33 @@ Parameters: `rate` (DSD rate in Hz), `nc` (candidates), `depth`, `lat` (latency)
 
 ## SINAD Results
 
-### Trellis SDM Direct Encode (nc=2, depth=4, auto lat)
+### Trellis SDM Direct Encode (nc=2, depth=4, path_table NTFs)
 
-Viterbi look-ahead search with production path_config settings.
+Viterbi look-ahead search with production path_config settings (matching real playback).
 
-| Rate | NTF Filter | Lat | SINAD (dB) |
-|------|------------|-----|------------|
-| DSD64 | CLANS-6 (order 6) | 32 | 90.3 |
-| DSD128 | SDM-6 (order 6) | 128 | 99.8 |
-| DSD256 | CLANS-6 (order 6) | 128 | 113.0 |
-| DSD512 | SDM-6 (order 6) | 32 | 140.6 |
+| Rate | NTF | Lat | SINAD | A-wtd | MT | NMod | Practical ceiling | Gap |
+|------|-----|-----|------:|------:|---:|-----:|-----------------:|----:|
+| DSD64 | CLANS-5 | 64 | 99.0 | 102.8 | 84.4 | 9.8 | ~120 | 21 dB |
+| DSD128 | CLANS-6 | 128 | 121.5 | 126.8 | 120.3 | 10.3 | ~130 | 9 dB |
+| DSD256 | CLANS-6 | 128 | 128.9 | 134.1 | 123.7 | 2.1 | ~135 | 6 dB |
+| DSD512 | SDM-6 | 32 | 140.5 | 147.7 | 119.8 | 20.0 | ~140 | 0 dB |
+
+Practical ceiling is ~120-140 dB for 1-bit DSD (OBG-constrained NTF, Lee's rule). Published references: SACD spec 120 dB, Philips trellis ~97 dB, Archimago ~110-116 dB, HQPlayer ASDM7 ~110 dB.
+
+NTF re-optimization (2026-03-24): DSD64 CLANS-6→CLANS-5 (+7.3 dB), DSD128 SDM-6→CLANS-6 (+19.5 dB), lat 32→64 for DSD64 (+7.5 dB). DSD512 at the practical 1-bit ceiling. `/fp:precise` required — `/fp:fast` causes up to 13 dB quality variation from FMA reordering (same root cause as CUDA `--fmad=false`).
+
+#### NTF Sweep Results (depth=4, nc=2, optimal lat per rate)
+
+Best NTF per rate from comprehensive 10-NTF sweep. All configurations zero collapse/conv_fail.
+
+| Rate | Best NTF | SINAD | 2nd best | SINAD | 3rd best | SINAD |
+|------|----------|------:|----------|------:|----------|------:|
+| DSD64 (lat=64) | CLANS-5 | 99.0 | SDM-6 | 92.5 | CLANS-6 | 91.7 |
+| DSD128 (lat=128) | CLANS-6 | 121.5 | CLANS-5 | 119.6 | CLANS-7 | 113.7 |
+| DSD256 (lat=128) | CLANS-6 | 128.9 | SDM-4 | 120.8 | CLANS-4 | 118.2 |
+| DSD512 (lat=32) | CLANS-5/7/8 | 140.6 | SDM-5 | 140.6 | SDM-6 | 140.3 |
+
+Higher NTF orders (7-8) can be worse than lower orders at lower DSD rates — the trellis has insufficient look-ahead bandwidth to exploit aggressive noise shaping at DSD64/128.
 
 ### PreCorr SDM (greedy + prediction correction)
 
@@ -435,7 +452,7 @@ Each filter contains:
 - `g[order]` -- Resonator gain coefficients
 - `order` -- Filter order (4-8)
 
-**Trellis auto-selection**: CLANS-6 for DSD64/DSD256, SDM-6 for DSD128/DSD512. Optimized via comprehensive NTF × limiter × cands × lat sweep (see path_table in engine.c).
+**Trellis auto-selection**: CLANS-5 for DSD64, CLANS-6 for DSD128/DSD256, SDM-6 for DSD512. Lat: 64 for DSD64/DSD512, 128 for DSD128/DSD256. Optimized via comprehensive NTF sweep at production depth=4 (see path_table in engine.c).
 
 **PreCorr auto-selection**: CLANS-6 for DSD64, CLANS-7 for DSD128/DSD256/DSD512. (CLANS-8 is unstable with PreCorr's greedy quantizer at DSD256 boxcar input.)
 

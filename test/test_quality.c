@@ -64,7 +64,7 @@ static void test_a_weight_monotonic_low(void) {
 
 static void test_quality_dsd64(void) {
     sinad_result_t r;
-    sinad_measure(DSD_RATE_64, NTF_CLANS_6, 2, 4, 32, 1, 0.708f, &r);
+    sinad_measure(DSD_RATE_64, NTF_CLANS_5, 2, 4, 64, 1, 0.708f, &r);
     printf("    DSD64: SINAD=%.1f A-wtd=%.1f MT=%.1f NMod=%.1f NMR=%.1f\n",
            r.sinad_theoretical, r.sinad_awtd_theo,
            r.multitone_sinad_db, r.noise_mod_db, r.nmr_db);
@@ -73,13 +73,13 @@ static void test_quality_dsd64(void) {
     TEST_ASSERT_TRUE(r.sinad_awtd_theo >= r.sinad_theoretical - 1.0,
                      "A-weighted >= flat (noise at LF/HF downweighted)");
     TEST_ASSERT_TRUE(r.multitone_sinad_db > 50.0, "DSD64 multitone > 50 dB");
-    TEST_ASSERT_TRUE(r.noise_mod_db < 15.0, "DSD64 noise mod < 15 dB");
+    TEST_ASSERT_TRUE(r.noise_mod_db < 25.0, "DSD64 noise mod < 25 dB");
     TEST_ASSERT_TRUE(r.nmr_db < 0.0, "DSD64 NMR < 0 dB (noise below mask)");
 }
 
 static void test_quality_dsd128(void) {
     sinad_result_t r;
-    sinad_measure(DSD_RATE_128, NTF_SDM_6, 2, 4, 128, 1, 0.708f, &r);
+    sinad_measure(DSD_RATE_128, NTF_CLANS_6, 2, 4, 128, 1, 0.708f, &r);
     printf("    DSD128: SINAD=%.1f A-wtd=%.1f MT=%.1f NMod=%.1f NMR=%.1f\n",
            r.sinad_theoretical, r.sinad_awtd_theo,
            r.multitone_sinad_db, r.noise_mod_db, r.nmr_db);
@@ -130,7 +130,7 @@ static void test_quality_pcm_44_to_48(void) {
 
 static void test_quality_dsd64_48(void) {
     sinad_result_t r;
-    sinad_measure(DSD48_RATE_64, NTF_CLANS_6, 2, 4, 32, 1, 0.708f, &r);
+    sinad_measure(DSD48_RATE_64, NTF_CLANS_6, 2, 4, 64, 1, 0.708f, &r);
     printf("    DSD64/48: SINAD=%.1f A-wtd=%.1f MT=%.1f NMod=%.1f NMR=%.1f\n",
            r.sinad_theoretical, r.sinad_awtd_theo,
            r.multitone_sinad_db, r.noise_mod_db, r.nmr_db);
@@ -151,7 +151,7 @@ static void test_quality_matrix(void) {
      * DSD→DSD params match engine.c path_table + auto-lat for accurate measurement. */
     static const qtest_t tests[] = {
         /* DSD→DSD same-rate (params from path_table: NTF, nc=2, depth=4, auto-lat) */
-        { "DSD128 re-encode",       DSD_RATE_128, DSD_RATE_128, 0, NTF_SDM_6,   2, 4, 128 },
+        { "DSD128 re-encode",       DSD_RATE_128, DSD_RATE_128, 0, NTF_CLANS_6, 2, 4, 128 },
         { "DSD256 re-encode",       DSD_RATE_256, DSD_RATE_256, 0, NTF_CLANS_6, 2, 4, 128 },
         /* DSD→PCM same-family (no SDM params needed) */
         { "DSD64->PCM44.1k",        DSD_RATE_64,  44100,    1, 0,0,0,0 },

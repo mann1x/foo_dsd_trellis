@@ -36,7 +36,7 @@ Where:
 - The **feedback DAC** is trivial for 1-bit (just the previous output ±1)
 - The **integrator state vector** `s[n]` accumulates the error history across all filter orders
 
-The NTF determines the noise-shaping profile. Higher-order NTFs push more quantization noise above the audio band, achieving better in-band Signal-to-Noise-and-Distortion Ratio (SINAD). A 6th-order NTF at DSD512 (22.579 MHz) can achieve >130 dB SINAD.
+The NTF determines the noise-shaping profile. Higher-order NTFs push more quantization noise above the audio band, achieving better in-band Signal-to-Noise-and-Distortion Ratio (SINAD). Per-rate optimal NTFs: CLANS-5 (order 5) for DSD64, CLANS-6 (order 6) for DSD128/256, SDM-6 (order 6) for DSD512. Measured SINAD: 99 dB (DSD64), 121 dB (DSD128), 129 dB (DSD256), 140 dB (DSD512).
 
 ### 1.2 The Sequential Dependency Problem
 
@@ -84,8 +84,8 @@ Each candidate carries:
 - **Path**: Bit history of length L (the output decisions)
 
 The trellis SDM produces dramatically better results than greedy SDM:
-- 90+ dB SINAD at DSD64 (vs ~60 dB greedy)
-- 140+ dB SINAD at DSD512 (vs ~100 dB greedy)
+- 99 dB SINAD at DSD64, 121 dB at DSD128 (vs ~60 dB greedy)
+- 129 dB at DSD256, 140 dB at DSD512 (practical 1-bit ceiling)
 
 ### 1.4 Computational Cost
 
@@ -381,7 +381,7 @@ This provides the seed state for the next audio chunk, maintaining continuity ac
 
 - **CPU**: AMD Ryzen 9 9950X (16 cores / 32 threads, Zen 5)
 - **OS**: Windows 10 Pro
-- **SDM**: 6th-order NTF (SDM6), trellis_cands=2, trellis_lat=32
+- **SDM**: 6th-order NTF (SDM-6), trellis_cands=2, trellis_lat=32, depth=4
 - **Format**: DSD512 (22.579 MHz, 1-bit, stereo)
 - **Segments**: 4 per channel (8 total for stereo)
 - **Chunk size**: ~176,400 samples per channel (1 second of audio at output rate)

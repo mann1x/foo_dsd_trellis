@@ -1879,10 +1879,10 @@ public:
             }
 
             /* Trellis latency: per-rate override or auto-compute from DSD rate.
-             * From sweep with stability analysis (2026-03-19, nc=2):
-             *   DSD64:  lat=32  → 103.5 dB, 0 collapse
-             *   DSD128: lat=128 → 127.4 dB, 0 collapse
-             *   DSD256: lat=128 → 143.5 dB, 0 collapse
+             * From NTF sweep (2026-03-24, depth=4, nc=2, path_table NTFs):
+             *   DSD64:  CLANS5/lat=64  →  99.0 dB, 0 collapse
+             *   DSD128: CLANS6/lat=128 → 121.5 dB, 0 collapse
+             *   DSD256: CLANS6/lat=128 → 128.9 dB, 0 collapse
              *   DSD512: lat=32  → 137.6 dB, 0 collapse */
             if (m_config.rate_lat[map_idx] > 0) {
                 chunk_cfg.trellis_lat = (int)m_config.rate_lat[map_idx];
@@ -1893,7 +1893,7 @@ public:
                 else if (out_dsd >= DSD_RATE_128)
                     chunk_cfg.trellis_lat = 128;
                 else
-                    chunk_cfg.trellis_lat = 32;   /* DSD64 */
+                    chunk_cfg.trellis_lat = 64;   /* DSD64 */
             }
         }
 
