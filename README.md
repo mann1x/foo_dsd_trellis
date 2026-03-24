@@ -270,19 +270,6 @@ Parameters: `rate` (DSD rate in Hz), `nc` (candidates), `depth`, `lat` (latency)
 
 ### Reference Results
 
-#### DSD Same-Rate Re-encode (nc=2, depth=4, auto NTF, FIR lowpass 127-tap)
-
-| Rate | NTF | Lat | SINAD | A-wtd | Multitone | NMod |
-|------|-----|-----|-------|-------|-----------|------|
-| DSD64 | CLANS-5 | 64 | 99.0 | 102.8 | 84.4 | 9.8 |
-| DSD128 | CLANS-6 | 128 | 121.5 | 126.8 | 120.3 | 10.3 |
-| DSD256 | CLANS-6 | 128 | 128.9 | 134.1 | 123.7 | 2.1 |
-| DSD512 | SDM-6 | 32 | 140.5 | 147.7 | 119.8 | 20.0 |
-| DSD64/48 | CLANS-6 | 64 | 103.0 | 107.3 | 105.3 | 13.5 |
-| DSD128/48 | CLANS-6 | 128 | 100.8 | 105.9 | 113.2 | 18.8 |
-| DSD256/48 | CLANS-6 | 128 | 120.1 | 125.2 | 117.2 | 17.6 |
-| DSD512/48 | SDM-6 | 32 | 127.6 | 132.7 | 123.3 | 24.5 |
-
 #### DSD → PCM Decimation (FIR only, no SDM)
 
 | Path | SINAD | A-wtd | Multitone | NMod |
@@ -303,7 +290,7 @@ Parameters: `rate` (DSD rate in Hz), `nc` (candidates), `depth`, `lat` (latency)
 
 ## SINAD Results
 
-### Trellis SDM Direct Encode (nc=2, depth=4, path_table NTFs)
+### Trellis SDM (nc=2, depth=4, path_table NTFs)
 
 Viterbi look-ahead search with production path_config settings (matching real playback).
 
@@ -316,7 +303,7 @@ Viterbi look-ahead search with production path_config settings (matching real pl
 
 Practical ceiling is ~120-140 dB for 1-bit DSD (OBG-constrained NTF, Lee's rule). Published references: SACD spec 120 dB, Philips trellis ~97 dB, Archimago ~110-116 dB, HQPlayer ASDM7 ~110 dB.
 
-NTF re-optimization (2026-03-24): DSD64 CLANS-6→CLANS-5 (+7.3 dB), DSD128 SDM-6→CLANS-6 (+19.5 dB), lat 32→64 for DSD64 (+7.5 dB). DSD512 at the practical 1-bit ceiling. `/fp:precise` required — `/fp:fast` causes up to 13 dB quality variation from FMA reordering (same root cause as CUDA `--fmad=false`).
+`/fp:precise` required — `/fp:fast` causes up to 13 dB quality variation from FMA reordering (same root cause as CUDA `--fmad=false`).
 
 #### NTF Sweep Results (depth=4, nc=2, optimal lat per rate)
 
@@ -333,14 +320,16 @@ Higher NTF orders (7-8) can be worse than lower orders at lower DSD rates — th
 
 ### PreCorr SDM (greedy + prediction correction)
 
-Greedy quantiser with trained prediction table. Near-zero CPU (~0.01x realtime).
+Greedy quantiser with trained prediction correction table. Near-zero CPU (~0.01x realtime).
 
-| Rate | NTF Filter | SINAD (dB) |
-|------|------------|------------|
-| DSD64 | CLANS-6 (order 6) | 117.2 |
-| DSD128 | CLANS-7 (order 7) | 115.3 |
-| DSD256 | CLANS-7 (order 7) | 135.7 |
-| DSD512 | CLANS-7 (order 7) | 137.5 |
+| Rate | NTF Filter | SINAD | A-wtd |
+|------|------------|------:|------:|
+| DSD64 | CLANS-6 (order 6) | 117.2 | — |
+| DSD128 | CLANS-7 (order 7) | 115.3 | — |
+| DSD256 | CLANS-7 (order 7) | 135.7 | — |
+| DSD512 | CLANS-7 (order 7) | 137.5 | — |
+
+PreCorr outperforms Trellis at DSD64 (+18.2 dB) because: (1) it uses a higher-order NTF (CLANS-6 vs CLANS-5), (2) its trained prediction table avoids the candidate collapse that degrades Trellis at low OSR, and (3) no path pruning overhead. Trellis catches up at DSD128+ where higher OSR gives the look-ahead more room to work.
 
 ### DSD Rate Conversion — Path-Adaptive Tuning
 
