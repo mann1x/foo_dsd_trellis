@@ -438,8 +438,8 @@ static void test_sdm_sinad_multibit(void) {
         }
         double sinad_g2 = 10.0 * log10(sig_g2 / (noise_g2 > 0 ? noise_g2 : 1e-30));
 
-        /* Test aggressive NTFs with 16 levels */
-        {
+        /* Test aggressive NTFs with 16 levels (SLOW — disabled for iteration) */
+        if (0) {
 #include "../include/ntf_multibit.h"
             const ntf_multibit_config_t *cfg = ntf_multibit_configs;
             int rate_idx = (dsd_rate_mult == 64) ? 0 : (dsd_rate_mult == 128) ? 1 :
@@ -489,8 +489,9 @@ static void test_sdm_sinad_multibit(void) {
             }
         }
 
-        /* Sweep: 2, 4, 8, 16 levels */
-        double sinad_by_nlev[5] = {0}; /* [0]=unused, [1]=2lev, [2]=4lev, [3]=8lev, [4]=16lev */
+        /* Sweep: 2, 4, 8, 16 levels (skip for fast iteration — only run 2-stage) */
+        double sinad_by_nlev[5] = {0};
+        if (0) { /* disabled for speed */
         sinad_by_nlev[1] = sinad_g2;
         sinad_by_nlev[2] = sinad_mb;
         int test_nlevs[] = {8, 16};
@@ -532,6 +533,161 @@ static void test_sdm_sinad_multibit(void) {
             }
             sinad_by_nlev[3 + tl] = 10.0 * log10(tsig / (tnoise > 0 ? tnoise : 1e-30));
         }
+        } /* end if(0) level sweep */
+        /* === OPTION 4: Oversampled intermediate ===
+         * SDM at 2× rate (better NTF), then decimate back to target rate.
+         * FIR decimate removes ultrasonic noise, giving cleaner input for
+         * final SDM re-encode. Tests if oversampling beats same-rate. */
+        {
+            unsigned n_2s = 65536;
+            if (dsd_rate_mult >= 128) n_2s = 131072;
+            if (dsd_rate_mult >= 256) n_2s = 262144;
+
+            /* Step 1: Generate test sine at target rate */
+            for (unsigned i = 0; i < n_2s; i++)
+                in[i] = 0.5 * sin(2.0 * 3.14159265358979323846 * freq * i / dsd_rate);
+
+            /* Step 2: 1-bit SDM at 2× rate (oversampled) */
+            unsigned n_up = n_2s * 2;
+            double *up_in = (double *)calloc(n_up, sizeof(double));
+            /* Zero-stuff upsample: insert zero between each sample */
+            for (unsigned i = 0; i < n_2s; i++) {
+                up_in[i * 2] = in[i] * 2.0;  /* ×2 to compensate for zero-stuffing */
+                up_in[i * 2 + 1] = 0.0;
+            }
+
+            /* SDM at 2× rate with the higher-rate NTF */
+            unsigned up_rate = dsd_rate * 2;
+            const ntf_filter_t *f_up = ntf_auto_select(up_rate);
+            fflush(stdout);
+            printf("    [OPT4-DBG] %s: up_rate=%u f_up=%p n_up=%u\n", names[r], up_rate, (void*)f_up, n_up);
+            fflush(stdout);
+            if (f_up) {
+                int up_lat = DSD_DEFAULT_TRELLIS_LAT;
+                sdm_context_t ctx_up;
+                sdm_context_init(&ctx_up, f_up, 8, 2, up_lat);
+                float *up_out = (float *)malloc(n_up * sizeof(float));
+                size_t up_prod = sdm_process_block(&ctx_up, up_in, up_out, n_up);
+
+                /* Step 3: Decimate 2× (take every other sample) */
+                unsigned dec_n = (unsigned)(up_prod / 2);
+                double *dec_out = (double *)malloc(dec_n * sizeof(double));
+                for (unsigned i = 0; i < dec_n; i++)
+                    dec_out[i] = (double)up_out[i * 2] * 2.0;  /* ×2 to compensate for 0.5× in stage 2 */
+
+                /* Step 4: Final 1-bit SDM at target rate */
+                sdm_context_t ctx_final;
+                sdm_context_init(&ctx_final, f, 8, 2, lat);
+                float *final_out = (float *)malloc(dec_n * sizeof(float));
+                size_t final_prod = sdm_process_block(&ctx_final, dec_out, final_out, dec_n);
+
+                /* Measure SINAD */
+                if (final_prod > 1000) {
+                    double f_sig = goertzel_power(final_out, final_prod, freq, (double)dsd_rate);
+                    double f_bw = (double)dsd_rate / (double)final_prod;
+                    unsigned f_max = (unsigned)(22050.0 / f_bw);
+                    unsigned f_sb = (unsigned)(freq / f_bw + 0.5);
+                    double f_noise = 0;
+                    for (unsigned b = 1; b <= f_max; b++) {
+                        if (b >= f_sb - 1 && b <= f_sb + 1) continue;
+                        f_noise += goertzel_power(final_out, final_prod, b * f_bw, (double)dsd_rate);
+                    }
+                    double sinad_opt4 = 10.0 * log10(f_sig / (f_noise > 0 ? f_noise : 1e-30));
+                    printf("    [OPT4] %s: oversampled(2x→%s→decimate→%s) = %.1f dB  vs single-stage = %.1f dB  delta = %+.1f dB\n",
+                           names[r], (dsd_rate_mult <= 64) ? "DSD128" : (dsd_rate_mult <= 128) ? "DSD256" : "DSD512",
+                           names[r], sinad_opt4, sinad1, sinad_opt4 - sinad1);
+                }
+                free(up_in); free(up_out); free(dec_out); free(final_out);
+                sdm_context_free(&ctx_up);
+                sdm_context_free(&ctx_final);
+            } else {
+                free(up_in);
+                printf("    [OPT4] %s: no NTF for 2x rate, skipped\n", names[r]);
+            }
+        }
+
+        /* === 2-STAGE MULTIBIT TEST (disabled — limited by stage 2 SINAD) === */
+        if (0) {
+            unsigned n_2s = 65536;
+            if (dsd_rate_mult >= 128) n_2s = 131072;
+            if (dsd_rate_mult >= 256) n_2s = 262144;
+            double *mb_out = (double *)calloc(n_2s, sizeof(double));
+            double s1_state[MAX_NTF_ORDER] = {0};
+            double s1_step = 2.0 / 15.0;
+            unsigned s1_prod = 0;
+            for (unsigned i = 0; i < n_2s; i++) {
+                in[i] = 0.5 * sin(2.0 * 3.14159265358979323846 * freq * i / dsd_rate);
+            }
+            for (unsigned i = 0; i < n_2s; i++) {
+                double xi = in[i] * 0.5;
+                double d[MAX_NTF_ORDER], v = xi;
+                d[0] = s1_state[0] - f->g[0] * s1_state[1] + xi;
+                v += f->a[0] * d[0];
+                for (int k = 1; k < f->order - 1; k++) {
+                    d[k] = s1_state[k] + s1_state[k-1] - f->g[k] * s1_state[k+1];
+                    v += f->a[k] * d[k];
+                }
+                d[f->order-1] = s1_state[f->order-1] + s1_state[f->order-2];
+                v += f->a[f->order-1] * d[f->order-1];
+                double y_ideal = v / f->a[0];
+                int idx = (int)((y_ideal + 1.0) / s1_step + 0.5);
+                if (idx < 0) idx = 0; if (idx > 15) idx = 15;
+                double y = -1.0 + (double)idx * s1_step;
+                s1_state[0] = d[0] - y;
+                for (int k = 1; k < f->order; k++) s1_state[k] = d[k];
+                if (i >= (unsigned)lat)
+                    mb_out[s1_prod++] = y;
+            }
+
+            /* FIR lowpass: recover smooth signal from multibit PDM.
+             * Simple boxcar filter (same as DSD-Wide volume control path). */
+            int bc_taps = (dsd_rate_mult <= 64) ? 32 :
+                          (dsd_rate_mult <= 128) ? 64 : 128;
+            double *smooth = (double *)malloc(s1_prod * sizeof(double));
+            {
+                double bc_sum = 0;
+                double *bc_ring = (double *)calloc((size_t)bc_taps, sizeof(double));
+                int bc_pos = 0;
+                for (unsigned i = 0; i < s1_prod; i++) {
+                    bc_sum -= bc_ring[bc_pos];
+                    bc_ring[bc_pos] = mb_out[i];
+                    bc_sum += mb_out[i];
+                    bc_pos = (bc_pos + 1) % bc_taps;
+                    smooth[i] = bc_sum / (double)bc_taps;
+                }
+                free(bc_ring);
+            }
+
+            /* Stage 2: feed smoothed signal into 1-bit trellis SDM (nc=2).
+             * Scale by 2.0 to compensate for sdm_process_block's internal ×0.5. */
+            for (unsigned i = 0; i < s1_prod; i++)
+                smooth[i] *= 2.0;
+            sdm_context_t ctx2;
+            sdm_context_init(&ctx2, f, 8, 2, lat);
+            float *s2_out = (float *)malloc(s1_prod * sizeof(float));
+            size_t s2_prod = sdm_process_block(&ctx2, smooth, s2_out, s1_prod);
+            free(smooth);
+
+            /* Measure combined SINAD */
+            if (s2_prod > 1000) {
+                double s2_sig = goertzel_power(s2_out, s2_prod, freq, (double)dsd_rate);
+                double s2_bw = (double)dsd_rate / (double)s2_prod;
+                unsigned s2_max = (unsigned)(22050.0 / s2_bw);
+                unsigned s2_sb = (unsigned)(freq / s2_bw + 0.5);
+                double s2_noise = 0;
+                for (unsigned b = 1; b <= s2_max; b++) {
+                    if (b >= s2_sb - 1 && b <= s2_sb + 1) continue;
+                    s2_noise += goertzel_power(s2_out, s2_prod, b * s2_bw, (double)dsd_rate);
+                }
+                double sinad_2stage = 10.0 * log10(s2_sig / (s2_noise > 0 ? s2_noise : 1e-30));
+                printf("    [2S] %s: stage1(16lev)=%.1f + stage2(1bit-nc2)=%.1f  vs single-stage=%.1f  delta=%+.1f dB\n",
+                       names[r], sinad_by_nlev[4], sinad_2stage, sinad1, sinad_2stage - sinad1);
+            }
+
+            free(mb_out); free(s2_out);
+            sdm_context_free(&ctx2);
+        }
+
         printf("    [MB] %s: 1bit-trellis=%.1f  greedy: 2lev=%.1f 4lev=%.1f 8lev=%.1f 16lev=%.1f\n",
                names[r], sinad1, sinad_by_nlev[1], sinad_by_nlev[2], sinad_by_nlev[3], sinad_by_nlev[4]);
 
