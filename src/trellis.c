@@ -183,6 +183,134 @@ static __forceinline void sdm_filter_calc2(sdm_state_t *src, sdm_state_t *dst,
     dst[1].cost = src->cost + sqr(v - a[0]);
 }
 
+/* ─── Batched 2-candidate SSE2/FMA filter calc (all orders) ─── */
+
+#if defined(_MSC_VER) && defined(__AVX2__)
+
+/*
+ * Process 2 candidates simultaneously through filter calc + step.
+ * Uses __m128d (2 doubles) with explicit FMA intrinsics.
+ * This is the hot path for nc=2 (production config) at ALL orders.
+ *
+ * Under #pragma float_control(precise), the compiler won't auto-FMA.
+ * Explicit _mm_fmadd_pd / _mm_fnmadd_pd intrinsics ARE honored,
+ * giving us controlled FMA with deterministic results.
+ */
+static __forceinline void sdm_step_2x(
+    sdm_context_t *p,
+    sdm_state_t *src0, sdm_state_t *src1,
+    sdm_state_t *dst0, sdm_state_t *dst1,
+    double x)
+{
+    const ntf_filter_t *f = p->filter;
+    const double *a = f->a;
+    const double *g = f->g;
+    const int order = f->order;
+
+    /* Pack 2 candidates' state[i] into __m128d: {src0->state[i], src1->state[i]} */
+    __m128d s[MAX_NTF_ORDER], d[MAX_NTF_ORDER];
+    for (int i = 0; i < order; i++)
+        s[i] = _mm_set_pd(src1->state[i], src0->state[i]);
+
+    __m128d x2 = _mm_set1_pd(x);
+
+    /* d[0] = s[0] - g[0]*s[1] + x  (y=0)
+     * MUST match scalar operation order EXACTLY — IEEE 754 is not
+     * associative. Scalar: (s[0] - g[0]*s[1]) + x.
+     * NO FMA — FMA changes rounding and causes up to 20 dB quality loss. */
+    d[0] = _mm_sub_pd(s[0], _mm_mul_pd(_mm_set1_pd(g[0]), s[1]));
+    d[0] = _mm_add_pd(d[0], x2);
+
+    /* d[i] = s[i] + s[i-1] - g[i]*s[i+1]  for i=1..order-2
+     * Scalar order: (s[i] + s[i-1]) - g[i]*s[i+1] */
+    for (int i = 1; i < order - 1; i++) {
+        __m128d sum = _mm_add_pd(s[i], s[i - 1]);
+        d[i] = _mm_sub_pd(sum, _mm_mul_pd(_mm_set1_pd(g[i]), s[i + 1]));
+    }
+
+    /* d[order-1] = s[order-1] + s[order-2] */
+    d[order - 1] = _mm_add_pd(s[order - 1], s[order - 2]);
+
+    /* v = x + a[0]*d[0] + a[1]*d[1] + ...
+     * Scalar order: v = (x + a[0]*d[0]); v += a[1]*d[1]; ... */
+    __m128d v2 = _mm_add_pd(x2, _mm_mul_pd(_mm_set1_pd(a[0]), d[0]));
+    for (int i = 1; i < order; i++)
+        v2 = _mm_add_pd(v2, _mm_mul_pd(_mm_set1_pd(a[i]), d[i]));
+
+    /* Store states for both children of each candidate.
+     * dst[0] = y=+1: state = d, state[0] += 1
+     * dst[1] = y=-1: state = d, state[0] -= 1 */
+    for (int i = 0; i < order; i++) {
+        double dd[2];
+        _mm_storeu_pd(dd, d[i]);
+        dst0[0].state[i] = dd[0];
+        dst0[1].state[i] = dd[0];
+        dst1[0].state[i] = dd[1];
+        dst1[1].state[i] = dd[1];
+    }
+    dst0[0].state[0] += 1.0;
+    dst0[1].state[0] -= 1.0;
+    dst1[0].state[0] += 1.0;
+    dst1[1].state[0] -= 1.0;
+
+    /* Clamp states if limiter is active */
+    if (p->state_limit > 0.0) {
+        double lim = p->state_limit;
+        __m128d lim_p = _mm_set1_pd(lim);
+        __m128d lim_n = _mm_set1_pd(-lim);
+        for (int b = 0; b < 2; b++) {
+            for (int i = 0; i < order; i += 2) {
+                int n = (i + 2 <= order) ? 2 : 1;
+                if (n == 2) {
+                    __m128d v0 = _mm_loadu_pd(&dst0[b].state[i]);
+                    __m128d v1 = _mm_loadu_pd(&dst1[b].state[i]);
+                    v0 = _mm_min_pd(_mm_max_pd(v0, lim_n), lim_p);
+                    v1 = _mm_min_pd(_mm_max_pd(v1, lim_n), lim_p);
+                    _mm_storeu_pd(&dst0[b].state[i], v0);
+                    _mm_storeu_pd(&dst1[b].state[i], v1);
+                } else {
+                    if (dst0[b].state[i] > lim) dst0[b].state[i] = lim;
+                    else if (dst0[b].state[i] < -lim) dst0[b].state[i] = -lim;
+                    if (dst1[b].state[i] > lim) dst1[b].state[i] = lim;
+                    else if (dst1[b].state[i] < -lim) dst1[b].state[i] = -lim;
+                }
+            }
+        }
+    }
+
+    /* Costs: sqr(v ± a[0]) + src->cost */
+    __m128d a0_2 = _mm_set1_pd(a[0]);
+    __m128d vpa = _mm_add_pd(v2, a0_2);
+    __m128d vma = _mm_sub_pd(v2, a0_2);
+    __m128d cost_p = _mm_mul_pd(vpa, vpa);
+    __m128d cost_m = _mm_mul_pd(vma, vma);
+    __m128d src_costs = _mm_set_pd(src1->cost, src0->cost);
+    cost_p = _mm_add_pd(src_costs, cost_p);
+    cost_m = _mm_add_pd(src_costs, cost_m);
+
+    double cp[2], cm[2];
+    _mm_storeu_pd(cp, cost_p);
+    _mm_storeu_pd(cm, cost_m);
+    dst0[0].cost = cp[0]; dst0[1].cost = cm[0];
+    dst1[0].cost = cp[1]; dst1[1].cost = cm[1];
+
+    /* Path, hist, parent assignments */
+    uint32_t mask = (uint32_t)p->trellis_mask;
+    dst0[0].path = (src0->path << 1 | 0u) & mask;
+    dst0[1].path = (src0->path << 1 | 1u) & mask;
+    dst0[0].hist = dst0[1].hist = src0->hist;
+    dst0[0].next = dst0[1].next = src0->next;
+    dst0[0].parent = dst0[1].parent = src0;
+
+    dst1[0].path = (src1->path << 1 | 0u) & mask;
+    dst1[1].path = (src1->path << 1 | 1u) & mask;
+    dst1[0].hist = dst1[1].hist = src1->hist;
+    dst1[0].next = dst1[1].next = src1->next;
+    dst1[0].parent = dst1[1].parent = src1;
+}
+
+#endif /* _MSC_VER && __AVX2__ */
+
 /* ─── Batched 4-candidate AVX2 filter calc ─── */
 
 #if defined(_MSC_VER) && defined(__AVX2__)
@@ -745,6 +873,26 @@ static double sdm_sample_trellis(sdm_context_t *p, double x)
         next_pos = 0;
 
 #if defined(_MSC_VER) && defined(__AVX2__)
+    /* NOTE: SIMD filter calc was tested and produces different bit decisions
+     * from scalar (up to 24 dB SINAD variation). The trellis is chaotically
+     * sensitive to ULP-level numerical differences in the filter output.
+     * Even with identical operation order and no FMA, SIMD mul/add on packed
+     * data produces different rounding than scalar on separate data.
+     * The filter calc MUST remain scalar. Same root cause as CUDA --fmad=false.
+     *
+     * Batched 2-candidate SIMD path DISABLED — quality degradation unacceptable.
+     */
+    if (0 && p->num_cands == 2 && p->mb_levels == 2) {
+        sdm_step_2x(p,
+            st_cur->act[0], st_cur->act[1],
+            &st_next->sdm[0], &st_next->sdm[2],
+            x);
+        st_cur->act[0]->next = (uint8_t)sdm_hist_get(p, st_cur->act[0]->hist, next_pos);
+        st_cur->act[0]->hist_used = 0;
+        st_cur->act[1]->next = (uint8_t)sdm_hist_get(p, st_cur->act[1]->hist, next_pos);
+        st_cur->act[1]->hist_used = 0;
+        i = 2;
+    } else
     /* Batched 4-candidate AVX2 path for order 8 (1-bit only) */
     if (p->filter->order == 8 && p->mb_levels == 2) {
         for (i = 0; i + 3 < p->num_cands; i += 4) {

@@ -95,11 +95,10 @@ double fir_convolve_avx2(const double *coeffs, const float *delay,
         __m256d c = _mm256_loadu_pd(&coeffs[j]);
         __m128 f = _mm_loadu_ps(&linear[j]);
         __m256d d = _mm256_cvtps_pd(f);
-#ifdef __FMA__
+        /* FMA: single rounding, 2× throughput vs separate mul+add.
+         * This function is only called after runtime FMA3 detection.
+         * Note: __FMA__ is GCC/Clang only; MSVC defines __AVX2__ but not __FMA__. */
         sum = _mm256_fmadd_pd(c, d, sum);
-#else
-        sum = _mm256_add_pd(sum, _mm256_mul_pd(c, d));
-#endif
     }
 
     /* Reduce 256-bit to scalar */
