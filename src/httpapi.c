@@ -1127,6 +1127,24 @@ static void handle_request(httpapi_t *api, SOCKET client) {
             send_method_not_allowed(client);
         }
 
+    } else if (strcmp(path, "/api/pgo_sweep") == 0) {
+        /* POST /api/pgo_sweep — flush PGO profile data (instrumented builds) */
+        if (_stricmp(method, "POST") == 0) {
+            typedef void (__cdecl *PgoSweepFn)(const char *);
+            HMODULE pgort = GetModuleHandleA("pgort140.dll");
+            PgoSweepFn sweep = pgort ?
+                (PgoSweepFn)GetProcAddress(pgort, "IrtAutoSweepA") : NULL;
+            if (sweep) {
+                sweep("foo_dsd_trellis");
+                send_json(client, 200, "OK", "{\"status\":\"flushed\"}", 20);
+            } else {
+                send_json(client, 200, "OK",
+                    "{\"status\":\"not_instrumented\"}", 28);
+            }
+        } else {
+            send_method_not_allowed(client);
+        }
+
     } else {
         send_not_found(client);
     }

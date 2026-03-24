@@ -149,6 +149,8 @@
     <Link>
       <AdditionalLibraryDirectories>$(ProjectDir)packages\intelipp.static.win-x64.2022.3.1.8\build\native\win-x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>ippsmt.lib;ippvmmt.lib;ippcoremt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions Condition="'$(PGOMode)'=='Instrument'">/GENPROFILE %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions Condition="'$(PGOMode)'=='Optimize'">/USEPROFILE %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <!-- Win32-specific: target machine -->

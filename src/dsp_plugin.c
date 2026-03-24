@@ -317,6 +317,20 @@ void plugin_destroy(plugin_state_t *s) {
     if (!s)
         return;
 
+#ifdef _MSC_VER
+    /* Flush PGO profile data if running an instrumented build.
+     * PgoAutoSweep is injected by the linker when /GENPROFILE is used.
+     * It's a no-op (unresolved) in non-PGO builds — weak-link it. */
+    {
+        typedef void (*PgoAutoSweepFn)(const char *);
+        HMODULE self = GetModuleHandleA("foo_dsd_trellis.dll");
+        PgoAutoSweepFn sweep = self ?
+            (PgoAutoSweepFn)GetProcAddress(self, "PgoAutoSweep") : NULL;
+        if (sweep)
+            sweep("foo_dsd_trellis");
+    }
+#endif
+
     /* Allow system to idle/sleep again */
     SetThreadExecutionState(ES_CONTINUOUS);
 
@@ -2672,6 +2686,24 @@ double plugin_get_latency(const plugin_state_t *s) {
 void plugin_flush(plugin_state_t *s) {
     if (!s || !s->initialized)
         return;
+
+#ifdef _MSC_VER
+    /* Flush PGO profile data on playback stop (instrumented builds only).
+     * plugin_destroy isn't called on force-kill, but flush runs on stop. */
+    {
+        typedef void (__cdecl *PgoSweepFn)(const char *);
+        static PgoSweepFn sweep = NULL;
+        static bool checked = false;
+        if (!checked) {
+            HMODULE pgort = GetModuleHandleA("pgort140.dll");
+            if (pgort)
+                sweep = (PgoSweepFn)GetProcAddress(pgort, "IrtAutoSweepA");
+            checked = true;
+        }
+        if (sweep)
+            sweep("foo_dsd_trellis");
+    }
+#endif
     /* Always fully reset SDM state on flush. With state-seeded parallelism,
      * the persistent SDM gets overwritten by temp SDM state each chunk.
      * Preserving this stale state across stop→play causes massive pops.
