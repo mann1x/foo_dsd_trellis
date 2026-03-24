@@ -299,6 +299,247 @@ static void test_sdm_sinad_dsd512(void) {
                      "DSD512 trellis SINAD should exceed 60 dB for 1kHz sine");
 }
 
+static void test_sdm_sinad_multibit(void) {
+    /* Test multi-bit trellis (4 levels, nc=2) vs 1-bit (2 levels, nc=2)
+     * at DSD128. Compare SINAD to see if multibit search improves quality. */
+    unsigned rates[] = {64, 128, 256};
+    const char *names[] = {"DSD64", "DSD128", "DSD256"};
+    for (int r = 0; r < 3; r++) {
+        unsigned dsd_rate_mult = rates[r];
+        unsigned dsd_rate = dsd_rate_mult * 44100;
+        unsigned n_dsd = (dsd_rate_mult <= 64) ? 262144u :
+                         (dsd_rate_mult <= 128) ? 524288u : 1048576u;
+        int lat = DSD_DEFAULT_TRELLIS_LAT;
+        unsigned produced_est = n_dsd - (unsigned)lat;
+        double bin_width = (double)dsd_rate / (double)produced_est;
+        unsigned sig_bin = (unsigned)(1000.0 / bin_width + 0.5);
+        double freq = sig_bin * bin_width;
+
+        const ntf_filter_t *f = ntf_auto_select(dsd_rate);
+        if (!f) continue;
+
+        /* 1-bit baseline */
+        sdm_context_t ctx1;
+        sdm_context_init(&ctx1, f, 8, 2, lat);
+        double *in = (double *)malloc(n_dsd * sizeof(double));
+        float *out = (float *)malloc(n_dsd * sizeof(float));
+        for (unsigned i = 0; i < n_dsd; i++)
+            in[i] = 0.5 * sin(2.0 * 3.14159265358979323846 * freq * i / dsd_rate);
+        size_t prod1 = sdm_process_block(&ctx1, in, out, n_dsd);
+        double sig1 = goertzel_power(out, prod1, freq, (double)dsd_rate);
+        double actual_bw = (double)dsd_rate / (double)prod1;
+        unsigned max_bin = (unsigned)(22050.0 / actual_bw);
+        unsigned actual_sig_bin = (unsigned)(freq / actual_bw + 0.5);
+        double noise1 = 0;
+        for (unsigned b = 1; b <= max_bin; b++) {
+            if (b >= actual_sig_bin - 1 && b <= actual_sig_bin + 1) continue;
+            noise1 += goertzel_power(out, prod1, b * actual_bw, (double)dsd_rate);
+        }
+        double sinad1 = 10.0 * log10(sig1 / (noise1 > 0 ? noise1 : 1e-30));
+
+        /* Multi-bit greedy (4 levels) with gain-compensated NTF.
+         * Scale a[] by (N-1)/2 to restore loop gain for multi-bit quantizer. */
+        float *out_mb = (float *)malloc(n_dsd * sizeof(float));
+        double mb_state[MAX_NTF_ORDER] = {0};
+        double mb_step = 2.0 / (double)(SDM_MB_LEVELS - 1);
+        double mb_gain = (double)(SDM_MB_LEVELS - 1) / 2.0;  /* 1.5 for 4 levels */
+        double a_mb[MAX_NTF_ORDER];
+        for (int k = 0; k < f->order; k++)
+            a_mb[k] = f->a[k] * mb_gain;
+        size_t prod_mb = n_dsd;
+        for (unsigned i = 0; i < n_dsd; i++) {
+            double xi = in[i] * 0.5;
+            double d[MAX_NTF_ORDER], vi = xi;
+            d[0] = mb_state[0] - f->g[0] * mb_state[1] + xi;
+            vi += a_mb[0] * d[0];
+            for (int k = 1; k < f->order - 1; k++) {
+                d[k] = mb_state[k] + mb_state[k-1] - f->g[k] * mb_state[k+1];
+                vi += a_mb[k] * d[k];
+            }
+            d[f->order-1] = mb_state[f->order-1] + mb_state[f->order-2];
+            vi += a_mb[f->order-1] * d[f->order-1];
+
+            /* Quantize: y = round(v/a_mb[0]) to nearest level */
+            double y_ideal = vi / a_mb[0];
+            int idx = (int)((y_ideal + 1.0) / mb_step + 0.5);
+            if (idx < 0) idx = 0;
+            if (idx > SDM_MB_LEVELS - 1) idx = SDM_MB_LEVELS - 1;
+            double y = -1.0 + (double)idx * mb_step;
+
+            mb_state[0] = d[0] - y;
+            for (int k = 1; k < f->order; k++) mb_state[k] = d[k];
+            if (i >= (unsigned)lat)
+                out_mb[i - (unsigned)lat] = (float)y;
+        }
+        prod_mb = n_dsd - (unsigned)lat;
+        memcpy(out, out_mb, prod_mb * sizeof(float));
+        free(out_mb);
+        double sig_mb = goertzel_power(out, prod_mb, freq, (double)dsd_rate);
+        actual_bw = (double)dsd_rate / (double)prod_mb;
+        max_bin = (unsigned)(22050.0 / actual_bw);
+        actual_sig_bin = (unsigned)(freq / actual_bw + 0.5);
+        double noise_mb = 0;
+        for (unsigned b = 1; b <= max_bin; b++) {
+            if (b >= actual_sig_bin - 1 && b <= actual_sig_bin + 1) continue;
+            noise_mb += goertzel_power(out, prod_mb, b * actual_bw, (double)dsd_rate);
+        }
+        double sinad_mb = 10.0 * log10(sig_mb / (noise_mb > 0 ? noise_mb : 1e-30));
+
+        /* Also test greedy 1-bit for comparison */
+        sdm_context_t ctx_g1;
+        sdm_context_init(&ctx_g1, f, 8, 1, lat);  /* nc=1 = greedy */
+        for (unsigned i = 0; i < n_dsd; i++)
+            in[i] = 0.5 * sin(2.0 * 3.14159265358979323846 * freq * i / dsd_rate);
+        size_t prod_g1 = sdm_process_block(&ctx_g1, in, out, n_dsd);
+        double sig_g1 = goertzel_power(out, prod_g1, freq, (double)dsd_rate);
+        actual_bw = (double)dsd_rate / (double)prod_g1;
+        max_bin = (unsigned)(22050.0 / actual_bw);
+        actual_sig_bin = (unsigned)(freq / actual_bw + 0.5);
+        double noise_g1 = 0;
+        for (unsigned b = 1; b <= max_bin; b++) {
+            if (b >= actual_sig_bin - 1 && b <= actual_sig_bin + 1) continue;
+            noise_g1 += goertzel_power(out, prod_g1, b * actual_bw, (double)dsd_rate);
+        }
+        double sinad_g1 = 10.0 * log10(sig_g1 / (noise_g1 > 0 ? noise_g1 : 1e-30));
+        sdm_context_free(&ctx_g1);
+
+        /* Also test greedy multibit with 2 levels (should match greedy 1-bit).
+         * NOTE: sdm_process_block skips first `lat` samples (latency buffer).
+         * We must do the same — no traceback, just skip output for first `lat`. */
+        double mb2_state[MAX_NTF_ORDER] = {0};
+        for (unsigned i = 0; i < n_dsd; i++)
+            in[i] = 0.5 * sin(2.0 * 3.14159265358979323846 * freq * i / dsd_rate);
+        unsigned mb2_produced = 0;
+        for (unsigned i = 0; i < n_dsd; i++) {
+            double xi = in[i] * 0.5;
+            double d2[MAX_NTF_ORDER], vi2 = xi;
+            d2[0] = mb2_state[0] - f->g[0] * mb2_state[1] + xi;
+            vi2 += f->a[0] * d2[0];
+            for (int k = 1; k < f->order - 1; k++) {
+                d2[k] = mb2_state[k] + mb2_state[k-1] - f->g[k] * mb2_state[k+1];
+                vi2 += f->a[k] * d2[k];
+            }
+            d2[f->order-1] = mb2_state[f->order-1] + mb2_state[f->order-2];
+            vi2 += f->a[f->order-1] * d2[f->order-1];
+            double y2 = (vi2 / f->a[0] > 0.0) ? 1.0 : -1.0;
+            mb2_state[0] = d2[0] - y2;
+            for (int k = 1; k < f->order; k++) mb2_state[k] = d2[k];
+            if (i >= (unsigned)lat)
+                out[mb2_produced++] = (float)y2;
+        }
+        double sig_g2 = goertzel_power(out, mb2_produced, freq, (double)dsd_rate);
+        actual_bw = (double)dsd_rate / (double)mb2_produced;
+        max_bin = (unsigned)(22050.0 / actual_bw);
+        actual_sig_bin = (unsigned)(freq / actual_bw + 0.5);
+        double noise_g2 = 0;
+        for (unsigned b = 1; b <= max_bin; b++) {
+            if (b >= actual_sig_bin - 1 && b <= actual_sig_bin + 1) continue;
+            noise_g2 += goertzel_power(out, mb2_produced, b * actual_bw, (double)dsd_rate);
+        }
+        double sinad_g2 = 10.0 * log10(sig_g2 / (noise_g2 > 0 ? noise_g2 : 1e-30));
+
+        /* Test aggressive NTFs with 16 levels */
+        {
+#include "../include/ntf_multibit.h"
+            const ntf_multibit_config_t *cfg = ntf_multibit_configs;
+            int rate_idx = (dsd_rate_mult == 64) ? 0 : (dsd_rate_mult == 128) ? 1 :
+                           (dsd_rate_mult == 256) ? 2 : 3;
+            while (cfg->config) {
+                const ntf_filter_t *mf = cfg->filters[rate_idx];
+                if (mf && cfg->min_levels <= 16) {
+                    double ms[MAX_NTF_ORDER] = {0};
+                    unsigned mp = 0;
+                    for (unsigned i = 0; i < n_dsd; i++) {
+                        double xi = in[i] * 0.5;
+                        double md[MAX_NTF_ORDER], mv = xi;
+                        md[0] = ms[0] - mf->g[0] * ms[1] + xi;
+                        mv += mf->a[0] * md[0];
+                        for (int k = 1; k < mf->order - 1; k++) {
+                            md[k] = ms[k] + ms[k-1] - mf->g[k] * ms[k+1];
+                            mv += mf->a[k] * md[k];
+                        }
+                        md[mf->order-1] = ms[mf->order-1] + ms[mf->order-2];
+                        mv += mf->a[mf->order-1] * md[mf->order-1];
+                        double mstep = 2.0 / 15.0; /* 16 levels */
+                        double my_ideal = mv / mf->a[0];
+                        int midx = (int)((my_ideal + 1.0) / mstep + 0.5);
+                        if (midx < 0) midx = 0;
+                        if (midx > 15) midx = 15;
+                        double my = -1.0 + (double)midx * mstep;
+                        ms[0] = md[0] - my;
+                        for (int k = 1; k < mf->order; k++) ms[k] = md[k];
+                        if (i >= (unsigned)mf->order * 16) /* skip warmup */
+                            out[mp++] = (float)my;
+                    }
+                    if (mp > 1000) {
+                        double msig = goertzel_power(out, mp, freq, (double)dsd_rate);
+                        double mbw = (double)dsd_rate / (double)mp;
+                        unsigned mmb = (unsigned)(22050.0 / mbw);
+                        unsigned msb = (unsigned)(freq / mbw + 0.5);
+                        double mn = 0;
+                        for (unsigned b = 1; b <= mmb; b++) {
+                            if (b >= msb - 1 && b <= msb + 1) continue;
+                            mn += goertzel_power(out, mp, b * mbw, (double)dsd_rate);
+                        }
+                        double ms_sinad = 10.0 * log10(msig / (mn > 0 ? mn : 1e-30));
+                        printf("    [NTF] %s %s 16lev: %.1f dB\n", names[r], cfg->config, ms_sinad);
+                    }
+                }
+                cfg++;
+            }
+        }
+
+        /* Sweep: 2, 4, 8, 16 levels */
+        double sinad_by_nlev[5] = {0}; /* [0]=unused, [1]=2lev, [2]=4lev, [3]=8lev, [4]=16lev */
+        sinad_by_nlev[1] = sinad_g2;
+        sinad_by_nlev[2] = sinad_mb;
+        int test_nlevs[] = {8, 16};
+        for (int tl = 0; tl < 2; tl++) {
+            int tnlev = test_nlevs[tl];
+            double tstep = 2.0 / (double)(tnlev - 1);
+            double tstate[MAX_NTF_ORDER] = {0};
+            for (unsigned i = 0; i < n_dsd; i++)
+                in[i] = 0.5 * sin(2.0 * 3.14159265358979323846 * freq * i / dsd_rate);
+            unsigned tprod = 0;
+            for (unsigned i = 0; i < n_dsd; i++) {
+                double xi = in[i] * 0.5;
+                double td[MAX_NTF_ORDER], tvi = xi;
+                td[0] = tstate[0] - f->g[0] * tstate[1] + xi;
+                tvi += f->a[0] * td[0];
+                for (int k = 1; k < f->order - 1; k++) {
+                    td[k] = tstate[k] + tstate[k-1] - f->g[k] * tstate[k+1];
+                    tvi += f->a[k] * td[k];
+                }
+                td[f->order-1] = tstate[f->order-1] + tstate[f->order-2];
+                tvi += f->a[f->order-1] * td[f->order-1];
+                double ty_ideal = tvi / f->a[0];
+                int tidx = (int)((ty_ideal + 1.0) / tstep + 0.5);
+                if (tidx < 0) tidx = 0;
+                if (tidx > tnlev - 1) tidx = tnlev - 1;
+                double ty = -1.0 + (double)tidx * tstep;
+                tstate[0] = td[0] - ty;
+                for (int k = 1; k < f->order; k++) tstate[k] = td[k];
+                if (i >= (unsigned)lat) out[tprod++] = (float)ty;
+            }
+            double tsig = goertzel_power(out, tprod, freq, (double)dsd_rate);
+            double tbw = (double)dsd_rate / (double)tprod;
+            unsigned tmax_bin = (unsigned)(22050.0 / tbw);
+            unsigned tsig_bin = (unsigned)(freq / tbw + 0.5);
+            double tnoise = 0;
+            for (unsigned b = 1; b <= tmax_bin; b++) {
+                if (b >= tsig_bin - 1 && b <= tsig_bin + 1) continue;
+                tnoise += goertzel_power(out, tprod, b * tbw, (double)dsd_rate);
+            }
+            sinad_by_nlev[3 + tl] = 10.0 * log10(tsig / (tnoise > 0 ? tnoise : 1e-30));
+        }
+        printf("    [MB] %s: 1bit-trellis=%.1f  greedy: 2lev=%.1f 4lev=%.1f 8lev=%.1f 16lev=%.1f\n",
+               names[r], sinad1, sinad_by_nlev[1], sinad_by_nlev[2], sinad_by_nlev[3], sinad_by_nlev[4]);
+
+        free(in); free(out);
+        sdm_context_free(&ctx1);
+    }
+}
+
 static void test_sdm_dc_stability(void) {
     const ntf_filter_t *f = ntf_auto_select(DSD_RATE_64);
     sdm_context_t ctx;
@@ -648,6 +889,7 @@ void test_trellis_suite(void) {
     TEST_RUN(test_sdm_sinad_dsd128);
     TEST_RUN(test_sdm_sinad_dsd256);
     TEST_RUN(test_sdm_sinad_dsd512);
+    TEST_RUN(test_sdm_sinad_multibit);
 }
 
 /* ─── Pipeline SINAD: simulate actual engine path ─── */

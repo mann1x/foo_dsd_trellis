@@ -1098,7 +1098,6 @@ size_t plugin_process(plugin_state_t *s,
          * DSD128 lat=128 → overlap=1024 (8×lat). Uncapping to 4096 didn't
          * improve audible quality (pops are ultrasonic, not overlap-related). */
         overlap = 32 * (size_t)s->config.trellis_lat;
-        if (overlap > 1024) overlap = 1024;
         segments_per_ch = num_threads / num_channels;
         if (segments_per_ch < 1) segments_per_ch = 1;
         int max_seg;
@@ -1506,29 +1505,23 @@ size_t plugin_process(plugin_state_t *s,
             }
         }
 
-        /* GPU offload: CPU state pass + GPU parallel output.
-         * CPU runs the full chunk sequentially to capture boundary states,
-         * then GPU re-processes segments in parallel with perfect seeding.
-         * No stitching needed — each GPU segment starts from exact CPU state. */
+        /* GPU multi-bit SDM experiment (PARKED).
+         * Stage 1 (GPU fp32 multibit) works at 14ms/chunk — blazing fast.
+         * But stage 2 (multibit → 1-bit) requires a full SDM, same cost as CPU.
+         * The 2-stage approach doesn't save computation for 1-bit output. */
         if (0 && s->config.gpu_sdm_enabled && s->gpu &&
             s->config.sdm_mode == SDM_MODE_TRELLIS &&
             (s->config.gpu_backend == 2 || s->config.gpu_backend == 3)) {
             size_t fir_n = fir_counts[0];
 
-            /* Ensure GPU SDM is set up for current rate */
+            /* GPU multi-bit SDM setup + process */
             {
                 const ntf_filter_t *f = s->channels[0].sdm.filter;
-                int cur_cands = (int)s->channels[0].sdm.trellis_num;
-                int cur_lat   = (int)s->channels[0].sdm.trellis_lat;
-                if (f)
-                    gpu_cuda_trellis_setup(s->gpu, cur_cands, f->order,
-                        cur_lat, f->a, f->g, s->channels[0].sdm.state_limit,
-                        s->config.trellis_depth);
+                if (f) {
+                    gpu_cuda_multibit_setup(s->gpu, f->order, f->a, f->g,
+                                            s->channels[0].sdm.state_limit, 16);
+                }
             }
-
-            /* GPU Trellis SDM: 2-pass DAS with internal stitching.
-             * gpu_cuda_trellis_das handles segment layout, 2-pass state
-             * chaining, and DAS density-matched stitching internally. */
             {
                 /* Pack fp64 fir_data into contiguous buffer for GPU */
                 size_t total_f64 = fir_n * (size_t)num_channels;
@@ -1546,9 +1539,10 @@ size_t plugin_process(plugin_state_t *s,
                         memcpy(das_in_f64 + ch * fir_n, fir_data[ch],
                                fir_n * sizeof(double));
 
-                    int rc = gpu_cuda_trellis_das(s->gpu, das_in_f64,
-                                                   s->gpu_das_out, fir_n,
-                                                   num_channels);
+                    float gain = s->channels[0].fir_gain * s->config.gain;
+                    int rc = gpu_cuda_multibit_process(s->gpu, das_in_f64,
+                                                       s->gpu_das_out, fir_n,
+                                                       num_channels, gain);
                     if (rc == 0) {
                         for (int ch = 0; ch < num_channels; ch++)
                             memcpy(s->ch_out[ch], s->gpu_das_out + ch * fir_n,
@@ -1562,7 +1556,7 @@ size_t plugin_process(plugin_state_t *s,
                     if (offload_log++ < 3) {
                         char msg[128];
                         snprintf(msg, sizeof(msg),
-                            "GPU SDM: trellis_das %zu samples, %d ch, rc=%d",
+                            "GPU multibit SDM: %zu samples, %d ch, rc=%d",
                             fir_n, num_channels, dsd_out_count > 0 ? 0 : -1);
                         trellis_log_c(msg);
                     }
@@ -1939,32 +1933,29 @@ size_t plugin_process(plugin_state_t *s,
                 if (half_w > (int)ovl_len / 2) half_w = (int)ovl_len / 2;
                 if (half_w < 4) half_w = 4;
 
-                /* O(n) sliding window: initialize window [0, min(2*half_w, ovl_len)),
-                 * then slide right, adding one sample and removing one. */
+                /* O(n) sliding window density scan.
+                 * Window for position p: [max(0, p-half_w), min(ovl_len, p+half_w))
+                 * Seed at p=0 with [0, half_w), then slide right. */
                 int best_density = 0, best_density_pos = 0;
-                int win = half_w * 2;
-                if (win > (int)ovl_len) win = (int)ovl_len;
-                /* Seed: count matches in initial window [0, win) */
                 int cur_matches = 0;
-                for (int w = 0; w < win && w < (int)ovl_len; w++) {
+                /* Seed: count matches in [0, min(half_w, ovl_len)) for p=0 */
+                int init_end = half_w < (int)ovl_len ? half_w : (int)ovl_len;
+                for (int w = 0; w < init_end; w++) {
                     if (prev_ovl[w] == this_ovl[w])
                         cur_matches++;
                 }
-                /* Position 0: window center at 0, covers [0, win) */
                 best_density = cur_matches;
                 best_density_pos = 0;
                 /* Slide window across all positions */
                 for (int p = 1; p < (int)ovl_len; p++) {
-                    /* Window for position p: [p - half_w, p + half_w)
-                     * clamped to [0, ovl_len). As p advances by 1:
-                     * - add sample at right edge (p + half_w - 1) if in range
-                     * - remove sample at left edge (p - half_w - 1) if was in range */
+                    /* Right edge expands: add sample at p+half_w-1 */
                     int add_idx = p + half_w - 1;
-                    int rem_idx = p - half_w - 1;
                     if (add_idx >= 0 && add_idx < (int)ovl_len) {
                         if (prev_ovl[add_idx] == this_ovl[add_idx])
                             cur_matches++;
                     }
+                    /* Left edge contracts: remove sample at p-half_w-1 */
+                    int rem_idx = p - half_w - 1;
                     if (rem_idx >= 0 && rem_idx < (int)ovl_len) {
                         if (prev_ovl[rem_idx] == this_ovl[rem_idx])
                             cur_matches--;

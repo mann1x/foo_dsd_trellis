@@ -53,12 +53,19 @@ Thread pool (`threadpool.c`) provides per-channel and per-segment parallelism wi
 
 For Trellis mode at high DSD rates (DSD512), single-core SDM processing exceeds real-time. The engine splits FIR output into N segments (up to 4 on CPU, 252 on GPU) processed in parallel:
 
-1. **State estimation**: a lightweight nc=1 greedy SDM pre-pass estimates the NTF integrator state at each segment boundary (~10ms for 1.4M DSD128 samples). Segments 1+ are seeded with these estimated states instead of replicating the persistent state, giving near-exact initial conditions.
-2. **Overlap extension**: each non-last segment extends by `overlap = 32 × trellis_lat` (capped at 1024) into the next segment's territory
-3. **DAS density scan**: windowed match density (window = 2 × trellis_lat) finds the region of best SDM convergence in the overlap
+1. **State estimation**: a 16-level (4-bit) greedy SDM pre-pass estimates the NTF integrator state at each segment boundary. Channels run in parallel on the threadpool. Segments 1+ are seeded with these estimated states instead of replicating the persistent state.
+2. **Overlap extension**: each non-last segment extends by `overlap = 32 × trellis_lat` into the next segment's territory
+3. **DAS density scan**: O(n) sliding window match density (window = 2 × trellis_lat) finds the region of best SDM convergence in the overlap
 4. **Hybrid stitch**: density peak + nearest exact bit-match for clean transition
 
-**State estimation impact**: DAS stitch density improved from ~63-88% (persistent state replication) to **74-99%** (estimated states). Density scores of 255/256 are routinely achieved, meaning segments agree on virtually all samples in the overlap region before stitching.
+**Performance** (AMD Ryzen 9 9950X, stereo, CUDA GPU for FIR):
+
+| Rate | Segments | RT Ratio | Overlap | Density |
+|------|----------|----------|---------|---------|
+| DSD512 | 4 | 0.85x | 1024 | 53-77% |
+| DSD256 | 2 | 0.52x | 4096 | 43-82% |
+| DSD128 | 2 | 0.27x | 4096 | 50-73% |
+| DSD64 | 2 | 0.19x | 1024 | 55-88% |
 
 **Validated artifact-free**: DSF A/B comparison proves CPU parallel DAS produces **bit-identical** output to sequential for simple signals, and **perceptually identical** output for real music (48.7% bit mismatch but identical noise characteristics).
 

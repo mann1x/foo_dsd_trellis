@@ -12,6 +12,7 @@
 #define SDM_TRELLIS_MAX_NUM   32
 #define SDM_TRELLIS_MAX_LAT   2048
 #define PATH_HASH_SIZE        128
+#define SDM_MB_LEVELS         4     /* multi-bit branching: 4 levels per candidate */
 
 /* Per-candidate path state */
 typedef struct sdm_state {
@@ -25,9 +26,10 @@ typedef struct sdm_state {
     struct sdm_state *path_list;    /* Hash chain for path dedup */
 } sdm_state_t;
 
-/* Trellis generation (double-buffered) */
+/* Trellis generation (double-buffered).
+ * Child array sized for multi-bit branching (N children per candidate). */
 typedef struct {
-    sdm_state_t   sdm[2 * SDM_TRELLIS_MAX_NUM];
+    sdm_state_t   sdm[SDM_MB_LEVELS * SDM_TRELLIS_MAX_NUM];
     sdm_state_t  *act[SDM_TRELLIS_MAX_NUM];
 } sdm_trellis_t;
 
@@ -41,6 +43,7 @@ typedef struct {
     uint32_t       trellis_num;
     uint32_t       trellis_lat;
     unsigned       num_cands;
+    unsigned       mb_levels;      /* branching factor: 2=1-bit, 4=multi-bit */
     unsigned       pos;
     unsigned       pending;
     unsigned       draining;
@@ -92,5 +95,13 @@ void sdm_context_free(sdm_context_t *ctx);
 void sdm_estimate_state(const ntf_filter_t *filter, const double *init_state,
                         const double *in, size_t count, double state_limit,
                         double *out_state);
+
+/* Multi-bit variant with configurable quantizer levels.
+ * num_levels=2 is 1-bit, num_levels=16 is 4-bit (default in sdm_estimate_state). */
+void sdm_estimate_state_multibit(const ntf_filter_t *filter,
+                                  const double *init_state,
+                                  const double *in, size_t count,
+                                  double state_limit, int num_levels,
+                                  double *out_state);
 
 #endif /* TRELLIS_H */

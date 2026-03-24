@@ -681,8 +681,9 @@ private:
             gpub.SetCurSel(sel);
             gpub.EnableWindow(m_cfg.gpu_enabled);
         }
-        CheckDlgButton(IDC_CHECK_GPU_SDM, m_cfg.gpu_sdm_enabled ? BST_CHECKED : BST_UNCHECKED);
-        ::EnableWindow(GetDlgItem(IDC_CHECK_GPU_SDM), m_cfg.gpu_enabled);
+        /* GPU SDM hidden — 2-stage multibit approach parked */
+        CheckDlgButton(IDC_CHECK_GPU_SDM, BST_UNCHECKED);
+        ::ShowWindow(GetDlgItem(IDC_CHECK_GPU_SDM), SW_HIDE);
         UpdateGpuStatus();
 
         /* PCM Encoding */
@@ -809,7 +810,6 @@ private:
         if (m_updating) return;
         bool enabled = IsDlgButtonChecked(IDC_CHECK_GPU_ENABLED) == BST_CHECKED;
         CComboBox(GetDlgItem(IDC_COMBO_GPU_BACKEND)).EnableWindow(enabled);
-        ::EnableWindow(GetDlgItem(IDC_CHECK_GPU_SDM), enabled);
         UpdateGpuStatus();
     }
 

@@ -475,44 +475,53 @@ stitch seg3: ovl=1024 density=43/64 pos=632 match=yes
 - **100% exact bit-match** at every stitch point
 - **Stitch positions span the full overlap** (35-850 out of 1024) — the algorithm finds the best convergence region wherever it occurs
 
-#### DAS with State Estimation Pre-Pass (current)
+#### DAS with Multi-bit State Estimation Pre-Pass (current)
 
-With the nc=1 greedy estimation pre-pass seeding segments with estimated boundary states (DSD128, trellis_cands=2, trellis_lat=128, 2 segments):
+A 16-level (4-bit) greedy SDM pre-pass estimates integrator state at each segment boundary. The multi-bit quantizer tracks the true trellis state more accurately than a 1-bit greedy estimator because 16 quantizer levels reduce quantization error by ~24 dB, producing closer state approximations.
+
+DSD128 same-rate, trellis_cands=2, trellis_lat=128, 2 segments, overlap=1024 (8×lat):
 
 ```
-stitch seg1: ovl=1024 density=255/256 pos=174 run=8 wp=5644800 stitch_at=2822574
-stitch seg1: ovl=1024 density=208/256 pos=421 run=8 wp=5644800 stitch_at=2822821
-stitch seg1: ovl=1024 density=216/256 pos=820 run=8 wp=5644800 stitch_at=2823220
-stitch seg1: ovl=1024 density=190/256 pos=921 run=8 wp=5644800 stitch_at=2823321
-stitch seg1: ovl=1024 density=212/256 pos=466 run=8 wp=5644800 stitch_at=2822866
-stitch seg1: ovl=1024 density=251/256 pos=655 run=8 wp=5644800 stitch_at=2823055
-stitch seg1: ovl=1024 density=236/256 pos=67  run=8 wp=5644800 stitch_at=2822467
-stitch seg1: ovl=1024 density=237/256 pos=587 run=8 wp=5644800 stitch_at=2822987
+stitch seg1: ovl=1024 density=165/256 pos=312 run=8 wp=5644800 stitch_at=2822712
+stitch seg1: ovl=1024 density=174/256 pos=308 run=8 wp=5644800 stitch_at=2822708
+stitch seg1: ovl=1024 density=138/256 pos=787 run=4 wp=5644800 stitch_at=2823187
+stitch seg1: ovl=1024 density=151/256 pos=919 run=8 wp=5644800 stitch_at=2823319
+stitch seg1: ovl=1024 density=162/256 pos=868 run=8 wp=5644800 stitch_at=2823268
+stitch seg1: ovl=1024 density=131/256 pos=459 run=4 wp=5644800 stitch_at=2822859
+stitch seg1: ovl=1024 density=190/256 pos=162 run=8 wp=5644800 stitch_at=2822562
+stitch seg1: ovl=1024 density=176/256 pos=524 run=8 wp=5644800 stitch_at=2822924
+stitch seg1: ovl=1024 density=157/256 pos=609 run=8 wp=5644800 stitch_at=2823009
+stitch seg1: ovl=1024 density=143/256 pos=276 run=8 wp=5644800 stitch_at=2822676
 ```
 
-- **Density: 190-255/256 (74-99%)** — dramatic improvement over persistent state replication
-- **255/256 = 99.6% match** — segments produce virtually identical output in the overlap region
-- **100% exact bit-match** at every stitch point (run=8 consistently)
-- The estimation pass adds ~10ms overhead per channel — negligible vs ~190ms total chunk time
+- **Density: 119-190/256 (46-74%)** — genuine convergence at 8× overlap
+- **100% exact bit-match** at every stitch point (run=4-8)
+- Estimation pass parallelized on threadpool: ~70ms for DSD128 stereo, ~140ms for DSD512
+- DSD64 same-rate (lat=32, window=64): density 35-56/64 (55-88%)
 
 #### Comparison: Seeding Strategy Impact
 
-| Seeding | Rate | Density Range | Peak | Interpretation |
-|---------|------|---------------|------|----------------|
-| Persistent replication | DSD512 | 40-56/64 | 88% | Moderate convergence — state at chunk start diverges significantly from midpoint |
-| **Estimated states** | **DSD128** | **190-255/256** | **99.6%** | **Near-perfect convergence — estimated state closely tracks true trellis state** |
+| Rate | Overlap | Density Range | Match Rate | RT Ratio |
+|------|---------|---------------|------------|----------|
+| DSD512 | 1024 (32×32) | 34-49/64 | 53-77% | 0.85x |
+| DSD256 | 4096 (32×128) | 109-210/256 | 43-82% | 0.52x |
+| DSD128 | 4096 (32×128) | 128-188/256 | 50-73% | 0.27x |
+| DSD64 | 1024 (32×32) | 35-56/64 | 55-88% | 0.19x |
 
-The improvement comes from giving seg1+ a starting state that reflects the actual NTF integrator evolution through the preceding input, rather than the stale state from the chunk boundary. The greedy quantizer agrees with the trellis quantizer ~80% of the time, so the estimated state after 1.4M samples is very close to the true state.
+All rates use 32×lat overlap. Multi-bit (16-level) state estimation, parallelized on threadpool.
+
+The estimation pass gives seg1+ a starting state that reflects the actual NTF integrator evolution through the preceding input, rather than the stale state from the chunk boundary. The 16-level quantizer closely tracks the trellis decisions, and the overlap warmup handles the remaining convergence gap.
 
 ### 5.4 Real-Time Performance
 
-| Configuration | Segments | RT Ratio | SDM Time | FIR Time |
-|---------------|----------|----------|----------|----------|
-| Sequential (1 seg) | 1 | >1.6x (not real-time) | >1000ms | ~150ms |
-| Old parallel (4x ovl) | 4 | 0.57x | ~350ms | ~150ms |
-| DAS 32x ovl | 4 | 0.57x | ~350ms | ~150ms |
+| Rate | Segments | RT Ratio | SDM Time | FIR Time | Overlap |
+|------|----------|----------|----------|----------|---------|
+| DSD512 | 4 | 0.85x | ~650ms | ~130ms | 1024 |
+| DSD256 | 2 | 0.52x | ~440ms | ~50ms | 4096 |
+| DSD128 | 2 | 0.27x | ~225ms | ~26ms | 4096 |
+| DSD64 | 2 | 0.19x | ~180ms | ~0ms | 1024 |
 
-The DAS overlap scan adds zero measurable overhead. The density calculation is O(overlap × window) = O(1024 × 64) = ~65,536 comparisons per stitch boundary, 3 boundaries per chunk = ~200K comparisons. This is negligible compared to the ~700K trellis operations per segment.
+The DAS overlap scan uses an O(n) sliding window and adds negligible overhead. The multi-bit state estimation pass runs in parallel on the threadpool (~70ms for DSD128 stereo, included in SDM time above).
 
 ### 5.5 Convergence Plateau
 

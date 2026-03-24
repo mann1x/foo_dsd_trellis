@@ -480,38 +480,35 @@ static unsigned sdm_sort_cands(sdm_context_t *p, sdm_trellis_t *st)
     sdm_state_t *r = NULL, *s, *t;
     sdm_state_t *min = NULL;
     unsigned i, j, n;
+    unsigned total_children = p->mb_levels * p->num_cands;
 
-    for (i = 0; i < 2 * p->num_cands; i++) {
+    for (i = 0; i < total_children; i++) {
         s = &st->sdm[i];
         p->path_hash[s->path & PATH_HASH_MASK] = NULL;
         if (!min || sdm_cmplt(s, min))
             min = s;
     }
 
-    p->total_children += 2 * p->num_cands;
+    p->total_children += total_children;
 
     /* Determine the output bit from the majority of candidates, not just min.
      * This is more robust than using only min->next, especially with many candidates. */
     unsigned next_votes[2] = {0, 0};
-    for (i = 0; i < 2 * p->num_cands; i++)
+    for (i = 0; i < total_children; i++)
         next_votes[st->sdm[i].next & 1]++;
     unsigned majority_next = (next_votes[1] > next_votes[0]) ? 1 : 0;
-    /* If min disagrees with majority AND has significantly higher cost
-     * than the best candidate with majority_next, use majority. */
     if (min->next != majority_next) {
-        /* Find the best candidate with majority_next */
         sdm_state_t *best_maj = NULL;
-        for (i = 0; i < 2 * p->num_cands; i++) {
+        for (i = 0; i < total_children; i++) {
             s = &st->sdm[i];
             if (s->next == majority_next && (!best_maj || sdm_cmplt(s, best_maj)))
                 best_maj = s;
         }
-        /* Use majority if it's within 10% cost of min */
         if (best_maj && best_maj->cost < min->cost * 1.1)
             min = best_maj;
     }
 
-    for (i = 0, n = 0; i < 2 * p->num_cands; i++) {
+    for (i = 0, n = 0; i < total_children; i++) {
         s = &st->sdm[i];
 
         if (s->next != min->next) {
@@ -605,6 +602,124 @@ static __forceinline void sdm_step(sdm_context_t *p, sdm_state_t *cur,
     }
 }
 
+/* ─── Multi-bit step: expand one candidate to N children ─── */
+
+static __forceinline void sdm_step_mb(sdm_context_t *p, sdm_state_t *cur,
+                                       sdm_state_t *children, double x, int nlevels)
+{
+    const ntf_filter_t *f = p->filter;
+    const double *a = f->a;
+    double d_base[MAX_NTF_ORDER];
+    double v;
+
+    /* NTF filter calc with y=0 */
+    v = sdm_filter_calc(cur->state, d_base, f, x, 0.0);
+
+    /* Generate N children at equally-spaced levels in [-1, +1] */
+    double step = 2.0 / (double)(nlevels - 1);
+    for (int lv = 0; lv < nlevels; lv++) {
+        double y = -1.0 + (double)lv * step;
+        sdm_state_t *ch = &children[lv];
+
+        /* State = d_base - y (NTF formula: d[0] = s[0] - g[0]*s[1] + x - y) */
+        for (int k = 0; k < f->order; k++)
+            ch->state[k] = d_base[k];
+        ch->state[0] -= y;
+
+        /* Clamp */
+        if (p->state_limit > 0.0) {
+            for (int k = 0; k < f->order; k++) {
+                if (ch->state[k] > p->state_limit) ch->state[k] = p->state_limit;
+                else if (ch->state[k] < -p->state_limit) ch->state[k] = -p->state_limit;
+            }
+        }
+
+        /* Cost: sqr(v - y * a[0]) */
+        double veff = v - y * a[0];
+        ch->cost = cur->cost + veff * veff;
+
+        /* Path: store sign bit (1 if positive, 0 if negative) for dedup
+         * compatibility with existing 1-bit path hash. */
+        unsigned sign_bit = (lv >= nlevels / 2) ? 1 : 0;
+        ch->path = (cur->path << 1 | sign_bit) & p->trellis_mask;
+        ch->hist = cur->hist;
+        ch->next = cur->next;
+        ch->parent = cur;
+    }
+}
+
+/* ─── Multi-bit per-sample trellis: N levels, multibit output ─── */
+
+static double sdm_sample_trellis_mb(sdm_context_t *p, double x)
+{
+    sdm_trellis_t *st_cur  = &p->trellis[p->idx];
+    sdm_trellis_t *st_next = &p->trellis[p->idx ^ 1];
+    int nlevels = (int)p->mb_levels;
+    double step = 2.0 / (double)(nlevels - 1);
+    unsigned next_pos = p->pos + 1;
+    if (next_pos == p->trellis_lat)
+        next_pos = 0;
+
+    /* Expand each candidate to N children */
+    for (unsigned i = 0; i < p->num_cands; i++) {
+        sdm_state_t *cur = st_cur->act[i];
+        sdm_step_mb(p, cur, &st_next->sdm[nlevels * i], x, nlevels);
+        cur->next = (uint8_t)sdm_hist_get(p, cur->hist, next_pos);
+        cur->hist_used = 0;
+    }
+
+    /* Sort/prune */
+    unsigned new_cands = sdm_sort_cands(p, st_next);
+    double min_cost = st_next->act[0]->cost;
+
+    /* Traceback output: the 'next' field carries the sign bit from lat samples ago.
+     * For multibit stage 1 output, we output the sign as ±1 for now.
+     * TODO: store full level index in history for true multibit traceback. */
+    unsigned output_bit = st_next->act[0]->next;
+
+    /* Also capture the IMMEDIATE best candidate's level for multibit output.
+     * The best candidate's path[0:1] holds the level index it chose. */
+    unsigned best_level_idx = st_next->act[0]->path & (unsigned)(nlevels - 1);
+    double best_level = -1.0 + (double)best_level_idx * step;
+
+    for (unsigned i = 0; i < new_cands; i++) {
+        sdm_state_t *s = st_next->act[i];
+        if (s->parent->hist_used) {
+            unsigned h = sdm_histbuf_get(p);
+            sdm_hist_copy(p, h, s->hist);
+            s->hist = (uint8_t)h;
+        } else {
+            s->parent->hist_used = 1;
+        }
+        s->cost -= min_cost;
+        s->next = s->parent->next;
+        /* Store sign bit in history for traceback */
+        unsigned lv_idx = s->path & (unsigned)(nlevels - 1);
+        unsigned sign_bit = (lv_idx >= (unsigned)(nlevels / 2)) ? 1 : 0;
+        sdm_hist_put(p, s->hist, p->pos, sign_bit);
+    }
+
+    for (unsigned i = 0; i < p->num_cands; i++) {
+        sdm_state_t *s = st_cur->act[i];
+        if (!s->hist_used)
+            sdm_histbuf_put(p, s->hist);
+    }
+
+    if (new_cands < p->num_cands) {
+        p->conv_fail++;
+        p->cands_collapse++;
+    }
+
+    p->num_cands = new_cands;
+    p->pos = next_pos;
+    p->idx ^= 1;
+
+    /* For multibit: output the immediate best level (not traceback).
+     * This loses look-ahead latency compensation but gives true multibit output.
+     * The pending/latency mechanism still buffers — output starts after lat samples. */
+    return best_level;
+}
+
 /* ─── Main per-sample trellis algorithm ─── */
 
 static double sdm_sample_trellis(sdm_context_t *p, double x)
@@ -622,8 +737,8 @@ static double sdm_sample_trellis(sdm_context_t *p, double x)
         next_pos = 0;
 
 #if defined(_MSC_VER) && defined(__AVX2__)
-    /* Batched 4-candidate AVX2 path for order 8 */
-    if (p->filter->order == 8) {
+    /* Batched 4-candidate AVX2 path for order 8 (1-bit only) */
+    if (p->filter->order == 8 && p->mb_levels == 2) {
         for (i = 0; i + 3 < p->num_cands; i += 4) {
             sdm_step_4x_o8(p,
                 st_cur->act[i], st_cur->act[i+1],
@@ -640,7 +755,6 @@ static double sdm_sample_trellis(sdm_context_t *p, double x)
             st_cur->act[i+3]->next = (uint8_t)sdm_hist_get(p, st_cur->act[i+3]->hist, next_pos);
             st_cur->act[i+3]->hist_used = 0;
         }
-        /* Handle remaining candidates (0-3) */
         for (; i < p->num_cands; i++) {
             sdm_state_t *cur  = st_cur->act[i];
             sdm_state_t *next = &st_next->sdm[2 * i];
@@ -652,7 +766,7 @@ static double sdm_sample_trellis(sdm_context_t *p, double x)
 #endif
     for (i = 0; i < p->num_cands; i++) {
         sdm_state_t *cur  = st_cur->act[i];
-        sdm_state_t *next = &st_next->sdm[2 * i];
+        sdm_state_t *next = &st_next->sdm[p->mb_levels * i];
         sdm_step(p, cur, next, x);
         cur->next = (uint8_t)sdm_hist_get(p, cur->hist, next_pos);
         cur->hist_used = 0;
@@ -717,6 +831,7 @@ int sdm_context_init(sdm_context_t *ctx, const ntf_filter_t *filter,
     ctx->trellis_lat = (uint32_t)trellis_lat;
     ctx->trellis_mask = ((uint64_t)1 << trellis_depth) - 1;
     ctx->num_cands = 1;
+    ctx->mb_levels = 2;  /* default: 1-bit (2 children). Set to SDM_MB_LEVELS for multibit. */
     ctx->state_limit = 0.0;  /* 0 = disabled; set by caller if needed */
 
     /* Init history buffer free list */
@@ -737,6 +852,10 @@ size_t sdm_process_block(sdm_context_t *ctx,
     float *outp = out;
     size_t len = count;
 
+    /* Select per-sample function based on branching mode */
+    double (*sample_fn)(sdm_context_t *, double) =
+        (ctx->mb_levels > 2) ? sdm_sample_trellis_mb : sdm_sample_trellis;
+
     /* Fill latency buffer first (no output produced) */
     if (ctx->pending < ctx->trellis_lat) {
         size_t pre = ctx->trellis_lat - ctx->pending;
@@ -745,13 +864,13 @@ size_t sdm_process_block(sdm_context_t *ctx,
         ctx->pending += (unsigned)pre;
         len -= pre;
         while (pre--) {
-            sdm_sample_trellis(ctx, *in++ * 0.5);
+            sample_fn(ctx, *in++ * 0.5);
         }
     }
 
     /* Produce output samples */
     while (len--) {
-        *outp++ = (float)sdm_sample_trellis(ctx, *in++ * 0.5);
+        *outp++ = (float)sample_fn(ctx, *in++ * 0.5);
     }
 
     return (size_t)(outp - out);
@@ -826,18 +945,31 @@ double sdm_state_distance(const sdm_context_t *a, const sdm_context_t *b) {
     return dist;
 }
 
-/* Lightweight nc=1 greedy SDM estimator.
- * Runs the NTF filter forward from init_state, making greedy ±1.0 decisions.
- * ~16 flops/sample for order 8 — ~10ms for 1.4M DSD128 samples.
- * Used to estimate integrator state at segment boundaries for parallel seeding. */
+/* Multi-bit greedy SDM estimator.
+ * Runs the NTF filter forward from init_state with a multi-level quantizer.
+ * 16 quantizer levels (4-bit) tracks the true trellis state much more
+ * accurately than 2-level (1-bit), giving better segment boundary estimates
+ * for DAS parallel seeding. Same computational cost — one NTF evaluation
+ * per sample, ~16 flops for order 8.
+ * num_levels: 2 = 1-bit (legacy), 16 = 4-bit (default). */
 void sdm_estimate_state(const ntf_filter_t *filter, const double *init_state,
                         const double *in, size_t count, double state_limit,
                         double *out_state) {
+    sdm_estimate_state_multibit(filter, init_state, in, count, state_limit,
+                                 16, out_state);
+}
+
+void sdm_estimate_state_multibit(const ntf_filter_t *filter,
+                                  const double *init_state,
+                                  const double *in, size_t count,
+                                  double state_limit, int num_levels,
+                                  double *out_state) {
     const int order = filter->order;
     const double *a = filter->a;
     const double *g = filter->g;
     double state[MAX_NTF_ORDER];
     double new_state[MAX_NTF_ORDER];
+    const double step = 2.0 / (double)(num_levels - 1);
 
     for (int i = 0; i < order; i++)
         state[i] = init_state[i];
@@ -856,10 +988,24 @@ void sdm_estimate_state(const ntf_filter_t *filter, const double *init_state,
         new_state[order - 1] = state[order - 1] + state[order - 2];
         v += a[order - 1] * new_state[order - 1];
 
-        /* Greedy quantizer: pick y that minimizes (v + y*a[0])²
-         * y=+1 when v*a[0] < 0, y=-1 otherwise */
-        double y = (v * a[0] < 0.0) ? 1.0 : -1.0;
-        new_state[0] += y;
+        /* Multi-bit greedy quantizer: minimize (v - y*a[0])².
+         * Optimal y = v / a[0], rounded to nearest quantizer level. */
+        double y;
+        if (num_levels <= 2) {
+            /* 1-bit: y ∈ {-1, +1}. Pick y=+1 when v/a[0] > 0. */
+            y = (v * a[0] > 0.0) ? 1.0 : -1.0;
+        } else {
+            /* Multi-bit: round v/a[0] to nearest level in [-1, +1] */
+            double y_ideal = v / a[0];
+            int idx = (int)((y_ideal + 1.0) / step + 0.5);
+            if (idx < 0) idx = 0;
+            if (idx > num_levels - 1) idx = num_levels - 1;
+            y = -1.0 + (double)idx * step;
+        }
+
+        /* Update state: NTF formula d[0] = s[0] - g[0]*s[1] + x - y
+         * new_state was computed with y=0, so subtract y now. */
+        new_state[0] -= y;
 
         /* State limit clamping */
         if (state_limit > 0.0) {
@@ -892,6 +1038,7 @@ void sdm_context_reset(sdm_context_t *ctx) {
 
     ctx->hist_fnum = 0;
     ctx->num_cands = 1;
+    /* Preserve mb_levels across reset (set by caller) */
     ctx->pos = 0;
     ctx->pending = 0;
     ctx->draining = 0;

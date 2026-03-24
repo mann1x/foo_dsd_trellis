@@ -24,6 +24,7 @@
 #include "kernels/sdm_parallel_ptx.h"
 #include "kernels/sdm_hawksford_ptx.h"
 #include "kernels/das_stitch_ptx.h"
+#include "kernels/sdm_multibit_ptx.h"
 
 /* ─── CUDA Driver API types (no CUDA headers needed) ─── */
 
@@ -164,6 +165,10 @@ typedef struct {
     /* Hawksford intra-step (from sdm_hawksford.ptx) */
     CUmodule       mod_hawksford;
     CUfunction     fn_hawksford;
+    /* Multi-bit SDM experiment (from sdm_multibit.ptx) */
+    CUmodule       mod_multibit;
+    CUfunction     fn_mb_segments;
+    CUfunction     fn_mb_to_1bit;
     int            num_sms;  /* GPU SM count for optimal parallelism */
     /* Triple-buffered device memory */
     CUdeviceptr    d_in[NUM_STREAMS];
@@ -489,6 +494,12 @@ gpu_context_t *gpu_cuda_create(void) {
     /* Load Hawksford kernel */
     if (pfn_cuModuleLoadData(&c->mod_hawksford, g_ptx_sdm_hawksford) == CUDA_SUCCESS)
         pfn_cuModuleGetFunction(&c->fn_hawksford, c->mod_hawksford, "trellis_hawksford");
+
+    /* Load multi-bit SDM kernel (experimental) */
+    if (pfn_cuModuleLoadData(&c->mod_multibit, g_ptx_sdm_multibit) == CUDA_SUCCESS) {
+        pfn_cuModuleGetFunction(&c->fn_mb_segments, c->mod_multibit, "sdm_multibit_segments");
+        pfn_cuModuleGetFunction(&c->fn_mb_to_1bit, c->mod_multibit, "sdm_multibit_to_1bit");
+    }
 
     /* Load DAS stitching kernels */
     if (pfn_cuModuleLoadData(&c->mod_das_stitch, g_ptx_das_stitch) == CUDA_SUCCESS) {
@@ -1490,9 +1501,6 @@ int gpu_cuda_trellis_das(cuda_context_t *c, const double *in, float *out,
     int L = lat;
     int num_segs = c->num_sms * 3;
     if (num_segs < 1) num_segs = 1;
-    /* Cap at num_sms/2 to balance parallelism vs memory/stitch overhead.
-     * 84 segments causes CUDA_ERROR_ILLEGAL_ADDRESS at DSD256 — needs investigation. */
-    if (num_segs > c->num_sms / 2) num_segs = c->num_sms / 2;
 
     int D = (int)(count / (size_t)num_segs);
 
@@ -2681,4 +2689,190 @@ int gpu_cuda_precorr(cuda_context_t *c, const float *in, float *out,
 
     c->precorr_state_valid = true;
     return 0;
+}
+
+/* ─── Multi-bit SDM experiment ─── */
+
+int gpu_cuda_multibit_setup(cuda_context_t *c, int order,
+                             const double *ntf_a, const double *ntf_g,
+                             double state_limit, int num_levels) {
+    if (!c || !c->mod_multibit) return -1;
+    pfn_cuCtxSetCurrent(c->context);
+
+    /* Upload NTF coefficients as fp32 to multi-bit constant memory */
+    float a32[8], g32[8];
+    for (int i = 0; i < order && i < 8; i++) {
+        a32[i] = (float)ntf_a[i];
+        g32[i] = (float)ntf_g[i];
+    }
+    CUdeviceptr sym; size_t sz;
+    if (pfn_cuModuleGetGlobal(&sym, &sz, c->mod_multibit, "c_mb_ntf_a") == CUDA_SUCCESS)
+        pfn_cuMemcpyHtoD(sym, a32, 8 * sizeof(float));
+    if (pfn_cuModuleGetGlobal(&sym, &sz, c->mod_multibit, "c_mb_ntf_g") == CUDA_SUCCESS)
+        pfn_cuMemcpyHtoD(sym, g32, 8 * sizeof(float));
+    if (pfn_cuModuleGetGlobal(&sym, &sz, c->mod_multibit, "c_mb_order") == CUDA_SUCCESS)
+        pfn_cuMemcpyHtoD(sym, &order, sizeof(int));
+    float sl32 = (float)state_limit;
+    if (pfn_cuModuleGetGlobal(&sym, &sz, c->mod_multibit, "c_mb_state_limit") == CUDA_SUCCESS)
+        pfn_cuMemcpyHtoD(sym, &sl32, sizeof(float));
+    if (pfn_cuModuleGetGlobal(&sym, &sz, c->mod_multibit, "c_mb_num_levels") == CUDA_SUCCESS)
+        pfn_cuMemcpyHtoD(sym, &num_levels, sizeof(int));
+    return 0;
+}
+
+int gpu_cuda_multibit_process(cuda_context_t *c, const double *in, float *out,
+                               size_t count, int num_channels, float gain) {
+    if (!c || !c->fn_mb_segments || !c->fn_mb_to_1bit || count == 0) return -1;
+    pfn_cuCtxSetCurrent(c->context);
+    CUstream stream = c->sdm_stream ? c->sdm_stream : c->streams[0];
+
+    int order = c->trellis_order;
+    int lat = c->trellis_lat;
+    /* Start with 1 segment to validate quality without stitching artifacts.
+     * TODO: add DAS stitching for multibit segments once quality is verified. */
+    int num_segs = 1;
+    int M = 0;  /* no warmup needed for single segment */
+    int D = (int)count;
+
+    size_t total_samples = count * (size_t)num_channels;
+    size_t in_bytes = total_samples * sizeof(double);
+    size_t out_bytes = total_samples * sizeof(float);
+    size_t seg_arr_bytes = (size_t)num_segs * sizeof(int);
+    size_t state_bytes = (size_t)num_segs * (size_t)order * sizeof(float);
+
+    /* Allocate device buffers */
+    CUdeviceptr d_in = 0, d_out = 0, d_mb = 0;
+    CUdeviceptr d_seg_starts = 0, d_seg_out_starts = 0;
+    CUdeviceptr d_init_states = 0, d_final_states = 0;
+
+    if (pfn_cuMemAlloc(&d_in, in_bytes) != CUDA_SUCCESS) return -1;
+    if (pfn_cuMemAlloc(&d_out, out_bytes) != CUDA_SUCCESS) goto fail;
+    if (pfn_cuMemAlloc(&d_mb, out_bytes) != CUDA_SUCCESS) goto fail;
+    if (pfn_cuMemAlloc(&d_seg_starts, seg_arr_bytes) != CUDA_SUCCESS) goto fail;
+    if (pfn_cuMemAlloc(&d_seg_out_starts, seg_arr_bytes) != CUDA_SUCCESS) goto fail;
+    if (pfn_cuMemAlloc(&d_init_states, state_bytes) != CUDA_SUCCESS) goto fail;
+
+    /* Upload input */
+    pfn_cuMemcpyHtoDAsync(d_in, in, in_bytes, stream);
+
+    /* Build segment descriptors */
+    {
+        int *h_starts = (int *)malloc(seg_arr_bytes);
+        int *h_out_starts = (int *)malloc(seg_arr_bytes);
+        float *h_init = (float *)calloc((size_t)num_segs * (size_t)order, sizeof(float));
+        if (!h_starts || !h_out_starts || !h_init) { free(h_starts); free(h_out_starts); free(h_init); goto fail; }
+
+        for (int s = 0; s < num_segs; s++) {
+            h_starts[s] = s * D;
+            h_out_starts[s] = s * D;
+            /* All segments start from zero state (first chunk) or
+             * could be seeded from CPU persistent state */
+        }
+        pfn_cuMemcpyHtoDAsync(d_seg_starts, h_starts, seg_arr_bytes, stream);
+        pfn_cuMemcpyHtoDAsync(d_seg_out_starts, h_out_starts, seg_arr_bytes, stream);
+        pfn_cuMemcpyHtoDAsync(d_init_states, h_init, state_bytes, stream);
+        free(h_starts); free(h_out_starts); free(h_init);
+    }
+
+    LARGE_INTEGER t0, t1, t2, pf;
+    QueryPerformanceFrequency(&pf);
+    QueryPerformanceCounter(&t0);
+
+    /* Stage 1: Multi-bit SDM — one block per segment, one thread per block */
+    {
+        int seg_total = M + D;
+        int ch_stride_in = (int)count;
+        int ch_stride_out = (int)count;
+        void *args[] = {
+            &d_in, &d_mb,
+            &d_seg_starts, &d_seg_out_starts,
+            &seg_total, &M, &D,
+            &num_segs, &ch_stride_in, &ch_stride_out,
+            &d_init_states, &d_final_states /* NULL */
+        };
+        /* Grid: (num_segs, num_channels, 1), Block: (1,1,1) */
+        CUresult rc = pfn_cuLaunchKernel(c->fn_mb_segments,
+            (unsigned)num_segs, (unsigned)num_channels, 1,
+            1, 1, 1, 0, stream, args, NULL);
+        if (rc != CUDA_SUCCESS) goto fail;
+        pfn_cuStreamSynchronize(stream);
+    }
+    QueryPerformanceCounter(&t1);
+
+    /* Download multibit output for CPU stage 2 */
+    {
+        size_t mb_bytes = (size_t)(D * num_segs) * (size_t)num_channels * sizeof(float);
+        float *h_mb = (float *)malloc(mb_bytes);
+        if (!h_mb) goto fail;
+        pfn_cuMemcpyDtoHAsync(h_mb, d_mb, mb_bytes, stream);
+        pfn_cuStreamSynchronize(stream);
+
+        /* Diagnostic: log multibit output stats */
+        {
+            float mn = 1e30f, mx = -1e30f;
+            double sum = 0;
+            size_t check_n = count < 1000 ? count : 1000;
+            for (size_t i = 0; i < check_n; i++) {
+                float v = h_mb[i];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+                sum += (double)(v * v);
+            }
+            extern void trellis_log_c(const char *);
+            char msg[256];
+            sprintf_s(msg, sizeof(msg),
+                "multibit output: min=%.4f max=%.4f rms=%.4f first=[%.3f,%.3f,%.3f,%.3f,%.3f]",
+                mn, mx, sqrt(sum / (double)check_n),
+                h_mb[0], h_mb[1], h_mb[2], h_mb[3], h_mb[4]);
+            trellis_log_c(msg);
+        }
+
+        /* Stage 2: Multi-bit → 1-bit on CPU.
+         * Simple 1st-order delta-sigma: integrator += input - output.
+         * The multibit input is already noise-shaped by stage 1's NTF,
+         * so stage 2 only needs to handle the 4-bit→1-bit requantization.
+         * A 1st-order SDM is stable and adds minimal extra noise. */
+        size_t per_ch = (size_t)(D * num_segs);
+        for (int ch = 0; ch < num_channels; ch++) {
+            float *mb_ch = h_mb + ch * per_ch;
+            float *out_ch = out + ch * count;
+            double integrator = 0.0;
+            for (size_t i = 0; i < per_ch && i < count; i++) {
+                double x = (double)mb_ch[i] * (double)gain;
+                integrator += x;
+                double y = (integrator >= 0.0) ? 1.0 : -1.0;
+                integrator -= y;
+                out_ch[i] = (float)y;
+            }
+        }
+        free(h_mb);
+    }
+
+    QueryPerformanceCounter(&t2);
+    /* Log timing */
+    {
+        extern void trellis_log_c(const char *);
+        double ms1 = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)pf.QuadPart;
+        double ms2 = (double)(t2.QuadPart - t1.QuadPart) * 1000.0 / (double)pf.QuadPart;
+        char msg[256];
+        sprintf_s(msg, sizeof(msg),
+            "[GPU multibit] %zu samples, %dch, %d segs, M=%d D=%d: "
+            "stage1=%.1fms stage2=%.1fms total=%.1fms",
+            count, num_channels, num_segs, M, D, ms1, ms2, ms1 + ms2);
+        trellis_log_c(msg);
+    }
+
+    pfn_cuMemFree(d_in); pfn_cuMemFree(d_out); pfn_cuMemFree(d_mb);
+    pfn_cuMemFree(d_seg_starts); pfn_cuMemFree(d_seg_out_starts);
+    pfn_cuMemFree(d_init_states);
+    return 0;
+
+fail:
+    if (d_in) pfn_cuMemFree(d_in);
+    if (d_out) pfn_cuMemFree(d_out);
+    if (d_mb) pfn_cuMemFree(d_mb);
+    if (d_seg_starts) pfn_cuMemFree(d_seg_starts);
+    if (d_seg_out_starts) pfn_cuMemFree(d_seg_out_starts);
+    if (d_init_states) pfn_cuMemFree(d_init_states);
+    return -1;
 }

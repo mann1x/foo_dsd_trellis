@@ -242,6 +242,13 @@ int gpu_cuda_precorr(void *ctx, const float *in, float *out, size_t count,
                       const gpu_precorr_state_t *init,
                       gpu_precorr_state_t *final_state);
 
+/* ─── Multi-bit SDM experiment ─── */
+int gpu_cuda_multibit_setup(void *ctx, int order,
+                             const double *ntf_a, const double *ntf_g,
+                             double state_limit, int num_levels);
+int gpu_cuda_multibit_process(void *ctx, const double *in, float *out,
+                               size_t count, int num_channels, float gain);
+
 #ifdef __cplusplus
 }
 #endif

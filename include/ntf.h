@@ -8,7 +8,7 @@
 
 #include "dsd_types.h"
 
-#define MAX_NTF_ORDER 8
+#define MAX_NTF_ORDER 10  /* increased from 8 for multibit aggressive NTFs */
 
 /* NTF filter coefficient structure */
 typedef struct {
