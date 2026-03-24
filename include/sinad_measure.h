@@ -46,6 +46,10 @@ void sinad_measure(uint32_t dsd_rate, int ntf_id,
                    int use_fir_lowpass, float fir_gain,
                    sinad_result_t *result);
 
+/* Measure PreCorr SDM quality.
+ * Uses ntf_auto_select_precorr for NTF selection. */
+void sinad_measure_precorr(uint32_t dsd_rate, sinad_result_t *result);
+
 /* Measure DSD→DSD rate conversion quality.
  * Generates clean PCM sine, encodes to DSD at fs_in, FIR rate-converts,
  * re-encodes via SDM at fs_out, decimates to PCM, measures SINAD.

@@ -7,6 +7,10 @@
  * See include/precorr.h for algorithm description.
  */
 
+#ifdef _MSC_VER
+#pragma float_control(precise, on, push)
+#endif
+
 #include "../include/precorr.h"
 #include <string.h>
 #include <math.h>
@@ -290,3 +294,7 @@ void precorr_context_free(precorr_context_t *ctx) {
         ctx->filter = filter;  /* Keep filter reference for potential re-init */
     }
 }
+
+#ifdef _MSC_VER
+#pragma float_control(pop)
+#endif

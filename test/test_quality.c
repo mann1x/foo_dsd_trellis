@@ -64,7 +64,7 @@ static void test_a_weight_monotonic_low(void) {
 
 static void test_quality_dsd64(void) {
     sinad_result_t r;
-    sinad_measure(DSD_RATE_64, NTF_CLANS_5, 2, 4, 64, 1, 0.708f, &r);
+    sinad_measure(DSD_RATE_64, NTF_CLANS_6, 2, 16, 32, 1, 0.708f, &r);
     printf("    DSD64: SINAD=%.1f A-wtd=%.1f MT=%.1f NMod=%.1f NMR=%.1f\n",
            r.sinad_theoretical, r.sinad_awtd_theo,
            r.multitone_sinad_db, r.noise_mod_db, r.nmr_db);
@@ -130,7 +130,7 @@ static void test_quality_pcm_44_to_48(void) {
 
 static void test_quality_dsd64_48(void) {
     sinad_result_t r;
-    sinad_measure(DSD48_RATE_64, NTF_CLANS_6, 2, 4, 64, 1, 0.708f, &r);
+    sinad_measure(DSD48_RATE_64, NTF_CLANS_6, 2, 16, 32, 1, 0.708f, &r);
     printf("    DSD64/48: SINAD=%.1f A-wtd=%.1f MT=%.1f NMod=%.1f NMR=%.1f\n",
            r.sinad_theoretical, r.sinad_awtd_theo,
            r.multitone_sinad_db, r.noise_mod_db, r.nmr_db);

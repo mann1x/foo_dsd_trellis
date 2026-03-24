@@ -1166,38 +1166,95 @@ static double measure_pipeline_sinad(unsigned rate_mult, int nc, int lat,
 void test_pipeline_sinad(void) {
     printf("\n=== Pipeline SINAD (sinad_measure: sine → SDM, all rates × lat) ===\n");
 
-    /* Comprehensive NTF sweep at depth=4 for all rates.
-     * Find the optimal NTF for each rate. */
-    const char *ntf_names[] = {
-        "CLANS4","SDM4","CLANS5","SDM5","CLANS6",
-        "SDM6","CLANS7","SDM7","CLANS8","SDM8"
+    /* DSD64 CLANS-6 investigation: why does PreCorr (117.2 dB) beat
+     * Trellis (91.7 dB) by 25 dB with the same NTF?
+     * Sweep nc, depth, lat to find where quality is lost. */
+    printf("\n  --- DSD64 CLANS-6 parameter sweep ---\n");
+    struct { int nc; int depth; int lat; const char *label; } sweep[] = {
+        /* Vary nc (candidates) */
+        { 1, 4, 64,  "nc=1  d=4 lat=64  (greedy)" },
+        { 2, 4, 64,  "nc=2  d=4 lat=64  (production)" },
+        { 4, 4, 64,  "nc=4  d=4 lat=64" },
+        { 8, 4, 64,  "nc=8  d=4 lat=64" },
+        { 16,4, 64,  "nc=16 d=4 lat=64" },
+        /* Vary depth (path dedup mask width) */
+        { 2, 2, 64,  "nc=2  d=2 lat=64" },
+        { 2, 4, 64,  "nc=2  d=4 lat=64" },
+        { 2, 8, 64,  "nc=2  d=8 lat=64" },
+        { 2, 16,64,  "nc=2  d=16 lat=64" },
+        /* Vary lat (look-ahead) */
+        { 2, 4, 16,  "nc=2  d=4 lat=16" },
+        { 2, 4, 32,  "nc=2  d=4 lat=32" },
+        { 2, 4, 64,  "nc=2  d=4 lat=64" },
+        { 2, 4, 128, "nc=2  d=4 lat=128" },
+        { 2, 4, 256, "nc=2  d=4 lat=256" },
+        /* nc=1 greedy (no look-ahead, no dedup — pure greedy baseline) */
+        { 1, 4, 1,   "nc=1  d=4 lat=1   (pure greedy)" },
+        { 1, 4, 16,  "nc=1  d=4 lat=16  (greedy+lat)" },
+        { 1, 4, 64,  "nc=1  d=4 lat=64  (greedy+lat)" },
     };
-    struct { unsigned rate; int lat; } rates[] = {
-        { DSD_RATE_64,  64 },
-        { DSD_RATE_128, 128 },
-        { DSD_RATE_256, 128 },
-        { DSD_RATE_512, 32 },
-    };
-    int n_rates = sizeof(rates) / sizeof(rates[0]);
-    for (int ri = 0; ri < n_rates; ri++) {
-        printf("\n  --- DSD%u (lat=%d, depth=4, nc=2) ---\n",
-               rates[ri].rate / 44100, rates[ri].lat);
-        for (int ntf = 0; ntf < 10; ntf++) {
-            if (!ntf_get_filter(ntf, rates[ri].rate)) continue;
-            sinad_result_t r;
-            memset(&r, 0, sizeof(r));
-            sinad_measure(rates[ri].rate, ntf, 2, 4, rates[ri].lat,
-                          1, 0.708f, &r);
-            printf("  %-6s: SINAD=%6.1f  A-wtd=%6.1f  MT=%6.1f  NMod=%5.1f"
-                   "  (fail=%llu coll=%llu drop=%.1f%%)\n",
-                   ntf_names[ntf], r.sinad_theoretical, r.sinad_awtd_theo,
-                   r.multitone_sinad_db, r.noise_mod_db,
-                   (unsigned long long)r.conv_fail,
-                   (unsigned long long)r.cands_collapse, r.drop_pct);
-        }
+    int n_sweep = sizeof(sweep) / sizeof(sweep[0]);
+    for (int i = 0; i < n_sweep; i++) {
+        sinad_result_t r;
+        memset(&r, 0, sizeof(r));
+        sinad_measure(DSD_RATE_64, NTF_CLANS_6, sweep[i].nc,
+                      sweep[i].depth, sweep[i].lat, 1, 0.708f, &r);
+        printf("  %-28s: SINAD=%6.1f  (fail=%llu coll=%llu drop=%.1f%%)\n",
+               sweep[i].label, r.sinad_theoretical,
+               (unsigned long long)r.conv_fail,
+               (unsigned long long)r.cands_collapse, r.drop_pct);
     }
 
-    /* Placeholder to keep the test framework happy */
+    /* Best combinations: depth=16 unlocks quality */
+    printf("\n  --- DSD64 CLANS-6: depth=16 combinations ---\n");
+    struct { int nc; int depth; int lat; const char *label; } best[] = {
+        { 2, 16, 32,  "nc=2  d=16 lat=32" },
+        { 2, 16, 64,  "nc=2  d=16 lat=64" },
+        { 2, 16, 128, "nc=2  d=16 lat=128" },
+        { 4, 16, 32,  "nc=4  d=16 lat=32" },
+        { 4, 16, 64,  "nc=4  d=16 lat=64" },
+        { 4, 16, 128, "nc=4  d=16 lat=128" },
+        { 4, 8,  64,  "nc=4  d=8  lat=64" },
+        { 4, 12, 64,  "nc=4  d=12 lat=64" },
+        { 2, 12, 64,  "nc=2  d=12 lat=64" },
+        { 2, 10, 64,  "nc=2  d=10 lat=64" },
+    };
+    for (int i = 0; i < 10; i++) {
+        sinad_result_t r;
+        memset(&r, 0, sizeof(r));
+        sinad_measure(DSD_RATE_64, NTF_CLANS_6, best[i].nc,
+                      best[i].depth, best[i].lat, 1, 0.708f, &r);
+        printf("  %-24s: SINAD=%6.1f  (fail=%llu coll=%llu drop=%.1f%%)\n",
+               best[i].label, r.sinad_theoretical,
+               (unsigned long long)r.conv_fail,
+               (unsigned long long)r.cands_collapse, r.drop_pct);
+    }
+
+    /* DSD64: NTF × depth comparison to find optimal production config */
+    printf("\n  --- DSD64 NTF × depth: find best production config ---\n");
+    struct { int ntf; int depth; int lat; const char *label; } finals[] = {
+        { NTF_CLANS_5, 4,  64,  "CLANS5 d=4  lat=64  (current)" },
+        { NTF_CLANS_5, 16, 32,  "CLANS5 d=16 lat=32" },
+        { NTF_CLANS_5, 16, 64,  "CLANS5 d=16 lat=64" },
+        { NTF_CLANS_6, 4,  64,  "CLANS6 d=4  lat=64" },
+        { NTF_CLANS_6, 16, 32,  "CLANS6 d=16 lat=32" },
+        { NTF_CLANS_6, 16, 64,  "CLANS6 d=16 lat=64" },
+        { NTF_SDM_6,   16, 32,  "SDM6   d=16 lat=32" },
+        { NTF_SDM_6,   16, 64,  "SDM6   d=16 lat=64" },
+    };
+    for (int i = 0; i < 8; i++) {
+        sinad_result_t r;
+        memset(&r, 0, sizeof(r));
+        sinad_measure(DSD_RATE_64, finals[i].ntf, 2,
+                      finals[i].depth, finals[i].lat, 1, 0.708f, &r);
+        printf("  %-28s: SINAD=%6.1f  A-wtd=%6.1f  MT=%6.1f  (fail=%llu coll=%llu)\n",
+               finals[i].label, r.sinad_theoretical, r.sinad_awtd_theo,
+               r.multitone_sinad_db,
+               (unsigned long long)r.conv_fail,
+               (unsigned long long)r.cands_collapse);
+    }
+
+    /* Placeholder */
     struct { unsigned rate; int ntf; int nc; int depth; int lat; const char *label; } configs[] = {
         { 0, 0, 0, 0, 0, NULL },
     };

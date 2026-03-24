@@ -8,9 +8,14 @@
  *   4. NMR (simplified PEAQ): noise vs masking threshold
  */
 
+#ifdef _MSC_VER
+#pragma float_control(precise, on, push)
+#endif
+
 #include <windows.h>
 #include "../include/sinad_measure.h"
 #include "../include/trellis.h"
+#include "../include/precorr.h"
 #include "../include/ntf.h"
 #include "../include/fir.h"
 #include "../include/dsd_types.h"
@@ -384,6 +389,142 @@ void sinad_measure(uint32_t dsd_rate, int ntf_id,
     /* ── Metric 3: Noise Modulation ── */
     result->noise_mod_db = measure_noise_modulation(
         dsd_rate, f, depth, cands, lat, use_fir_lowpass, gain);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * PreCorr SDM quality measurement
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+void sinad_measure_precorr(uint32_t dsd_rate, sinad_result_t *result) {
+    if (!result) return;
+    memset(result, 0, sizeof(*result));
+    result->sinad_theoretical = -999.0;
+    result->sinad_awtd_theo = -999.0;
+    result->multitone_sinad_db = -999.0;
+    result->noise_mod_db = -999.0;
+    result->nmr_db = -999.0;
+
+    const ntf_filter_t *f = ntf_auto_select_precorr(dsd_rate);
+    if (!f) return;
+
+    unsigned rate_mult = dsd_rate / 44100;
+    if (rate_mult == 0) rate_mult = dsd_rate / 48000;
+    const unsigned n_dsd = (rate_mult <= 64)  ? 282240u :
+                           (rate_mult <= 128) ? 564480u :
+                           (rate_mult <= 256) ? 1128960u : 2257920u;
+
+    /* Bin-align frequency */
+    double bin_width = (double)dsd_rate / (double)n_dsd;
+    unsigned sig_bin = (unsigned)(1000.0 / bin_width + 0.5);
+    double freq = sig_bin * bin_width;
+
+    precorr_context_t ctx;
+    if (precorr_context_init(&ctx, f) != 0)
+        return;
+
+    double *in = (double *)malloc(n_dsd * sizeof(double));
+    float *out = (float *)malloc(n_dsd * sizeof(float));
+    if (!in || !out) {
+        free(in); free(out); precorr_context_free(&ctx); return;
+    }
+
+    for (unsigned i = 0; i < n_dsd; i++)
+        in[i] = 0.5 * sin(2.0 * M_PI * freq * (double)i / (double)dsd_rate);
+
+    precorr_process_block(&ctx, in, out, n_dsd);
+
+    result->sinad_theoretical = measure_goertzel_sinad(
+        out, n_dsd, freq, dsd_rate, &result->sinad_awtd_theo);
+    result->nmr_db = measure_nmr(out, n_dsd, freq, dsd_rate);
+    result->ok = 1;
+
+    free(in); free(out);
+    precorr_context_free(&ctx);
+
+    /* ── Metric 2: Multitone SINAD (PreCorr) ── */
+    {
+        precorr_context_t mt_ctx;
+        if (precorr_context_init(&mt_ctx, f) != 0) return;
+        double *mt_in = (double *)malloc(n_dsd * sizeof(double));
+        float  *mt_out = (float  *)malloc(n_dsd * sizeof(float));
+        if (mt_in && mt_out) {
+            double est_bw = (double)dsd_rate / (double)n_dsd;
+            /* PreCorr has no internal 0.5 scaling (unlike Trellis sdm_process_block).
+             * Halve amplitude to match Trellis's effective level at the NTF. */
+            double amp = 0.25 / sqrt(32.0);
+            for (unsigned i = 0; i < n_dsd; i++) {
+                double s = 0.0;
+                for (int t = 0; t < 32; t++) {
+                    unsigned abin = (unsigned)(g_multitone_freqs[t] / est_bw + 0.5);
+                    double af = abin * est_bw;
+                    s += amp * sin(2.0 * M_PI * af * (double)i / (double)dsd_rate);
+                }
+                mt_in[i] = s;
+            }
+            precorr_process_block(&mt_ctx, mt_in, mt_out, n_dsd);
+            double actual_bw = (double)dsd_rate / (double)n_dsd;
+            unsigned max_bin = (unsigned)(20000.0 / actual_bw);
+            double total_signal = 0.0, noise = 0.0;
+            unsigned sig_bins[32];
+            for (int t = 0; t < 32; t++) {
+                unsigned abin = (unsigned)(g_multitone_freqs[t] / est_bw + 0.5);
+                double af = abin * est_bw;
+                sig_bins[t] = (unsigned)(af / actual_bw + 0.5);
+                total_signal += goertzel_power(mt_out, n_dsd, af, (double)dsd_rate);
+            }
+            for (unsigned b = 1; b <= max_bin; b++) {
+                int is_sig = 0;
+                for (int t = 0; t < 32; t++)
+                    if (b >= sig_bins[t] - 1 && b <= sig_bins[t] + 1) { is_sig = 1; break; }
+                if (!is_sig)
+                    noise += goertzel_power(mt_out, n_dsd, b * actual_bw, (double)dsd_rate);
+            }
+            if (noise <= 0.0) noise = 1e-30;
+            result->multitone_sinad_db = 10.0 * log10(total_signal / noise);
+        }
+        free(mt_in); free(mt_out);
+        precorr_context_free(&mt_ctx);
+    }
+
+    /* ── Metric 3: Noise Modulation (PreCorr) ── */
+    {
+        /* Halved vs Trellis: PreCorr has no internal 0.5 scaling */
+        static const double amplitudes[4] = { 0.025, 0.075, 0.15, 0.25 };
+        double noise_floors[4];
+        const unsigned n_short = (rate_mult <= 64) ? 65536u :
+                                 (rate_mult <= 128) ? 131072u :
+                                 (rate_mult <= 256) ? 262144u : 524288u;
+        double nm_bw = (double)dsd_rate / (double)n_short;
+        unsigned nm_sig_bin = (unsigned)(1000.0 / nm_bw + 0.5);
+        double nm_freq = nm_sig_bin * nm_bw;
+
+        for (int a = 0; a < 4; a++) {
+            precorr_context_t nm_ctx;
+            if (precorr_context_init(&nm_ctx, f) != 0) return;
+            double *nm_in = (double *)malloc(n_short * sizeof(double));
+            float  *nm_out = (float  *)malloc(n_short * sizeof(float));
+            if (!nm_in || !nm_out) { free(nm_in); free(nm_out); precorr_context_free(&nm_ctx); return; }
+            for (unsigned i = 0; i < n_short; i++)
+                nm_in[i] = amplitudes[a] * sin(2.0 * M_PI * nm_freq * (double)i / (double)dsd_rate);
+            precorr_process_block(&nm_ctx, nm_in, nm_out, n_short);
+            unsigned max_bin = (unsigned)(20000.0 / nm_bw);
+            double noise = 0.0;
+            for (unsigned b = 1; b <= max_bin; b++) {
+                if (b >= nm_sig_bin - 1 && b <= nm_sig_bin + 1) continue;
+                noise += goertzel_power(nm_out, n_short, b * nm_bw, (double)dsd_rate);
+            }
+            if (noise <= 0.0) noise = 1e-30;
+            noise_floors[a] = 10.0 * log10(noise);
+            free(nm_in); free(nm_out);
+            precorr_context_free(&nm_ctx);
+        }
+        double max_nf = noise_floors[0], min_nf = noise_floors[0];
+        for (int a = 1; a < 4; a++) {
+            if (noise_floors[a] > max_nf) max_nf = noise_floors[a];
+            if (noise_floors[a] < min_nf) min_nf = noise_floors[a];
+        }
+        result->noise_mod_db = max_nf - min_nf;
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -839,3 +980,7 @@ void sinad_measure_dsd_to_dsd(uint32_t fs_in, uint32_t fs_out,
     result->ok = 1;
     free(pcm);
 }
+
+#ifdef _MSC_VER
+#pragma float_control(pop)
+#endif

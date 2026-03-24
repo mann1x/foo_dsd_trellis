@@ -5,6 +5,14 @@
  * Adapted for float32 I/O and foobar2000 DSP context.
  */
 
+/* Force /fp:precise for this file even when project uses /fp:fast.
+ * The trellis cost computation is extremely sensitive to FP operation
+ * ordering — FMA causes up to 13 dB quality variation (same root
+ * cause as CUDA --fmad=false). */
+#ifdef _MSC_VER
+#pragma float_control(precise, on, push)
+#endif
+
 #include "../include/trellis.h"
 #include <stdlib.h>
 #include <string.h>
@@ -1063,3 +1071,7 @@ void sdm_context_reset(sdm_context_t *ctx) {
 void sdm_context_free(sdm_context_t *ctx) {
     memset(ctx, 0, sizeof(*ctx));
 }
+
+#ifdef _MSC_VER
+#pragma float_control(pop)
+#endif

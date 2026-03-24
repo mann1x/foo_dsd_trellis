@@ -1504,19 +1504,25 @@ private:
             engine_path_info_t pi;
             engine_get_path_info(fs_in, fs_out, (int)ntf_val, sdm_mode, &m_cfg, &pi);
 
-            int fir_mode_raw = m_cfg.rate_fir_mode[idx];
-            int use_fir = (fir_mode_raw == FIR_MODE_FIR) ? 1 :
-                          (fir_mode_raw == FIR_MODE_BOXCAR) ? 0 :
-                          (sdm_mode == SDM_MODE_TRELLIS) ? 1 : 0;
-            float fir_gain = fir_gain_db_to_linear(m_cfg.fir_gain_db);
-
             sinad_result_t result;
-            sinad_measure(fs_out, pi.ntf_filter, pi.cands, pi.depth, pi.lat,
-                          use_fir, fir_gain, &result);
+
+            if (sdm_mode == SDM_MODE_PRECORR) {
+                /* PreCorr: use dedicated measurement (precorr_process_block) */
+                sinad_measure_precorr(fs_out, &result);
+            } else {
+                /* Trellis: standard measurement with path_table params */
+                int fir_mode_raw = m_cfg.rate_fir_mode[idx];
+                int use_fir = (fir_mode_raw == FIR_MODE_FIR) ? 1 :
+                              (fir_mode_raw == FIR_MODE_BOXCAR) ? 0 : 1;
+                float fir_gain = fir_gain_db_to_linear(m_cfg.fir_gain_db);
+
+                sinad_measure(fs_out, pi.ntf_filter, pi.cands, pi.depth, pi.lat,
+                              use_fir, fir_gain, &result);
+            }
 
             if (result.ok) {
                 SaveSinadResult(row, pi.ntf_filter, pi.cands, pi.depth, pi.lat,
-                                use_fir, &result);
+                                0, &result);
             }
         } else if (in_is_dsd) {
             /* DSD → PCM: measure FIR decimation SINAD */
@@ -1880,7 +1886,7 @@ public:
 
             /* Trellis latency: per-rate override or auto-compute from DSD rate.
              * From NTF sweep (2026-03-24, depth=4, nc=2, path_table NTFs):
-             *   DSD64:  CLANS5/lat=64  →  99.0 dB, 0 collapse
+             *   DSD64:  CLANS6/d=16/lat=32 → 110.7 dB, 0 collapse
              *   DSD128: CLANS6/lat=128 → 121.5 dB, 0 collapse
              *   DSD256: CLANS6/lat=128 → 128.9 dB, 0 collapse
              *   DSD512: lat=32  → 137.6 dB, 0 collapse */
@@ -1893,7 +1899,7 @@ public:
                 else if (out_dsd >= DSD_RATE_128)
                     chunk_cfg.trellis_lat = 128;
                 else
-                    chunk_cfg.trellis_lat = 64;   /* DSD64 */
+                    chunk_cfg.trellis_lat = 32;   /* DSD64 (d=16 needs short lat) */
             }
         }
 

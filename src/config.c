@@ -115,9 +115,16 @@ static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
     + 2 * RATE_MAP_COUNT         /* rate_pcm_bits + rate_pcm_dither */ \
     )
 
+/* v17: v16 + rate_parallel(20) + gpu_sdm_enabled(1) + rate_fir_prec(20) */
+#define CONFIG_V17_SIZE (CONFIG_V16_SIZE \
+    + RATE_MAP_COUNT             /* rate_parallel */ \
+    + 1                          /* gpu_sdm_enabled */ \
+    + RATE_MAP_COUNT             /* rate_fir_prec */ \
+    )
+
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
-    if (buf_size < CONFIG_V16_SIZE)
+    if (buf_size < CONFIG_V17_SIZE)
         return 0;
 
     size_t pos = 0;
@@ -193,6 +200,10 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     memcpy(buf + pos, cfg->rate_parallel, RATE_MAP_COUNT);
     pos += RATE_MAP_COUNT;
     pos = write_u8(buf, pos, cfg->gpu_sdm_enabled ? 1 : 0);
+
+    /* v17: per-rate FIR precision */
+    memcpy(buf + pos, cfg->rate_fir_prec, RATE_MAP_COUNT);
+    pos += RATE_MAP_COUNT;
 
     return pos;
 }
@@ -329,7 +340,7 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
                 memcpy(cfg->rate_lat, buf + pos, rate_count * sizeof(int16_t));
                 pos += rate_count * sizeof(int16_t);
             }
-            /* Version 16 adds PCM encoding + resampler */
+            /* Version 16+ adds PCM encoding + resampler */
             if (version >= 16) {
                 uint8_t u8;
                 pos = read_u8(buf, pos, &u8); cfg->pcm_bit_depth = (int8_t)u8;
@@ -349,6 +360,13 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
                     uint8_t u8;
                     pos = read_u8(buf, pos, &u8);
                     cfg->gpu_sdm_enabled = (u8 != 0);
+                }
+            }
+            /* Version 17 adds per-rate FIR precision */
+            if (version >= 17) {
+                if (pos + RATE_MAP_COUNT <= buf_size) {
+                    memcpy(cfg->rate_fir_prec, buf + pos, RATE_MAP_COUNT);
+                    pos += RATE_MAP_COUNT;
                 }
             }
         } else {
@@ -461,4 +479,10 @@ void config_validate(dsd_config_t *cfg) {
         cfg->resample_engine = RESAMPLE_AUTO;
     if (cfg->soxr_quality < SOXR_QUALITY_MQ || cfg->soxr_quality > SOXR_QUALITY_VHQ)
         cfg->soxr_quality = SOXR_QUALITY_HQ;
+
+    /* Validate per-rate FIR precision */
+    for (int i = 0; i < RATE_MAP_COUNT; i++) {
+        if (cfg->rate_fir_prec[i] < FIR_PREC_AUTO || cfg->rate_fir_prec[i] > FIR_PREC_FP64)
+            cfg->rate_fir_prec[i] = (int8_t)FIR_PREC_AUTO;
+    }
 }

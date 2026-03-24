@@ -22,8 +22,9 @@
 #define IPP_HB_KAISER_BETA 12.0   /* ~120 dB stopband */
 
 /* Global half-band taps for GPU sharing */
-float g_hb_taps[IPP_HB_NTAPS] = {0};
-int   g_hb_ntaps = IPP_HB_NTAPS;
+float  g_hb_taps[IPP_HB_NTAPS] = {0};
+double g_hb_taps_d[IPP_HB_NTAPS] = {0};
+int    g_hb_ntaps = IPP_HB_NTAPS;
 static bool g_hb_taps_initialized = false;
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -80,6 +81,7 @@ static int ipp_firsr_stage_init(fir_chain_t *chain, int stage_idx) {
     /* Cache taps globally for GPU backend */
     if (!g_hb_taps_initialized) {
         memcpy(g_hb_taps, taps, sizeof(g_hb_taps));
+        memcpy(g_hb_taps_d, hd, sizeof(g_hb_taps_d));
         g_hb_taps_initialized = true;
     }
 
@@ -273,6 +275,163 @@ static size_t ipp_downsample2(fir_chain_t *chain, int stage_idx,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * FP64 IPP FIRSR per-stage init/free
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static void ensure_hb_taps_d(void) {
+    /* Make sure g_hb_taps_d is populated even if fp32 init was never called */
+    if (!g_hb_taps_initialized) {
+        double hd[IPP_HB_NTAPS];
+        design_halfband_kaiser(hd, IPP_HB_NTAPS, IPP_HB_KAISER_BETA);
+        Ipp32f taps_f[IPP_HB_NTAPS];
+        for (int i = 0; i < IPP_HB_NTAPS; i++)
+            taps_f[i] = (Ipp32f)hd[i];
+        memcpy(g_hb_taps, taps_f, sizeof(g_hb_taps));
+        memcpy(g_hb_taps_d, hd, sizeof(g_hb_taps_d));
+        g_hb_taps_initialized = true;
+    }
+}
+
+static int ipp_firsr_stage_init_d(fir_chain_t *chain, int stage_idx) {
+    ensure_hb_taps_d();
+
+    Ipp64f taps[IPP_HB_NTAPS];
+    for (int i = 0; i < IPP_HB_NTAPS; i++)
+        taps[i] = g_hb_taps_d[i];
+
+    int specSize = 0, bufSize = 0;
+    IppStatus st = ippsFIRSRGetSize(IPP_HB_NTAPS, ipp64f, &specSize, &bufSize);
+    if (st != ippStsNoErr)
+        return -1;
+
+    IppsFIRSpec_64f *spec = (IppsFIRSpec_64f *)ippsMalloc_8u(specSize);
+    if (!spec)
+        return -1;
+
+    st = ippsFIRSRInit_64f(taps, IPP_HB_NTAPS, ippAlgDirect, spec);
+    if (st != ippStsNoErr) {
+        ippsFree(spec);
+        return -1;
+    }
+
+    Ipp8u *buf = ippsMalloc_8u(bufSize);
+    if (!buf) {
+        ippsFree(spec);
+        return -1;
+    }
+
+    int dlyLen = IPP_HB_NTAPS - 1;
+    Ipp64f *dly = ippsMalloc_64f(dlyLen);
+    if (!dly) {
+        ippsFree(buf);
+        ippsFree(spec);
+        return -1;
+    }
+    ippsZero_64f(dly, dlyLen);
+
+    chain->ipp_spec_d[stage_idx] = spec;
+    chain->ipp_buf_d[stage_idx] = buf;
+    chain->ipp_dly_d[stage_idx] = dly;
+    chain->ipp_taps_len = IPP_HB_NTAPS;
+
+    return 0;
+}
+
+static void ipp_firsr_stage_free_d(fir_chain_t *chain, int stage_idx) {
+    if (chain->ipp_spec_d[stage_idx]) {
+        ippsFree(chain->ipp_spec_d[stage_idx]);
+        chain->ipp_spec_d[stage_idx] = NULL;
+    }
+    if (chain->ipp_buf_d[stage_idx]) {
+        ippsFree(chain->ipp_buf_d[stage_idx]);
+        chain->ipp_buf_d[stage_idx] = NULL;
+    }
+    if (chain->ipp_dly_d[stage_idx]) {
+        ippsFree(chain->ipp_dly_d[stage_idx]);
+        chain->ipp_dly_d[stage_idx] = NULL;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * FP64 zero-stuff temp buffer
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static int ipp_ensure_zerostuff_d(fir_chain_t *chain, size_t need) {
+    if (chain->ipp_zerostuff_d_sz >= need)
+        return 0;
+    if (chain->ipp_zerostuff_d)
+        ippsFree(chain->ipp_zerostuff_d);
+    chain->ipp_zerostuff_d = ippsMalloc_64f((int)need);
+    chain->ipp_zerostuff_d_sz = chain->ipp_zerostuff_d ? need : 0;
+    return chain->ipp_zerostuff_d ? 0 : -1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * FP64 Upsample / Downsample 2x via IPP FIRSR
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static size_t ipp_upsample2_d(fir_chain_t *chain, int stage_idx,
+                               const double *in, double *out, size_t count) {
+    size_t out_count = count * 2;
+
+    if (ipp_ensure_zerostuff_d(chain, out_count) != 0)
+        return 0;
+
+    /* Zero-stuff: in[i] -> tmp[2i], 0 -> tmp[2i+1] */
+    ippsZero_64f(chain->ipp_zerostuff_d, (int)out_count);
+    for (size_t i = 0; i < count; i++)
+        chain->ipp_zerostuff_d[2 * i] = in[i];
+
+    IppsFIRSpec_64f *spec = (IppsFIRSpec_64f *)chain->ipp_spec_d[stage_idx];
+    Ipp64f *dly = chain->ipp_dly_d[stage_idx];
+    Ipp8u *buf = (Ipp8u *)chain->ipp_buf_d[stage_idx];
+
+    ippsFIRSR_64f(chain->ipp_zerostuff_d, out, (int)out_count,
+                  spec, dly, dly, buf);
+
+    /* Scale by 2 to compensate for zero insertion */
+    ippsMulC_64f_I(2.0, out, (int)out_count);
+
+    return out_count;
+}
+
+static size_t ipp_downsample2_d(fir_chain_t *chain, int stage_idx,
+                                 const double *in, double *out, size_t in_count) {
+    size_t out_count = in_count / 2;
+
+    if (ipp_ensure_zerostuff_d(chain, in_count) != 0)
+        return 0;
+
+    IppsFIRSpec_64f *spec = (IppsFIRSpec_64f *)chain->ipp_spec_d[stage_idx];
+    Ipp64f *dly = chain->ipp_dly_d[stage_idx];
+    Ipp8u *buf = (Ipp8u *)chain->ipp_buf_d[stage_idx];
+
+    ippsFIRSR_64f(in, chain->ipp_zerostuff_d, (int)in_count,
+                  spec, dly, dly, buf);
+
+    /* Decimate: keep every other sample */
+    for (size_t i = 0; i < out_count; i++)
+        out[i] = chain->ipp_zerostuff_d[2 * i];
+
+    return out_count;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * FP64 scratch buffer management
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static int ensure_scratch_d(fir_chain_t *chain, size_t need) {
+    if (chain->scratch_d_size >= need)
+        return 0;
+    double *p = (double *)realloc(chain->scratch_d, need * sizeof(double));
+    if (!p)
+        return -1;
+    chain->scratch_d = p;
+    chain->scratch_d_size = need;
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  * Scratch buffer management
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -291,15 +450,17 @@ static int ensure_scratch(fir_chain_t *chain, size_t need) {
  * Public API
  * ═══════════════════════════════════════════════════════════════════════ */
 
-int fir_chain_init(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out) {
+int fir_chain_init_ex(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out,
+                      bool use_fp64) {
     memset(chain, 0, sizeof(*chain));
+    chain->use_fp64 = use_fp64;
 
     if (fs_in == fs_out) {
         chain->num_stages = 0;
         return 0;
     }
 
-    /* Determine number of ×2 or ÷2 stages needed */
+    /* Determine number of x2 or /2 stages needed */
     uint32_t ratio;
 
     if (fs_out > fs_in) {
@@ -327,11 +488,21 @@ int fir_chain_init(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out) {
     chain->num_stages = stages;
 
     /* Init per-stage IPP FIRSR specs */
-    for (int i = 0; i < stages; i++) {
-        if (ipp_firsr_stage_init(chain, i) != 0) {
-            for (int j = 0; j < i; j++)
-                ipp_firsr_stage_free(chain, j);
-            return -1;
+    if (use_fp64) {
+        for (int i = 0; i < stages; i++) {
+            if (ipp_firsr_stage_init_d(chain, i) != 0) {
+                for (int j = 0; j < i; j++)
+                    ipp_firsr_stage_free_d(chain, j);
+                return -1;
+            }
+        }
+    } else {
+        for (int i = 0; i < stages; i++) {
+            if (ipp_firsr_stage_init(chain, i) != 0) {
+                for (int j = 0; j < i; j++)
+                    ipp_firsr_stage_free(chain, j);
+                return -1;
+            }
         }
     }
 
@@ -340,6 +511,10 @@ int fir_chain_init(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out) {
      * than pre-filtered (demod) input despite worse FIR-only SINAD. */
 
     return 0;
+}
+
+int fir_chain_init(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out) {
+    return fir_chain_init_ex(chain, fs_in, fs_out, false);
 }
 
 size_t fir_chain_process(fir_chain_t *chain,
@@ -399,22 +574,78 @@ size_t fir_chain_process(fir_chain_t *chain,
     return count;
 }
 
+size_t fir_chain_process_d(fir_chain_t *chain,
+                            const double *in, double *out,
+                            size_t in_count) {
+    if (chain->num_stages == 0) {
+        memcpy(out, in, in_count * sizeof(double));
+        return in_count;
+    }
+
+    /* Single stage: direct in -> out */
+    if (chain->num_stages == 1) {
+        if (chain->upsample)
+            return ipp_upsample2_d(chain, 0, in, out, in_count);
+        else
+            return ipp_downsample2_d(chain, 0, in, out, in_count);
+    }
+
+    /* Multi-stage: ping-pong between scratch_d and out */
+    size_t max_intermediate;
+    if (chain->upsample)
+        max_intermediate = in_count << (chain->num_stages - 1);
+    else
+        max_intermediate = in_count / 2;
+
+    if (ensure_scratch_d(chain, max_intermediate) != 0)
+        return 0;
+
+    double *bufs[2] = { out, chain->scratch_d };
+    const double *src = in;
+    size_t count = in_count;
+
+    for (int i = 0; i < chain->num_stages; i++) {
+        int remaining = chain->num_stages - 1 - i;
+        double *dst = bufs[remaining & 1];
+
+        if (chain->upsample)
+            count = ipp_upsample2_d(chain, i, src, dst, count);
+        else
+            count = ipp_downsample2_d(chain, i, src, dst, count);
+
+        src = dst;
+    }
+
+    return count;
+}
+
 void fir_chain_reset(fir_chain_t *chain) {
     if (chain->has_demod && chain->demod_dly)
         ippsZero_32f(chain->demod_dly, chain->ipp_taps_len - 1);
 
     int dlyLen = chain->ipp_taps_len - 1;
-    for (int i = 0; i < chain->num_stages; i++) {
-        if (chain->ipp_dly[i])
-            ippsZero_32f(chain->ipp_dly[i], dlyLen);
+    if (dlyLen <= 0) return;
+
+    if (chain->use_fp64) {
+        for (int i = 0; i < chain->num_stages; i++) {
+            if (chain->ipp_dly_d[i])
+                ippsZero_64f(chain->ipp_dly_d[i], dlyLen);
+        }
+    } else {
+        for (int i = 0; i < chain->num_stages; i++) {
+            if (chain->ipp_dly[i])
+                ippsZero_32f(chain->ipp_dly[i], dlyLen);
+        }
     }
 }
 
 void fir_chain_free(fir_chain_t *chain) {
     ipp_firsr_demod_free(chain);
 
-    for (int i = 0; i < FIR_MAX_STAGES; i++)
+    for (int i = 0; i < FIR_MAX_STAGES; i++) {
         ipp_firsr_stage_free(chain, i);
+        ipp_firsr_stage_free_d(chain, i);
+    }
 
     if (chain->ipp_zerostuff) {
         ippsFree(chain->ipp_zerostuff);
@@ -422,10 +653,22 @@ void fir_chain_free(fir_chain_t *chain) {
         chain->ipp_zerostuff_sz = 0;
     }
 
+    if (chain->ipp_zerostuff_d) {
+        ippsFree(chain->ipp_zerostuff_d);
+        chain->ipp_zerostuff_d = NULL;
+        chain->ipp_zerostuff_d_sz = 0;
+    }
+
     free(chain->scratch);
     chain->scratch = NULL;
     chain->scratch_size = 0;
+
+    free(chain->scratch_d);
+    chain->scratch_d = NULL;
+    chain->scratch_d_size = 0;
+
     chain->num_stages = 0;
+    chain->use_fp64 = false;
 }
 
 const char *fir_ipp_version(void) {

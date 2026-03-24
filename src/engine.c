@@ -47,12 +47,13 @@ static const path_config_t path_table[] = {
     /* Same-rate re-encode (boxcar/FIR → SDM).
      * nc=2 for all same-rate: nc=4 causes candidate collapse over time.
      * Optimal NTF from comprehensive sweep (2026-03-24, depth=4, nc=2):
-     *   DSD64:  CLANS5/lat=64  →  99.0 dB, 0 collapse (CLANS6=91.7, SDM6=92.5)
-     *   DSD128: CLANS6/lat=128 → 121.5 dB, 0 collapse (SDM6=102.0, CLANS5=119.6)
-     *   DSD256: CLANS6/lat=128 → 128.9 dB, 0 collapse (SDM4=120.8, CLANS4=118.2)
-     *   DSD512: SDM6/lat=32    → 140.3 dB, 0 collapse (CLANS5/7/8=140.6, ceiling) */
-    /* nc=2 avoids candidate collapse and is 2x cheaper. */
-    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_5, 0.0,  2,  0, 4, 0.708f },
+     *   DSD64:  CLANS6/d=16/lat=32 → 110.7 dB (depth=16 unlocks order-6 path diversity)
+     *   DSD128: CLANS6/d=4/lat=128 → 121.5 dB, 0 collapse
+     *   DSD256: CLANS6/d=4/lat=128 → 128.9 dB, 0 collapse
+     *   DSD512: SDM6/d=4/lat=32    → 140.3 dB, 0 collapse (at ceiling) */
+    /* nc=2 avoids candidate collapse and is 2x cheaper.
+     * DSD64 needs depth=16: 4-bit dedup mask kills path diversity at low OSR. */
+    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_6, 0.0,  2,  0, 16, 0.708f },
     { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_512, DSD_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
@@ -73,7 +74,7 @@ static const path_config_t path_table[] = {
     { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 0.708f },
     /* ─── DSD/48 paths (mirror DSD/44 NTF choices) ─── */
     /* Same-rate re-encode */
-    { DSD48_RATE_64,  DSD48_RATE_64,  NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_64,  DSD48_RATE_64,  NTF_CLANS_6, 0.0,  2,  0, 16, 0.708f },
     { DSD48_RATE_128, DSD48_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
@@ -146,14 +147,14 @@ int engine_channel_init(engine_channel_t *eng, int channel,
     eng->fir_only = (fs_out < DSD_RATE_64 && cfg->fs_in >= DSD_RATE_64);
 
     if (eng->fir_only && !cfg->mute) {
-        if (fir_chain_init(&eng->fir, cfg->fs_in, fs_out) != 0)
+        if (fir_chain_init_ex(&eng->fir, cfg->fs_in, fs_out, true) != 0)
             return -1;
         return 0;
     }
 
     if (!cfg->mute) {
-        /* Init FIR chain */
-        if (fir_chain_init(&eng->fir, cfg->fs_in, fs_out) != 0)
+        /* Init FIR chain (fp64 for native double precision throughout) */
+        if (fir_chain_init_ex(&eng->fir, cfg->fs_in, fs_out, true) != 0)
             return -1;
 
         /* Path-adaptive lookup — always look up for gain/limiter.
@@ -357,7 +358,7 @@ size_t engine_process_block(engine_channel_t *eng,
     if (fs_out < cfg->fs_in && count / 2 > buf_need)
         buf_need = count / 2;
 
-    /* Ensure intermediate buffers: float for FIR chain (IPP), double for SDM */
+    /* Ensure intermediate buffer (double for SDM) */
     if (eng->fir_buf_sz < buf_need * sizeof(double)) {
         free(eng->fir_buf);
         eng->fir_buf = (double *)malloc(buf_need * sizeof(double));
@@ -366,22 +367,48 @@ size_t engine_process_block(engine_channel_t *eng,
     if (!eng->fir_buf)
         return 0;
 
-    /* FIR chain outputs float — use TLS buffer, then widen to double */
-    static __declspec(thread) float *tls_fir_f = NULL;
-    static __declspec(thread) size_t tls_fir_sz = 0;
-    if (tls_fir_sz < buf_need) {
-        free(tls_fir_f);
-        tls_fir_f = (float *)malloc(buf_need * sizeof(float));
-        tls_fir_sz = tls_fir_f ? buf_need : 0;
-    }
-    if (!tls_fir_f) return 0;
-
-    size_t fir_out = fir_chain_process(&eng->fir, in, tls_fir_f, count);
-
-    /* Widen to double and apply gain in one pass */
+    size_t fir_out;
     double combined_gain = (double)eng->fir_gain * (double)cfg->gain;
-    for (size_t i = 0; i < fir_out; i++)
-        eng->fir_buf[i] = (double)tls_fir_f[i] * combined_gain;
+
+    if (eng->fir.use_fp64) {
+        /* FP64 path: widen float DSD input to double, FIR in fp64, output double directly */
+        static __declspec(thread) double *tls_fir_d = NULL;
+        static __declspec(thread) size_t tls_fir_d_sz = 0;
+        if (tls_fir_d_sz < count) {
+            free(tls_fir_d);
+            tls_fir_d = (double *)malloc(count * sizeof(double));
+            tls_fir_d_sz = tls_fir_d ? count : 0;
+        }
+        if (!tls_fir_d) return 0;
+
+        /* Widen input: float -> double */
+        for (size_t i = 0; i < count; i++)
+            tls_fir_d[i] = (double)in[i];
+
+        fir_out = fir_chain_process_d(&eng->fir, tls_fir_d, eng->fir_buf, count);
+
+        /* Apply gain in fp64 */
+        if (combined_gain != 1.0) {
+            for (size_t i = 0; i < fir_out; i++)
+                eng->fir_buf[i] *= combined_gain;
+        }
+    } else {
+        /* FP32 path: FIR in fp32, then widen to double */
+        static __declspec(thread) float *tls_fir_f = NULL;
+        static __declspec(thread) size_t tls_fir_sz = 0;
+        if (tls_fir_sz < buf_need) {
+            free(tls_fir_f);
+            tls_fir_f = (float *)malloc(buf_need * sizeof(float));
+            tls_fir_sz = tls_fir_f ? buf_need : 0;
+        }
+        if (!tls_fir_f) return 0;
+
+        fir_out = fir_chain_process(&eng->fir, in, tls_fir_f, count);
+
+        /* Widen to double and apply gain in one pass */
+        for (size_t i = 0; i < fir_out; i++)
+            eng->fir_buf[i] = (double)tls_fir_f[i] * combined_gain;
+    }
 
     /* SDM (CPU only) */
     size_t sdm_out;
@@ -499,8 +526,21 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
             }
         }
         fir_count = count;
+    } else if (eng->fir.use_fp64) {
+        /* Rate conversion: FP64 path — widen input, FIR in fp64, output double directly */
+        static __declspec(thread) double *tls_fir_d2 = NULL;
+        static __declspec(thread) size_t tls_fir_d_sz2 = 0;
+        if (tls_fir_d_sz2 < count) {
+            free(tls_fir_d2);
+            tls_fir_d2 = (double *)malloc(count * sizeof(double));
+            tls_fir_d_sz2 = tls_fir_d2 ? count : 0;
+        }
+        if (!tls_fir_d2) { *fir_out_ptr = NULL; return 0; }
+        for (size_t i = 0; i < count; i++)
+            tls_fir_d2[i] = (double)in[i];
+        fir_count = fir_chain_process_d(&eng->fir, tls_fir_d2, eng->fir_buf, count);
     } else {
-        /* Rate conversion: FIR chain (float) → widen to double */
+        /* Rate conversion: FP32 path — FIR in fp32, then widen to double */
         static __declspec(thread) float *tls_fir_f2 = NULL;
         static __declspec(thread) size_t tls_fir_sz2 = 0;
         if (tls_fir_sz2 < buf_need) {
@@ -633,7 +673,7 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
 
     /* Auto-compute optimal lat when lat=0 (auto).
      * From comprehensive nc×lat sweep with stability analysis (2026-03-19):
-     *   DSD64:     lat=64  (103.4 dB, 0 collapse) — lat=32 was 99.3, lat=128 was 87.2
+     *   DSD64:     lat=32  (110.7 dB with d=16) — d=16 needs shorter lat for best quality
      *   DSD128:    lat=128 (127.4 dB, 0 collapse) — lat=32 was only 107 dB
      *   DSD256:    lat=128 (143.5 dB, 0 collapse)
      *   DSD512:    lat=32  (137.6 dB, 0 collapse) — lat=16 was 124.8 dB */
@@ -646,7 +686,7 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
         else if (rate >= DSD_RATE_128)
             info->lat = 128;
         else
-            info->lat = 64;   /* DSD64 or DSD64/48 */
+            info->lat = 32;   /* DSD64 or DSD64/48 (d=16 needs short lat) */
     }
 
     return 0;

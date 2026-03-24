@@ -85,6 +85,13 @@ typedef enum {
     PCM_DITHER_SHAPED = 2,    /* First-order noise-shaped */
 } pcm_dither_t;
 
+/* FIR rate conversion precision */
+typedef enum {
+    FIR_PREC_AUTO = -1,   /* Auto: fp64 */
+    FIR_PREC_FP32 = 0,
+    FIR_PREC_FP64 = 1,
+} fir_precision_t;
+
 /* Polyphase resampler engine (for cross-family PCM→PCM) */
 typedef enum {
     RESAMPLE_AUTO = -1,   /* IPP default, libsoxr if available */
@@ -387,6 +394,7 @@ typedef struct {
     int8_t    rate_pcm_dither[RATE_MAP_COUNT]; /* Per-rate PCM dither override */
     int8_t    rate_parallel[RATE_MAP_COUNT];   /* Per-rate Trellis parallel: -1=Auto, 0=Sequential, 1=Parallel */
     bool      gpu_sdm_enabled;    /* Enable GPU Trellis SDM SBVD (experimental, default disabled) */
+    int8_t    rate_fir_prec[RATE_MAP_COUNT];   /* Per-rate FIR precision: -1=Auto(fp64), 0=fp32, 1=fp64 */
 } dsd_config_t;
 
 /* Trellis parallel mode */
@@ -400,7 +408,7 @@ typedef struct {
 #define FIR_MODE_FIR      1
 
 /* Config serialization version */
-#define DSD_CONFIG_VERSION 16
+#define DSD_CONFIG_VERSION 17
 
 /* FIR gain Auto sentinel and default */
 #define FIR_GAIN_AUTO    (-128)
@@ -485,6 +493,7 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     memset(cfg->rate_pcm_dither, 0xFF, sizeof(cfg->rate_pcm_dither)); /* -1 = Auto */
     memset(cfg->rate_parallel, 0xFF, sizeof(cfg->rate_parallel));     /* -1 = Auto */
     cfg->gpu_sdm_enabled = false;  /* GPU Trellis SDM disabled by default */
+    memset(cfg->rate_fir_prec, 0xFF, sizeof(cfg->rate_fir_prec)); /* -1 = Auto (fp64) */
 }
 
 #endif /* DSD_TYPES_H */
