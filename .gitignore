@@ -47,6 +47,14 @@ packages/
 src/build_version_hash.h
 src/build_version_gen.h
 
+# Temporary test files and captures
+tmp/
+test_output/
+*.wav
+*.dsf
+*.dff
+*.raw
+
 # OS junk
 Thumbs.db
 desktop.ini
