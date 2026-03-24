@@ -540,6 +540,7 @@ Runtime parameters serialized to foobar2000 config store (version 16):
 | ML noise filter | per-rate | Auto / Off / On | Auto |
 | FIR gain | global | Auto (-3 dB) / 0 to -12 dB | Auto |
 | FIR mode | per-rate | Auto / Boxcar / FIR | Auto |
+| FIR precision | per-rate | Auto (FP64) / FP32 / FP64 | Auto |
 | Trellis latency | per-rate | Auto / 16-512 | Auto |
 | GPU FIR | per-rate | Auto / Off / On | Auto |
 | PCM bit depth | global + per-rate | Auto (float) / 16 / 24 / 32 / Float | Auto |
