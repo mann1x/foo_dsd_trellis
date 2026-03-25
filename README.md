@@ -303,14 +303,14 @@ Viterbi look-ahead search with production path_config settings (matching real pl
 | DSD256 | CLANS-6 | 4 | 128 | 128.9 | 134.1 | 123.7 | 2.1 | ~135 | 6 dB |
 | DSD512 | SDM-6 | 4 | 32 | 140.5 | 147.7 | 119.8 | 20.0 | ~140 | 0 dB |
 
-**48 kHz family:**
+**48 kHz family** (independently swept, not mirrored from /44):
 
 | Rate | NTF | Depth | Lat | SINAD | A-wtd | MT | NMod |
 |------|-----|------:|----:|------:|------:|---:|-----:|
 | DSD64/48 | SDM-6 | 16 | 64 | 113.5 | 118.9 | 108.4 | 12.3 |
-| DSD128/48 | CLANS-6 | 4 | 128 | 109.9 | 115.0 | 111.5 | 26.3 |
-| DSD256/48 | CLANS-6 | 4 | 128 | 120.1 | 125.2 | 117.2 | 17.6 |
-| DSD512/48 | SDM-6 | 4 | 32 | 127.6 | 132.7 | 123.3 | 24.5 |
+| DSD128/48 | CLANS-6 | 4 | 32 | 136.5 | 141.7 | 109.7 | 10.3 |
+| DSD256/48 | SDM-4 | 16 | 128 | 143.4 | 148.9 | 114.6 | 6.6 |
+| DSD512/48 | SDM-4 | 16 | 128 | 139.2 | 145.1 | 138.7 | 32.1 |
 
 Practical ceiling is ~120-140 dB for 1-bit DSD (OBG-constrained NTF, Lee's rule). Published references: SACD spec 120 dB, Philips trellis ~97 dB, Archimago ~110-116 dB, HQPlayer ASDM7 ~110 dB.
 
@@ -443,6 +443,7 @@ Each filter contains:
 - DSD64/44: CLANS-6/d=16/lat=32 (110.7 dB). DSD64/48: SDM-6/d=16/lat=64 (113.5 dB).
 - DSD128: CLANS-6/d=4/lat=128 (121.5 dB). DSD256: CLANS-6/d=4/lat=128 (128.9 dB).
 - DSD512: SDM-6/d=4/lat=32 (140.5 dB). Depth=16 critical for DSD64 (4-bit dedup mask kills path diversity at low OSR).
+- 48k family: independently swept — SDM-4 dominates at DSD256/48 (143.4) and DSD512/48 (139.2).
 
 **PreCorr auto-selection**: CLANS-6 for DSD64, CLANS-7 for DSD128/DSD256/DSD512. (CLANS-8 is unstable with PreCorr's greedy quantizer at DSD256 boxcar input.)
 
