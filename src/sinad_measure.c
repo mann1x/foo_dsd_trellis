@@ -43,7 +43,9 @@ static double goertzel_power(const float *x, size_t n, double freq_hz,
     }
     double real = s1 - s2 * cos(w);
     double imag = s2 * sin(w);
-    return (real * real + imag * imag) / ((double)n * (double)n);
+    /* Goertzel magnitude squared / N^2 gives one-sided PSD.
+     * Multiply by 2 to get full signal power (positive + negative freq). */
+    return 2.0 * (real * real + imag * imag) / ((double)n * (double)n);
 }
 
 /* ─── A-weighting (IEC 61672) ─── */
