@@ -193,9 +193,11 @@
     </ClCompile>
     <ClCompile Include="src\trellis.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WholeProgramOptimization>false</WholeProgramOptimization>
     </ClCompile>
     <ClCompile Include="src\trellis_fast.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WholeProgramOptimization>false</WholeProgramOptimization>
     </ClCompile>
     <ClCompile Include="src\ntf.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
