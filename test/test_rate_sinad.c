@@ -154,25 +154,13 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     int lat   = pi.lat > 0 ? pi.lat : SINAD_TRELLIS_LAT;
     int depth = pi.depth > 0 ? pi.depth : SINAD_TRELLIS_DEPTH;
 
-    /* Align test frequency to the DSD output measurement grid.
-     * Use input SDM latency (SINAD_TRELLIS_LAT=512) for input estimate,
-     * output path lat for output estimate. For multi-stage downsample,
-     * also account for per-stage filter delay (~taps/2 per stage). */
-    size_t est_in_produced = n_in - SINAD_TRELLIS_LAT;
-    size_t est_fir_out;
-    if (fs_out >= fs_in)
-        est_fir_out = est_in_produced * (fs_out / fs_in);
-    else {
-        est_fir_out = est_in_produced;
-        uint32_t r = fs_in / fs_out;
-        while (r > 1) {
-            est_fir_out = est_fir_out / 2 - IPP_HB_NTAPS / 2;  /* per-stage loss */
-            r /= 2;
-        }
-    }
-    size_t est_sdm_out = est_fir_out - (size_t)lat;
-    if (est_sdm_out < 1024) est_sdm_out = 1024;
-    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm_out);
+    /* Approximate frequency alignment. Exact alignment done post-SDM
+     * using actual output count (avoids multi-stage FIR delay estimation). */
+    size_t est_in = n_in - SINAD_TRELLIS_LAT;
+    size_t est_fir = (fs_out >= fs_in) ?
+        est_in * (fs_out / fs_in) : est_in / (fs_in / fs_out);
+    size_t est_sdm = (est_fir > (size_t)lat) ? est_fir - (size_t)lat : 1024;
+    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm);
     size_t dsd_in_count = generate_dsd_sine(fs_in, freq, 0.5, n_in, dsd_in);
 
     if (dsd_in_count < 1024) {
@@ -1537,25 +1525,13 @@ static double measure_weak_path_sinad(uint32_t fs_in, uint32_t fs_out,
         return -999.0;
     }
 
-    /* Align test frequency to the DSD output measurement grid.
-     * Use input SDM latency (SINAD_TRELLIS_LAT=512) for input estimate,
-     * output path lat for output estimate. For multi-stage downsample,
-     * also account for per-stage filter delay (~taps/2 per stage). */
-    size_t est_in_produced = n_in - SINAD_TRELLIS_LAT;
-    size_t est_fir_out;
-    if (fs_out >= fs_in)
-        est_fir_out = est_in_produced * (fs_out / fs_in);
-    else {
-        est_fir_out = est_in_produced;
-        uint32_t r = fs_in / fs_out;
-        while (r > 1) {
-            est_fir_out = est_fir_out / 2 - IPP_HB_NTAPS / 2;  /* per-stage loss */
-            r /= 2;
-        }
-    }
-    size_t est_sdm_out = est_fir_out - (size_t)lat;
-    if (est_sdm_out < 1024) est_sdm_out = 1024;
-    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm_out);
+    /* Approximate frequency alignment. Exact alignment done post-SDM
+     * using actual output count (avoids multi-stage FIR delay estimation). */
+    size_t est_in = n_in - SINAD_TRELLIS_LAT;
+    size_t est_fir = (fs_out >= fs_in) ?
+        est_in * (fs_out / fs_in) : est_in / (fs_in / fs_out);
+    size_t est_sdm = (est_fir > (size_t)lat) ? est_fir - (size_t)lat : 1024;
+    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm);
     size_t dsd_in_count = generate_dsd_sine(fs_in, freq, 0.5, n_in, dsd_in);
 
     if (dsd_in_count < 1024) {
@@ -2731,8 +2707,9 @@ static double measure_fir_experiment(uint32_t fs_in, uint32_t fs_out,
     int lat = pi.lat > 0 ? pi.lat : 32;
     int depth = pi.depth > 0 ? pi.depth : 4;
 
-    size_t est_in = n_in - 512;
-    size_t est_fir = (fs_out >= fs_in) ? est_in * (fs_out / fs_in) : est_in / (fs_in / fs_out);
+    size_t est_in = n_in - 512;  /* input SDM latency */
+    size_t est_fir = (fs_out >= fs_in) ?
+        est_in * (fs_out / fs_in) : est_in / (fs_in / fs_out);
     size_t est_sdm = (est_fir > (size_t)lat) ? est_fir - (size_t)lat : 1024;
     double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm);
 
@@ -2820,6 +2797,9 @@ static double measure_fir_experiment(uint32_t fs_in, uint32_t fs_out,
     sdm_context_free(&sdm);
 
     if (out_count < 512) { free(dsd_out); return -999.0; }
+
+    /* Re-align frequency to actual output count */
+    freq = bin_align_freq(freq, (double)fs_out, out_count);
 
     double sinad = measure_sinad(dsd_out, out_count, freq, (double)fs_out);
     free(dsd_out);
