@@ -211,6 +211,7 @@
     </ClCompile>
     <ClCompile Include="src\sinad_measure.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WholeProgramOptimization>false</WholeProgramOptimization>
     </ClCompile>
     <ClCompile Include="src\resample.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
