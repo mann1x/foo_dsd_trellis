@@ -72,12 +72,16 @@ static const path_config_t path_table[] = {
     { DSD_RATE_512, DSD_RATE_64,  NTF_SDM_6,   0.0,  8,  0, 0, 0.708f },
     { DSD_RATE_512, DSD_RATE_128, NTF_SDM_4,  16.0, 16,  0, 0, 0.708f },
     { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 0.708f },
-    /* ─── DSD/48 paths (mirror DSD/44 NTF choices) ─── */
-    /* Same-rate re-encode */
-    { DSD48_RATE_64,  DSD48_RATE_64,  NTF_SDM_6,   0.0,  2, 64, 16, 0.708f },
-    { DSD48_RATE_128, DSD48_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
-    { DSD48_RATE_256, DSD48_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
-    { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
+    /* ─── DSD/48 paths (independently swept, NOT mirrored from /44) ─── */
+    /* Same-rate re-encode — optimized via comprehensive 48k NTF sweep (2026-03-25):
+     *   DSD64/48:  SDM-6/d=16/lat=64  → 113.5 dB
+     *   DSD128/48: CLANS-6/d=4/lat=32 → 136.5 dB
+     *   DSD256/48: SDM-4/d=16/lat=128 → 143.4 dB
+     *   DSD512/48: SDM-4/d=16/lat=128 → 139.2 dB */
+    { DSD48_RATE_64,  DSD48_RATE_64,  NTF_SDM_6,   0.0,  2,  64, 16, 0.708f },
+    { DSD48_RATE_128, DSD48_RATE_128, NTF_CLANS_6, 0.0,  2,  32,  4, 0.708f },
+    { DSD48_RATE_256, DSD48_RATE_256, NTF_SDM_4,   0.0,  2, 128, 16, 0.708f },
+    { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_4,   0.0,  2, 128, 16, 0.708f },
     /* DSD/48 upsample */
     { DSD48_RATE_64,  DSD48_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },
     { DSD48_RATE_64,  DSD48_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 0.708f },

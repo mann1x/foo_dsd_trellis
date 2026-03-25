@@ -1995,7 +1995,7 @@ static void test_depth16_spot_check(void) {
     TEST_ASSERT_TRUE(1, "Depth+NTF+nc sweep completed");
 }
 
-static void test_dsd64_48_ntf_sweep(void) {
+static void sweep_48k_rate(uint32_t rate, const char *rate_name) {
     static const ntf_filter_id_t ntfs[] = {
         NTF_CLANS_4, NTF_SDM_4, NTF_CLANS_5, NTF_SDM_5,
         NTF_CLANS_6, NTF_SDM_6, NTF_CLANS_7, NTF_SDM_7,
@@ -2008,9 +2008,12 @@ static void test_dsd64_48_ntf_sweep(void) {
     };
     static const int depths[] = { 4, 8, 16 };
     static const int lats[] = { 16, 32, 64, 128 };
-    uint32_t rate = DSD48_RATE_64;
 
-    printf("\n    DSD64/48 NTF × Depth × Lat sweep (nc=2, gain=0.708)\n");
+    printf("\n    %s NTF × Depth × Lat sweep (nc=2, gain=0.708)\n", rate_name);
+    double best = -999.0;
+    const char *best_ntf = "?";
+    int best_d = 0, best_l = 0;
+
     for (int li = 0; li < 4; li++) {
         printf("\n    lat=%d:\n    %-10s  d=4     d=8     d=16\n", lats[li], "NTF");
         for (int f = 0; f < 10; f++) {
@@ -2018,17 +2021,28 @@ static void test_dsd64_48_ntf_sweep(void) {
             for (int d = 0; d < 3; d++) {
                 sinad_result_t r;
                 sinad_measure(rate, ntfs[f], 2, depths[d], lats[li], 1, 0.708f, &r);
-                printf("  %6.1f", r.ok ? r.sinad_theoretical : -999.0);
+                double s = r.ok ? r.sinad_theoretical : -999.0;
+                printf("  %6.1f", s);
+                if (s > best) { best = s; best_ntf = names[f]; best_d = depths[d]; best_l = lats[li]; }
             }
             printf("\n");
         }
     }
-    TEST_ASSERT_TRUE(1, "DSD64/48 NTF sweep completed");
+    printf("\n    >>> %s BEST: %s d=%d lat=%d → %.1f dB\n",
+           rate_name, best_ntf, best_d, best_l, best);
+}
+
+static void test_48k_ntf_sweep(void) {
+    sweep_48k_rate(DSD48_RATE_64,  "DSD64/48");
+    sweep_48k_rate(DSD48_RATE_128, "DSD128/48");
+    sweep_48k_rate(DSD48_RATE_256, "DSD256/48");
+    sweep_48k_rate(DSD48_RATE_512, "DSD512/48");
+    TEST_ASSERT_TRUE(1, "48k family NTF sweep completed");
 }
 
 void test_depth16_suite(void) {
-    TEST_SUITE("Depth-16 Rate Conv Spot Check");
-    TEST_RUN(test_dsd64_48_ntf_sweep);
+    TEST_SUITE("48k NTF Sweep");
+    TEST_RUN(test_48k_ntf_sweep);
 }
 
 void test_rate_sweep_suite(void) {
