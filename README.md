@@ -25,7 +25,7 @@ A native foobar2000 DSP plugin that converts PCM and DSD audio to DSD using sigm
 | Intel IPP | Statically linked, automatic CPU dispatch (SSE2 -> AVX2 -> AVX-512) |
 | ONNX ML Filter | Optional causal CNN post-filter for DSD noise reduction (delay-loaded onnxruntime.dll) |
 | Property Page | Full configuration dialog with per-rate settings, path info display, dark mode support |
-| Config Versioning | Forward-compatible binary preset serialization (v16) with legacy fallback |
+| Config Versioning | Forward-compatible binary preset serialization (v17) with legacy fallback |
 | REST API | HTTP control/monitoring API on port 8881 |
 | CPU Topology | Dynamic CPUSET core selection with scheduling_class priority, SMT/CCD/E-core awareness |
 | TUSBAudio | Runtime XMOS DAC detection and status logging |
@@ -35,7 +35,7 @@ A native foobar2000 DSP plugin that converts PCM and DSD audio to DSD using sigm
 Four-layer design with clean separation of concerns:
 
 ```
-1-bit in -> unpack -> float32 @ Fs_in -> [IPP FIRSR] -> x gain -> SDM (Trellis|PreCorr) -> 1-bit out @ Fs_out
+1-bit in -> unpack -> float32 @ Fs_in -> [IPP FIRMR] -> x gain -> SDM (Trellis|PreCorr) -> 1-bit out @ Fs_out
 ```
 
 | Layer | Purpose | Files |
@@ -137,6 +137,7 @@ On the first chunk after stop→play, inserts DoP 0x69 silence before real audio
 | Path | Method | Notes |
 |------|--------|-------|
 | PCM → DSD (same family) | FIR upsample + SDM | 44.1k→DSD/44, 48k→DSD/48 |
+| PCM → DSD (cross family) | Polyphase + FIR + SDM | 48k→DSD/44, 44.1k→DSD/48 via soxr/IPP |
 | PCM → PCM (same family) | FIR chain | Power-of-2 ratio, no SDM |
 | PCM → PCM (cross family) | Polyphase resampler | IPP (72 dB) or libsoxr (114 dB) |
 | DSD → DSD (same family) | Boxcar/FIR + SDM | DSD/44↔DSD/44, DSD/48↔DSD/48 |
@@ -327,7 +328,7 @@ Greedy quantiser with trained prediction correction table. Near-zero CPU (~0.01x
 | DSD256 | CLANS-7 (order 7) | 135.7 | — |
 | DSD512 | CLANS-7 (order 7) | 137.5 | — |
 
-PreCorr outperforms Trellis at DSD64 (+18.2 dB) because: (1) it uses a higher-order NTF (CLANS-6 vs CLANS-5), (2) its trained prediction table avoids the candidate collapse that degrades Trellis at low OSR, and (3) no path pruning overhead. Trellis catches up at DSD128+ where higher OSR gives the look-ahead more room to work.
+PreCorr outperforms Trellis at DSD64 (+6.5 dB) because its trained prediction table avoids the candidate collapse that degrades Trellis at low OSR. Trellis catches up at DSD128+ where higher OSR gives the look-ahead more room to work.
 
 ### DSD Rate Conversion — Path-Adaptive Tuning
 
@@ -355,12 +356,26 @@ Rate conversion uses production path_config values: per-path optimal NTF filter,
 | DSD512→DSD128 | SDM-4 | 0.71 | 16 | 16 | 108.1 | 112.9 | 101.6 | 17.5 |
 | DSD512→DSD256 | SDM-6 | 0.71 | 16 | 8 | 121.2 | 126.3 | 133.5 | 13.8 |
 
+**48 kHz family rate conversion:**
+
+| Conversion | NTF | Gain | Cands | SINAD | A-wtd | MT | NMod |
+|------------|-----|------|-------|-------|-------|----|------|
+| DSD64/48→DSD128/48 (UP) | SDM-4 | 0.71 | 2 | 104.5 | 109.5 | 107.9 | 3.3 |
+| DSD64/48→DSD256/48 (UP) | CLANS-8 | 0.71 | 2 | 123.6 | 128.8 | 117.1 | 9.6 |
+| DSD128/48→DSD256/48 (UP) | CLANS-8 | 0.71 | 2 | 123.6 | 128.8 | 117.1 | 9.6 |
+| DSD128/48→DSD64/48 (DN) | CLANS-4 | 0.71 | 32 | 97.1 | 99.7 | 90.6 | 8.2 |
+| DSD256/48→DSD128/48 (DN) | CLANS-4 | 0.71 | 8 | 104.8 | 109.8 | 104.6 | 15.8 |
+| DSD256/48→DSD64/48 (DN) | CLANS-8 | 0.71 | 8 | 99.3 | 102.8 | 109.5 | 8.2 |
+
 **Key observations:**
 - All paths achieve 85+ dB SINAD — well above CD quality (96 dB dynamic range)
 - Upsample to DSD512: 130–141 dB — exceeds 22-bit PCM quality
+- Downsample →DSD64 paths are FIR-limited at ~85 dB; SDM params have minimal effect
 - Uniform FIR gain of 0.708 (-3 dB) prevents volume changes across rate transitions
 - Path-adaptive settings (NTF, limiter, cands, depth) applied automatically when NTF = Auto
 - Per-rate overrides available for SDM mode, candidates, depth, and state limiter
+
+**Note on DSD→DSD measurement**: SINAD values above are measured by running `sinad_measure` at the output rate with the path-configured NTF/cands/lat. This isolates the SDM encoding quality. A comprehensive end-to-end sweep (DSD→FIR→SDM→Goertzel) confirmed that downsample →DSD64 paths are FIR-chain-limited at ~72-85 dB regardless of SDM parameters.
 
 ### DSD to PCM Decimation
 
@@ -489,9 +504,9 @@ Intel IPP FIRMR polyphase multi-rate FIR for power-of-2 DSD rate conversion:
 - 127-tap Kaiser-windowed sinc (beta=10.0, ~100 dB stopband, 50 kHz cutoff)
 - Sharper transition band (22 kHz vs 45 kHz with 63 taps) reduces ultrasonic noise leakage from original DSD noise shaping into the SDM re-encoder input
 
-**Upsample 2x:** zero-stuff -> `ippsFIRSR_32f` -> scale by 2
+**Upsample 2x:** `ippsFIRMR_32f` polyphase (upFactor=2, downFactor=1) — no explicit zero-stuffing or scaling
 
-**Downsample 2x:** `ippsFIRSR_32f` -> decimate (keep every other sample)
+**Downsample 2x:** `ippsFIRMR_32f` polyphase (upFactor=1, downFactor=2) — no explicit decimation
 
 **Multi-stage chaining:** up to 9 stages (512x ratio, e.g., PCM 44.1k → DSD512) with ping-pong scratch buffers.
 
@@ -592,7 +607,7 @@ foo_dsd_trellis/
 |-- src/
 |   |-- dsp_fb2k.cpp          fb2k DSP v2 C++ wrapper
 |   |-- dsp_plugin.c          Plugin state management
-|   |-- config.c              Configuration serialization (v16)
+|   |-- config.c              Configuration serialization (v17)
 |   |-- dop.c                 DoP detection, pack/unpack
 |   |-- bitpack.c             Native ASIO bitstream pack/unpack
 |   |-- engine.c              Per-channel processing orchestrator
@@ -667,7 +682,7 @@ foo_dsd_trellis/
 | Trellis SDM | `trellis` | 13 | Init, reset, latency, drain, SINAD (4 rates), DC stability |
 | PreCorr SDM | `precorr` | 8 | Init, binary output, no latency, SINAD (4 rates) |
 | Rate Conversion | `rate` | 37 | SINAD for all DSD/44 + DSD/48 upsample/downsample + DSD-to-PCM decimation |
-| Config | `config` | 99 | Serialization, versioning (v1-v16), validation, rate/NTF/limiter maps |
+| Config | `config` | 99 | Serialization, versioning (v1-v17), validation, rate/NTF/limiter maps |
 | CPU & IPP | `simd` | 5 | CPU detection, IPP kernel, FIR correctness |
 | Hardening | `hardening` | 24 | Edge cases, robustness |
 | Thread Pool | `threadpool` | 8 | Create/destroy, concurrent SDM, stress |

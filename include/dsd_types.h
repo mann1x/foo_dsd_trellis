@@ -321,7 +321,6 @@ static inline bool rate_map_valid_output(int input_idx, uint8_t output_idx) {
     if (input_idx < 0 || input_idx >= RATE_MAP_COUNT) return false;
 
     bool in_is_pcm = rate_idx_is_pcm(input_idx);
-    bool in_is_48k = rate_idx_is_48k_family(input_idx);
     bool out_is_dsd = rate_out_is_dsd(output_idx);
     bool out_is_pcm_val = rate_out_is_pcm(output_idx);
 
@@ -330,9 +329,8 @@ static inline bool rate_map_valid_output(int input_idx, uint8_t output_idx) {
         return true;
     }
     if (in_is_pcm && out_is_dsd) {
-        /* PCM→DSD: same family only */
-        bool out_is_48k_dsd = rate_out_is_dsd48(output_idx);
-        return in_is_48k == out_is_48k_dsd;
+        /* PCM→DSD: same family direct, cross-family via polyphase resample */
+        return true;
     }
     if (rate_idx_is_dsd(input_idx) && out_is_pcm_val) {
         /* DSD→PCM: any combination allowed */

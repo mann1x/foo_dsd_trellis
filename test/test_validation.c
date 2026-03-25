@@ -98,13 +98,12 @@ static void test_valid_pcm_to_dsd_same_family(void) {
     TEST_ASSERT_TRUE(rate_map_valid_output(RATEIDX_384000, RATE_OUT_DSD512_48), "384k→DSD512/48");
 }
 
-static void test_invalid_pcm_to_dsd_cross_family(void) {
-    /* 44.1k PCM → DSD/48: INVALID (not power-of-2) */
-    TEST_ASSERT_FALSE(rate_map_valid_output(RATEIDX_44100, RATE_OUT_DSD64_48), "44.1k→DSD64/48 invalid");
-    TEST_ASSERT_FALSE(rate_map_valid_output(RATEIDX_88200, RATE_OUT_DSD128_48), "88.2k→DSD128/48 invalid");
-    /* 48k PCM → DSD/44: INVALID */
-    TEST_ASSERT_FALSE(rate_map_valid_output(RATEIDX_48000, RATE_OUT_DSD64), "48k→DSD64 invalid");
-    TEST_ASSERT_FALSE(rate_map_valid_output(RATEIDX_96000, RATE_OUT_DSD128), "96k→DSD128 invalid");
+static void test_valid_pcm_to_dsd_cross_family(void) {
+    /* Cross-family PCM→DSD: valid (polyphase resample + FIR upsample) */
+    TEST_ASSERT_TRUE(rate_map_valid_output(RATEIDX_44100, RATE_OUT_DSD64_48), "44.1k→DSD64/48 cross-family");
+    TEST_ASSERT_TRUE(rate_map_valid_output(RATEIDX_88200, RATE_OUT_DSD128_48), "88.2k→DSD128/48 cross-family");
+    TEST_ASSERT_TRUE(rate_map_valid_output(RATEIDX_48000, RATE_OUT_DSD64), "48k→DSD64 cross-family");
+    TEST_ASSERT_TRUE(rate_map_valid_output(RATEIDX_96000, RATE_OUT_DSD128), "96k→DSD128 cross-family");
 }
 
 static void test_valid_pcm_to_pcm(void) {
@@ -156,10 +155,10 @@ static void test_invalid_out_of_range(void) {
 static void test_valid_high_pcm_to_dsd(void) {
     /* 705600 (44.1k family) → DSD/44 */
     TEST_ASSERT_TRUE(rate_map_valid_output(RATEIDX_705600, RATE_OUT_DSD512), "705.6k→DSD512");
-    TEST_ASSERT_FALSE(rate_map_valid_output(RATEIDX_705600, RATE_OUT_DSD512_48), "705.6k→DSD512/48 invalid");
+    TEST_ASSERT_TRUE(rate_map_valid_output(RATEIDX_705600, RATE_OUT_DSD512_48), "705.6k→DSD512/48 cross-family");
     /* 768000 (48k family) → DSD/48 */
     TEST_ASSERT_TRUE(rate_map_valid_output(RATEIDX_768000, RATE_OUT_DSD512_48), "768k→DSD512/48");
-    TEST_ASSERT_FALSE(rate_map_valid_output(RATEIDX_768000, RATE_OUT_DSD512), "768k→DSD512 invalid");
+    TEST_ASSERT_TRUE(rate_map_valid_output(RATEIDX_768000, RATE_OUT_DSD512), "768k→DSD512 cross-family");
     /* 1411200 (44.1k family) → DSD/44 */
     TEST_ASSERT_TRUE(rate_map_valid_output(RATEIDX_1411200, RATE_OUT_DSD512), "1411.2k→DSD512");
     /* 1536000 (48k family) → DSD/48 */
@@ -196,7 +195,7 @@ void test_validation_suite(void) {
     TEST_RUN(test_rate_family_48k);
     TEST_RUN(test_valid_bypass);
     TEST_RUN(test_valid_pcm_to_dsd_same_family);
-    TEST_RUN(test_invalid_pcm_to_dsd_cross_family);
+    TEST_RUN(test_valid_pcm_to_dsd_cross_family);
     TEST_RUN(test_valid_pcm_to_pcm);
     TEST_RUN(test_valid_dsd_to_pcm);
     TEST_RUN(test_valid_dsd_to_dsd_same_family);

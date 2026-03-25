@@ -188,11 +188,11 @@ static void test_config_rate_map_validate(void) {
     TEST_ASSERT_EQ(cfg.rate_map[RATEIDX_44100], RATE_OUT_BYPASS,
                    "invalid rate_map entry clamped to bypass");
 
-    /* 48000-family can't convert to DSD/44 — should be forced to bypass */
+    /* 48000-family → DSD/44: now valid (cross-family via polyphase resample) */
     cfg.rate_map[RATEIDX_48000] = RATE_OUT_DSD64;
     config_validate(&cfg);
-    TEST_ASSERT_EQ(cfg.rate_map[RATEIDX_48000], RATE_OUT_BYPASS,
-                   "48000 DSD/44 output forced to bypass");
+    TEST_ASSERT_EQ(cfg.rate_map[RATEIDX_48000], RATE_OUT_DSD64,
+                   "48000 DSD/44 output allowed (cross-family)");
     /* But 48000-family CAN convert to DSD/48 */
     cfg.rate_map[RATEIDX_48000] = RATE_OUT_DSD64_48;
     config_validate(&cfg);

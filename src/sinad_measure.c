@@ -106,6 +106,7 @@ static const double g_multitone_freqs[32] = {
 static double measure_multitone(uint32_t dsd_rate, const ntf_filter_t *f,
                                  int depth, int cands, int lat,
                                  int use_fir_lowpass, double gain) {
+    (void)use_fir_lowpass; (void)gain;
     unsigned rate_mult = dsd_rate / 44100;
     const unsigned n_dsd = (rate_mult <= 64) ? 262144u :
                            (rate_mult <= 128) ? 524288u :
@@ -187,6 +188,7 @@ static double measure_multitone(uint32_t dsd_rate, const ntf_filter_t *f,
 static double measure_noise_modulation(uint32_t dsd_rate, const ntf_filter_t *f,
                                         int depth, int cands, int lat,
                                         int use_fir_lowpass, double gain) {
+    (void)use_fir_lowpass; (void)gain;
     /* Amplitudes below SDM overload threshold (0.5 is safe for most NTFs) */
     static const double amplitudes[4] = { 0.05, 0.15, 0.30, 0.50 };
     double noise_floors[4];
@@ -891,7 +893,7 @@ void sinad_measure_dsd_to_dsd(uint32_t fs_in, uint32_t fs_out,
     float *fir_buf = (float *)malloc(max_out * sizeof(float));
     if (!fir_buf) { free(dsd_in); return; }
 
-    size_t fir_count;
+    size_t fir_count = 0;
     if (fs_in == fs_out) {
         /* Same-rate: FIR lowpass (fp64) */
         fir_lowpass_t lp;
@@ -966,18 +968,22 @@ void sinad_measure_dsd_to_dsd(uint32_t fs_in, uint32_t fs_out,
         freq = bin * bw;
     }
 
-    /* SINAD via Goertzel */
-    double sig_power = goertzel_power(pcm + skip, meas_n, freq, (double)base);
-    double total_power = 0;
-    for (size_t i = skip; i < pcm_n; i++)
-        total_power += (double)pcm[i] * pcm[i];
-    total_power /= (double)meas_n;
-    double noise_power = total_power - sig_power;
-    if (noise_power < 1e-30) noise_power = 1e-30;
-    result->sinad_theoretical = 10.0 * log10(sig_power / noise_power);
+    /* SINAD via bin-by-bin Goertzel (matches measure_sinad methodology) */
+    double bw = (double)base / (double)meas_n;
+    unsigned max_bin = (unsigned)(22050.0 / bw);
+    unsigned sig_bin = (unsigned)(freq / bw + 0.5);
 
-    /* A-weighted SINAD */
-    result->sinad_awtd_theo = result->sinad_theoretical + 3.0;  /* rough +3 dB A-weighting */
+    double sig_power = goertzel_power(pcm + skip, meas_n, freq, (double)base);
+    double noise = 0.0;
+    for (unsigned b = 1; b <= max_bin; b++) {
+        if (b >= sig_bin - 1 && b <= sig_bin + 1) continue;
+        noise += goertzel_power(pcm + skip, meas_n, b * bw, (double)base);
+    }
+    if (noise <= 0.0) noise = 1e-30;
+    result->sinad_theoretical = 10.0 * log10(sig_power / noise);
+
+    /* A-weighted SINAD (rough +3 dB) */
+    result->sinad_awtd_theo = result->sinad_theoretical + 3.0;
 
     result->ok = 1;
     free(pcm);

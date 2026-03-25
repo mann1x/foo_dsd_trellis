@@ -2040,9 +2040,692 @@ static void test_48k_ntf_sweep(void) {
     TEST_ASSERT_TRUE(1, "48k family NTF sweep completed");
 }
 
+/* ─── PreCorr intermediate step experiment ───
+ * Compare direct FIR downsample vs PreCorr intermediate for weak paths.
+ * Path A: DSD_in → FIR(full ratio) → Trellis@DSD_out
+ * Path B: DSD_in → FIR(half) → PreCorr@DSD_mid → FIR(half) → Trellis@DSD_out */
+static void test_precorr_intermediate(void) {
+    #include "../include/precorr.h"
+
+    typedef struct {
+        uint32_t fs_in, fs_mid, fs_out;
+        const char *name;
+    } path_t;
+
+    static const path_t paths[] = {
+        { DSD_RATE_256, DSD_RATE_128, DSD_RATE_64, "DSD256→128→64" },
+        { DSD_RATE_512, DSD_RATE_256, DSD_RATE_128, "DSD512→256→128" },
+        { DSD_RATE_128, 0, DSD_RATE_64, "DSD128→64 (no mid)" },
+    };
+    int n_paths = sizeof(paths) / sizeof(paths[0]);
+
+    printf("\n    ╔══════════════════════════════════════════════════════╗\n");
+    printf("    ║  PreCorr Intermediate Step Experiment                ║\n");
+    printf("    ╚══════════════════════════════════════════════════════╝\n");
+
+    for (int p = 0; p < n_paths; p++) {
+        uint32_t fs_in = paths[p].fs_in;
+        uint32_t fs_out = paths[p].fs_out;
+        uint32_t fs_mid = paths[p].fs_mid;
+
+        /* Generate clean DSD at fs_in */
+        size_t n_in = fs_in;  /* 1 second */
+        double freq = 997.0;
+        double *sine = (double *)malloc(n_in * sizeof(double));
+        if (!sine) continue;
+        for (size_t i = 0; i < n_in; i++)
+            sine[i] = 0.5 * sin(2.0 * M_PI * freq * (double)i / (double)fs_in);
+
+        const ntf_filter_t *f_in = ntf_auto_select(fs_in);
+        sdm_context_t enc;
+        sdm_context_init(&enc, f_in, f_in->order, 16, 512);
+        float *dsd_in = (float *)calloc(n_in, sizeof(float));
+        size_t enc_n = sdm_process_block(&enc, sine, dsd_in, n_in);
+        sdm_context_free(&enc);
+        free(sine);
+
+        /* ── Path A: Direct FIR + Trellis ── */
+        fir_chain_t fir_a;
+        fir_chain_init(&fir_a, fs_in, fs_out);
+        size_t max_a = enc_n;
+        float *fir_a_out = (float *)malloc(max_a * sizeof(float));
+        size_t fir_a_n = fir_chain_process(&fir_a, dsd_in, fir_a_out, enc_n);
+        fir_chain_free(&fir_a);
+
+        /* Apply gain */
+        for (size_t i = 0; i < fir_a_n; i++) fir_a_out[i] *= 0.708f;
+
+        const ntf_filter_t *f_out = ntf_auto_select(fs_out);
+        sdm_context_t sdm_a;
+        sdm_context_init(&sdm_a, f_out, 4, 2, 32);
+        double *sdm_a_in = (double *)malloc(fir_a_n * sizeof(double));
+        float *dsd_a_out = (float *)calloc(fir_a_n, sizeof(float));
+        for (size_t i = 0; i < fir_a_n; i++) sdm_a_in[i] = (double)fir_a_out[i];
+        size_t out_a = sdm_process_block(&sdm_a, sdm_a_in, dsd_a_out, fir_a_n);
+        sdm_context_free(&sdm_a);
+        double sinad_a = (out_a > 1024) ?
+            measure_sinad(dsd_a_out, out_a, freq, (double)fs_out) : -999.0;
+        free(fir_a_out); free(sdm_a_in); free(dsd_a_out);
+
+        /* ── Path B: FIR(half) → PreCorr@mid → FIR(half) → Trellis ── */
+        double sinad_b = -999.0;
+        if (fs_mid > 0) {
+            /* Step 1: FIR downsample to mid rate */
+            fir_chain_t fir_b1;
+            fir_chain_init(&fir_b1, fs_in, fs_mid);
+            float *fir_b1_out = (float *)malloc(enc_n * sizeof(float));
+            size_t fir_b1_n = fir_chain_process(&fir_b1, dsd_in, fir_b1_out, enc_n);
+            fir_chain_free(&fir_b1);
+
+            for (size_t i = 0; i < fir_b1_n; i++) fir_b1_out[i] *= 0.708f;
+
+            /* Step 2: PreCorr SDM at mid rate */
+            const ntf_filter_t *f_mid = ntf_auto_select_precorr(fs_mid);
+            precorr_context_t pc;
+            precorr_context_init(&pc, f_mid);
+            double *pc_in = (double *)malloc(fir_b1_n * sizeof(double));
+            float *dsd_mid = (float *)calloc(fir_b1_n, sizeof(float));
+            for (size_t i = 0; i < fir_b1_n; i++) pc_in[i] = (double)fir_b1_out[i];
+            size_t mid_n = precorr_process_block(&pc, pc_in, dsd_mid, fir_b1_n);
+            precorr_context_free(&pc);
+            free(fir_b1_out); free(pc_in);
+
+            /* Step 3: FIR downsample mid → out */
+            fir_chain_t fir_b2;
+            fir_chain_init(&fir_b2, fs_mid, fs_out);
+            float *fir_b2_out = (float *)malloc(mid_n * sizeof(float));
+            size_t fir_b2_n = fir_chain_process(&fir_b2, dsd_mid, fir_b2_out, mid_n);
+            fir_chain_free(&fir_b2);
+            free(dsd_mid);
+
+            for (size_t i = 0; i < fir_b2_n; i++) fir_b2_out[i] *= 0.708f;
+
+            /* Step 4: Trellis SDM at out rate */
+            sdm_context_t sdm_b;
+            sdm_context_init(&sdm_b, f_out, 4, 2, 32);
+            double *sdm_b_in = (double *)malloc(fir_b2_n * sizeof(double));
+            float *dsd_b_out = (float *)calloc(fir_b2_n, sizeof(float));
+            for (size_t i = 0; i < fir_b2_n; i++) sdm_b_in[i] = (double)fir_b2_out[i];
+            size_t out_b = sdm_process_block(&sdm_b, sdm_b_in, dsd_b_out, fir_b2_n);
+            sdm_context_free(&sdm_b);
+            sinad_b = (out_b > 1024) ?
+                measure_sinad(dsd_b_out, out_b, freq, (double)fs_out) : -999.0;
+            free(fir_b2_out); free(sdm_b_in); free(dsd_b_out);
+        }
+
+        free(dsd_in);
+
+        printf("\n    %s:\n", paths[p].name);
+        printf("      Direct:              %.1f dB\n", sinad_a);
+        if (fs_mid > 0)
+            printf("      PreCorr intermediate: %.1f dB (delta: %+.1f)\n",
+                   sinad_b, sinad_b - sinad_a);
+    }
+
+    TEST_ASSERT_TRUE(1, "PreCorr intermediate experiment completed");
+}
+
+/* ─── FIR tap count experiment for downsample ───
+ * Test if longer FIR filters improve the weak downsample paths.
+ * The 63-tap half-band has ~120 dB stopband but DSD ultrasonic noise
+ * is enormous. Transition band leakage may be the bottleneck. */
+static void test_fir_taps_experiment(void) {
+    static const int tap_counts[] = { 63, 127, 255, 511 };
+    static const double betas[] = { 12.0, 12.0, 12.0, 12.0 };
+    int n_taps = sizeof(tap_counts) / sizeof(tap_counts[0]);
+
+    typedef struct { uint32_t fs_in, fs_out; const char *name; } path_t;
+    static const path_t paths[] = {
+        { DSD_RATE_128, DSD_RATE_64, "DSD128→64" },
+        { DSD_RATE_256, DSD_RATE_64, "DSD256→64" },
+        { DSD_RATE_512, DSD_RATE_64, "DSD512→64" },
+    };
+    int n_paths = sizeof(paths) / sizeof(paths[0]);
+
+    printf("\n    ╔══════════════════════════════════════════════════════╗\n");
+    printf("    ║  FIR Tap Count Experiment (downsample paths)         ║\n");
+    printf("    ╚══════════════════════════════════════════════════════╝\n");
+    printf("    %-14s", "Path");
+    for (int t = 0; t < n_taps; t++)
+        printf("  %d-tap", tap_counts[t]);
+    printf("\n");
+
+    for (int p = 0; p < n_paths; p++) {
+        uint32_t fs_in = paths[p].fs_in, fs_out = paths[p].fs_out;
+
+        /* Generate clean DSD at fs_in */
+        size_t n_in = fs_in / 2;  /* 0.5 seconds */
+        double freq = 997.0;
+        double *sine = (double *)malloc(n_in * sizeof(double));
+        if (!sine) continue;
+        for (size_t i = 0; i < n_in; i++)
+            sine[i] = 0.5 * sin(2.0 * M_PI * freq * (double)i / (double)fs_in);
+
+        const ntf_filter_t *f_in = ntf_auto_select(fs_in);
+        sdm_context_t enc;
+        sdm_context_init(&enc, f_in, f_in->order, 16, 512);
+        float *dsd_in = (float *)calloc(n_in, sizeof(float));
+        size_t enc_n = sdm_process_block(&enc, sine, dsd_in, n_in);
+        sdm_context_free(&enc);
+        free(sine);
+
+        printf("    %-14s", paths[p].name);
+
+        for (int t = 0; t < n_taps; t++) {
+            int ntaps = tap_counts[t];
+
+            /* Design half-band filter with specified taps */
+            double *hd = (double *)calloc((size_t)ntaps, sizeof(double));
+            float *hf = (float *)calloc((size_t)ntaps, sizeof(float));
+            {
+                int center = (ntaps - 1) / 2;
+                double beta = betas[t];
+                /* Inline Kaiser design */
+                double sum = 0.0;
+                for (int n = 0; n < ntaps; n++) {
+                    double x = (double)(n - center) / 2.0;
+                    double sinc_val = (fabs(x) < 1e-15) ? 1.0 : sin(M_PI * x) / (M_PI * x);
+                    double tt = (double)(n - center) / center;
+                    double arg = 1.0 - tt * tt;
+                    if (arg < 0) arg = 0;
+                    /* Bessel I0 approximation */
+                    double bx = beta * sqrt(arg);
+                    double I0_val = 1.0, term = 1.0, bx2 = (bx/2)*(bx/2);
+                    for (int k = 1; k <= 25; k++) {
+                        term *= bx2 / ((double)k * k);
+                        I0_val += term;
+                        if (term < 1e-20 * I0_val) break;
+                    }
+                    double I0_beta_val;
+                    {
+                        double bb = beta;
+                        double I0b = 1.0, term2 = 1.0, bb2 = (bb/2)*(bb/2);
+                        for (int k = 1; k <= 25; k++) {
+                            term2 *= bb2 / ((double)k * k);
+                            I0b += term2;
+                        }
+                        I0_beta_val = I0b;
+                    }
+                    double w = I0_val / I0_beta_val;
+                    hd[n] = sinc_val * w;
+                    sum += hd[n];
+                }
+                for (int n = 0; n < ntaps; n++) hd[n] /= sum;
+                for (int n = 0; n < ntaps; n++) hf[n] = (float)hd[n];
+            }
+
+            /* Manual FIR downsample chain (can't use fir_chain since tap count is fixed) */
+            uint32_t ratio = fs_in / fs_out;
+            int stages = 0;
+            { uint32_t r = ratio; while (r > 1) { stages++; r >>= 1; } }
+
+            /* Simple direct-form FIR downsample (no IPP, just measure quality) */
+            float *cur_buf = (float *)malloc(enc_n * sizeof(float));
+            memcpy(cur_buf, dsd_in, enc_n * sizeof(float));
+            size_t cur_n = enc_n;
+
+            for (int s = 0; s < stages; s++) {
+                size_t out_n = cur_n / 2;
+                float *out_buf = (float *)calloc(out_n, sizeof(float));
+                for (size_t i = 0; i < out_n; i++) {
+                    double acc = 0.0;
+                    int ii = (int)(i * 2);
+                    for (int k = 0; k < ntaps; k++) {
+                        int si = ii - k;
+                        if (si >= 0 && si < (int)cur_n)
+                            acc += hd[k] * (double)cur_buf[si];
+                    }
+                    out_buf[i] = (float)acc;
+                }
+                free(cur_buf);
+                cur_buf = out_buf;
+                cur_n = out_n;
+            }
+
+            /* Apply gain */
+            for (size_t i = 0; i < cur_n; i++) cur_buf[i] *= 0.708f;
+
+            /* Trellis SDM at output rate */
+            const ntf_filter_t *f_out = ntf_auto_select(fs_out);
+            sdm_context_t sdm;
+            sdm_context_init(&sdm, f_out, 4, 2, 32);
+            double *sdm_in = (double *)malloc(cur_n * sizeof(double));
+            float *dsd_out = (float *)calloc(cur_n, sizeof(float));
+            for (size_t i = 0; i < cur_n; i++) sdm_in[i] = (double)cur_buf[i];
+            size_t out_count = sdm_process_block(&sdm, sdm_in, dsd_out, cur_n);
+            sdm_context_free(&sdm);
+
+            double sinad = (out_count > 1024) ?
+                measure_sinad(dsd_out, out_count, freq, (double)fs_out) : -999.0;
+
+            printf("  %6.1f", sinad);
+
+            free(cur_buf); free(sdm_in); free(dsd_out);
+            free(hd); free(hf);
+        }
+        printf("\n");
+        free(dsd_in);
+    }
+
+    TEST_ASSERT_TRUE(1, "FIR taps experiment completed");
+}
+
+/* ─── FIR quality experiment: what limits the downsample ceiling? ───
+ * Test the FIR-only SINAD (no SDM re-encode) to isolate FIR quality. */
+static void test_fir_ceiling(void) {
+    typedef struct { uint32_t fs_in, fs_out; const char *name; } path_t;
+    static const path_t paths[] = {
+        { DSD_RATE_128, DSD_RATE_64, "DSD128→64" },
+        { DSD_RATE_256, DSD_RATE_64, "DSD256→64" },
+        { DSD_RATE_256, DSD_RATE_128, "DSD256→128" },
+        { DSD_RATE_512, DSD_RATE_64, "DSD512→64" },
+        { DSD_RATE_512, DSD_RATE_128, "DSD512→128" },
+    };
+    int n_paths = sizeof(paths) / sizeof(paths[0]);
+
+    printf("\n    ╔══════════════════════════════════════════════════════╗\n");
+    printf("    ║  FIR Ceiling Test: FIR-only vs FIR+SDM              ║\n");
+    printf("    ╚══════════════════════════════════════════════════════╝\n");
+    printf("    %-14s  FIR-only  FIR+SDM   SDM cost\n", "Path");
+
+    for (int p = 0; p < n_paths; p++) {
+        uint32_t fs_in = paths[p].fs_in, fs_out = paths[p].fs_out;
+        size_t n_in = fs_in;  /* 1 second */
+        double freq = 997.0;
+
+        /* Generate high-quality DSD at fs_in */
+        double *sine = (double *)malloc(n_in * sizeof(double));
+        for (size_t i = 0; i < n_in; i++)
+            sine[i] = 0.5 * sin(2.0 * M_PI * freq * (double)i / (double)fs_in);
+        const ntf_filter_t *f_in = ntf_auto_select(fs_in);
+        sdm_context_t enc;
+        sdm_context_init(&enc, f_in, f_in->order, 16, 512);
+        float *dsd_in = (float *)calloc(n_in, sizeof(float));
+        size_t enc_n = sdm_process_block(&enc, sine, dsd_in, n_in);
+        sdm_context_free(&enc); free(sine);
+
+        /* FIR downsample */
+        fir_chain_t fir;
+        fir_chain_init(&fir, fs_in, fs_out);
+        float *fir_out = (float *)malloc(enc_n * sizeof(float));
+        size_t fir_n = fir_chain_process(&fir, dsd_in, fir_out, enc_n);
+        fir_chain_free(&fir); free(dsd_in);
+
+        for (size_t i = 0; i < fir_n; i++) fir_out[i] *= 0.708f;
+
+        /* Measure FIR-only SINAD (at output DSD rate, on multi-bit signal) */
+        double sinad_fir = measure_sinad(fir_out, fir_n, freq, (double)fs_out);
+
+        /* SDM re-encode + measure */
+        const ntf_filter_t *f_out = ntf_auto_select(fs_out);
+        sdm_context_t sdm;
+        sdm_context_init(&sdm, f_out, 4, 8, 128);
+        double *sdm_in = (double *)malloc(fir_n * sizeof(double));
+        float *dsd_out = (float *)calloc(fir_n, sizeof(float));
+        for (size_t i = 0; i < fir_n; i++) sdm_in[i] = (double)fir_out[i];
+        size_t out_n = sdm_process_block(&sdm, sdm_in, dsd_out, fir_n);
+        sdm_context_free(&sdm);
+        double sinad_sdm = (out_n > 1024) ?
+            measure_sinad(dsd_out, out_n, freq, (double)fs_out) : -999.0;
+
+        printf("    %-14s  %6.1f    %6.1f    %+.1f dB\n",
+               paths[p].name, sinad_fir, sinad_sdm, sinad_sdm - sinad_fir);
+
+        free(fir_out); free(sdm_in); free(dsd_out);
+    }
+
+    TEST_ASSERT_TRUE(1, "FIR ceiling test completed");
+}
+
+/* ─── Lowpass before SDM experiment ───
+ * Same-rate paths use 50kHz lowpass → SDM. Rate conversion doesn't.
+ * Test if adding a lowpass between FIR chain and SDM improves quality. */
+static void test_lowpass_before_sdm(void) {
+    typedef struct { uint32_t fs_in, fs_out; const char *name; } path_t;
+    static const path_t paths[] = {
+        { DSD_RATE_128, DSD_RATE_64,  "DSD128→64" },
+        { DSD_RATE_256, DSD_RATE_64,  "DSD256→64" },
+        { DSD_RATE_256, DSD_RATE_128, "DSD256→128" },
+        { DSD_RATE_512, DSD_RATE_128, "DSD512→128" },
+    };
+    int n_paths = sizeof(paths) / sizeof(paths[0]);
+
+    printf("\n    ╔══════════════════════════════════════════════════════╗\n");
+    printf("    ║  Lowpass Before SDM Experiment                       ║\n");
+    printf("    ║  FIR chain → [optional 50kHz LP] → Trellis SDM      ║\n");
+    printf("    ╚══════════════════════════════════════════════════════╝\n");
+    printf("    %-14s  no-LP    with-LP   delta\n", "Path");
+
+    for (int p = 0; p < n_paths; p++) {
+        uint32_t fs_in = paths[p].fs_in, fs_out = paths[p].fs_out;
+        size_t n_in = fs_in;
+        double freq = 997.0;
+
+        /* Generate clean DSD at fs_in */
+        double *sine = (double *)malloc(n_in * sizeof(double));
+        for (size_t i = 0; i < n_in; i++)
+            sine[i] = 0.5 * sin(2.0 * M_PI * freq * (double)i / (double)fs_in);
+        const ntf_filter_t *f_in = ntf_auto_select(fs_in);
+        sdm_context_t enc;
+        sdm_context_init(&enc, f_in, f_in->order, 16, 512);
+        float *dsd_in = (float *)calloc(n_in, sizeof(float));
+        size_t enc_n = sdm_process_block(&enc, sine, dsd_in, n_in);
+        sdm_context_free(&enc); free(sine);
+
+        /* FIR downsample */
+        fir_chain_t fir;
+        fir_chain_init(&fir, fs_in, fs_out);
+        float *fir_out = (float *)malloc(enc_n * sizeof(float));
+        size_t fir_n = fir_chain_process(&fir, dsd_in, fir_out, enc_n);
+        fir_chain_free(&fir); free(dsd_in);
+        for (size_t i = 0; i < fir_n; i++) fir_out[i] *= 0.708f;
+
+        /* Path A: Direct FIR → SDM (no lowpass) */
+        const ntf_filter_t *f_out = ntf_auto_select(fs_out);
+        sdm_context_t sdm_a;
+        sdm_context_init(&sdm_a, f_out, 4, 8, 128);
+        double *in_a = (double *)malloc(fir_n * sizeof(double));
+        float *out_a = (float *)calloc(fir_n, sizeof(float));
+        for (size_t i = 0; i < fir_n; i++) in_a[i] = (double)fir_out[i];
+        size_t n_a = sdm_process_block(&sdm_a, in_a, out_a, fir_n);
+        sdm_context_free(&sdm_a);
+        double sinad_a = (n_a > 1024) ? measure_sinad(out_a, n_a, freq, (double)fs_out) : -999.0;
+        free(in_a); free(out_a);
+
+        /* Path B: FIR → Lowpass@50kHz → SDM */
+        fir_lowpass_t lp;
+        fir_lowpass_init(&lp, fs_out);
+        double *lp_in = (double *)malloc(fir_n * sizeof(double));
+        double *lp_out_d = (double *)malloc(fir_n * sizeof(double));
+        for (size_t i = 0; i < fir_n; i++) lp_in[i] = (double)fir_out[i];
+        fir_lowpass_process(&lp, lp_in, lp_out_d, fir_n);
+        fir_lowpass_free(&lp);
+        free(lp_in);
+
+        sdm_context_t sdm_b;
+        sdm_context_init(&sdm_b, f_out, 4, 8, 128);
+        float *out_b = (float *)calloc(fir_n, sizeof(float));
+        size_t n_b = sdm_process_block(&sdm_b, lp_out_d, out_b, fir_n);
+        sdm_context_free(&sdm_b);
+        double sinad_b = (n_b > 1024) ? measure_sinad(out_b, n_b, freq, (double)fs_out) : -999.0;
+        free(lp_out_d); free(out_b); free(fir_out);
+
+        printf("    %-14s  %6.1f    %6.1f    %+.1f dB\n",
+               paths[p].name, sinad_a, sinad_b, sinad_b - sinad_a);
+    }
+
+    TEST_ASSERT_TRUE(1, "Lowpass before SDM experiment completed");
+}
+
 void test_depth16_suite(void) {
-    TEST_SUITE("48k NTF Sweep");
-    TEST_RUN(test_48k_ntf_sweep);
+    TEST_SUITE("Lowpass Before SDM");
+    TEST_RUN(test_lowpass_before_sdm);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Downsample Path NTF+nc+depth+lat Sweep
+ * ═══════════════════════════════════════════════════════════════════════
+ * Comprehensive sweep for downsample rate conversion paths.
+ * Input encoded at high quality (nc=16, lat=512), then FIR downsampled,
+ * then SDM re-encoded with variable NTF/nc/depth/lat.
+ * Measurement: bin-by-bin Goertzel at output DSD rate (audio band). */
+
+static double measure_downsample_sinad(uint32_t fs_in, uint32_t fs_out,
+                                        ntf_filter_id_t filter_id,
+                                        int nc, int depth, int lat,
+                                        float gain) {
+    unsigned base = rate_is_48k_family(fs_in) ? 48000 : 44100;
+    unsigned mult_in = fs_in / base;
+    /* Use larger samples for stable measurements */
+    size_t n_in;
+    if (mult_in <= 64)       n_in = 131072;
+    else if (mult_in <= 128) n_in = 262144;
+    else if (mult_in <= 256) n_in = 524288;
+    else                     n_in = 1048576;
+
+    /* For multi-stage downsample, fir_chain_process uses out buffer for
+     * intermediate ping-pong. Stage 0 writes n_in/2 to out. Must size
+     * for the largest intermediate, not just the final output. */
+    size_t max_out = n_in / 2 + 4096;
+
+    float *dsd_in  = (float *)malloc(n_in * sizeof(float));
+    float *fir_buf = (float *)malloc(max_out * sizeof(float));
+    float *dsd_out = (float *)malloc(max_out * sizeof(float));
+    if (!dsd_in || !fir_buf || !dsd_out) {
+        free(dsd_in); free(fir_buf); free(dsd_out);
+        return -999.0;
+    }
+
+    /* Estimate output sample count for frequency alignment */
+    size_t est_in = n_in - 512;
+    size_t est_fir = est_in / (fs_in / fs_out);
+    size_t est_sdm = (est_fir > (size_t)lat) ? est_fir - (size_t)lat : 512;
+    if (est_sdm < 512) est_sdm = 512;
+    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm);
+
+    /* Generate high-quality DSD input (nc=16, lat=512) */
+    const ntf_filter_t *f_in = ntf_auto_select(fs_in);
+    if (!f_in) { free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+    sdm_context_t gen;
+    if (sdm_context_init(&gen, f_in, 8, 16, 512) != 0) {
+        free(dsd_in); free(fir_buf); free(dsd_out); return -999.0;
+    }
+    double *sine = (double *)malloc(n_in * sizeof(double));
+    if (!sine) { sdm_context_free(&gen); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+    for (size_t i = 0; i < n_in; i++)
+        sine[i] = 0.5 * sin(2.0 * M_PI * freq * (double)i / (double)fs_in);
+    size_t dsd_in_count = sdm_process_block(&gen, sine, dsd_in, n_in);
+    free(sine);
+    sdm_context_free(&gen);
+    if (dsd_in_count < 512) { free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+
+    /* FIR downsample */
+    fir_chain_t fir;
+    if (fir_chain_init(&fir, fs_in, fs_out) != 0) {
+        free(dsd_in); free(fir_buf); free(dsd_out); return -999.0;
+    }
+    size_t fir_count = fir_chain_process(&fir, dsd_in, fir_buf, dsd_in_count);
+    fir_chain_free(&fir);
+    if (fir_count < 512) { free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+
+    /* Apply gain */
+    if (gain != 1.0f)
+        for (size_t i = 0; i < fir_count; i++)
+            fir_buf[i] *= gain;
+
+    /* SDM re-encode with specified params */
+    const ntf_filter_t *f_out = ntf_get_filter(filter_id, fs_out);
+    if (!f_out) { free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+    sdm_context_t sdm;
+    if (sdm_context_init(&sdm, f_out, (unsigned)depth, (unsigned)nc, (unsigned)lat) != 0) {
+        free(dsd_in); free(fir_buf); free(dsd_out); return -999.0;
+    }
+    double *sdm_in_d = float_to_double(fir_buf, fir_count);
+    if (!sdm_in_d) { sdm_context_free(&sdm); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+    size_t out_count = sdm_process_block(&sdm, sdm_in_d, dsd_out, fir_count);
+    free(sdm_in_d);
+    sdm_context_free(&sdm);
+    if (out_count < 512) { free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+
+    double sinad_db = measure_sinad(dsd_out, out_count, freq, (double)fs_out);
+    free(dsd_in); free(fir_buf); free(dsd_out);
+    return sinad_db;
+}
+
+static void test_downsample_sweep(void) {
+    typedef struct {
+        uint32_t fs_in, fs_out;
+        const char *name;
+    } dn_path_t;
+
+    static const dn_path_t paths[] = {
+        { DSD_RATE_128, DSD_RATE_64,  "DSD128->64"  },
+        { DSD_RATE_256, DSD_RATE_64,  "DSD256->64"  },
+        { DSD_RATE_512, DSD_RATE_64,  "DSD512->64"  },
+        { DSD_RATE_256, DSD_RATE_128, "DSD256->128" },
+        { DSD_RATE_512, DSD_RATE_128, "DSD512->128" },
+        { DSD_RATE_512, DSD_RATE_256, "DSD512->256" },
+    };
+    static const int n_paths = sizeof(paths) / sizeof(paths[0]);
+
+    static const ntf_filter_id_t filters[] = {
+        NTF_CLANS_4, NTF_SDM_4,
+        NTF_CLANS_5, NTF_SDM_5,
+        NTF_CLANS_6, NTF_SDM_6,
+        NTF_CLANS_7, NTF_SDM_7,
+        NTF_CLANS_8, NTF_SDM_8,
+    };
+    static const char *filter_names[] = {
+        "clans-4", "sdm-4",
+        "clans-5", "sdm-5",
+        "clans-6", "sdm-6",
+        "clans-7", "sdm-7",
+        "clans-8", "sdm-8",
+    };
+    static const int n_filters = 10;
+
+    /* ─── Phase 1: NTF × nc sweep (d=4, lat=128) ─── */
+    /* nc is the dominant parameter for downsample quality.
+     * nc=2 gives 65-75 dB, production nc=32 gives 85 dB. */
+    static const int nc_vals[]  = { 2, 4, 8, 16, 32 };
+    static const int n_nc = 5;
+
+    printf("\n    ╔══════════════════════════════════════════════════════════════╗\n");
+    printf("    ║  Downsample NTF × nc Sweep (Phase 1)                        ║\n");
+    printf("    ║  %d paths × %d NTFs × %d nc = %d measurements                ║\n",
+           n_paths, n_filters, n_nc, n_paths * n_filters * n_nc);
+    printf("    ║  Fixed: depth=4, lat=128, gain=0.708                        ║\n");
+    printf("    ╚══════════════════════════════════════════════════════════════╝\n");
+
+    /* Track best per path for Phase 2 */
+    typedef struct {
+        ntf_filter_id_t filter;
+        int nc;
+        double sinad;
+    } winner_t;
+    winner_t best_p1[6];
+    for (int p = 0; p < n_paths; p++) best_p1[p].sinad = -999.0;
+
+    for (int p = 0; p < n_paths; p++) {
+        printf("\n    --- %s ---\n", paths[p].name);
+        printf("    %-10s", "NTF\\nc");
+        for (int n = 0; n < n_nc; n++)
+            printf("  nc=%-3d", nc_vals[n]);
+        printf("   best\n");
+
+        for (int f = 0; f < n_filters; f++) {
+            printf("    %-10s", filter_names[f]);
+            double row_best = -999.0;
+            int row_best_nc = 0;
+
+            for (int n = 0; n < n_nc; n++) {
+                fflush(stdout);
+                double s = measure_downsample_sinad(
+                    paths[p].fs_in, paths[p].fs_out,
+                    filters[f], nc_vals[n], 4, 128, 0.708f);
+                printf("  %6.1f", s);
+                if (s > row_best) { row_best = s; row_best_nc = nc_vals[n]; }
+                if (s > best_p1[p].sinad) {
+                    best_p1[p].filter = filters[f];
+                    best_p1[p].nc = nc_vals[n];
+                    best_p1[p].sinad = s;
+                }
+            }
+            printf("  %6.1f (nc=%d)\n", row_best, row_best_nc);
+            fflush(stdout);
+        }
+    }
+
+    /* Print Phase 1 winners */
+    printf("\n    ╔══════════════════════════════════════════════════════════════╗\n");
+    printf("    ║  Phase 1 Winners                                            ║\n");
+    printf("    ╠══════════════════════════════════════════════════════════════╣\n");
+    for (int p = 0; p < n_paths; p++) {
+        const char *fn = "?";
+        for (int f = 0; f < n_filters; f++)
+            if (filters[f] == best_p1[p].filter) { fn = filter_names[f]; break; }
+        printf("    ║  %-14s %-10s nc=%-2d         %7.1f dB            ║\n",
+               paths[p].name, fn, best_p1[p].nc, best_p1[p].sinad);
+    }
+    printf("    ╚══════════════════════════════════════════════════════════════╝\n");
+
+    /* ─── Phase 2: depth × lat sweep on Phase 1 winners ─── */
+    static const int depths[]   = { 2, 4, 8, 16 };
+    static const int lat_vals[] = { 32, 64, 128, 256, 512 };
+    static const int n_depths = 4, n_lat = 5;
+
+    printf("\n    ╔══════════════════════════════════════════════════════════════╗\n");
+    printf("    ║  Downsample depth × lat Sweep (Phase 2)                     ║\n");
+    printf("    ║  Best NTF+nc per path × %d depth × %d lat = %d measurements  ║\n",
+           n_depths, n_lat, n_paths * n_depths * n_lat);
+    printf("    ╚══════════════════════════════════════════════════════════════╝\n");
+
+    typedef struct {
+        ntf_filter_id_t filter;
+        int nc, depth, lat;
+        double sinad;
+    } best_config_t;
+    best_config_t best[6];
+    for (int p = 0; p < n_paths; p++) best[p].sinad = -999.0;
+
+    for (int p = 0; p < n_paths; p++) {
+        if (best_p1[p].sinad < -900.0) continue;
+        const char *fn = "?";
+        for (int f = 0; f < n_filters; f++)
+            if (filters[f] == best_p1[p].filter) { fn = filter_names[f]; break; }
+
+        printf("\n    --- %s (NTF=%s, nc=%d, Phase1=%.1f dB) ---\n",
+               paths[p].name, fn, best_p1[p].nc, best_p1[p].sinad);
+        printf("    %-10s", "depth\\lat");
+        for (int l = 0; l < n_lat; l++)
+            printf("  lat=%-3d", lat_vals[l]);
+        printf("   best\n");
+
+        for (int d = 0; d < n_depths; d++) {
+            printf("    d=%-6d", depths[d]);
+            double row_best = -999.0;
+            int row_best_lat = 0;
+
+            for (int l = 0; l < n_lat; l++) {
+                double s = measure_downsample_sinad(
+                    paths[p].fs_in, paths[p].fs_out,
+                    best_p1[p].filter, best_p1[p].nc, depths[d],
+                    lat_vals[l], 0.708f);
+                printf("  %7.1f", s);
+                if (s > row_best) { row_best = s; row_best_lat = lat_vals[l]; }
+                if (s > best[p].sinad) {
+                    best[p].filter = best_p1[p].filter;
+                    best[p].nc = best_p1[p].nc;
+                    best[p].depth = depths[d];
+                    best[p].lat = lat_vals[l];
+                    best[p].sinad = s;
+                }
+            }
+            printf("  %7.1f (lat=%d)\n", row_best, row_best_lat);
+        }
+    }
+
+    /* Print final results */
+    printf("\n    ╔══════════════════════════════════════════════════════════════╗\n");
+    printf("    ║  Optimal Downsample Configurations                          ║\n");
+    printf("    ╠══════════════════════════════════════════════════════════════╣\n");
+    for (int p = 0; p < n_paths; p++) {
+        if (best[p].sinad < -900.0) continue;
+        const char *fn = "?";
+        for (int f = 0; f < n_filters; f++)
+            if (filters[f] == best[p].filter) { fn = filter_names[f]; break; }
+        printf("    ║  %-14s %-10s nc=%-2d d=%-2d lat=%-3d  %7.1f dB  ║\n",
+               paths[p].name, fn, best[p].nc, best[p].depth,
+               best[p].lat, best[p].sinad);
+    }
+    printf("    ╚══════════════════════════════════════════════════════════════╝\n");
+
+    TEST_ASSERT_TRUE(1, "Downsample NTF+nc+depth+lat sweep completed");
+}
+
+void test_downsample_sweep_suite(void) {
+    TEST_SUITE("Downsample Sweep");
+    TEST_RUN(test_downsample_sweep);
 }
 
 void test_rate_sweep_suite(void) {

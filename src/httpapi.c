@@ -536,26 +536,32 @@ static void handle_render(SOCKET client, const char *body) {
     QueryPerformanceFrequency(&tfreq);
     QueryPerformanceCounter(&t0);
 
+    /* Convert float input to double (SDM functions require double) */
+    double *in_d = (double *)malloc(n_samples * sizeof(double));
+    if (!in_d) { free(in); free(out); goto oom_render; }
+    for (size_t i = 0; i < n_samples; i++)
+        in_d[i] = (double)in[i];
+
     size_t produced;
     if (sdm_mode == SDM_MODE_PRECORR) {
         precorr_context_t ctx;
         if (precorr_context_init(&ctx, filter) != 0) {
-            free(in); free(out);
+            free(in); free(in_d); free(out);
             const char *e = "{\"error\":\"precorr init failed\"}";
             send_json(client, 500, "Internal Server Error", e, (int)strlen(e));
             return;
         }
-        produced = precorr_process_block(&ctx, in, out, n_samples);
+        produced = precorr_process_block(&ctx, in_d, out, n_samples);
         precorr_context_free(&ctx);
     } else {
         sdm_context_t ctx;
         if (sdm_context_init(&ctx, filter, depth, cands, lat) != 0) {
-            free(in); free(out);
+            free(in); free(in_d); free(out);
             const char *e = "{\"error\":\"trellis init failed\"}";
             send_json(client, 500, "Internal Server Error", e, (int)strlen(e));
             return;
         }
-        produced = sdm_process_block(&ctx, in, out, n_samples);
+        produced = sdm_process_block(&ctx, in_d, out, n_samples);
         /* Drain latency buffer */
         float *drain_buf = (float *)malloc((size_t)lat * sizeof(float));
         if (drain_buf) {
@@ -593,6 +599,7 @@ static void handle_render(SOCKET client, const char *body) {
     }
 
     free(in);
+    free(in_d);
     free(out);
 
     /* Build response */
@@ -1077,13 +1084,13 @@ static void handle_request(httpapi_t *api, SOCKET client) {
             const char *q = strchr(path, '?');
             if (q) {
                 const char *p;
-                if ((p = strstr(q, "rate=")))    rate = (uint32_t)atoi(p + 5);
-                if ((p = strstr(q, "ntf=")))     ntf_id = atoi(p + 4);
-                if ((p = strstr(q, "nc=")))      nc = atoi(p + 3);
-                if ((p = strstr(q, "depth=")))   depth = atoi(p + 6);
-                if ((p = strstr(q, "lat=")))     lat = atoi(p + 4);
-                if ((p = strstr(q, "fir=")))     fir_mode = atoi(p + 4);
-                if ((p = strstr(q, "gain=")))    gain = (float)atof(p + 5);
+                p = strstr(q, "rate=");    if (p) rate = (uint32_t)atoi(p + 5);
+                p = strstr(q, "ntf=");     if (p) ntf_id = atoi(p + 4);
+                p = strstr(q, "nc=");      if (p) nc = atoi(p + 3);
+                p = strstr(q, "depth=");   if (p) depth = atoi(p + 6);
+                p = strstr(q, "lat=");     if (p) lat = atoi(p + 4);
+                p = strstr(q, "fir=");     if (p) fir_mode = atoi(p + 4);
+                p = strstr(q, "gain=");    if (p) gain = (float)atof(p + 5);
             }
 
             /* Resolve NTF if auto — find the ID by matching the auto-selected filter */

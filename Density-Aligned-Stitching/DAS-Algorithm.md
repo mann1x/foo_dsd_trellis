@@ -1,5 +1,7 @@
 # Density-Aligned Stitching (DAS) for State-Convergent Parallel SDM
 
+**Author:** Francesco Calpini
+
 ## Abstract
 
 Density-Aligned Stitching (DAS) is a novel algorithm for parallelizing 1-bit Trellis Sigma-Delta Modulators (SDM) across multiple CPU cores without introducing audible artifacts at segment boundaries. The algorithm solves the fundamental challenge of SDM parallelization: the feedback loop creates a strict sample-by-sample sequential dependency that prevents naive temporal decomposition.
@@ -10,7 +12,7 @@ DAS introduces three key innovations:
 2. **Windowed match density scanning** that identifies regions of genuine SDM convergence within the overlap, replacing random bit-matching with a convergence-aware metric
 3. **Hybrid stitch point selection** that combines density-based convergence detection with exact bit-matching for artifact-free transitions
 
-The algorithm achieves real-time DSD512 processing (22.579 MHz, 1-bit) at 0.57x real-time on a 16-core AMD Ryzen 9 9950X using 4 parallel segments, with 100% exact bit-match rate at every stitch boundary. No prior published work achieves temporal parallelism of trellis SDM for audio.
+The algorithm achieves real-time DSD512 processing (22.579 MHz, 1-bit) at 0.85x real-time on a 16-core AMD Ryzen 9 9950X using 4 parallel segments (Par4), with 100% exact bit-match rate at every stitch boundary. No prior published work achieves temporal parallelism of trellis SDM for audio.
 
 ---
 
@@ -36,7 +38,7 @@ Where:
 - The **feedback DAC** is trivial for 1-bit (just the previous output ±1)
 - The **integrator state vector** `s[n]` accumulates the error history across all filter orders
 
-The NTF determines the noise-shaping profile. Higher-order NTFs push more quantization noise above the audio band, achieving better in-band Signal-to-Noise-and-Distortion Ratio (SINAD). Per-rate optimal NTFs: CLANS-5 (order 5) for DSD64, CLANS-6 (order 6) for DSD128/256, SDM-6 (order 6) for DSD512. Measured SINAD: 99 dB (DSD64), 121 dB (DSD128), 129 dB (DSD256), 140 dB (DSD512).
+The NTF determines the noise-shaping profile. Higher-order NTFs push more quantization noise above the audio band, achieving better in-band Signal-to-Noise-and-Distortion Ratio (SINAD). Per-rate optimal NTFs: CLANS-6 (order 6, depth=16) for DSD64, CLANS-6 (order 6) for DSD128/256, SDM-6 (order 6) for DSD512. Measured SINAD: 111 dB (DSD64), 122 dB (DSD128), 129 dB (DSD256), 141 dB (DSD512).
 
 ### 1.2 The Sequential Dependency Problem
 
@@ -84,8 +86,8 @@ Each candidate carries:
 - **Path**: Bit history of length L (the output decisions)
 
 The trellis SDM produces dramatically better results than greedy SDM:
-- 99 dB SINAD at DSD64, 121 dB at DSD128 (vs ~60 dB greedy)
-- 129 dB at DSD256, 140 dB at DSD512 (practical 1-bit ceiling)
+- 111 dB SINAD at DSD64, 122 dB at DSD128 (vs ~60 dB greedy)
+- 129 dB at DSD256, 141 dB at DSD512 (practical 1-bit ceiling)
 
 ### 1.4 Computational Cost
 
@@ -634,7 +636,7 @@ Density-Aligned Stitching (DAS) solves the parallelization problem for trellis S
 
 4. **Hybrid stitch selection**: From the density peak, a spiral search finds the nearest exact bit-match for a clean, artifact-free transition. This combines convergence-aware positioning with glitch-free stitching.
 
-The algorithm adds negligible overhead (~10ms estimation + ~0ms density scan), achieves 100% exact-match rate at all stitch boundaries, and enables real-time DSD512 (22.579 MHz) processing at 0.57x RT on commodity hardware. No prior published work achieves temporal parallelism of trellis SDM for audio.
+The algorithm adds negligible overhead (~10ms estimation + ~0ms density scan), achieves 100% exact-match rate at all stitch boundaries, and enables real-time DSD512 (22.579 MHz) processing at 0.85x RT on commodity hardware with 4 parallel segments. No prior published work achieves temporal parallelism of trellis SDM for audio.
 
 ---
 

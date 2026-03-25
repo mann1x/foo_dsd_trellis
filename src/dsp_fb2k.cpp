@@ -1269,6 +1269,21 @@ private:
                 info << "\nFIR chain (power-of-2 ratio, no SDM)";
             }
         } else {
+            /* Check for cross-family PCM→DSD */
+            if (!is_dsd_input && rate_out_is_dsd(out_idx)) {
+                bool in_48k = rate_idx_is_48k_family(idx);
+                bool out_48k = rate_out_is_dsd48(out_idx);
+                if (in_48k != out_48k) {
+                    uint32_t target_base = out_48k ? 48000u : 44100u;
+                    uint32_t inter = target_base;
+                    while (inter * 2 <= fs_in)
+                        inter *= 2;
+                    const char *rs = resample_soxr_available() ? "soxr" : "IPP";
+                    if (m_cfg.resample_engine == RESAMPLE_IPP) rs = "IPP";
+                    else if (m_cfg.resample_engine == RESAMPLE_SOXR) rs = "soxr";
+                    info << "\nCross-family: " << rs << " " << fs_in << "Hz -> " << inter << "Hz -> FIR upsample";
+                }
+            }
             const char *sdm_name = (sdm_mode == SDM_MODE_TRELLIS) ? "Trellis" : "PreCorr";
             info << "\nSDM: " << sdm_name;
             if (sdm_mode == SDM_MODE_TRELLIS)
@@ -1385,6 +1400,8 @@ private:
         snprintf(path, sz, "%sfoo_dsd_trellis_sinad.json", dll_path);
     }
 
+#pragma warning(push)
+#pragma warning(disable: 4996) /* fopen/sscanf deprecation */
     void SaveSinadResult(int row, int ntf_id, int cands, int depth, int lat,
                           int fir_mode, const sinad_result_t *r) {
         SYSTEMTIME st;
@@ -1453,6 +1470,7 @@ private:
 
     bool LoadCachedSinad(int row, int ntf_id, int cands, int depth, int lat,
                           char *out, size_t out_sz) {
+        (void)ntf_id; (void)cands; (void)depth; (void)lat;
         char path[MAX_PATH];
         GetSinadJsonPath(path, sizeof(path));
 
@@ -1482,11 +1500,11 @@ private:
                     double etheo = -999.0, eawtd = -999.0, emt = -999.0;
                     double enmod = -999.0, enmr = -999.0;
                     char *fp;
-                    if ((fp = strstr(p, "\"theo\":"))) sscanf(fp, "\"theo\":%lf", &etheo);
-                    if ((fp = strstr(p, "\"awtd\":"))) sscanf(fp, "\"awtd\":%lf", &eawtd);
-                    if ((fp = strstr(p, "\"mt\":")))   sscanf(fp, "\"mt\":%lf", &emt);
-                    if ((fp = strstr(p, "\"nmod\":"))) sscanf(fp, "\"nmod\":%lf", &enmod);
-                    if ((fp = strstr(p, "\"nmr\":")))  sscanf(fp, "\"nmr\":%lf", &enmr);
+                    fp = strstr(p, "\"theo\":"); if (fp) sscanf(fp, "\"theo\":%lf", &etheo);
+                    fp = strstr(p, "\"awtd\":"); if (fp) sscanf(fp, "\"awtd\":%lf", &eawtd);
+                    fp = strstr(p, "\"mt\":");   if (fp) sscanf(fp, "\"mt\":%lf", &emt);
+                    fp = strstr(p, "\"nmod\":"); if (fp) sscanf(fp, "\"nmod\":%lf", &enmod);
+                    fp = strstr(p, "\"nmr\":");  if (fp) sscanf(fp, "\"nmr\":%lf", &enmr);
                     /* Extract timestamp */
                     char *ts_start = strstr(p, "\"ts\":\"");
                     if (ts_start) {
@@ -1522,6 +1540,7 @@ private:
         free(buf);
         return found;
     }
+#pragma warning(pop)
 
     /* ─── Test Quality button ─── */
 
@@ -2386,9 +2405,9 @@ public:
             /* Convert i24 back to float for capture (capture path only, not hot) */
             pfc::array_staticsize_t<float> cap_f;
             cap_f.set_size_discard(total_out);
-            const uint8_t *src = out_buf.get_ptr();
+            const uint8_t *cap_src = out_buf.get_ptr();
             for (size_t i = 0; i < total_out; i++) {
-                int32_t v = (int32_t)src[i*3] | ((int32_t)src[i*3+1] << 8) | ((int32_t)src[i*3+2] << 16);
+                int32_t v = (int32_t)cap_src[i*3] | ((int32_t)cap_src[i*3+1] << 8) | ((int32_t)cap_src[i*3+2] << 16);
                 if (v & 0x800000) v |= (int32_t)0xFF000000;
                 cap_f[i] = (float)((double)v / 8388608.0);
             }

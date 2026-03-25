@@ -175,38 +175,43 @@ static uint32_t dsd_to_dop_pcm_rate(uint32_t dsd_rate) {
 }
 
 /* Determine target DSD rate for PCM→DSD conversion.
- * Returns 0 if the PCM rate is not supported or the ratio is not a power of 2. */
+ * Returns 0 if the PCM rate is not supported.
+ * Cross-family (e.g., 48k PCM → DSD/44) is supported via polyphase resample. */
 static uint32_t pcm_to_target_dsd_rate(uint32_t pcm_rate, uint32_t cfg_fs_out) {
-    /* If user configured a specific output rate, check compatibility */
+    /* If user configured a specific output rate, accept it.
+     * Cross-family is handled by resampling PCM to the DSD's base rate first. */
     if (cfg_fs_out != 0) {
-        if (cfg_fs_out <= pcm_rate)
-            return 0;  /* DSD rate must be higher than PCM rate */
-        uint32_t ratio = cfg_fs_out / pcm_rate;
-        if (cfg_fs_out != ratio * pcm_rate)
-            return 0;  /* Not evenly divisible */
-        /* Check power of 2 */
-        if (ratio == 0 || (ratio & (ratio - 1)) != 0)
-            return 0;
+        /* Determine DSD family base rate */
+        uint32_t dsd_base = rate_is_48k_family(cfg_fs_out) ? 48000 : 44100;
+        bool pcm_is_44 = (pcm_rate % 44100 == 0);
+        bool pcm_is_48 = (pcm_rate % 48000 == 0);
+        if (!pcm_is_44 && !pcm_is_48) return 0;
+
+        /* Same family: check power-of-2 ratio */
+        bool same_family = (pcm_is_44 && dsd_base == 44100) ||
+                           (pcm_is_48 && dsd_base == 48000);
+        if (same_family) {
+            if (cfg_fs_out <= pcm_rate) return 0;
+            uint32_t ratio = cfg_fs_out / pcm_rate;
+            if (cfg_fs_out != ratio * pcm_rate) return 0;
+            if (ratio == 0 || (ratio & (ratio - 1)) != 0) return 0;
+        }
+        /* Cross-family: polyphase resample handles the base rate conversion */
         return cfg_fs_out;
     }
 
     /* Auto-select: DSD64 base rate for the PCM rate's family */
-    /* 44100 family: 44100, 88200, 176400, 352800 → DSD base = 2822400 */
-    /* 48000 family: 48000, 96000, 192000, 384000 → DSD base = 3072000 */
     uint32_t dsd_base;
     if (pcm_rate % 44100 == 0)
         dsd_base = DSD_RATE_64;    /* 2822400 = 64 * 44100 */
     else if (pcm_rate % 48000 == 0)
         dsd_base = 64 * 48000;     /* 3072000 = 64 * 48000 */
     else
-        return 0;  /* Unsupported PCM rate family */
+        return 0;
 
-    /* dsd_base must be > pcm_rate and ratio must be power of 2 */
     if (dsd_base <= pcm_rate) {
-        /* PCM rate is already at or above DSD64 equivalent — use DSD128 etc. */
-        /* Find smallest DSD rate > pcm_rate with power-of-2 ratio */
         uint32_t base_unit = (pcm_rate % 44100 == 0) ? 44100 : 48000;
-        uint32_t mult = 64;  /* Start at DSD64 */
+        uint32_t mult = 64;
         while (mult <= 512) {
             uint32_t dsd_rate = mult * base_unit;
             if (dsd_rate > pcm_rate) {
@@ -2399,9 +2404,29 @@ size_t plugin_process_pcm(plugin_state_t *s,
             return 0;
     }
 
-    /* FIR upsample ratio */
-    uint32_t ratio = dsd_rate / pcm_rate;
-    size_t dsd_out_count = pcm_frames * ratio;
+    /* Cross-family detection: PCM rate family != DSD rate family.
+     * e.g., 48k PCM → DSD/44 needs polyphase resample 48k→44.1k first. */
+    uint32_t dsd_base_unit = rate_is_48k_family(dsd_rate) ? 48000 : 44100;
+    bool pcm_is_44 = (pcm_rate % 44100 == 0);
+    bool cross_family = (pcm_is_44 && dsd_base_unit == 48000) ||
+                        (!pcm_is_44 && dsd_base_unit == 44100);
+
+    /* For cross-family: resample PCM to same-family rate, then FIR upsample.
+     * e.g., 48000 → 44100 → FIR 64x → DSD64/44 (2822400) */
+    uint32_t fir_input_rate = pcm_rate;
+    size_t fir_input_frames = pcm_frames;
+    if (cross_family) {
+        /* Target: highest same-family PCM rate <= pcm_rate */
+        uint32_t target = dsd_base_unit;
+        while (target * 2 <= pcm_rate)
+            target *= 2;
+        fir_input_rate = target;
+        fir_input_frames = (size_t)((double)pcm_frames *
+                           (double)fir_input_rate / (double)pcm_rate) + 1;
+    }
+
+    uint32_t ratio = dsd_rate / fir_input_rate;
+    size_t dsd_out_count = fir_input_frames * ratio + 256;
 
     /* Ensure per-channel buffers */
     if (ensure_ch_bufs(s, num_channels, dsd_out_count) != 0)
@@ -2416,6 +2441,23 @@ size_t plugin_process_pcm(plugin_state_t *s,
             s->ch_in[ch][f] = in_pcm[f * (size_t)num_channels + (size_t)ch];
     }
 
+    /* Cross-family: polyphase resample each channel in-place */
+    if (cross_family) {
+        for (int ch = 0; ch < num_channels; ch++) {
+            float *rs_out = (float *)malloc(fir_input_frames * sizeof(float));
+            if (!rs_out) return 0;
+            resample_ctx_t *rs = resample_create(pcm_rate, fir_input_rate,
+                                                  s->config.resample_engine,
+                                                  s->config.soxr_quality);
+            if (!rs) { free(rs_out); return 0; }
+            fir_input_frames = resample_process(rs, s->ch_in[ch], rs_out, pcm_frames);
+            resample_free(rs);
+            memcpy(s->ch_in[ch], rs_out, fir_input_frames * sizeof(float));
+            free(rs_out);
+        }
+        dsd_out_count = fir_input_frames * ratio + 256;
+    }
+
     QueryPerformanceCounter(&t_end);
     s->time_unpack_ms = perf_ms(t_start, t_end);
 
@@ -2428,7 +2470,7 @@ size_t plugin_process_pcm(plugin_state_t *s,
     for (int ch = 0; ch < num_channels; ch++) {
         blocks[ch].in       = s->ch_in[ch];
         blocks[ch].out      = s->ch_out[ch];
-        blocks[ch].count    = pcm_frames;
+        blocks[ch].count    = fir_input_frames;
         blocks[ch].out_count = 0;
         blocks[ch].channel  = ch;
         blocks[ch].eng      = &s->channels[ch];

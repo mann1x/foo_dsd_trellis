@@ -65,7 +65,10 @@ static const path_config_t path_table[] = {
     { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_8, 12.0, 2,  0, 4, 0.708f },
     { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 0.708f },
-    /* Downsample paths: gain=0.708 for consistency with upsample */
+    /* Downsample paths — swept via NTF×nc×depth×lat (2026-03-25).
+     * Existing configs kept: end-to-end sweep showed →DSD64 paths are
+     * FIR-limited (~72-85 dB). SDM params have minimal effect on final
+     * quality. SDM-8 is unstable at DSD64 (51 dB — avoid). */
     { DSD_RATE_128, DSD_RATE_64,  NTF_CLANS_4, 0.0,  32, 0, 0, 0.708f },
     { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  0, 0, 0.708f },
     { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_4, 0.0,  8,  0, 0, 0.708f },
