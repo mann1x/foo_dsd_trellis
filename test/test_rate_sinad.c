@@ -110,36 +110,10 @@ static size_t generate_dsd_sine(uint32_t dsd_rate, double freq_hz,
 /* ─── Measure SINAD for a rate conversion path ─── */
 
 static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
-    /* For DSD→DSD rate conversion, use sinad_measure at fs_out
-     * (matches the Test Quality button methodology). This measures
-     * the SDM encode quality at the output rate with the path-configured
-     * NTF/cands/lat. The FIR rate conversion quality is tested separately
-     * in the DSD→PCM tests. */
-    if (fs_in != fs_out && fs_in >= DSD_RATE_64 && fs_out >= DSD_RATE_64) {
-        dsd_config_t cfg;
-        memset(&cfg, 0, sizeof(cfg));
-        cfg.fs_in = fs_in; cfg.fs_out = fs_out;
-        engine_path_info_t pi;
-        engine_get_path_info(fs_in, fs_out, NTF_AUTO, SDM_MODE_TRELLIS, &cfg, &pi);
-        int cands = pi.cands > 0 ? pi.cands : 2;
-        int lat = pi.lat > 0 ? pi.lat : 32;
-        int depth = pi.depth > 0 ? pi.depth : 4;
-        sinad_result_t r;
-        memset(&r, 0, sizeof(r));
-        sinad_measure(fs_out, pi.ntf_filter, cands, depth, lat, 1, pi.fir_gain, &r);
-        unsigned base_in  = rate_is_48k_family(fs_in)  ? 48000 : 44100;
-        unsigned base_out = rate_is_48k_family(fs_out) ? 48000 : 44100;
-        const char *dir = (fs_out > fs_in) ? "UP" : "DN";
-        printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB A-wtd=%.1f MT=%.1f NMod=%.1f"
-               "  [%s, gain=%.2f, cands=%d, lat=%d]\n",
-               fs_in/base_in, fs_out/base_out, dir,
-               r.sinad_theoretical, r.sinad_awtd_theo,
-               r.multitone_sinad_db, r.noise_mod_db,
-               pi.ntf_filter != NTF_AUTO ?
-                   ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, fs_out)->name : "auto",
-               pi.fir_gain, cands, lat);
-        return r.sinad_theoretical;
-    }
+    /* Full end-to-end pipeline for all paths:
+     * DSD→DSD: generate DSD @ fs_in → FIR rate conv → SDM re-encode → decimate to PCM → Goertzel
+     * DSD same-rate: generate DSD → FIR lowpass → SDM re-encode → decimate to PCM → Goertzel
+     * No shortcut — measures actual conversion quality, not just SDM encoding quality. */
 
     unsigned base = rate_is_48k_family(fs_in) ? 48000 : 44100;
     unsigned mult_in = fs_in / base;
@@ -180,9 +154,8 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     int lat   = pi.lat > 0 ? pi.lat : SINAD_TRELLIS_LAT;
     int depth = pi.depth > 0 ? pi.depth : SINAD_TRELLIS_DEPTH;
 
-    /* Align test frequency to the FINAL PCM measurement grid (44100/48000 Hz).
-     * This ensures clean Goertzel measurement after DSD→PCM decimation. */
-    unsigned meas_pcm_rate = rate_is_48k_family(fs_out) ? 48000 : 44100;
+    /* Align test frequency to the DSD output measurement grid.
+     * Goertzel measures directly at fs_out (no PCM decimation). */
     size_t est_in_produced = n_in - (size_t)lat;
     size_t est_fir_out;
     if (fs_out >= fs_in)
@@ -190,9 +163,8 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     else
         est_fir_out = est_in_produced / (fs_in / fs_out);
     size_t est_sdm_out = est_fir_out - (size_t)lat;
-    size_t est_pcm_out = est_sdm_out / (fs_out / meas_pcm_rate);
-    if (est_pcm_out < 256) est_pcm_out = 256;
-    double freq = bin_align_freq(1000.0, (double)meas_pcm_rate, est_pcm_out);
+    if (est_sdm_out < 1024) est_sdm_out = 1024;
+    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm_out);
     size_t dsd_in_count = generate_dsd_sine(fs_in, freq, 0.5, n_in, dsd_in);
 
     if (dsd_in_count < 1024) {
@@ -262,27 +234,10 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
         return -999.0;
     }
 
-    /* Decimate DSD to audio rate before SINAD measurement.
-     * Raw DSD Goertzel has spectral leakage from shaped noise.
-     * FIR decimation removes ultrasonic noise → accurate in-band SINAD. */
-    double sinad_db;
-    {
-        fir_chain_t dec_fir;
-        memset(&dec_fir, 0, sizeof(dec_fir));
-        fir_chain_init(&dec_fir, fs_out, meas_pcm_rate);
-        float *pcm_buf = (float *)calloc(out_count, sizeof(float));
-        size_t pcm_n = pcm_buf ? fir_chain_process(&dec_fir, dsd_out, pcm_buf, out_count) : 0;
-        fir_chain_free(&dec_fir);
-        size_t skip = 256;
-        if (pcm_n > skip + 1024) {
-            size_t meas_n = pcm_n - skip;
-            /* freq is already bin-aligned to meas_pcm_rate from the start */
-            sinad_db = measure_sinad(pcm_buf + skip, meas_n, freq, (double)meas_pcm_rate);
-        } else {
-            sinad_db = -999.0;
-        }
-        free(pcm_buf);
-    }
+    /* Measure SINAD directly at DSD output rate (bin-by-bin Goertzel up to 22 kHz).
+     * This is the correct end-to-end measurement: DSD→FIR→SDM→Goertzel. */
+    double sinad_db = (out_count > 1024) ?
+        measure_sinad(dsd_out, out_count, freq, (double)fs_out) : -999.0;
 
     unsigned base_in  = rate_is_48k_family(fs_in)  ? 48000 : 44100;
     unsigned base_out = rate_is_48k_family(fs_out) ? 48000 : 44100;
@@ -1571,9 +1526,8 @@ static double measure_weak_path_sinad(uint32_t fs_in, uint32_t fs_out,
         return -999.0;
     }
 
-    /* Align test frequency to the FINAL PCM measurement grid (44100/48000 Hz).
-     * This ensures clean Goertzel measurement after DSD→PCM decimation. */
-    unsigned meas_pcm_rate = rate_is_48k_family(fs_out) ? 48000 : 44100;
+    /* Align test frequency to the DSD output measurement grid.
+     * Goertzel measures directly at fs_out (no PCM decimation). */
     size_t est_in_produced = n_in - (size_t)lat;
     size_t est_fir_out;
     if (fs_out >= fs_in)
@@ -1581,9 +1535,8 @@ static double measure_weak_path_sinad(uint32_t fs_in, uint32_t fs_out,
     else
         est_fir_out = est_in_produced / (fs_in / fs_out);
     size_t est_sdm_out = est_fir_out - (size_t)lat;
-    size_t est_pcm_out = est_sdm_out / (fs_out / meas_pcm_rate);
-    if (est_pcm_out < 256) est_pcm_out = 256;
-    double freq = bin_align_freq(1000.0, (double)meas_pcm_rate, est_pcm_out);
+    if (est_sdm_out < 1024) est_sdm_out = 1024;
+    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm_out);
     size_t dsd_in_count = generate_dsd_sine(fs_in, freq, 0.5, n_in, dsd_in);
 
     if (dsd_in_count < 1024) {
