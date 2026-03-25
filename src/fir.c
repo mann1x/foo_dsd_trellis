@@ -20,14 +20,28 @@
  * Without this, IPP's auto-dispatcher may select SSE4 on AMD,
  * leaving up to 2x performance on the table. */
 static void ipp_force_avx2(void) {
+    extern void trellis_log_c(const char *);
     Ipp64u mask = 0;
     ippGetCpuFeatures(&mask, NULL);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg), "IPP dispatch: mask=0x%llx AVX2=%s AVX=%s SSE42=%s AVX512F=%s",
+             (unsigned long long)mask,
+             (mask & ippCPUID_AVX2) ? "yes" : "NO",
+             (mask & ippCPUID_AVX) ? "yes" : "no",
+             (mask & ippCPUID_SSE42) ? "yes" : "no",
+             (mask & ippCPUID_AVX512F) ? "yes" : "no");
+    trellis_log_c(msg);
+
     if (!(mask & ippCPUID_AVX2)) {
         /* IPP didn't detect AVX2 — force it if CPU supports it */
         int cpuInfo[4] = {0};
         __cpuidex(cpuInfo, 7, 0);
         if (cpuInfo[1] & (1 << 5)) {  /* EBX bit 5 = AVX2 */
             ippSetCpuFeatures(mask | ippCPUID_AVX2);
+            trellis_log_c("IPP: forced AVX2 dispatch on AMD");
+        } else {
+            trellis_log_c("IPP: CPU does not support AVX2");
         }
     }
 }
@@ -98,7 +112,6 @@ static int ipp_firmr_stage_init(fir_chain_t *chain, int stage_idx,
 
     /* Cache taps globally for GPU backend */
     if (!g_hb_taps_initialized) {
-        ipp_force_avx2();
         memcpy(g_hb_taps, taps, sizeof(g_hb_taps));
         memcpy(g_hb_taps_d, hd, sizeof(g_hb_taps_d));
         g_hb_taps_initialized = true;
@@ -429,6 +442,12 @@ static int ensure_scratch(fir_chain_t *chain, size_t need) {
 
 int fir_chain_init_ex(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out,
                       bool use_fp64) {
+    static bool ipp_checked = false;
+    if (!ipp_checked) {
+        ipp_force_avx2();
+        ipp_checked = true;
+    }
+
     memset(chain, 0, sizeof(*chain));
     chain->use_fp64 = use_fp64;
 
