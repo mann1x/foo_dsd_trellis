@@ -7,7 +7,7 @@ A native foobar2000 DSP plugin that converts PCM and DSD audio to DSD using sigm
 | Feature | Description |
 |---------|-------------|
 | SDM Modes | PreCorr (default, ~0.01x RT) and Trellis (high quality, configurable depth/candidates) |
-| Rate Conversion | DSD64-512 (44.1kHz + 48kHz families) via Intel IPP FIRSR (127-tap Kaiser half-band) |
+| Rate Conversion | DSD64-512 (44.1kHz + 48kHz families) via Intel IPP FIRMR polyphase (63-tap Kaiser half-band) |
 | PCM to DSD | Float32 PCM input upsampled via FIR then quantised to 1-bit DSD |
 | PCM to PCM | Same-family (FIR chain) and cross-family (polyphase resampler: IPP or libsoxr) |
 | PCM Encoding | Output bit depth (16/24/32/float) with TPDF or noise-shaped dither, global + per-rate |
@@ -290,33 +290,31 @@ Parameters: `rate` (DSD rate in Hz), `nc` (candidates), `depth`, `lat` (latency)
 
 ## SINAD Results
 
-### Trellis SDM (nc=2, depth=4, path_table NTFs)
+### Trellis SDM (nc=2, production path_table NTFs)
 
-Viterbi look-ahead search with production path_config settings (matching real playback).
+Viterbi look-ahead search with production path_config settings (matching real playback). DSD64 uses depth=16 (path diversity); all others depth=4.
 
-| Rate | NTF | Lat | SINAD | A-wtd | MT | NMod | Practical ceiling | Gap |
-|------|-----|-----|------:|------:|---:|-----:|-----------------:|----:|
-| DSD64 | CLANS-5 | 64 | 99.0 | 102.8 | 84.4 | 9.8 | ~120 | 21 dB |
-| DSD128 | CLANS-6 | 128 | 121.5 | 126.8 | 120.3 | 10.3 | ~130 | 9 dB |
-| DSD256 | CLANS-6 | 128 | 128.9 | 134.1 | 123.7 | 2.1 | ~135 | 6 dB |
-| DSD512 | SDM-6 | 32 | 140.5 | 147.7 | 119.8 | 20.0 | ~140 | 0 dB |
+**44.1 kHz family:**
+
+| Rate | NTF | Depth | Lat | SINAD | A-wtd | MT | NMod | Ceiling | Gap |
+|------|-----|------:|----:|------:|------:|---:|-----:|--------:|----:|
+| DSD64 | CLANS-6 | 16 | 32 | 110.7 | 114.0 | 95.5 | 4.8 | ~120 | 9 dB |
+| DSD128 | CLANS-6 | 4 | 128 | 121.5 | 126.8 | 120.3 | 10.3 | ~130 | 9 dB |
+| DSD256 | CLANS-6 | 4 | 128 | 128.9 | 134.1 | 123.7 | 2.1 | ~135 | 6 dB |
+| DSD512 | SDM-6 | 4 | 32 | 140.5 | 147.7 | 119.8 | 20.0 | ~140 | 0 dB |
+
+**48 kHz family:**
+
+| Rate | NTF | Depth | Lat | SINAD | A-wtd | MT | NMod |
+|------|-----|------:|----:|------:|------:|---:|-----:|
+| DSD64/48 | SDM-6 | 16 | 64 | 113.5 | 118.9 | 108.4 | 12.3 |
+| DSD128/48 | CLANS-6 | 4 | 128 | 109.9 | 115.0 | 111.5 | 26.3 |
+| DSD256/48 | CLANS-6 | 4 | 128 | 120.1 | 125.2 | 117.2 | 17.6 |
+| DSD512/48 | SDM-6 | 4 | 32 | 127.6 | 132.7 | 123.3 | 24.5 |
 
 Practical ceiling is ~120-140 dB for 1-bit DSD (OBG-constrained NTF, Lee's rule). Published references: SACD spec 120 dB, Philips trellis ~97 dB, Archimago ~110-116 dB, HQPlayer ASDM7 ~110 dB.
 
-`/fp:precise` required — `/fp:fast` causes up to 13 dB quality variation from FMA reordering (same root cause as CUDA `--fmad=false`).
-
-#### NTF Sweep Results (depth=4, nc=2, optimal lat per rate)
-
-Best NTF per rate from comprehensive 10-NTF sweep. All configurations zero collapse/conv_fail.
-
-| Rate | Best NTF | SINAD | 2nd best | SINAD | 3rd best | SINAD |
-|------|----------|------:|----------|------:|----------|------:|
-| DSD64 (lat=64) | CLANS-5 | 99.0 | SDM-6 | 92.5 | CLANS-6 | 91.7 |
-| DSD128 (lat=128) | CLANS-6 | 121.5 | CLANS-5 | 119.6 | CLANS-7 | 113.7 |
-| DSD256 (lat=128) | CLANS-6 | 128.9 | SDM-4 | 120.8 | CLANS-4 | 118.2 |
-| DSD512 (lat=32) | CLANS-5/7/8 | 140.6 | SDM-5 | 140.6 | SDM-6 | 140.3 |
-
-Higher NTF orders (7-8) can be worse than lower orders at lower DSD rates — the trellis has insufficient look-ahead bandwidth to exploit aggressive noise shaping at DSD64/128.
+`/fp:precise` required — `/fp:fast` causes up to 13 dB quality variation from FMA reordering (same root cause as CUDA `--fmad=false`). PGO provides 0% improvement (trellis is dependency-chain-bound, not branch/layout-bound).
 
 ### PreCorr SDM (greedy + prediction correction)
 
@@ -368,23 +366,23 @@ Rate conversion uses production path_config values: per-path optimal NTF filter,
 
 FIR-only decimation (no SDM re-encoding) for DSD-to-PCM conversion. Output is multi-bit float32 PCM. FIR startup transient skipped before measurement.
 
-| Input | Output | Ratio | SINAD (dB) | A-wtd (dB) |
-|-------|--------|-------|------------|------------|
-| DSD64 | PCM 44.1k | 64x | 104.7 | 106.9 |
-| DSD64 | PCM 88.2k | 32x | 103.0 | 104.8 |
-| DSD64 | PCM 176.4k | 16x | 85.7 | 87.5 |
-| DSD128 | PCM 44.1k | 128x | 131.9 | 133.5 |
-| DSD128 | PCM 88.2k | 64x | 132.3 | 134.0 |
-| DSD128 | PCM 176.4k | 32x | 121.1 | 123.0 |
-| DSD256 | PCM 44.1k | 256x | 134.0 | 135.6 |
-| DSD256 | PCM 88.2k | 128x | 133.6 | 135.2 |
-| DSD256 | PCM 176.4k | 64x | 133.5 | 135.1 |
-| DSD512 | PCM 44.1k | 512x | 135.8 | 137.4 |
-| DSD512 | PCM 88.2k | 256x | 136.8 | 138.4 |
-| DSD512 | PCM 176.4k | 128x | 136.3 | 137.9 |
-| DSD512 | PCM 352.8k | 64x | 136.6 | 138.2 |
-| DSD64/48 | PCM 48k | 64x | 105.0 | 107.2 |
-| DSD128/48 | PCM 96k | 64x | 132.4 | 134.0 |
+| Input | Output | Ratio | SINAD (dB) |
+|-------|--------|------:|-----------:|
+| DSD64 | PCM 44.1k | 64x | 103.3 |
+| DSD64 | PCM 88.2k | 32x | 103.0 |
+| DSD64 | PCM 176.4k | 16x | 85.7 |
+| DSD128 | PCM 44.1k | 128x | 131.5 |
+| DSD128 | PCM 88.2k | 64x | 132.1 |
+| DSD128 | PCM 176.4k | 32x | 121.1 |
+| DSD256 | PCM 44.1k | 256x | 133.6 |
+| DSD256 | PCM 88.2k | 128x | 133.5 |
+| DSD256 | PCM 176.4k | 64x | 133.3 |
+| DSD512 | PCM 44.1k | 512x | 134.9 |
+| DSD512 | PCM 88.2k | 256x | 136.2 |
+| DSD512 | PCM 176.4k | 128x | 136.0 |
+| DSD512 | PCM 352.8k | 64x | 136.5 |
+| DSD64/48 | PCM 48k | 64x | 105.0 |
+| DSD128/48 | PCM 96k | 64x | 132.2 |
 
 **Key observations:**
 - Higher input DSD rates yield better SINAD (more aggressive noise shaping, lower in-band noise)
@@ -441,7 +439,10 @@ Each filter contains:
 - `g[order]` -- Resonator gain coefficients
 - `order` -- Filter order (4-8)
 
-**Trellis auto-selection**: CLANS-5 for DSD64, CLANS-6 for DSD128/DSD256, SDM-6 for DSD512. Lat: 64 for DSD64/DSD512, 128 for DSD128/DSD256. Optimized via comprehensive NTF sweep at production depth=4 (see path_table in engine.c).
+**Trellis auto-selection** (via path_table in engine.c):
+- DSD64/44: CLANS-6/d=16/lat=32 (110.7 dB). DSD64/48: SDM-6/d=16/lat=64 (113.5 dB).
+- DSD128: CLANS-6/d=4/lat=128 (121.5 dB). DSD256: CLANS-6/d=4/lat=128 (128.9 dB).
+- DSD512: SDM-6/d=4/lat=32 (140.5 dB). Depth=16 critical for DSD64 (4-bit dedup mask kills path diversity at low OSR).
 
 **PreCorr auto-selection**: CLANS-6 for DSD64, CLANS-7 for DSD128/DSD256/DSD512. (CLANS-8 is unstable with PreCorr's greedy quantizer at DSD256 boxcar input.)
 
@@ -477,7 +478,7 @@ Greedy sigma-delta modulator with prediction correction table:
 
 ### FIR Rate Conversion (`fir.c`)
 
-Intel IPP FIRSR-based half-band FIR for power-of-2 DSD rate conversion:
+Intel IPP FIRMR polyphase multi-rate FIR for power-of-2 DSD rate conversion:
 
 **Half-band filter (rate conversion):**
 - 63-tap Kaiser-windowed sinc (beta=12.0, ~120 dB stopband)
@@ -594,7 +595,7 @@ foo_dsd_trellis/
 |   |-- dop.c                 DoP detection, pack/unpack
 |   |-- bitpack.c             Native ASIO bitstream pack/unpack
 |   |-- engine.c              Per-channel processing orchestrator
-|   |-- fir.c                 IPP FIRSR half-band FIR (rate conversion)
+|   |-- fir.c                 IPP FIRMR polyphase FIR (rate conversion)
 |   |-- trellis.c             Viterbi look-ahead trellis SDM
 |   |-- precorr.c             Greedy + prediction correction SDM
 |   |-- ntf.c                 NTF coefficient tables (40 filters)
