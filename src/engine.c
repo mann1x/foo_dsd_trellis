@@ -74,7 +74,7 @@ static const path_config_t path_table[] = {
     { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 0.708f },
     /* ─── DSD/48 paths (mirror DSD/44 NTF choices) ─── */
     /* Same-rate re-encode */
-    { DSD48_RATE_64,  DSD48_RATE_64,  NTF_CLANS_6, 0.0,  2,  0, 16, 0.708f },
+    { DSD48_RATE_64,  DSD48_RATE_64,  NTF_SDM_6,   0.0,  2, 64, 16, 0.708f },
     { DSD48_RATE_128, DSD48_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },

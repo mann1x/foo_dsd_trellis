@@ -1995,9 +1995,40 @@ static void test_depth16_spot_check(void) {
     TEST_ASSERT_TRUE(1, "Depth+NTF+nc sweep completed");
 }
 
+static void test_dsd64_48_ntf_sweep(void) {
+    static const ntf_filter_id_t ntfs[] = {
+        NTF_CLANS_4, NTF_SDM_4, NTF_CLANS_5, NTF_SDM_5,
+        NTF_CLANS_6, NTF_SDM_6, NTF_CLANS_7, NTF_SDM_7,
+        NTF_CLANS_8, NTF_SDM_8,
+    };
+    static const char *names[] = {
+        "clans-4","sdm-4","clans-5","sdm-5",
+        "clans-6","sdm-6","clans-7","sdm-7",
+        "clans-8","sdm-8",
+    };
+    static const int depths[] = { 4, 8, 16 };
+    static const int lats[] = { 16, 32, 64, 128 };
+    uint32_t rate = DSD48_RATE_64;
+
+    printf("\n    DSD64/48 NTF × Depth × Lat sweep (nc=2, gain=0.708)\n");
+    for (int li = 0; li < 4; li++) {
+        printf("\n    lat=%d:\n    %-10s  d=4     d=8     d=16\n", lats[li], "NTF");
+        for (int f = 0; f < 10; f++) {
+            printf("    %-10s", names[f]);
+            for (int d = 0; d < 3; d++) {
+                sinad_result_t r;
+                sinad_measure(rate, ntfs[f], 2, depths[d], lats[li], 1, 0.708f, &r);
+                printf("  %6.1f", r.ok ? r.sinad_theoretical : -999.0);
+            }
+            printf("\n");
+        }
+    }
+    TEST_ASSERT_TRUE(1, "DSD64/48 NTF sweep completed");
+}
+
 void test_depth16_suite(void) {
     TEST_SUITE("Depth-16 Rate Conv Spot Check");
-    TEST_RUN(test_depth16_spot_check);
+    TEST_RUN(test_dsd64_48_ntf_sweep);
 }
 
 void test_rate_sweep_suite(void) {
