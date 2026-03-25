@@ -155,13 +155,21 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     int depth = pi.depth > 0 ? pi.depth : SINAD_TRELLIS_DEPTH;
 
     /* Align test frequency to the DSD output measurement grid.
-     * Goertzel measures directly at fs_out (no PCM decimation). */
-    size_t est_in_produced = n_in - (size_t)lat;
+     * Use input SDM latency (SINAD_TRELLIS_LAT=512) for input estimate,
+     * output path lat for output estimate. For multi-stage downsample,
+     * also account for per-stage filter delay (~taps/2 per stage). */
+    size_t est_in_produced = n_in - SINAD_TRELLIS_LAT;
     size_t est_fir_out;
     if (fs_out >= fs_in)
         est_fir_out = est_in_produced * (fs_out / fs_in);
-    else
-        est_fir_out = est_in_produced / (fs_in / fs_out);
+    else {
+        est_fir_out = est_in_produced;
+        uint32_t r = fs_in / fs_out;
+        while (r > 1) {
+            est_fir_out = est_fir_out / 2 - IPP_HB_NTAPS / 2;  /* per-stage loss */
+            r /= 2;
+        }
+    }
     size_t est_sdm_out = est_fir_out - (size_t)lat;
     if (est_sdm_out < 1024) est_sdm_out = 1024;
     double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm_out);
@@ -233,6 +241,9 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
         free(dsd_in); free(fir_buf); free(dsd_out);
         return -999.0;
     }
+
+    /* Align frequency to actual output bin grid for clean Goertzel measurement. */
+    freq = bin_align_freq(freq, (double)fs_out, out_count);
 
     /* Measure SINAD directly at DSD output rate (bin-by-bin Goertzel up to 22 kHz).
      * This is the correct end-to-end measurement: DSD→FIR→SDM→Goertzel. */
@@ -1527,13 +1538,21 @@ static double measure_weak_path_sinad(uint32_t fs_in, uint32_t fs_out,
     }
 
     /* Align test frequency to the DSD output measurement grid.
-     * Goertzel measures directly at fs_out (no PCM decimation). */
-    size_t est_in_produced = n_in - (size_t)lat;
+     * Use input SDM latency (SINAD_TRELLIS_LAT=512) for input estimate,
+     * output path lat for output estimate. For multi-stage downsample,
+     * also account for per-stage filter delay (~taps/2 per stage). */
+    size_t est_in_produced = n_in - SINAD_TRELLIS_LAT;
     size_t est_fir_out;
     if (fs_out >= fs_in)
         est_fir_out = est_in_produced * (fs_out / fs_in);
-    else
-        est_fir_out = est_in_produced / (fs_in / fs_out);
+    else {
+        est_fir_out = est_in_produced;
+        uint32_t r = fs_in / fs_out;
+        while (r > 1) {
+            est_fir_out = est_fir_out / 2 - IPP_HB_NTAPS / 2;  /* per-stage loss */
+            r /= 2;
+        }
+    }
     size_t est_sdm_out = est_fir_out - (size_t)lat;
     if (est_sdm_out < 1024) est_sdm_out = 1024;
     double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm_out);
@@ -2674,6 +2693,178 @@ static void test_downsample_sweep(void) {
     printf("    ╚══════════════════════════════════════════════════════════════╝\n");
 
     TEST_ASSERT_TRUE(1, "Downsample NTF+nc+depth+lat sweep completed");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * FIR Chain Improvement Experiments
+ * ═══════════════════════════════════════════════════════════════════════
+ * Test approaches to improve DSD→DSD rate conversion SINAD (currently 15-68 dB).
+ * Baseline: fp32 FIR chain (63-tap Kaiser beta=12). */
+
+static double measure_fir_experiment(uint32_t fs_in, uint32_t fs_out,
+                                      int use_fp64, int use_lowpass_pre) {
+    unsigned base = rate_is_48k_family(fs_in) ? 48000 : 44100;
+    unsigned mult_in = fs_in / base;
+    size_t n_in;
+    if (mult_in <= 64)       n_in = 262144;
+    else if (mult_in <= 128) n_in = 524288;
+    else if (mult_in <= 256) n_in = 1048576;
+    else                     n_in = 2097152;
+
+    /* Buffer for largest intermediate (multi-stage ping-pong) */
+    size_t max_buf;
+    if (fs_out >= fs_in)
+        max_buf = n_in * (fs_out / fs_in) + 4096;
+    else
+        max_buf = n_in / 2 + 4096;
+
+    float *dsd_in  = (float *)malloc(n_in * sizeof(float));
+    float *dsd_out = (float *)malloc(max_buf * sizeof(float));
+    if (!dsd_in || !dsd_out) { free(dsd_in); free(dsd_out); return -999.0; }
+
+    /* Estimate output for frequency alignment */
+    dsd_config_t cfg; memset(&cfg, 0, sizeof(cfg));
+    cfg.fs_in = fs_in; cfg.fs_out = fs_out;
+    engine_path_info_t pi;
+    engine_get_path_info(fs_in, fs_out, NTF_AUTO, SDM_MODE_TRELLIS, &cfg, &pi);
+    int cands = pi.cands > 0 ? pi.cands : 2;
+    int lat = pi.lat > 0 ? pi.lat : 32;
+    int depth = pi.depth > 0 ? pi.depth : 4;
+
+    size_t est_in = n_in - 512;
+    size_t est_fir = (fs_out >= fs_in) ? est_in * (fs_out / fs_in) : est_in / (fs_in / fs_out);
+    size_t est_sdm = (est_fir > (size_t)lat) ? est_fir - (size_t)lat : 1024;
+    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm);
+
+    /* Generate high-quality DSD input */
+    size_t dsd_in_count = generate_dsd_sine(fs_in, freq, 0.5, n_in, dsd_in);
+    if (dsd_in_count < 1024) { free(dsd_in); free(dsd_out); return -999.0; }
+
+    /* Optional: FIR lowpass BEFORE rate conversion (removes DSD shaped noise) */
+    double *lp_buf = NULL;
+    if (use_lowpass_pre) {
+        fir_lowpass_t lp;
+        memset(&lp, 0, sizeof(lp));
+        if (fir_lowpass_init(&lp, fs_in) != 0) { free(dsd_in); free(dsd_out); return -999.0; }
+        double *lp_in = (double *)malloc(dsd_in_count * sizeof(double));
+        lp_buf = (double *)malloc(dsd_in_count * sizeof(double));
+        if (!lp_in || !lp_buf) { free(lp_in); free(lp_buf); free(dsd_in); free(dsd_out); fir_lowpass_free(&lp); return -999.0; }
+        for (size_t i = 0; i < dsd_in_count; i++) lp_in[i] = (double)dsd_in[i];
+        size_t lp_n = fir_lowpass_process(&lp, lp_in, lp_buf, dsd_in_count);
+        free(lp_in);
+        fir_lowpass_free(&lp);
+        /* Copy back to dsd_in as float for FIR chain */
+        for (size_t i = 0; i < lp_n; i++) dsd_in[i] = (float)lp_buf[i];
+        dsd_in_count = lp_n;
+    }
+
+    /* FIR rate conversion */
+    size_t fir_count;
+    if (use_fp64) {
+        fir_chain_t fir;
+        if (fir_chain_init_ex(&fir, fs_in, fs_out, true) != 0) {
+            free(dsd_in); free(dsd_out); free(lp_buf); return -999.0;
+        }
+        double *din = (double *)malloc(dsd_in_count * sizeof(double));
+        double *dout = (double *)malloc(max_buf * sizeof(double));
+        if (!din || !dout) { free(din); free(dout); free(dsd_in); free(dsd_out); free(lp_buf); fir_chain_free(&fir); return -999.0; }
+        if (use_lowpass_pre && lp_buf) {
+            memcpy(din, lp_buf, dsd_in_count * sizeof(double));
+        } else {
+            for (size_t i = 0; i < dsd_in_count; i++) din[i] = (double)dsd_in[i];
+        }
+        fir_count = fir_chain_process_d(&fir, din, dout, dsd_in_count);
+        /* Convert back to float for SDM */
+        float *fir_buf = (float *)malloc(fir_count * sizeof(float));
+        if (fir_buf) {
+            for (size_t i = 0; i < fir_count; i++) fir_buf[i] = (float)dout[i];
+            free(dsd_in);
+            dsd_in = fir_buf;  /* reuse pointer */
+        }
+        free(din); free(dout);
+        fir_chain_free(&fir);
+    } else {
+        float *fir_buf = (float *)malloc(max_buf * sizeof(float));
+        if (!fir_buf) { free(dsd_in); free(dsd_out); free(lp_buf); return -999.0; }
+        fir_chain_t fir;
+        if (fir_chain_init(&fir, fs_in, fs_out) != 0) {
+            free(dsd_in); free(fir_buf); free(dsd_out); free(lp_buf); return -999.0;
+        }
+        fir_count = fir_chain_process(&fir, dsd_in, fir_buf, dsd_in_count);
+        fir_chain_free(&fir);
+        free(dsd_in);
+        dsd_in = fir_buf;
+    }
+    free(lp_buf);
+
+    if (fir_count < 512) { free(dsd_in); free(dsd_out); return -999.0; }
+
+    /* Apply gain */
+    if (pi.fir_gain != 1.0f)
+        for (size_t i = 0; i < fir_count; i++)
+            dsd_in[i] *= pi.fir_gain;
+
+    /* SDM re-encode */
+    const ntf_filter_t *f_out = (pi.ntf_filter != NTF_AUTO) ?
+        ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, fs_out) : ntf_auto_select(fs_out);
+    if (!f_out) { free(dsd_in); free(dsd_out); return -999.0; }
+    sdm_context_t sdm;
+    if (sdm_context_init(&sdm, f_out, depth, cands, lat) != 0) {
+        free(dsd_in); free(dsd_out); return -999.0;
+    }
+    if (pi.state_limit > 0.0) sdm.state_limit = pi.state_limit;
+    double *sdm_in_d = float_to_double(dsd_in, fir_count);
+    if (!sdm_in_d) { sdm_context_free(&sdm); free(dsd_in); free(dsd_out); return -999.0; }
+    size_t out_count = sdm_process_block(&sdm, sdm_in_d, dsd_out, fir_count);
+    free(sdm_in_d); free(dsd_in);
+    sdm_context_free(&sdm);
+
+    if (out_count < 512) { free(dsd_out); return -999.0; }
+
+    double sinad = measure_sinad(dsd_out, out_count, freq, (double)fs_out);
+    free(dsd_out);
+    return sinad;
+}
+
+static void test_fir_improvement_experiment(void) {
+    typedef struct { uint32_t fs_in, fs_out; const char *name; } path_t;
+    static const path_t paths[] = {
+        { DSD_RATE_64,  DSD_RATE_128, "DSD64->128 UP"  },
+        { DSD_RATE_64,  DSD_RATE_256, "DSD64->256 UP"  },
+        { DSD_RATE_128, DSD_RATE_256, "DSD128->256 UP" },
+        { DSD_RATE_256, DSD_RATE_512, "DSD256->512 UP" },
+        { DSD_RATE_128, DSD_RATE_64,  "DSD128->64 DN"  },
+        { DSD_RATE_256, DSD_RATE_64,  "DSD256->64 DN"  },
+        { DSD_RATE_512, DSD_RATE_64,  "DSD512->64 DN"  },
+        { DSD_RATE_256, DSD_RATE_128, "DSD256->128 DN" },
+        { DSD_RATE_512, DSD_RATE_256, "DSD512->256 DN" },
+    };
+    int n_paths = sizeof(paths) / sizeof(paths[0]);
+
+    printf("\n    ╔══════════════════════════════════════════════════════════════╗\n");
+    printf("    ║  FIR Improvement: fp32 vs fp64 vs lowpass+fp32/fp64         ║\n");
+    printf("    ╚══════════════════════════════════════════════════════════════╝\n");
+    printf("    %-18s %8s %8s %8s %8s\n", "Path", "A(fp32)", "B(fp64)", "C(lp32)", "D(lp64)");
+
+    for (int p = 0; p < n_paths; p++) {
+        printf("    %-18s", paths[p].name);
+        fflush(stdout);
+        double a = measure_fir_experiment(paths[p].fs_in, paths[p].fs_out, 0, 0);
+        printf(" %7.1f", a); fflush(stdout);
+        double b = measure_fir_experiment(paths[p].fs_in, paths[p].fs_out, 1, 0);
+        printf(" %7.1f", b); fflush(stdout);
+        double c = measure_fir_experiment(paths[p].fs_in, paths[p].fs_out, 0, 1);
+        printf(" %7.1f", c); fflush(stdout);
+        double d = measure_fir_experiment(paths[p].fs_in, paths[p].fs_out, 1, 1);
+        printf(" %7.1f\n", d); fflush(stdout);
+    }
+
+    TEST_ASSERT_TRUE(1, "FIR precision/lowpass experiment completed");
+}
+
+void test_fir_experiment_suite(void) {
+    TEST_SUITE("FIR Experiment");
+    TEST_RUN(test_fir_improvement_experiment);
 }
 
 void test_downsample_sweep_suite(void) {

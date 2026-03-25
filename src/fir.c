@@ -53,8 +53,8 @@ static void ipp_force_avx2(void) {
 #define IPP_HB_KAISER_BETA 12.0   /* ~120 dB stopband */
 
 /* Global half-band taps for GPU sharing */
-float  g_hb_taps[IPP_HB_NTAPS] = {0};
-double g_hb_taps_d[IPP_HB_NTAPS] = {0};
+float  g_hb_taps[IPP_HB_NTAPS_MAX] = {0};
+double g_hb_taps_d[IPP_HB_NTAPS_MAX] = {0};
 int    g_hb_ntaps = IPP_HB_NTAPS;
 static bool g_hb_taps_initialized = false;
 

@@ -13,12 +13,14 @@
 /* Rate conversion chain (up to 9 stages for PCM 44.1k → DSD512) */
 #define FIR_MAX_STAGES 9
 
-/* IPP FIRSR half-band filter length */
+/* IPP half-band filter length (must be odd).
+ * 63 = ~120 dB stopband at beta=12. 127 = sharper transition. 255 = even sharper. */
+#define IPP_HB_NTAPS_MAX 255
 #define IPP_HB_NTAPS 63
 
 /* Global half-band taps (computed once, shared with GPU backend) */
-extern float  g_hb_taps[IPP_HB_NTAPS];
-extern double g_hb_taps_d[IPP_HB_NTAPS];
+extern float  g_hb_taps[IPP_HB_NTAPS_MAX];
+extern double g_hb_taps_d[IPP_HB_NTAPS_MAX];
 extern int    g_hb_ntaps;
 
 typedef struct {
