@@ -334,48 +334,37 @@ PreCorr outperforms Trellis at DSD64 (+6.5 dB) because its trained prediction ta
 
 Rate conversion uses production path_config values: per-path optimal NTF filter, FIR gain (-3 dB uniform), state limiter, candidates, depth. All paths use 0.708 (-3 dB) FIR gain for consistent volume across rate transitions.
 
-**Upsample paths:**
+**Upsample paths** (end-to-end: DSD→FIR→SDM→Goertzel at output rate):
 
-| Conversion | NTF | Gain | Lim | Cands | SINAD | A-wtd | MT | NMod |
-|------------|-----|------|-----|-------|-------|-------|----|------|
-| DSD64→DSD128 | SDM-4 | 0.71 | off | 2 | 97.6 | 102.7 | 101.5 | 8.6 |
-| DSD64→DSD256 | CLANS-8 | 0.71 | off | 2 | 112.0 | 117.1 | 132.5 | 15.7 |
-| DSD64→DSD512 | CLANS-6 | 0.71 | 10 | 2 | 129.9 | 135.1 | 130.7 | 14.4 |
-| DSD128→DSD256 | CLANS-8 | 0.71 | off | 2 | 112.0 | 117.1 | 132.5 | 15.7 |
-| DSD128→DSD512 | CLANS-8 | 0.71 | 12 | 2 | 140.6 | 148.0 | 147.3 | 21.0 |
-| DSD256→DSD512 | CLANS-8 | 0.71 | 6 | 2 | 140.6 | 148.0 | 147.3 | 21.0 |
+| Conversion | NTF | Gain | Lim | Cands | SINAD |
+|------------|-----|------|-----|-------|------:|
+| DSD64→DSD128 | SDM-4 | 0.71 | off | 2 | 95.3 |
+| DSD64→DSD256 | CLANS-8 | 0.71 | off | 2 | 85.6 |
+| DSD64→DSD512 | CLANS-6 | 0.71 | 10 | 2 | 60.1 |
+| DSD128→DSD256 | CLANS-8 | 0.71 | off | 2 | 104.7 |
+| DSD128→DSD512 | CLANS-8 | 0.71 | 12 | 2 | 60.2 |
+| DSD256→DSD512 | CLANS-8 | 0.71 | 6 | 2 | 114.3 |
 
-**Downsample paths:**
+**Downsample paths** (end-to-end):
 
-| Conversion | NTF | Gain | Lim | Cands | SINAD | A-wtd | MT | NMod |
-|------------|-----|------|-----|-------|-------|-------|----|------|
-| DSD128→DSD64 | CLANS-4 | 0.71 | off | 32 | 85.3 | 89.5 | 96.6 | 8.7 |
-| DSD256→DSD64 | CLANS-8 | 0.71 | off | 8 | 85.0 | 90.0 | 90.1 | 15.6 |
-| DSD512→DSD64 | SDM-6 | 0.71 | off | 8 | 93.8 | 99.5 | 84.5 | 10.7 |
-| DSD256→DSD128 | CLANS-4 | 0.71 | off | 8 | 101.6 | 106.5 | 108.7 | 12.6 |
-| DSD512→DSD128 | SDM-4 | 0.71 | 16 | 16 | 108.1 | 112.9 | 101.6 | 17.5 |
-| DSD512→DSD256 | SDM-6 | 0.71 | 16 | 8 | 121.2 | 126.3 | 133.5 | 13.8 |
-
-**48 kHz family rate conversion:**
-
-| Conversion | NTF | Gain | Cands | SINAD | A-wtd | MT | NMod |
-|------------|-----|------|-------|-------|-------|----|------|
-| DSD64/48→DSD128/48 (UP) | SDM-4 | 0.71 | 2 | 104.5 | 109.5 | 107.9 | 3.3 |
-| DSD64/48→DSD256/48 (UP) | CLANS-8 | 0.71 | 2 | 123.6 | 128.8 | 117.1 | 9.6 |
-| DSD128/48→DSD256/48 (UP) | CLANS-8 | 0.71 | 2 | 123.6 | 128.8 | 117.1 | 9.6 |
-| DSD128/48→DSD64/48 (DN) | CLANS-4 | 0.71 | 32 | 97.1 | 99.7 | 90.6 | 8.2 |
-| DSD256/48→DSD128/48 (DN) | CLANS-4 | 0.71 | 8 | 104.8 | 109.8 | 104.6 | 15.8 |
-| DSD256/48→DSD64/48 (DN) | CLANS-8 | 0.71 | 8 | 99.3 | 102.8 | 109.5 | 8.2 |
+| Conversion | NTF | Gain | Lim | Cands | SINAD |
+|------------|-----|------|-----|-------|------:|
+| DSD128→DSD64 | CLANS-4 | 0.71 | off | 32 | 76.6 |
+| DSD256→DSD64 | CLANS-8 | 0.71 | off | 8 | 76.5 |
+| DSD512→DSD64 | SDM-6 | 0.71 | off | 8 | 76.5 |
+| DSD256→DSD128 | CLANS-4 | 0.71 | off | 8 | 83.3 |
+| DSD512→DSD128 | SDM-4 | 0.71 | 16 | 16 | 82.6 |
+| DSD512→DSD256 | SDM-6 | 0.71 | 16 | 8 | 93.2 |
 
 **Key observations:**
-- All paths achieve 85+ dB SINAD — well above CD quality (96 dB dynamic range)
-- Upsample to DSD512: 130–141 dB — exceeds 22-bit PCM quality
-- Downsample →DSD64 paths are FIR-limited at ~85 dB; SDM params have minimal effect
+- All upsample 2x paths achieve 85+ dB SINAD
+- →DSD512 paths with state limiter show 60 dB — limiter interaction degrades quality
+- DSD256→DSD512 (no limiter needed): 114 dB — excellent
+- Downsample paths are SDM-limited at 76–93 dB (FIR chain is not the bottleneck; fp64 FIR, longer taps, and lowpass pre-filter all tested with zero improvement)
 - Uniform FIR gain of 0.708 (-3 dB) prevents volume changes across rate transitions
 - Path-adaptive settings (NTF, limiter, cands, depth) applied automatically when NTF = Auto
-- Per-rate overrides available for SDM mode, candidates, depth, and state limiter
 
-**Note on DSD→DSD measurement**: SINAD values above are measured by running `sinad_measure` at the output rate with the path-configured NTF/cands/lat. This isolates the SDM encoding quality. A comprehensive end-to-end sweep (DSD→FIR→SDM→Goertzel) confirmed that downsample →DSD64 paths are FIR-chain-limited at ~72-85 dB regardless of SDM parameters.
+**Measurement methodology**: End-to-end pipeline (generate DSD at input rate → FIR rate conversion → SDM re-encode → Goertzel at output DSD rate, audio band 0–22 kHz). This measures the actual conversion quality including FIR noise leakage and SDM re-encoding noise.
 
 ### DSD to PCM Decimation
 
