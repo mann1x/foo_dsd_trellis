@@ -109,12 +109,11 @@ static size_t generate_dsd_sine(uint32_t dsd_rate, double freq_hz,
 
 /* ─── Measure SINAD for a rate conversion path ─── */
 
-static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
-    /* Full end-to-end pipeline for all paths:
-     * DSD→DSD: generate DSD @ fs_in → FIR rate conv → SDM re-encode → decimate to PCM → Goertzel
-     * DSD same-rate: generate DSD → FIR lowpass → SDM re-encode → decimate to PCM → Goertzel
-     * No shortcut — measures actual conversion quality, not just SDM encoding quality. */
-
+/* Single-frequency measurement core (no printf). */
+static double measure_rate_sinad_at(uint32_t fs_in, uint32_t fs_out,
+                                     double target_hz,
+                                     const engine_path_info_t *pi,
+                                     int cands, int lat, int depth) {
     unsigned base = rate_is_48k_family(fs_in) ? 48000 : 44100;
     unsigned mult_in = fs_in / base;
     size_t n_in;
@@ -137,30 +136,11 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
         return -999.0;
     }
 
-    /* Query path-adaptive settings (mirrors production engine behavior) */
-    dsd_config_t test_cfg;
-    memset(&test_cfg, 0, sizeof(test_cfg));
-    test_cfg.fs_in = fs_in;
-    test_cfg.fs_out = fs_out;
-    test_cfg.trellis_depth = SINAD_TRELLIS_DEPTH;
-    test_cfg.trellis_cands = SINAD_TRELLIS_CANDS;
-    test_cfg.trellis_lat = SINAD_TRELLIS_LAT;
-
-    engine_path_info_t pi;
-    engine_get_path_info(fs_in, fs_out, NTF_AUTO, SDM_MODE_TRELLIS, &test_cfg, &pi);
-
-    /* Use path-resolved values (engine_get_path_info auto-resolves lat/depth) */
-    int cands = pi.cands > 0 ? pi.cands : SINAD_TRELLIS_CANDS;
-    int lat   = pi.lat > 0 ? pi.lat : SINAD_TRELLIS_LAT;
-    int depth = pi.depth > 0 ? pi.depth : SINAD_TRELLIS_DEPTH;
-
-    /* Approximate frequency alignment. Exact alignment done post-SDM
-     * using actual output count (avoids multi-stage FIR delay estimation). */
     size_t est_in = n_in - SINAD_TRELLIS_LAT;
     size_t est_fir = (fs_out >= fs_in) ?
         est_in * (fs_out / fs_in) : est_in / (fs_in / fs_out);
     size_t est_sdm = (est_fir > (size_t)lat) ? est_fir - (size_t)lat : 1024;
-    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm);
+    double freq = bin_align_freq(target_hz, (double)fs_out, est_sdm);
     size_t dsd_in_count = generate_dsd_sine(fs_in, freq, 0.5, n_in, dsd_in);
 
     if (dsd_in_count < 1024) {
@@ -222,23 +202,23 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     /* Apply path-adaptive FIR gain (in fp64 when available, matching engine) */
     if (fir_d_out) {
         /* fp64 path: apply gain in double precision */
-        double gain = (double)pi.fir_gain;
+        double gain = (double)pi->fir_gain;
         if (gain != 1.0) {
             for (size_t i = 0; i < fir_count; i++)
                 fir_d_out[i] *= gain;
         }
     } else {
         /* fp32/lowpass path: apply gain in float */
-        if (pi.fir_gain != 1.0f) {
+        if (pi->fir_gain != 1.0f) {
             for (size_t i = 0; i < fir_count; i++)
-                fir_buf[i] *= pi.fir_gain;
+                fir_buf[i] *= pi->fir_gain;
         }
     }
 
     /* SDM requantize at fs_out with path-adaptive NTF/cands/lat */
     const ntf_filter_t *f_out;
-    if (pi.ntf_filter != NTF_AUTO)
-        f_out = ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, fs_out);
+    if (pi->ntf_filter != NTF_AUTO)
+        f_out = ntf_get_filter((ntf_filter_id_t)pi->ntf_filter, fs_out);
     else
         f_out = ntf_auto_select(fs_out);
     if (!f_out) {
@@ -250,10 +230,9 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
         free(fir_d_out); free(dsd_in); free(fir_buf); free(dsd_out);
         return -999.0;
     }
-    if (pi.state_limit > 0.0)
-        sdm.state_limit = pi.state_limit;
+    if (pi->state_limit > 0.0)
+        sdm.state_limit = pi->state_limit;
 
-    /* Diagnostic: checksum FIR output for DSD128→64 */
     /* Feed SDM: use fp64 FIR output directly (no float truncation) or
      * widen fp32/lowpass output to double */
     double *sdm_in_d;
@@ -281,11 +260,57 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     double sinad_db = (out_count > 1024) ?
         measure_sinad(dsd_out, out_count, freq, (double)fs_out) : -999.0;
 
+    free(dsd_in);
+    free(fir_buf);
+    free(dsd_out);
+
+    return sinad_db;
+}
+
+/* Helper: median of 3 doubles */
+static double median3(double a, double b, double c) {
+    if (a > b) { double t = a; a = b; b = t; }
+    if (b > c) { double t = b; b = c; c = t; }
+    if (a > b) { double t = a; a = b; b = t; }
+    return b;
+}
+
+/* Multi-frequency median SINAD measurement.
+ * Trellis SDMs are chaotic dynamical systems — a few Hz frequency shift
+ * causes dramatically different quantization noise patterns. Measuring at
+ * 3 adjacent frequencies (900, 1000, 1100 Hz) and taking the median gives
+ * a robust quality estimate that is insensitive to individual limit cycles. */
+static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
+    /* Query path-adaptive settings once */
+    dsd_config_t test_cfg;
+    memset(&test_cfg, 0, sizeof(test_cfg));
+    test_cfg.fs_in = fs_in;
+    test_cfg.fs_out = fs_out;
+    test_cfg.trellis_depth = SINAD_TRELLIS_DEPTH;
+    test_cfg.trellis_cands = SINAD_TRELLIS_CANDS;
+    test_cfg.trellis_lat = SINAD_TRELLIS_LAT;
+
+    engine_path_info_t pi;
+    engine_get_path_info(fs_in, fs_out, NTF_AUTO, SDM_MODE_TRELLIS, &test_cfg, &pi);
+
+    int cands = pi.cands > 0 ? pi.cands : SINAD_TRELLIS_CANDS;
+    int lat   = pi.lat > 0 ? pi.lat : SINAD_TRELLIS_LAT;
+    int depth = pi.depth > 0 ? pi.depth : SINAD_TRELLIS_DEPTH;
+
+    /* Measure at 3 frequencies to average out SDM chaotic sensitivity */
+    double s1 = measure_rate_sinad_at(fs_in, fs_out, 900.0, &pi, cands, lat, depth);
+    double s2 = measure_rate_sinad_at(fs_in, fs_out, 1000.0, &pi, cands, lat, depth);
+    double s3 = measure_rate_sinad_at(fs_in, fs_out, 1100.0, &pi, cands, lat, depth);
+    double sinad_db = median3(s1, s2, s3);
+
     unsigned base_in  = rate_is_48k_family(fs_in)  ? 48000 : 44100;
     unsigned base_out = rate_is_48k_family(fs_out) ? 48000 : 44100;
     unsigned rate_in_mult  = fs_in  / base_in;
     unsigned rate_out_mult = fs_out / base_out;
-    const char *dir = (fs_out > fs_in) ? "UP" : "DN";
+    const char *dir;
+    if (fs_out > fs_in) dir = "UP";
+    else if (fs_out < fs_in) dir = "DN";
+    else dir = "same";
     printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB  [%s, gain=%.2f, lim=%s, cands=%d, depth=%d]\n",
            rate_in_mult, rate_out_mult, dir, sinad_db,
            pi.ntf_filter != NTF_AUTO ?
@@ -293,10 +318,6 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
            pi.fir_gain,
            pi.state_limit > 0.0 ? "on" : "off",
            cands, depth);
-
-    free(dsd_in);
-    free(fir_buf);
-    free(dsd_out);
 
     return sinad_db;
 }

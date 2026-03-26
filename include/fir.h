@@ -42,7 +42,7 @@ typedef struct {
     void       *ipp_spec[FIR_MAX_STAGES];   /* IppsFIRSpec_32f* */
     void       *ipp_buf[FIR_MAX_STAGES];    /* Ipp8u* work buffer */
     float      *ipp_dly[FIR_MAX_STAGES];    /* Delay lines (tapsLen-1 floats) */
-    int         ipp_taps_len;               /* Actual filter length */
+    int         ipp_taps[FIR_MAX_STAGES];   /* Per-stage filter length */
 
     /* IPP FIRMR state — fp64 (per stage, polyphase multi-rate) */
     void       *ipp_spec_d[FIR_MAX_STAGES]; /* IppsFIRSpec_64f* */

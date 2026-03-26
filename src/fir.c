@@ -98,28 +98,46 @@ static void design_halfband_kaiser(double *h, int ntaps, double beta) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * Per-stage tap count selection
+ *
+ * The stage operating at the lowest sample rate needs the most taps
+ * (narrower transition band) because DSD noise is concentrated near fs/4.
+ * For upsample: stage 0 is lowest rate. For downsample: last stage is.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static int get_stage_ntaps(int stage_idx, int num_stages, bool upsample) {
+    (void)stage_idx; (void)num_stages; (void)upsample;
+    /* All stages use 63 taps. Per-stage 255/127/63 was tested (2026-03-26) but
+     * caused massive regressions: the trellis SDM is chaotically sensitive to
+     * FIR output signal characteristics. Different tap counts produce different
+     * noise patterns that the SDM handles unpredictably. The path table configs
+     * were optimized for 63-tap FIR output and cannot be easily re-tuned. */
+    return IPP_HB_NTAPS;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  * IPP FIRMR per-stage init/free (polyphase multi-rate)
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static int ipp_firmr_stage_init(fir_chain_t *chain, int stage_idx,
-                                 bool upsample) {
-    double hd[IPP_HB_NTAPS];
-    design_halfband_kaiser(hd, IPP_HB_NTAPS, IPP_HB_KAISER_BETA);
+                                 bool upsample, int ntaps) {
+    double hd[IPP_HB_NTAPS_MAX];
+    design_halfband_kaiser(hd, ntaps, IPP_HB_KAISER_BETA);
 
-    Ipp32f taps[IPP_HB_NTAPS];
-    for (int i = 0; i < IPP_HB_NTAPS; i++)
+    Ipp32f taps[IPP_HB_NTAPS_MAX];
+    for (int i = 0; i < ntaps; i++)
         taps[i] = (Ipp32f)hd[i];
 
-    /* Cache taps globally for GPU backend */
-    if (!g_hb_taps_initialized) {
-        memcpy(g_hb_taps, taps, sizeof(g_hb_taps));
-        memcpy(g_hb_taps_d, hd, sizeof(g_hb_taps_d));
+    /* Cache 63-tap version globally for GPU backend */
+    if (!g_hb_taps_initialized && ntaps == IPP_HB_NTAPS) {
+        memcpy(g_hb_taps, taps, ntaps * sizeof(float));
+        memcpy(g_hb_taps_d, hd, ntaps * sizeof(double));
         g_hb_taps_initialized = true;
     }
 
     /* Upsample: pre-scale taps by 2 to compensate for polyphase energy split */
     if (upsample) {
-        for (int i = 0; i < IPP_HB_NTAPS; i++)
+        for (int i = 0; i < ntaps; i++)
             taps[i] *= 2.0f;
     }
 
@@ -127,7 +145,7 @@ static int ipp_firmr_stage_init(fir_chain_t *chain, int stage_idx,
     int downFactor = upsample ? 1 : 2;
 
     int specSize = 0, bufSize = 0;
-    IppStatus st = ippsFIRMRGetSize(IPP_HB_NTAPS, upFactor, downFactor,
+    IppStatus st = ippsFIRMRGetSize(ntaps, upFactor, downFactor,
                                      ipp32f, &specSize, &bufSize);
     if (st != ippStsNoErr)
         return -1;
@@ -136,7 +154,7 @@ static int ipp_firmr_stage_init(fir_chain_t *chain, int stage_idx,
     if (!spec)
         return -1;
 
-    st = ippsFIRMRInit_32f(taps, IPP_HB_NTAPS, upFactor, 0, downFactor, 0,
+    st = ippsFIRMRInit_32f(taps, ntaps, upFactor, 0, downFactor, 0,
                             spec);
     if (st != ippStsNoErr) {
         ippsFree(spec);
@@ -150,7 +168,7 @@ static int ipp_firmr_stage_init(fir_chain_t *chain, int stage_idx,
     }
     ippsZero_8u(buf, bufSize);  /* Zero work buffer — IPP may read before write on some codepaths */
 
-    int dlyLen = IPP_HB_NTAPS - 1;
+    int dlyLen = ntaps - 1;
     Ipp32f *dly = ippsMalloc_32f(dlyLen);
     if (!dly) {
         ippsFree(buf);
@@ -162,7 +180,7 @@ static int ipp_firmr_stage_init(fir_chain_t *chain, int stage_idx,
     chain->ipp_spec[stage_idx] = spec;
     chain->ipp_buf[stage_idx] = buf;
     chain->ipp_dly[stage_idx] = dly;
-    chain->ipp_taps_len = IPP_HB_NTAPS;
+    chain->ipp_taps[stage_idx] = ntaps;
 
     return 0;
 }
@@ -287,7 +305,7 @@ static size_t ipp_downsample2(fir_chain_t *chain, int stage_idx,
     ippsFIRMR_32f(in, out, (int)numIters, spec, dly, dly, buf);
 
     /* IPP AMD AVX2 dispatch: NaN guard for warmup region (same as fp64 path) */
-    int ntaps = chain->ipp_taps_len;
+    int ntaps = chain->ipp_taps[stage_idx];
     for (int i = 0; i < ntaps && i < (int)numIters; i++) {
         if (out[i] != out[i]) out[i] = 0.0f;
     }
@@ -300,30 +318,36 @@ static size_t ipp_downsample2(fir_chain_t *chain, int stage_idx,
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static void ensure_hb_taps_d(void) {
-    /* Make sure g_hb_taps_d is populated even if fp32 init was never called */
+    /* Make sure g_hb_taps_d is populated even if fp32 init was never called.
+     * Always uses 63-tap version for GPU backend compatibility. */
     if (!g_hb_taps_initialized) {
         double hd[IPP_HB_NTAPS];
         design_halfband_kaiser(hd, IPP_HB_NTAPS, IPP_HB_KAISER_BETA);
         Ipp32f taps_f[IPP_HB_NTAPS];
         for (int i = 0; i < IPP_HB_NTAPS; i++)
             taps_f[i] = (Ipp32f)hd[i];
-        memcpy(g_hb_taps, taps_f, sizeof(g_hb_taps));
-        memcpy(g_hb_taps_d, hd, sizeof(g_hb_taps_d));
+        memcpy(g_hb_taps, taps_f, IPP_HB_NTAPS * sizeof(float));
+        memcpy(g_hb_taps_d, hd, IPP_HB_NTAPS * sizeof(double));
         g_hb_taps_initialized = true;
     }
 }
 
 static int ipp_firmr_stage_init_d(fir_chain_t *chain, int stage_idx,
-                                   bool upsample) {
+                                   bool upsample, int ntaps) {
+    /* Ensure global 63-tap cache is populated for GPU backend */
     ensure_hb_taps_d();
 
-    Ipp64f taps[IPP_HB_NTAPS];
-    for (int i = 0; i < IPP_HB_NTAPS; i++)
-        taps[i] = g_hb_taps_d[i];
+    /* Design filter fresh for this stage's tap count */
+    double hd[IPP_HB_NTAPS_MAX];
+    design_halfband_kaiser(hd, ntaps, IPP_HB_KAISER_BETA);
+
+    Ipp64f taps[IPP_HB_NTAPS_MAX];
+    for (int i = 0; i < ntaps; i++)
+        taps[i] = hd[i];
 
     /* Upsample: pre-scale taps by 2 to compensate for polyphase energy split */
     if (upsample) {
-        for (int i = 0; i < IPP_HB_NTAPS; i++)
+        for (int i = 0; i < ntaps; i++)
             taps[i] *= 2.0;
     }
 
@@ -331,7 +355,7 @@ static int ipp_firmr_stage_init_d(fir_chain_t *chain, int stage_idx,
     int downFactor = upsample ? 1 : 2;
 
     int specSize = 0, bufSize = 0;
-    IppStatus st = ippsFIRMRGetSize(IPP_HB_NTAPS, upFactor, downFactor,
+    IppStatus st = ippsFIRMRGetSize(ntaps, upFactor, downFactor,
                                      ipp64f, &specSize, &bufSize);
     if (st != ippStsNoErr)
         return -1;
@@ -340,7 +364,7 @@ static int ipp_firmr_stage_init_d(fir_chain_t *chain, int stage_idx,
     if (!spec)
         return -1;
 
-    st = ippsFIRMRInit_64f(taps, IPP_HB_NTAPS, upFactor, 0, downFactor, 0,
+    st = ippsFIRMRInit_64f(taps, ntaps, upFactor, 0, downFactor, 0,
                             spec);
     if (st != ippStsNoErr) {
         ippsFree(spec);
@@ -354,7 +378,7 @@ static int ipp_firmr_stage_init_d(fir_chain_t *chain, int stage_idx,
     }
     ippsZero_8u(buf, bufSize);  /* Zero work buffer — IPP may read before write on some codepaths */
 
-    int dlyLen = IPP_HB_NTAPS - 1;
+    int dlyLen = ntaps - 1;
     Ipp64f *dly = ippsMalloc_64f(dlyLen);
     if (!dly) {
         ippsFree(buf);
@@ -366,7 +390,7 @@ static int ipp_firmr_stage_init_d(fir_chain_t *chain, int stage_idx,
     chain->ipp_spec_d[stage_idx] = spec;
     chain->ipp_buf_d[stage_idx] = buf;
     chain->ipp_dly_d[stage_idx] = dly;
-    chain->ipp_taps_len = IPP_HB_NTAPS;
+    chain->ipp_taps[stage_idx] = ntaps;
 
     return 0;
 }
@@ -414,7 +438,7 @@ static size_t ipp_downsample2_d(fir_chain_t *chain, int stage_idx,
     /* IPP AMD AVX2 dispatch bug: ippsFIRMR_64f can produce NaN in the first
      * ~32 output samples (delay line warmup region) when heap-allocated buffers
      * have certain alignment. Replace any NaN with 0.0 (warmup period anyway). */
-    int ntaps = chain->ipp_taps_len;
+    int ntaps = chain->ipp_taps[stage_idx];
     for (int i = 0; i < ntaps && i < (int)numIters; i++) {
         if (out[i] != out[i]) out[i] = 0.0;
     }
@@ -499,10 +523,13 @@ int fir_chain_init_ex(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out,
 
     chain->num_stages = stages;
 
-    /* Init per-stage IPP FIRMR specs (polyphase multi-rate) */
+    /* Init per-stage IPP FIRMR specs (polyphase multi-rate).
+     * Each stage gets a tap count based on its distance from the
+     * lowest-rate stage (most DSD noise near fs/4). */
     if (use_fp64) {
         for (int i = 0; i < stages; i++) {
-            if (ipp_firmr_stage_init_d(chain, i, chain->upsample) != 0) {
+            int ntaps = get_stage_ntaps(i, stages, chain->upsample);
+            if (ipp_firmr_stage_init_d(chain, i, chain->upsample, ntaps) != 0) {
                 for (int j = 0; j < i; j++)
                     ipp_firmr_stage_free_d(chain, j);
                 return -1;
@@ -510,7 +537,8 @@ int fir_chain_init_ex(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out,
         }
     } else {
         for (int i = 0; i < stages; i++) {
-            if (ipp_firmr_stage_init(chain, i, chain->upsample) != 0) {
+            int ntaps = get_stage_ntaps(i, stages, chain->upsample);
+            if (ipp_firmr_stage_init(chain, i, chain->upsample, ntaps) != 0) {
                 for (int j = 0; j < i; j++)
                     ipp_firmr_stage_free(chain, j);
                 return -1;
@@ -632,20 +660,21 @@ size_t fir_chain_process_d(fir_chain_t *chain,
 }
 
 void fir_chain_reset(fir_chain_t *chain) {
-    if (chain->has_demod && chain->demod_dly)
-        ippsZero_32f(chain->demod_dly, chain->ipp_taps_len - 1);
-
-    int dlyLen = chain->ipp_taps_len - 1;
-    if (dlyLen <= 0) return;
+    if (chain->has_demod && chain->demod_dly) {
+        /* Demod always uses IPP_HB_NTAPS (63) */
+        ippsZero_32f(chain->demod_dly, IPP_HB_NTAPS - 1);
+    }
 
     if (chain->use_fp64) {
         for (int i = 0; i < chain->num_stages; i++) {
-            if (chain->ipp_dly_d[i])
+            int dlyLen = chain->ipp_taps[i] - 1;
+            if (dlyLen > 0 && chain->ipp_dly_d[i])
                 ippsZero_64f(chain->ipp_dly_d[i], dlyLen);
         }
     } else {
         for (int i = 0; i < chain->num_stages; i++) {
-            if (chain->ipp_dly[i])
+            int dlyLen = chain->ipp_taps[i] - 1;
+            if (dlyLen > 0 && chain->ipp_dly[i])
                 ippsZero_32f(chain->ipp_dly[i], dlyLen);
         }
     }
