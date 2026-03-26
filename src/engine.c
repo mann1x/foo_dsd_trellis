@@ -61,7 +61,7 @@ static const path_config_t path_table[] = {
      * FIR upsampling of ±1 DSD produces peaks at ±2.24. */
     { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 0.708f },
-    { DSD_RATE_64,  DSD_RATE_512, NTF_CLANS_6, 10.0, 2,  0, 4, 0.708f },
+    { DSD_RATE_64,  DSD_RATE_512, NTF_SDM_8,   16.0, 4,  64, 8, 0.708f },  /* sweep: 68.1 dB (was clans-6/lim=10/nc=2: 59) */
     { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_6, 0.0,  4,  0, 4, 0.708f },  /* fp64 sweep: 127.3 dB (was clans-8/nc=2: 54 dB) */
     { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },  /* limiter sweep: 120.3 dB (was clans-8/lim=12: 60 dB) */
     { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 0.708f },
@@ -87,7 +87,7 @@ static const path_config_t path_table[] = {
     /* DSD/48 upsample */
     { DSD48_RATE_64,  DSD48_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },
     { DSD48_RATE_64,  DSD48_RATE_256, NTF_SDM_7,   0.0,  8,  0, 4, 0.708f },  /* fp64 sweep: 91.3 dB (was clans-8/nc=2: 54.6 dB) */
-    { DSD48_RATE_64,  DSD48_RATE_512, NTF_CLANS_6, 10.0, 2,  0, 4, 0.708f },
+    { DSD48_RATE_64,  DSD48_RATE_512, NTF_SDM_8,   16.0, 4,  64, 8, 0.708f },  /* mirror /44 sweep */
     { DSD48_RATE_128, DSD48_RATE_256, NTF_CLANS_6, 0.0,  4,  0, 4, 0.708f },  /* fp64 sweep: 118.6 dB (was clans-8/nc=2: 97 dB) */
     { DSD48_RATE_128, DSD48_RATE_512, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },  /* mirror /44: limiter disabled, clans-6 */
     { DSD48_RATE_256, DSD48_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 0.708f },

@@ -166,7 +166,7 @@ When `Resampler = Auto`, libsoxr is used if `soxr.dll` is present, otherwise fal
 
 ## SINAD Measurement Methodology
 
-**Signal**: Bin-aligned 1 kHz sine wave at amplitude 0.5 (50% full scale). The test frequency is adjusted slightly from 1000 Hz so that it falls exactly on a DFT bin boundary at the output sample rate — this prevents spectral leakage from corrupting the signal power measurement.
+**Signal**: Multi-frequency median of three bin-aligned sine waves (900/1000/1100 Hz) at amplitude 0.5 (50% full scale), for robustness against SDM limit-cycle sensitivity at any single frequency. Each test frequency is adjusted slightly so that it falls exactly on a DFT bin boundary at the output sample rate — this prevents spectral leakage from corrupting the signal power measurement. The median of the three SINAD values is reported.
 
 **Generation**: The test signal is encoded to DSD at the input rate using a Trellis SDM (depth=8, candidates=16, latency=512) with the auto-selected NTF filter for that rate. This produces a 1-bit DSD representation of the sine wave.
 
@@ -338,42 +338,45 @@ Rate conversion uses production path_config values: per-path optimal NTF filter,
 
 | Conversion | NTF | Gain | Lim | Cands | SINAD |
 |------------|-----|------|-----|-------|------:|
-| DSD64→DSD128 | SDM-4 | 0.71 | off | 2 | 91.6 |
-| DSD64→DSD256 | CLANS-8 | 0.71 | off | 2 | 85.3 |
-| DSD64→DSD512 | CLANS-6 | 0.71 | 10 | 2 | 60.1 |
-| DSD128→DSD256 | CLANS-8 | 0.71 | off | 2 | 103.6 |
-| DSD128→DSD512 | CLANS-8 | 0.71 | 12 | 2 | 60.2 |
-| DSD256→DSD512 | CLANS-8 | 0.71 | 6 | 2 | 112.6 |
+| DSD64→DSD128 | SDM-4 | 0.71 | off | 2 | 87.4 |
+| DSD64→DSD256 | CLANS-8 | 0.71 | off | 2 | 54.2 |
+| DSD64→DSD512 | SDM-8 | 0.71 | on | 4 | 60.7 |
+| DSD128→DSD256 | CLANS-6 | 0.71 | off | 4 | 105.9 |
+| DSD128→DSD512 | CLANS-6 | 0.71 | off | 2 | 89.4 |
+| DSD256→DSD512 | CLANS-8 | 0.71 | on | 2 | 114.2 |
 
 **44.1 kHz family — downsample** (end-to-end):
 
 | Conversion | NTF | Gain | Lim | Cands | SINAD |
 |------------|-----|------|-----|-------|------:|
-| DSD128→DSD64 | CLANS-4 | 0.71 | off | 32 | 81.6 |
-| DSD256→DSD64 | CLANS-8 | 0.71 | off | 8 | 74.6 |
-| DSD512→DSD64 | SDM-6 | 0.71 | off | 8 | 69.0 |
-| DSD256→DSD128 | CLANS-4 | 0.71 | off | 8 | 87.1 |
-| DSD512→DSD128 | SDM-4 | 0.71 | 16 | 16 | 86.1 |
-| DSD512→DSD256 | SDM-6 | 0.71 | 16 | 8 | 95.5 |
+| DSD128→DSD64 | CLANS-4 | 0.71 | off | 32 | 67.3 |
+| DSD256→DSD64 | CLANS-8 | 0.71 | off | 8 | 73.0 |
+| DSD512→DSD64 | SDM-6 | 0.71 | off | 8 | 67.7 |
+| DSD256→DSD128 | CLANS-6 | 0.71 | off | 2 | 86.0 |
+| DSD512→DSD128 | SDM-6 | 0.71 | off | 8 | 93.2 |
+| DSD512→DSD256 | SDM-6 | 0.71 | on | 8 | 94.1 |
 
 **48 kHz family — rate conversion** (independently swept):
 
 | Conversion | NTF | Gain | Cands | SINAD |
 |------------|-----|------|-------|------:|
-| DSD128/48→DSD256/48 (UP) | CLANS-8 | 0.71 | 2 | 101.6 |
-| DSD128/48→DSD64/48 (DN) | CLANS-4 | 0.71 | 32 | 73.7 |
-| DSD256/48→DSD64/48 (DN) | CLANS-8 | 0.71 | 8 | 80.5 |
-| DSD256/48→DSD128/48 (DN) | SDM-7 | 0.71 | 2 | 100.0 |
+| DSD64/48→DSD128/48 (UP) | SDM-4 | 0.71 | 2 | 94.7 |
+| DSD64/48→DSD256/48 (UP) | SDM-7 | 0.71 | 8 | 82.9 |
+| DSD128/48→DSD256/48 (UP) | CLANS-6 | 0.71 | 4 | 107.2 |
+| DSD128/48→DSD64/48 (DN) | CLANS-4 | 0.71 | 32 | 71.1 |
+| DSD256/48→DSD64/48 (DN) | CLANS-8 | 0.71 | 8 | 72.9 |
+| DSD256/48→DSD128/48 (DN) | SDM-6 | 0.71 | 8 | 81.2 |
 
 **Key observations:**
-- Upsample 2x paths: 86–104 dB SINAD — excellent quality
-- →DSD512 paths with state limiter: 60 dB — limiter interaction degrades quality
-- DSD256→DSD512 (limiter not triggered): 113 dB
-- Downsample paths: 69–96 dB. fp64 FIR is critical (fp32 loses 3–40 dB on multi-stage paths)
-- 48k family independently swept — SDM-7/nc=2 for DSD256/48→DSD128/48: 100 dB
-- Uniform FIR gain of 0.708 (-3 dB) prevents volume changes across rate transitions
+- Upsample 2x paths: 87–106 dB SINAD — excellent quality
+- DSD128→DSD512: 89 dB — 127-tap first FIR stage broke the 60 dB floor (+29 dB)
+- DSD256→DSD512: 114 dB — single-step upsample preserves quality
+- DSD64→DSD512: 61 dB — 3-stage 8x chain fundamentally limited by DSD64 noise density
+- Downsample paths: 67–94 dB. fp64 FIR is critical (fp32 loses 3–40 dB on multi-stage paths)
+- 48k family independently swept — SDM-6/nc=8 for DSD256/48→DSD128/48: 81 dB
+- Per-stage FIR taps: 127-tap first stage for →DSD512 upsample, 63-tap elsewhere
 
-**Measurement methodology**: End-to-end pipeline (generate DSD at input rate → fp64 FIR rate conversion → SDM re-encode → Goertzel at output DSD rate, audio band 0–22 kHz). fp64 FIR matches production (Auto=fp64). DSD64/48 upsample paths omitted (anomalous — under investigation).
+**Measurement methodology**: End-to-end pipeline (generate DSD at input rate → fp64 FIR rate conversion → SDM re-encode → Goertzel at output DSD rate, audio band 0–22 kHz). fp64 FIR matches production (Auto=fp64). Multi-frequency median (900/1000/1100 Hz) used for robustness against SDM limit-cycle sensitivity.
 
 ### DSD to PCM Decimation
 

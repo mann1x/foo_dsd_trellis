@@ -3403,6 +3403,70 @@ static void test_dsd512_limiter_sweep(void) {
     TEST_ASSERT_TRUE(1, "DSD512 limiter sweep completed");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * DSD64→DSD512 focused sweep: NTF × nc × limiter (with 127-tap FIR)
+ * ═══════════════════════════════════════════════════════════════════════ */
+static void test_dsd64_to_512_sweep(void) {
+    static const ntf_filter_id_t filters[] = {
+        NTF_CLANS_5, NTF_SDM_5, NTF_CLANS_6, NTF_SDM_6,
+        NTF_CLANS_7, NTF_SDM_7, NTF_CLANS_8, NTF_SDM_8
+    };
+    static const int n_filters = sizeof(filters) / sizeof(filters[0]);
+    static const int nc_vals[] = { 2, 4, 8 };
+    static const int n_nc = 3;
+    static const double limits[] = { 0.0, 6.0, 10.0, 16.0 };
+    static const int n_limits = 4;
+
+    printf("\n=== DSD64->DSD512 NTF x nc x limiter sweep ===\n");
+
+    ntf_filter_id_t best_f = NTF_CLANS_6;
+    int best_nc = 2;
+    double best_lim = 10.0;
+    double best_s = -999.0;
+
+    for (int f = 0; f < n_filters; f++) {
+        const ntf_filter_t *ft = ntf_get_filter(filters[f], DSD_RATE_512);
+        for (int n = 0; n < n_nc; n++) {
+            for (int l = 0; l < n_limits; l++) {
+                double s = measure_rateconv_sinad(
+                    DSD_RATE_64, DSD_RATE_512,
+                    filters[f], nc_vals[n], 4, 128, limits[l], 0.708f);
+                printf("  %-9s nc=%-2d lim=%4.1f: %.1f dB\n",
+                       ft ? ft->name : "?", nc_vals[n], limits[l], s);
+                fflush(stdout);
+                if (s > best_s) {
+                    best_s = s; best_f = filters[f];
+                    best_nc = nc_vals[n]; best_lim = limits[l];
+                }
+            }
+        }
+    }
+
+    const ntf_filter_t *bft = ntf_get_filter(best_f, DSD_RATE_512);
+    printf("\n  Winner: %s nc=%d lim=%.1f → %.1f dB\n",
+           bft ? bft->name : "?", best_nc, best_lim, best_s);
+
+    /* Phase 2: depth x lat on winner */
+    static const int depths[] = { 4, 8, 16 };
+    static const int lats[] = { 32, 64, 128 };
+    double best_s2 = best_s;
+    int best_d = 4, best_l = 128;
+    printf("\n  Phase 2: depth x lat\n");
+    for (int d = 0; d < 3; d++) {
+        for (int ll = 0; ll < 3; ll++) {
+            double s = measure_rateconv_sinad(
+                DSD_RATE_64, DSD_RATE_512,
+                best_f, best_nc, depths[d], lats[ll], best_lim, 0.708f);
+            printf("  d=%-2d lat=%-3d: %.1f dB\n", depths[d], lats[ll], s);
+            fflush(stdout);
+            if (s > best_s2) { best_s2 = s; best_d = depths[d]; best_l = lats[ll]; }
+        }
+    }
+    printf("\n  Final: %s nc=%d lim=%.1f d=%d lat=%d → %.1f dB\n",
+           bft ? bft->name : "?", best_nc, best_lim, best_d, best_l, best_s2);
+    TEST_ASSERT_TRUE(1, "DSD64->512 sweep completed");
+}
+
 void test_downsample_sweep_suite(void) {
     TEST_SUITE("Downsample Sweep");
     TEST_RUN(test_downsample_sweep);
@@ -3410,6 +3474,7 @@ void test_downsample_sweep_suite(void) {
     TEST_RUN(test_fp64_resweep);
     TEST_RUN(test_64_48_to_256_48_sweep);
     TEST_RUN(test_dsd512_limiter_sweep);
+    TEST_RUN(test_dsd64_to_512_sweep);
 }
 
 void test_rate_sweep_suite(void) {
