@@ -2842,9 +2842,88 @@ static void test_fir_improvement_experiment(void) {
     TEST_ASSERT_TRUE(1, "FIR precision/lowpass experiment completed");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * NTF Candidate Testing (pydelsig-generated NTFs)
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static double test_ntf_sinad(const ntf_filter_t *f, uint32_t dsd_rate,
+                              int depth, int cands, int lat) {
+    size_t n = (dsd_rate / 44100 <= 64) ? 262144 :
+               (dsd_rate / 44100 <= 128) ? 524288 : 1048576;
+    float *out = (float *)calloc(n, sizeof(float));
+    if (!out) return -999.0;
+
+    sdm_context_t ctx;
+    if (sdm_context_init(&ctx, f, depth, cands, lat) != 0) { free(out); return -999.0; }
+
+    double *sine = (double *)malloc(n * sizeof(double));
+    if (!sine) { sdm_context_free(&ctx); free(out); return -999.0; }
+    double freq = bin_align_freq(1000.0, (double)dsd_rate, n - lat);
+    for (size_t i = 0; i < n; i++)
+        sine[i] = 0.5 * sin(2.0 * M_PI * freq * (double)i / (double)dsd_rate);
+    size_t produced = sdm_process_block(&ctx, sine, out, n);
+    free(sine);
+    sdm_context_free(&ctx);
+
+    if (produced < 1024) { free(out); return -999.0; }
+    freq = bin_align_freq(freq, (double)dsd_rate, produced);
+    double sinad = measure_sinad(out, produced, freq, (double)dsd_rate);
+    free(out);
+    return sinad;
+}
+
+static void test_pydelsig_ntf_candidates(void) {
+    /* pydelsig-generated NTFs (reversed a[], zero-interleaved g[]) */
+    static const ntf_filter_t candidates[] = {
+      { { 5.56285181e-01, 2.50809320e-01, 5.67247036e-02, 1.00372674e-02, 1.05328380e-03, 5.59904858e-05 },
+        { 2.09475548e-03, 0, 1.05336853e-03, 0, 1.37198910e-04, 0 },
+        6, 2822400, "opt1-h15" },
+      { { 7.50410415e-01, 6.23302293e-01, 2.18968155e-01, 6.86702761e-02, 1.15867896e-02, 1.05133287e-03 },
+        { 2.09475548e-03, 0, 1.05336853e-03, 0, 1.37198910e-04, 0 },
+        6, 2822400, "opt1-h20" },
+      { { 8.40262670e-01, 9.65403526e-01, 4.16382876e-01, 1.75614505e-01, 3.75659037e-02, 4.45647920e-03 },
+        { 2.09475548e-03, 0, 1.05336853e-03, 0, 1.37198910e-04, 0 },
+        6, 2822400, "opt1-h25" },
+      { { 7.50000000e-01, 6.25393860e-01, 2.19242324e-01, 6.91331866e-02, 1.15576735e-02, 1.05422766e-03 },
+        { 0, 0, 0, 0, 0, 0 },
+        6, 2822400, "opt0-h20" },
+      { { 8.40000005e-01, 9.67376466e-01, 4.16556688e-01, 1.76250195e-01, 3.74850761e-02, 4.46051626e-03 },
+        { 0, 0, 0, 0, 0, 0 },
+        6, 2822400, "opt0-h25" },
+      { { 5.56553351e-01, 2.50929241e-01, 5.76763359e-02, 1.11272300e-02, 1.42854237e-03, 1.35736774e-04, 8.51829433e-06, 2.54758348e-07 },
+        { 2.22159111e-03, 0, 1.52910719e-03, 0, 6.65451549e-04, 0, 8.10795197e-05, 0 },
+        8, 2822400, "o8-opt1-h15" },
+      { { 7.50561643e-01, 6.27518403e-01, 2.24613788e-01, 7.82652033e-02, 1.60789148e-02, 2.70150491e-03, 2.73158861e-04, 1.41349628e-05 },
+        { 2.22159111e-03, 0, 1.52910719e-03, 0, 6.65451549e-04, 0, 8.10795197e-05, 0 },
+        8, 2822400, "o8-opt1-h20" },
+    };
+    int n_cands = sizeof(candidates) / sizeof(candidates[0]);
+
+    /* Also test existing best: CLANS-6 @ DSD64 */
+    const ntf_filter_t *clans6 = ntf_get_filter(NTF_CLANS_6, DSD_RATE_64);
+
+    printf("\n    NTF Candidate SINAD Test (DSD64, depth=16, nc=2, lat=32)\n");
+    printf("    %-16s %8s\n", "Name", "SINAD");
+
+    if (clans6) {
+        double s = test_ntf_sinad(clans6, DSD_RATE_64, 16, 2, 32);
+        printf("    %-16s %7.1f dB  (existing)\n", clans6->name, s);
+    }
+
+    for (int i = 0; i < n_cands; i++) {
+        int d = (candidates[i].order <= 6) ? 16 : 8;
+        double s = test_ntf_sinad(&candidates[i], DSD_RATE_64, d, 2, 32);
+        printf("    %-16s %7.1f dB\n", candidates[i].name, s);
+        fflush(stdout);
+    }
+
+    TEST_ASSERT_TRUE(1, "NTF candidate test completed");
+}
+
 void test_fir_experiment_suite(void) {
     TEST_SUITE("FIR Experiment");
     TEST_RUN(test_fir_improvement_experiment);
+    TEST_RUN(test_pydelsig_ntf_candidates);
 }
 
 void test_downsample_sweep_suite(void) {
