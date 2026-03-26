@@ -147,7 +147,7 @@ static void open_test_log(const char *exe_path) {
     } else {
         strcpy_s(log_path, sizeof(log_path), "foo_dsd_trellis_test.log");
     }
-    fopen_s(&g_log_fp, log_path, "w");
+    g_log_fp = _fsopen(log_path, "w", 0x20 /* _SH_DENYWR — allow concurrent reads */);
     setvbuf(stdout, NULL, _IONBF, 0);
 }
 
@@ -157,6 +157,7 @@ static void close_test_log(void) {
 
 /* Override printf to also write to log file */
 #include <stdarg.h>
+#include <share.h>
 int test_printf(const char *fmt, ...) {
     va_list args, args2;
     va_start(args, fmt);

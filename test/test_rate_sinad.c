@@ -168,49 +168,71 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
         return -999.0;
     }
 
-    /* FIR processing: rate conversion uses fir_chain, same-rate uses lowpass */
+    /* FIR processing: rate conversion uses fir_chain (fp64), same-rate uses lowpass.
+     * Production engine keeps fp64 FIR output as double all the way to SDM —
+     * no float truncation. Match that here. */
     size_t fir_count;
+    double *fir_d_out = NULL;  /* fp64 output (kept alive for SDM input) */
     if (fs_in == fs_out) {
-        /* Same-rate: FIR lowpass smoothing (matches engine's fir_lowpass path) */
+        /* Same-rate: FIR lowpass smoothing (matches engine's fir_lowpass path).
+         * Lowpass takes double in/out — keep as double for SDM. */
         fir_lowpass_t lp;
         memset(&lp, 0, sizeof(lp));
         if (fir_lowpass_init(&lp, fs_in) != 0) {
             free(dsd_in); free(fir_buf); free(dsd_out);
             return -999.0;
         }
-        fir_count = fir_lowpass_process(&lp, dsd_in, fir_buf, dsd_in_count);
+        double *lp_d_in = (double *)malloc(dsd_in_count * sizeof(double));
+        fir_d_out = (double *)malloc(max_out * sizeof(double));
+        if (!lp_d_in || !fir_d_out) {
+            free(lp_d_in); free(fir_d_out); free(dsd_in); free(fir_buf); free(dsd_out);
+            fir_lowpass_free(&lp); fir_d_out = NULL; return -999.0;
+        }
+        for (size_t i = 0; i < dsd_in_count; i++)
+            lp_d_in[i] = (double)dsd_in[i];
+        fir_count = fir_lowpass_process(&lp, lp_d_in, fir_d_out, dsd_in_count);
+        free(lp_d_in);
         fir_lowpass_free(&lp);
     } else {
-        /* Rate conversion: fp64 FIR chain (matches production Auto=fp64) */
+        /* Rate conversion: fp64 FIR chain (matches production Auto=fp64).
+         * Keep output as double — no float truncation, matching engine.c. */
         fir_chain_t fir;
         if (fir_chain_init_ex(&fir, fs_in, fs_out, true) != 0) {
             free(dsd_in); free(fir_buf); free(dsd_out);
             return -999.0;
         }
         double *fir_d_in = (double *)malloc(dsd_in_count * sizeof(double));
-        double *fir_d_out = (double *)malloc(max_out * sizeof(double));
+        fir_d_out = (double *)malloc(max_out * sizeof(double));
         if (!fir_d_in || !fir_d_out) {
             free(fir_d_in); free(fir_d_out); free(dsd_in); free(fir_buf); free(dsd_out);
-            fir_chain_free(&fir); return -999.0;
+            fir_chain_free(&fir); fir_d_out = NULL; return -999.0;
         }
         for (size_t i = 0; i < dsd_in_count; i++)
             fir_d_in[i] = (double)dsd_in[i];
         fir_count = fir_chain_process_d(&fir, fir_d_in, fir_d_out, dsd_in_count);
-        for (size_t i = 0; i < fir_count; i++)
-            fir_buf[i] = (float)fir_d_out[i];
-        free(fir_d_in); free(fir_d_out);
+        free(fir_d_in);
         fir_chain_free(&fir);
     }
 
     if (fir_count < 1024) {
-        free(dsd_in); free(fir_buf); free(dsd_out);
+        free(fir_d_out); free(dsd_in); free(fir_buf); free(dsd_out);
         return -999.0;
     }
 
-    /* Apply path-adaptive FIR gain */
-    if (pi.fir_gain != 1.0f) {
-        for (size_t i = 0; i < fir_count; i++)
-            fir_buf[i] *= pi.fir_gain;
+    /* Apply path-adaptive FIR gain (in fp64 when available, matching engine) */
+    if (fir_d_out) {
+        /* fp64 path: apply gain in double precision */
+        double gain = (double)pi.fir_gain;
+        if (gain != 1.0) {
+            for (size_t i = 0; i < fir_count; i++)
+                fir_d_out[i] *= gain;
+        }
+    } else {
+        /* fp32/lowpass path: apply gain in float */
+        if (pi.fir_gain != 1.0f) {
+            for (size_t i = 0; i < fir_count; i++)
+                fir_buf[i] *= pi.fir_gain;
+        }
     }
 
     /* SDM requantize at fs_out with path-adaptive NTF/cands/lat */
@@ -220,20 +242,29 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     else
         f_out = ntf_auto_select(fs_out);
     if (!f_out) {
-        free(dsd_in); free(fir_buf); free(dsd_out);
+        free(fir_d_out); free(dsd_in); free(fir_buf); free(dsd_out);
         return -999.0;
     }
     sdm_context_t sdm;
     if (sdm_context_init(&sdm, f_out, depth, cands, lat) != 0) {
-        free(dsd_in); free(fir_buf); free(dsd_out);
+        free(fir_d_out); free(dsd_in); free(fir_buf); free(dsd_out);
         return -999.0;
     }
     if (pi.state_limit > 0.0)
         sdm.state_limit = pi.state_limit;
-    double *sdm_in_d = float_to_double(fir_buf, fir_count);
-    if (!sdm_in_d) { sdm_context_free(&sdm); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+
+    /* Feed SDM: use fp64 FIR output directly (no float truncation) or
+     * widen fp32/lowpass output to double */
+    double *sdm_in_d;
+    if (fir_d_out) {
+        sdm_in_d = fir_d_out;  /* already fp64 — use directly */
+    } else {
+        sdm_in_d = float_to_double(fir_buf, fir_count);
+        if (!sdm_in_d) { sdm_context_free(&sdm); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+    }
     size_t out_count = sdm_process_block(&sdm, sdm_in_d, dsd_out, fir_count);
-    free(sdm_in_d);
+    if (!fir_d_out) free(sdm_in_d);  /* only free if we allocated via float_to_double */
+    free(fir_d_out);
     sdm_context_free(&sdm);
 
     if (out_count < 1024) {
@@ -2478,36 +2509,138 @@ static double measure_downsample_sinad(uint32_t fs_in, uint32_t fs_out,
     sdm_context_free(&gen);
     if (dsd_in_count < 512) { free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
 
-    /* FIR downsample */
+    /* FIR downsample (fp64, matching production Auto=fp64) */
     fir_chain_t fir;
-    if (fir_chain_init(&fir, fs_in, fs_out) != 0) {
+    if (fir_chain_init_ex(&fir, fs_in, fs_out, true) != 0) {
         free(dsd_in); free(fir_buf); free(dsd_out); return -999.0;
     }
-    size_t fir_count = fir_chain_process(&fir, dsd_in, fir_buf, dsd_in_count);
+    double *fir_d_in = (double *)malloc(dsd_in_count * sizeof(double));
+    double *fir_d_out = (double *)malloc(max_out * sizeof(double));
+    if (!fir_d_in || !fir_d_out) {
+        free(fir_d_in); free(fir_d_out); free(dsd_in); free(fir_buf); free(dsd_out);
+        fir_chain_free(&fir); return -999.0;
+    }
+    for (size_t i = 0; i < dsd_in_count; i++)
+        fir_d_in[i] = (double)dsd_in[i];
+    size_t fir_count = fir_chain_process_d(&fir, fir_d_in, fir_d_out, dsd_in_count);
+    free(fir_d_in);
     fir_chain_free(&fir);
-    if (fir_count < 512) { free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+    if (fir_count < 512) { free(fir_d_out); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
 
-    /* Apply gain */
-    if (gain != 1.0f)
+    /* Apply gain in fp64 */
+    if (gain != 1.0f) {
+        double g = (double)gain;
         for (size_t i = 0; i < fir_count; i++)
-            fir_buf[i] *= gain;
+            fir_d_out[i] *= g;
+    }
 
     /* SDM re-encode with specified params */
     const ntf_filter_t *f_out = ntf_get_filter(filter_id, fs_out);
-    if (!f_out) { free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
+    if (!f_out) { free(fir_d_out); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
     sdm_context_t sdm;
     if (sdm_context_init(&sdm, f_out, (unsigned)depth, (unsigned)nc, (unsigned)lat) != 0) {
-        free(dsd_in); free(fir_buf); free(dsd_out); return -999.0;
+        free(fir_d_out); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0;
     }
-    double *sdm_in_d = float_to_double(fir_buf, fir_count);
-    if (!sdm_in_d) { sdm_context_free(&sdm); free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
-    size_t out_count = sdm_process_block(&sdm, sdm_in_d, dsd_out, fir_count);
-    free(sdm_in_d);
+    size_t out_count = sdm_process_block(&sdm, fir_d_out, dsd_out, fir_count);
+    free(fir_d_out);
     sdm_context_free(&sdm);
     if (out_count < 512) { free(dsd_in); free(fir_buf); free(dsd_out); return -999.0; }
 
     double sinad_db = measure_sinad(dsd_out, out_count, freq, (double)fs_out);
     free(dsd_in); free(fir_buf); free(dsd_out);
+    return sinad_db;
+}
+
+/* General rate-conversion SINAD with configurable NTF/nc/depth/lat, fp64 FIR.
+ * Works for both upsample and downsample (buffer sizing handles both). */
+static double measure_rateconv_sinad(uint32_t fs_in, uint32_t fs_out,
+                                      ntf_filter_id_t filter_id,
+                                      int nc, int depth, int lat,
+                                      double state_limit, float gain) {
+    unsigned base = rate_is_48k_family(fs_in) ? 48000 : 44100;
+    unsigned mult_in = fs_in / base;
+    size_t n_in;
+    if (mult_in <= 64)       n_in = 131072;
+    else if (mult_in <= 128) n_in = 262144;
+    else if (mult_in <= 256) n_in = 524288;
+    else                     n_in = 1048576;
+
+    size_t max_out;
+    if (fs_out >= fs_in)
+        max_out = n_in * (fs_out / fs_in) + 4096;
+    else
+        max_out = n_in / 2 + 4096;
+
+    float *dsd_in  = (float *)malloc(n_in * sizeof(float));
+    float *dsd_out = (float *)malloc(max_out * sizeof(float));
+    if (!dsd_in || !dsd_out) {
+        free(dsd_in); free(dsd_out); return -999.0;
+    }
+
+    size_t est_in = n_in - 512;
+    size_t est_fir = (fs_out >= fs_in) ?
+        est_in * (fs_out / fs_in) : est_in / (fs_in / fs_out);
+    size_t est_sdm = (est_fir > (size_t)lat) ? est_fir - (size_t)lat : 512;
+    if (est_sdm < 512) est_sdm = 512;
+    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm);
+
+    const ntf_filter_t *f_in = ntf_auto_select(fs_in);
+    if (!f_in) { free(dsd_in); free(dsd_out); return -999.0; }
+    sdm_context_t gen;
+    if (sdm_context_init(&gen, f_in, 8, 16, 512) != 0) {
+        free(dsd_in); free(dsd_out); return -999.0;
+    }
+    double *sine = (double *)malloc(n_in * sizeof(double));
+    if (!sine) { sdm_context_free(&gen); free(dsd_in); free(dsd_out); return -999.0; }
+    for (size_t i = 0; i < n_in; i++)
+        sine[i] = 0.5 * sin(2.0 * M_PI * freq * (double)i / (double)fs_in);
+    size_t dsd_in_count = sdm_process_block(&gen, sine, dsd_in, n_in);
+    free(sine);
+    sdm_context_free(&gen);
+    if (dsd_in_count < 512) { free(dsd_in); free(dsd_out); return -999.0; }
+
+    /* FIR rate conversion (fp64, matching production) */
+    fir_chain_t fir;
+    if (fir_chain_init_ex(&fir, fs_in, fs_out, true) != 0) {
+        free(dsd_in); free(dsd_out); return -999.0;
+    }
+    double *fir_d_in = (double *)malloc(dsd_in_count * sizeof(double));
+    double *fir_d_out = (double *)malloc(max_out * sizeof(double));
+    if (!fir_d_in || !fir_d_out) {
+        free(fir_d_in); free(fir_d_out); free(dsd_in); free(dsd_out);
+        fir_chain_free(&fir); return -999.0;
+    }
+    for (size_t i = 0; i < dsd_in_count; i++)
+        fir_d_in[i] = (double)dsd_in[i];
+    size_t fir_count = fir_chain_process_d(&fir, fir_d_in, fir_d_out, dsd_in_count);
+    free(fir_d_in);
+    fir_chain_free(&fir);
+    if (fir_count < 512) { free(fir_d_out); free(dsd_in); free(dsd_out); return -999.0; }
+
+    /* Apply gain in fp64 */
+    if (gain != 1.0f) {
+        double g = (double)gain;
+        for (size_t i = 0; i < fir_count; i++)
+            fir_d_out[i] *= g;
+    }
+
+    /* SDM re-encode */
+    const ntf_filter_t *f_out = ntf_get_filter(filter_id, fs_out);
+    if (!f_out) { free(fir_d_out); free(dsd_in); free(dsd_out); return -999.0; }
+    sdm_context_t sdm;
+    if (sdm_context_init(&sdm, f_out, (unsigned)depth, (unsigned)nc, (unsigned)lat) != 0) {
+        free(fir_d_out); free(dsd_in); free(dsd_out); return -999.0;
+    }
+    if (state_limit > 0.0)
+        sdm.state_limit = state_limit;
+    size_t out_count = sdm_process_block(&sdm, fir_d_out, dsd_out, fir_count);
+    free(fir_d_out);
+    sdm_context_free(&sdm);
+    if (out_count < 512) { free(dsd_in); free(dsd_out); return -999.0; }
+
+    freq = bin_align_freq(freq, (double)fs_out, out_count);
+    double sinad_db = measure_sinad(dsd_out, out_count, freq, (double)fs_out);
+    free(dsd_in); free(dsd_out);
     return sinad_db;
 }
 
@@ -3019,10 +3152,126 @@ static void test_48k_downsample_sweep(void) {
     TEST_ASSERT_TRUE(1, "48k downsample sweep completed");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * fp64 Re-sweep: paths that regressed after removing float truncation
+ * ═══════════════════════════════════════════════════════════════════════ */
+static void test_fp64_resweep(void) {
+    typedef struct {
+        uint32_t fs_in, fs_out;
+        const char *name;
+    } path_t;
+
+    /* Paths that regressed when switching to fp64-direct pipeline */
+    static const path_t paths[] = {
+        { DSD_RATE_128, DSD_RATE_256,   "128->256 /44"    },
+        { DSD48_RATE_256, DSD48_RATE_128, "256->128 /48"  },
+        /* Also check these for potential improvement */
+        { DSD_RATE_256, DSD_RATE_128,   "256->128 /44"    },
+        { DSD_RATE_512, DSD_RATE_128,   "512->128 /44"    },
+        { DSD48_RATE_128, DSD48_RATE_256, "128->256 /48"  },
+    };
+    static const int n_paths = sizeof(paths) / sizeof(paths[0]);
+
+    static const ntf_filter_id_t filters[] = {
+        NTF_CLANS_4, NTF_SDM_4, NTF_CLANS_5, NTF_SDM_5,
+        NTF_CLANS_6, NTF_SDM_6, NTF_CLANS_7, NTF_SDM_7,
+        NTF_CLANS_8, NTF_SDM_8
+    };
+    static const int n_filters = sizeof(filters) / sizeof(filters[0]);
+
+    static const int nc_vals[] = { 2, 4, 8, 16, 32 };
+    static const int n_nc = sizeof(nc_vals) / sizeof(nc_vals[0]);
+
+    printf("\n=== fp64 Re-sweep: NTF x nc (Phase 1) ===\n");
+
+    struct { ntf_filter_id_t filter; int nc; double sinad; } best[5];
+    for (int p = 0; p < n_paths; p++)
+        best[p].sinad = -999.0;
+
+    for (int f = 0; f < n_filters; f++) {
+        const ntf_filter_t *ft = ntf_get_filter(filters[f], DSD_RATE_128);
+        const char *fn = ft ? ft->name : "?";
+
+        for (int n = 0; n < n_nc; n++) {
+            printf("  %-9s nc=%-2d:", fn, nc_vals[n]);
+            fflush(stdout);
+
+            for (int p = 0; p < n_paths; p++) {
+                double s = measure_rateconv_sinad(
+                    paths[p].fs_in, paths[p].fs_out,
+                    filters[f], nc_vals[n], 4, 128, 0.0, 0.708f);
+                printf("  %6.1f", s);
+                if (s > best[p].sinad) {
+                    best[p].sinad = s;
+                    best[p].filter = filters[f];
+                    best[p].nc = nc_vals[n];
+                }
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+    }
+
+    printf("\n  Phase 1 winners:\n");
+    for (int p = 0; p < n_paths; p++) {
+        const ntf_filter_t *ft = ntf_get_filter(best[p].filter, DSD_RATE_128);
+        printf("    %-16s %-10s nc=%-2d  %.1f dB\n",
+               paths[p].name, ft ? ft->name : "?", best[p].nc, best[p].sinad);
+    }
+
+    /* Phase 2: depth x lat on winners */
+    static const int depths[] = { 4, 8, 16 };
+    static const int n_depths = sizeof(depths) / sizeof(depths[0]);
+    static const int lat_vals[] = { 16, 32, 64, 128 };
+    static const int n_lats = sizeof(lat_vals) / sizeof(lat_vals[0]);
+
+    printf("\n=== fp64 Re-sweep: depth x lat (Phase 2) ===\n");
+
+    struct { int depth; int lat; double sinad; } best2[5];
+    for (int p = 0; p < n_paths; p++) {
+        best2[p].sinad = best[p].sinad;
+        best2[p].depth = 4;
+        best2[p].lat = 128;
+    }
+
+    for (int d = 0; d < n_depths; d++) {
+        for (int l = 0; l < n_lats; l++) {
+            printf("  d=%-2d lat=%-3d:", depths[d], lat_vals[l]);
+            fflush(stdout);
+
+            for (int p = 0; p < n_paths; p++) {
+                double s = measure_rateconv_sinad(
+                    paths[p].fs_in, paths[p].fs_out,
+                    best[p].filter, best[p].nc, depths[d],
+                    lat_vals[l], 0.0, 0.708f);
+                printf("  %6.1f", s);
+                if (s > best2[p].sinad) {
+                    best2[p].sinad = s;
+                    best2[p].depth = depths[d];
+                    best2[p].lat = lat_vals[l];
+                }
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+    }
+
+    printf("\n  Final winners (fp64 pipeline):\n");
+    for (int p = 0; p < n_paths; p++) {
+        const ntf_filter_t *ft = ntf_get_filter(best[p].filter, DSD_RATE_128);
+        printf("    %-16s %-10s nc=%-2d d=%-2d lat=%-3d  %.1f dB\n",
+               paths[p].name, ft ? ft->name : "?", best[p].nc,
+               best2[p].depth, best2[p].lat, best2[p].sinad);
+    }
+
+    TEST_ASSERT_TRUE(1, "fp64 re-sweep completed");
+}
+
 void test_downsample_sweep_suite(void) {
     TEST_SUITE("Downsample Sweep");
     TEST_RUN(test_downsample_sweep);
     TEST_RUN(test_48k_downsample_sweep);
+    TEST_RUN(test_fp64_resweep);
 }
 
 void test_rate_sweep_suite(void) {
