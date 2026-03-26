@@ -396,12 +396,12 @@ static void log_set_enabled(bool enabled) {
     LeaveCriticalSection(&g_log_cs);
 }
 
-/* Use foo_dsd_processor's GUID so foo_input_sacd's autoproxy_dsp
- * whitelist allows us to modify DoP data.
- * {C5F65473-79C6-466E-9F6B-AFA46F87249E} */
+/* Our own GUID — added to foo_input_sacd's autoproxy_dsp whitelist
+ * in v2.0.19-1. No longer need to impersonate foo_dsd_processor.
+ * {7B3A4E5C-2D1F-4A8B-9C6E-3F5D8A2B1E7C} */
 static const GUID g_dsp_guid =
-    { 0xc5f65473, 0x79c6, 0x466e,
-      { 0x9f, 0x6b, 0xaf, 0xa4, 0x6f, 0x87, 0x24, 0x9e } };
+    { 0x7b3a4e5c, 0x2d1f, 0x4a8b,
+      { 0x9c, 0x6e, 0x3f, 0x5d, 0x8a, 0x2b, 0x1e, 0x7c } };
 
 /* ─── Preset serialization using dsp_preset_builder/parser ─── */
 

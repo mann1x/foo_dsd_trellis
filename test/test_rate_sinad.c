@@ -2926,9 +2926,81 @@ void test_fir_experiment_suite(void) {
     TEST_RUN(test_pydelsig_ntf_candidates);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * DSD/48 Downsample NTF+nc Sweep (same methodology as /44 sweep)
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static void test_48k_downsample_sweep(void) {
+    typedef struct { uint32_t fs_in, fs_out; const char *name; } dn_path_t;
+    static const dn_path_t paths[] = {
+        { DSD48_RATE_128, DSD48_RATE_64,  "128/48->64/48"  },
+        { DSD48_RATE_256, DSD48_RATE_64,  "256/48->64/48"  },
+        { DSD48_RATE_256, DSD48_RATE_128, "256/48->128/48" },
+    };
+    int n_paths = sizeof(paths) / sizeof(paths[0]);
+
+    static const ntf_filter_id_t filters[] = {
+        NTF_CLANS_4, NTF_SDM_4, NTF_CLANS_5, NTF_SDM_5,
+        NTF_CLANS_6, NTF_SDM_6, NTF_CLANS_7, NTF_SDM_7,
+        NTF_CLANS_8, NTF_SDM_8,
+    };
+    static const char *fnames[] = {
+        "clans-4","sdm-4","clans-5","sdm-5","clans-6","sdm-6",
+        "clans-7","sdm-7","clans-8","sdm-8",
+    };
+    int n_filters = 10;
+    static const int nc_vals[] = { 2, 4, 8, 16, 32 };
+    int n_nc = 5;
+
+    printf("\n    DSD/48 Downsample NTF x nc Sweep (d=4, lat=128, gain=0.708)\n");
+    printf("    %d paths x %d NTFs x %d nc = %d measurements\n\n",
+           n_paths, n_filters, n_nc, n_paths * n_filters * n_nc);
+
+    typedef struct { ntf_filter_id_t filter; int nc; double sinad; } best_t;
+    best_t best[3];
+    for (int p = 0; p < n_paths; p++) best[p].sinad = -999.0;
+
+    for (int p = 0; p < n_paths; p++) {
+        printf("    --- %s ---\n", paths[p].name);
+        printf("    %-10s", "NTF\\nc");
+        for (int n = 0; n < n_nc; n++) printf("  nc=%-3d", nc_vals[n]);
+        printf("   best\n");
+
+        for (int f = 0; f < n_filters; f++) {
+            printf("    %-10s", fnames[f]);
+            double row_best = -999.0; int row_nc = 0;
+            for (int n = 0; n < n_nc; n++) {
+                fflush(stdout);
+                double s = measure_downsample_sinad(
+                    paths[p].fs_in, paths[p].fs_out,
+                    filters[f], nc_vals[n], 4, 128, 0.708f);
+                printf("  %6.1f", s);
+                if (s > row_best) { row_best = s; row_nc = nc_vals[n]; }
+                if (s > best[p].sinad) {
+                    best[p].filter = filters[f]; best[p].nc = nc_vals[n]; best[p].sinad = s;
+                }
+            }
+            printf("  %6.1f (nc=%d)\n", row_best, row_nc);
+            fflush(stdout);
+        }
+    }
+
+    printf("\n    Winners:\n");
+    for (int p = 0; p < n_paths; p++) {
+        const char *fn = "?";
+        for (int f = 0; f < n_filters; f++)
+            if (filters[f] == best[p].filter) { fn = fnames[f]; break; }
+        printf("    %-16s %-10s nc=%-2d  %.1f dB\n",
+               paths[p].name, fn, best[p].nc, best[p].sinad);
+    }
+
+    TEST_ASSERT_TRUE(1, "48k downsample sweep completed");
+}
+
 void test_downsample_sweep_suite(void) {
     TEST_SUITE("Downsample Sweep");
     TEST_RUN(test_downsample_sweep);
+    TEST_RUN(test_48k_downsample_sweep);
 }
 
 void test_rate_sweep_suite(void) {
