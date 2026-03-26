@@ -105,14 +105,19 @@ static void design_halfband_kaiser(double *h, int ntaps, double beta) {
  * For upsample: stage 0 is lowest rate. For downsample: last stage is.
  * ═══════════════════════════════════════════════════════════════════════ */
 
-static int get_stage_ntaps(int stage_idx, int num_stages, bool upsample) {
-    (void)stage_idx; (void)num_stages; (void)upsample;
-    /* All stages use 63 taps. Per-stage 255/127/63 was tested (2026-03-26) but
-     * caused massive regressions: the trellis SDM is chaotically sensitive to
-     * FIR output signal characteristics. Different tap counts produce different
-     * noise patterns that the SDM handles unpredictably. The path table configs
-     * were optimized for 63-tap FIR output and cannot be easily re-tuned. */
-    return IPP_HB_NTAPS;
+static int get_stage_ntaps(int stage_idx, int num_stages, bool upsample,
+                            uint32_t fs_out) {
+    /* 127-tap first stage for →DSD512 upsample only.
+     * 127 taps: 6.1% transition BW (vs 12.3% for 63). Halves noise leakage
+     * from DSD noise near fs/4 on the first (lowest-rate) upsample stage.
+     * Result: DSD128→512 broke 60 dB floor (60→89 dB).
+     *
+     * Restricted to →DSD512: SDM chaos causes regressions on →DSD256 /48
+     * paths (tested 2026-03-26). Downsample paths also regress. */
+    if (upsample && num_stages >= 2 && stage_idx == 0 &&
+        (fs_out == 22579200u || fs_out == 24576000u))  /* DSD512 or DSD512/48 */
+        return 127;
+    return IPP_HB_NTAPS;  /* 63 for all other stages */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -528,7 +533,7 @@ int fir_chain_init_ex(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out,
      * lowest-rate stage (most DSD noise near fs/4). */
     if (use_fp64) {
         for (int i = 0; i < stages; i++) {
-            int ntaps = get_stage_ntaps(i, stages, chain->upsample);
+            int ntaps = get_stage_ntaps(i, stages, chain->upsample, fs_out);
             if (ipp_firmr_stage_init_d(chain, i, chain->upsample, ntaps) != 0) {
                 for (int j = 0; j < i; j++)
                     ipp_firmr_stage_free_d(chain, j);
@@ -537,7 +542,7 @@ int fir_chain_init_ex(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out,
         }
     } else {
         for (int i = 0; i < stages; i++) {
-            int ntaps = get_stage_ntaps(i, stages, chain->upsample);
+            int ntaps = get_stage_ntaps(i, stages, chain->upsample, fs_out);
             if (ipp_firmr_stage_init(chain, i, chain->upsample, ntaps) != 0) {
                 for (int j = 0; j < i; j++)
                     ipp_firmr_stage_free(chain, j);
