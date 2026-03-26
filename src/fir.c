@@ -148,6 +148,7 @@ static int ipp_firmr_stage_init(fir_chain_t *chain, int stage_idx,
         ippsFree(spec);
         return -1;
     }
+    ippsZero_8u(buf, bufSize);  /* Zero work buffer — IPP may read before write on some codepaths */
 
     int dlyLen = IPP_HB_NTAPS - 1;
     Ipp32f *dly = ippsMalloc_32f(dlyLen);
@@ -285,6 +286,12 @@ static size_t ipp_downsample2(fir_chain_t *chain, int stage_idx,
 
     ippsFIRMR_32f(in, out, (int)numIters, spec, dly, dly, buf);
 
+    /* IPP AMD AVX2 dispatch: NaN guard for warmup region (same as fp64 path) */
+    int ntaps = chain->ipp_taps_len;
+    for (int i = 0; i < ntaps && i < (int)numIters; i++) {
+        if (out[i] != out[i]) out[i] = 0.0f;
+    }
+
     return numIters;
 }
 
@@ -345,6 +352,7 @@ static int ipp_firmr_stage_init_d(fir_chain_t *chain, int stage_idx,
         ippsFree(spec);
         return -1;
     }
+    ippsZero_8u(buf, bufSize);  /* Zero work buffer — IPP may read before write on some codepaths */
 
     int dlyLen = IPP_HB_NTAPS - 1;
     Ipp64f *dly = ippsMalloc_64f(dlyLen);
@@ -402,6 +410,14 @@ static size_t ipp_downsample2_d(fir_chain_t *chain, int stage_idx,
     Ipp8u *buf = (Ipp8u *)chain->ipp_buf_d[stage_idx];
 
     ippsFIRMR_64f(in, out, (int)numIters, spec, dly, dly, buf);
+
+    /* IPP AMD AVX2 dispatch bug: ippsFIRMR_64f can produce NaN in the first
+     * ~32 output samples (delay line warmup region) when heap-allocated buffers
+     * have certain alignment. Replace any NaN with 0.0 (warmup period anyway). */
+    int ntaps = chain->ipp_taps_len;
+    for (int i = 0; i < ntaps && i < (int)numIters; i++) {
+        if (out[i] != out[i]) out[i] = 0.0;
+    }
 
     return numIters;
 }

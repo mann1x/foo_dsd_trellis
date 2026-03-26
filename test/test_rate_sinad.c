@@ -202,7 +202,7 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
             return -999.0;
         }
         double *fir_d_in = (double *)malloc(dsd_in_count * sizeof(double));
-        fir_d_out = (double *)malloc(max_out * sizeof(double));
+        fir_d_out = (double *)calloc(max_out, sizeof(double));
         if (!fir_d_in || !fir_d_out) {
             free(fir_d_in); free(fir_d_out); free(dsd_in); free(fir_buf); free(dsd_out);
             fir_chain_free(&fir); fir_d_out = NULL; return -999.0;
@@ -253,6 +253,7 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     if (pi.state_limit > 0.0)
         sdm.state_limit = pi.state_limit;
 
+    /* Diagnostic: checksum FIR output for DSD128→64 */
     /* Feed SDM: use fp64 FIR output directly (no float truncation) or
      * widen fp32/lowpass output to double */
     double *sdm_in_d;
