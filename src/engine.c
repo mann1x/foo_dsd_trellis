@@ -92,13 +92,15 @@ static const path_config_t path_table[] = {
     { DSD48_RATE_128, DSD48_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 0.708f },
     { DSD48_RATE_128, DSD48_RATE_512, NTF_CLANS_8, 12.0, 2,  0, 4, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 0.708f },
-    /* DSD/48 downsample */
+    /* DSD/48 downsample — swept via NTF×nc (2026-03-26).
+     *   256/48→128/48: SDM-7/nc=2 → 87.4 dB (+5.6 over /44 mirror)
+     *   →64/48 paths: /44 mirror retained (sweep winner scored lower in rate suite) */
     { DSD48_RATE_128, DSD48_RATE_64,  NTF_CLANS_4, 0.0,  32, 0, 0, 0.708f },
-    { DSD48_RATE_256, DSD48_RATE_64,  NTF_CLANS_8, 0.0,  8,  0, 0, 0.708f },
-    { DSD48_RATE_256, DSD48_RATE_128, NTF_CLANS_4, 0.0,  8,  0, 0, 0.708f },
-    { DSD48_RATE_512, DSD48_RATE_64,  NTF_SDM_6,   0.0,  8,  0, 0, 0.708f },
-    { DSD48_RATE_512, DSD48_RATE_128, NTF_SDM_4,  16.0, 16,  0, 0, 0.708f },
-    { DSD48_RATE_512, DSD48_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 0.708f },
+    { DSD48_RATE_256, DSD48_RATE_64,  NTF_CLANS_8, 0.0,   8, 0, 0, 0.708f },
+    { DSD48_RATE_256, DSD48_RATE_128, NTF_SDM_7,   0.0,   2, 0, 0, 0.708f },
+    { DSD48_RATE_512, DSD48_RATE_64,  NTF_SDM_6,   0.0,   8, 0, 0, 0.708f },
+    { DSD48_RATE_512, DSD48_RATE_128, NTF_SDM_4,  16.0,  16, 0, 0, 0.708f },
+    { DSD48_RATE_512, DSD48_RATE_256, NTF_SDM_6,  16.0,   8, 0, 0, 0.708f },
 };
 
 #define PATH_TABLE_COUNT (sizeof(path_table) / sizeof(path_table[0]))
