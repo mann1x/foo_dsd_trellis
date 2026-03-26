@@ -334,45 +334,46 @@ PreCorr outperforms Trellis at DSD64 (+6.5 dB) because its trained prediction ta
 
 Rate conversion uses production path_config values: per-path optimal NTF filter, FIR gain (-3 dB uniform), state limiter, candidates, depth. All paths use 0.708 (-3 dB) FIR gain for consistent volume across rate transitions.
 
-**44.1 kHz family — upsample** (end-to-end: DSD→FIR→SDM→Goertzel at output rate):
+**44.1 kHz family — upsample** (end-to-end: DSD→fp64 FIR→SDM→Goertzel at output rate):
 
 | Conversion | NTF | Gain | Lim | Cands | SINAD |
 |------------|-----|------|-----|-------|------:|
-| DSD64→DSD128 | SDM-4 | 0.71 | off | 2 | 95.3 |
-| DSD64→DSD256 | CLANS-8 | 0.71 | off | 2 | 85.6 |
+| DSD64→DSD128 | SDM-4 | 0.71 | off | 2 | 91.6 |
+| DSD64→DSD256 | CLANS-8 | 0.71 | off | 2 | 85.3 |
 | DSD64→DSD512 | CLANS-6 | 0.71 | 10 | 2 | 60.1 |
-| DSD128→DSD256 | CLANS-8 | 0.71 | off | 2 | 104.7 |
+| DSD128→DSD256 | CLANS-8 | 0.71 | off | 2 | 103.6 |
 | DSD128→DSD512 | CLANS-8 | 0.71 | 12 | 2 | 60.2 |
-| DSD256→DSD512 | CLANS-8 | 0.71 | 6 | 2 | 114.3 |
+| DSD256→DSD512 | CLANS-8 | 0.71 | 6 | 2 | 112.6 |
 
 **44.1 kHz family — downsample** (end-to-end):
 
 | Conversion | NTF | Gain | Lim | Cands | SINAD |
 |------------|-----|------|-----|-------|------:|
-| DSD128→DSD64 | CLANS-4 | 0.71 | off | 32 | 76.6 |
-| DSD256→DSD128 | CLANS-4 | 0.71 | off | 8 | 83.3 |
-| DSD512→DSD128 | SDM-4 | 0.71 | 16 | 16 | 82.6 |
-| DSD512→DSD256 | SDM-6 | 0.71 | 16 | 8 | 93.2 |
+| DSD128→DSD64 | CLANS-4 | 0.71 | off | 32 | 81.6 |
+| DSD256→DSD64 | CLANS-8 | 0.71 | off | 8 | 74.6 |
+| DSD512→DSD64 | SDM-6 | 0.71 | off | 8 | 69.0 |
+| DSD256→DSD128 | CLANS-4 | 0.71 | off | 8 | 87.1 |
+| DSD512→DSD128 | SDM-4 | 0.71 | 16 | 16 | 86.1 |
+| DSD512→DSD256 | SDM-6 | 0.71 | 16 | 8 | 95.5 |
 
 **48 kHz family — rate conversion** (independently swept):
 
 | Conversion | NTF | Gain | Cands | SINAD |
 |------------|-----|------|-------|------:|
-| DSD64/48→DSD128/48 (UP) | SDM-4 | 0.71 | 2 | 88.6 |
-| DSD128/48→DSD256/48 (UP) | CLANS-8 | 0.71 | 2 | 54.6 |
-| DSD128/48→DSD64/48 (DN) | CLANS-4 | 0.71 | 32 | 69.4 |
-| DSD256/48→DSD64/48 (DN) | CLANS-8 | 0.71 | 8 | 80.1 |
-| DSD256/48→DSD128/48 (DN) | SDM-7 | 0.71 | 2 | 87.4 |
+| DSD128/48→DSD256/48 (UP) | CLANS-8 | 0.71 | 2 | 101.6 |
+| DSD128/48→DSD64/48 (DN) | CLANS-4 | 0.71 | 32 | 73.7 |
+| DSD256/48→DSD64/48 (DN) | CLANS-8 | 0.71 | 8 | 80.5 |
+| DSD256/48→DSD128/48 (DN) | SDM-7 | 0.71 | 2 | 100.0 |
 
 **Key observations:**
-- Upsample 2x paths: 86–105 dB SINAD — excellent quality
+- Upsample 2x paths: 86–104 dB SINAD — excellent quality
 - →DSD512 paths with state limiter: 60 dB — limiter interaction degrades quality
-- DSD256→DSD512 (limiter not triggered): 114 dB
-- Downsample paths: 69–93 dB, SDM-limited (FIR chain is not the bottleneck; fp64 FIR, longer taps, and lowpass pre-filter all tested with zero improvement)
-- 48k family independently swept — SDM-7/nc=2 for DSD256/48→DSD128/48 gained +5.6 dB over /44 mirror
+- DSD256→DSD512 (limiter not triggered): 113 dB
+- Downsample paths: 69–96 dB. fp64 FIR is critical (fp32 loses 3–40 dB on multi-stage paths)
+- 48k family independently swept — SDM-7/nc=2 for DSD256/48→DSD128/48: 100 dB
 - Uniform FIR gain of 0.708 (-3 dB) prevents volume changes across rate transitions
 
-**Measurement methodology**: End-to-end pipeline (generate DSD at input rate → FIR rate conversion → SDM re-encode → Goertzel at output DSD rate, audio band 0–22 kHz). This measures the actual conversion quality including FIR noise leakage and SDM re-encoding noise.
+**Measurement methodology**: End-to-end pipeline (generate DSD at input rate → fp64 FIR rate conversion → SDM re-encode → Goertzel at output DSD rate, audio band 0–22 kHz). fp64 FIR matches production (Auto=fp64). DSD64/48 upsample paths omitted (anomalous — under investigation).
 
 ### DSD to PCM Decimation
 

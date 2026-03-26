@@ -149,7 +149,7 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     engine_path_info_t pi;
     engine_get_path_info(fs_in, fs_out, NTF_AUTO, SDM_MODE_TRELLIS, &test_cfg, &pi);
 
-    /* Use path-optimal values (matching real production behavior) */
+    /* Use path-resolved values (engine_get_path_info auto-resolves lat/depth) */
     int cands = pi.cands > 0 ? pi.cands : SINAD_TRELLIS_CANDS;
     int lat   = pi.lat > 0 ? pi.lat : SINAD_TRELLIS_LAT;
     int depth = pi.depth > 0 ? pi.depth : SINAD_TRELLIS_DEPTH;
