@@ -2799,9 +2799,12 @@ static double measure_fir_experiment(uint32_t fs_in, uint32_t fs_out,
     if (out_count < 512) { free(dsd_out); return -999.0; }
 
     /* Re-align frequency to actual output count */
+    double freq_pre = freq;
     freq = bin_align_freq(freq, (double)fs_out, out_count);
 
     double sinad = measure_sinad(dsd_out, out_count, freq, (double)fs_out);
+
+
     free(dsd_out);
     return sinad;
 }
@@ -2809,15 +2812,23 @@ static double measure_fir_experiment(uint32_t fs_in, uint32_t fs_out,
 static void test_fir_improvement_experiment(void) {
     typedef struct { uint32_t fs_in, fs_out; const char *name; } path_t;
     static const path_t paths[] = {
-        { DSD_RATE_64,  DSD_RATE_128, "DSD64->128 UP"  },
-        { DSD_RATE_64,  DSD_RATE_256, "DSD64->256 UP"  },
-        { DSD_RATE_128, DSD_RATE_256, "DSD128->256 UP" },
-        { DSD_RATE_256, DSD_RATE_512, "DSD256->512 UP" },
-        { DSD_RATE_128, DSD_RATE_64,  "DSD128->64 DN"  },
-        { DSD_RATE_256, DSD_RATE_64,  "DSD256->64 DN"  },
-        { DSD_RATE_512, DSD_RATE_64,  "DSD512->64 DN"  },
-        { DSD_RATE_256, DSD_RATE_128, "DSD256->128 DN" },
-        { DSD_RATE_512, DSD_RATE_256, "DSD512->256 DN" },
+        /* /44 family */
+        { DSD_RATE_64,  DSD_RATE_128, "64->128 UP"     },
+        { DSD_RATE_64,  DSD_RATE_256, "64->256 UP"     },
+        { DSD_RATE_64,  DSD_RATE_512, "64->512 UP"     },
+        { DSD_RATE_128, DSD_RATE_256, "128->256 UP"    },
+        { DSD_RATE_128, DSD_RATE_512, "128->512 UP"    },
+        { DSD_RATE_256, DSD_RATE_512, "256->512 UP"    },
+        { DSD_RATE_128, DSD_RATE_64,  "128->64 DN"     },
+        { DSD_RATE_256, DSD_RATE_128, "256->128 DN"    },
+        { DSD_RATE_512, DSD_RATE_256, "512->256 DN"    },
+        /* /48 family */
+        { DSD48_RATE_64,  DSD48_RATE_128, "64/48->128/48 UP"  },
+        { DSD48_RATE_64,  DSD48_RATE_256, "64/48->256/48 UP"  },
+        { DSD48_RATE_128, DSD48_RATE_256, "128/48->256/48 UP" },
+        { DSD48_RATE_128, DSD48_RATE_64,  "128/48->64/48 DN"  },
+        { DSD48_RATE_256, DSD48_RATE_64,  "256/48->64/48 DN"  },
+        { DSD48_RATE_256, DSD48_RATE_128, "256/48->128/48 DN" },
     };
     int n_paths = sizeof(paths) / sizeof(paths[0]);
 
