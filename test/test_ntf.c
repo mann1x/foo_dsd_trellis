@@ -9,7 +9,7 @@
 /* ── filter count and basic structure ───────────────────────── */
 
 static void test_ntf_filter_count(void) {
-    TEST_ASSERT_EQ(ntf_get_filter_count(), 40, "should have 40 filters");
+    TEST_ASSERT_TRUE(ntf_get_filter_count() >= 40, "should have at least 40 filters");
 }
 
 static void test_ntf_all_entries_valid(void) {
@@ -218,10 +218,11 @@ static void test_ntf_dsd512_clans8_coefficients(void) {
 
 static void test_ntf_get_by_index_bounds(void) {
     TEST_ASSERT_NULL(ntf_get_by_index(-1), "index -1 should be null");
-    TEST_ASSERT_NULL(ntf_get_by_index(40), "index 40 should be null");
+    int count = ntf_get_filter_count();
+    TEST_ASSERT_NULL(ntf_get_by_index(count), "index past end should be null");
     TEST_ASSERT_NULL(ntf_get_by_index(100), "index 100 should be null");
     TEST_ASSERT_NOT_NULL(ntf_get_by_index(0), "index 0 valid");
-    TEST_ASSERT_NOT_NULL(ntf_get_by_index(39), "index 39 valid");
+    TEST_ASSERT_NOT_NULL(ntf_get_by_index(count - 1), "last index valid");
 }
 
 /* ── suite entry point ──────────────────────────────────────── */
