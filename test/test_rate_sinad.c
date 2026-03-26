@@ -181,13 +181,24 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
         fir_count = fir_lowpass_process(&lp, dsd_in, fir_buf, dsd_in_count);
         fir_lowpass_free(&lp);
     } else {
-        /* Rate conversion: multi-stage FIR chain */
+        /* Rate conversion: fp64 FIR chain (matches production Auto=fp64) */
         fir_chain_t fir;
-        if (fir_chain_init(&fir, fs_in, fs_out) != 0) {
+        if (fir_chain_init_ex(&fir, fs_in, fs_out, true) != 0) {
             free(dsd_in); free(fir_buf); free(dsd_out);
             return -999.0;
         }
-        fir_count = fir_chain_process(&fir, dsd_in, fir_buf, dsd_in_count);
+        double *fir_d_in = (double *)malloc(dsd_in_count * sizeof(double));
+        double *fir_d_out = (double *)malloc(max_out * sizeof(double));
+        if (!fir_d_in || !fir_d_out) {
+            free(fir_d_in); free(fir_d_out); free(dsd_in); free(fir_buf); free(dsd_out);
+            fir_chain_free(&fir); return -999.0;
+        }
+        for (size_t i = 0; i < dsd_in_count; i++)
+            fir_d_in[i] = (double)dsd_in[i];
+        fir_count = fir_chain_process_d(&fir, fir_d_in, fir_d_out, dsd_in_count);
+        for (size_t i = 0; i < fir_count; i++)
+            fir_buf[i] = (float)fir_d_out[i];
+        free(fir_d_in); free(fir_d_out);
         fir_chain_free(&fir);
     }
 
