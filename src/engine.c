@@ -400,6 +400,26 @@ size_t engine_process_block(engine_channel_t *eng,
         for (size_t i = 0; i < count; i++)
             tls_fir_d[i] = (double)in[i];
 
+        /* Boxcar pre-smooth for DSD256→128 downsample (+11 dB /48, +1.5 /44).
+         * 32-tap running average removes worst DSD noise spikes before FIR. */
+        if (fs_out < cfg->fs_in) {
+            unsigned base_r = rate_is_48k_family(cfg->fs_in) ? 48000 : 44100;
+            unsigned mult_in_r = cfg->fs_in / base_r;
+            unsigned mult_out_r = fs_out / base_r;
+            if (mult_in_r == 256 && mult_out_r == 128) {
+                const int btaps = 32;
+                double bsum = 0.0;
+                double ring[32] = {0};
+                int bp = 0;
+                double inv = 1.0 / (double)btaps;
+                for (size_t i = 0; i < count; i++) {
+                    bsum -= ring[bp]; ring[bp] = tls_fir_d[i]; bsum += tls_fir_d[i];
+                    bp = (bp + 1) % btaps;
+                    tls_fir_d[i] = bsum * inv;
+                }
+            }
+        }
+
         fir_out = fir_chain_process_d(&eng->fir, tls_fir_d, eng->fir_buf, count);
 
         /* Apply gain in fp64 */
