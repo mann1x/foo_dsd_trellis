@@ -44,14 +44,14 @@ static const path_config_t path_table[] = {
      * by reducing the signal to ~7% of the quantizer range on same-rate paths.
      * lat = 0 means "auto" (computed as cands * 8 at runtime).
      * Optimal lat from nc×lat sweep: nc=2→16, nc=4→32, nc=8→64. */
-    /* Same-rate re-encode (boxcar/FIR → SDM).
-     * nc=2 for all same-rate: nc=4 causes candidate collapse over time.
-     * Optimal NTF from comprehensive sweep (2026-03-24, depth=4, nc=2):
-     *   DSD64:  CLANS6/d=16/lat=32 → 110.7 dB (depth=16 unlocks order-6 path diversity)
-     *   DSD128: CLANS6/d=4/lat=128 → 121.5 dB, 0 collapse
-     *   DSD256: CLANS6/d=4/lat=128 → 128.9 dB, 0 collapse
-     *   DSD512: SDM6/d=4/lat=32    → 140.3 dB, 0 collapse (at ceiling) */
-    /* nc=2 avoids candidate collapse and is 2x cheaper.
+    /* Same-rate re-encode: boxcar DSD-Wide → trellis SDM (2026-03-27).
+     * Boxcar taps: DSD64=32, DSD128/256=64, DSD512=16.
+     * End-to-end SINAD (boxcar + SDM, multi-freq median):
+     *   DSD64:  CLANS6/d=16/lat=32 → 84.5 dB
+     *   DSD128: CLANS6/d=4/lat=128 → 99.5 dB
+     *   DSD256: CLANS6/d=4/lat=128 → 108.5 dB
+     *   DSD512: SDM6/d=4/lat=32    → 108.6 dB
+     * nc=2 avoids candidate collapse and is 2x cheaper.
      * DSD64 needs depth=16: 4-bit dedup mask kills path diversity at low OSR. */
     { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_6, 0.0,  2,  0, 16, 0.708f },
     { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
@@ -75,11 +75,11 @@ static const path_config_t path_table[] = {
     { DSD_RATE_512, DSD_RATE_128, NTF_SDM_6,   0.0,  8, 16, 16, 0.708f },  /* fp64 sweep: 92.8 dB, d=16/lat=16 (was sdm-4/nc=16: 79 dB) */
     { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 0.708f },
     /* ─── DSD/48 paths (independently swept, NOT mirrored from /44) ─── */
-    /* Same-rate re-encode — optimized via comprehensive 48k NTF sweep (2026-03-25):
-     *   DSD64/48:  SDM-6/d=16/lat=64  → 113.5 dB
-     *   DSD128/48: CLANS-6/d=4/lat=32 → 136.5 dB
-     *   DSD256/48: SDM-4/d=16/lat=128 → 143.4 dB
-     *   DSD512/48: SDM-4/d=16/lat=128 → 139.2 dB */
+    /* Same-rate re-encode /48: boxcar DSD-Wide → trellis SDM (2026-03-27):
+     *   DSD64/48:  SDM-6/d=16/lat=64  → 84.6 dB
+     *   DSD128/48: CLANS-6/d=4/lat=32 → 103.4 dB
+     *   DSD256/48: SDM-4/d=16/lat=128 → 103.8 dB
+     *   DSD512/48: SDM-4/d=16/lat=128 → 109.8 dB */
     { DSD48_RATE_64,  DSD48_RATE_64,  NTF_SDM_6,   0.0,  2,  64, 16, 0.708f },
     { DSD48_RATE_128, DSD48_RATE_128, NTF_CLANS_6, 0.0,  2,  32,  4, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_256, NTF_SDM_4,   0.0,  2, 128, 16, 0.708f },
