@@ -25,6 +25,7 @@ extern int    g_hb_ntaps;
 
 typedef struct {
     int         num_stages;     /* 0 = passthrough */
+    int         stage_factor[FIR_MAX_STAGES]; /* Up/down factor per stage (2 or 4) */
     float      *scratch;        /* Intermediate buffer between stages (fp32 path) */
     size_t      scratch_size;
     bool        upsample;       /* Direction for all stages */

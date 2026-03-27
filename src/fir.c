@@ -97,6 +97,29 @@ static void design_halfband_kaiser(double *h, int ntaps, double beta) {
         h[n] /= sum;
 }
 
+/* Quarter-band lowpass for 4x polyphase stages (cutoff at fs_out/8) */
+static void design_quarterband_kaiser(double *h, int ntaps, double beta) {
+    int center = (ntaps - 1) / 2;
+    double I0b = bessel_I0(beta);
+    double sum = 0.0;
+    double cutoff = 0.25;  /* 1/(2*factor) = 1/8 of output fs, but sinc arg is cutoff*2*x */
+
+    for (int n = 0; n < ntaps; n++) {
+        double x = (double)(n - center) * cutoff;
+        double sinc_val = (fabs(x) < 1e-15) ? 1.0 : sin(M_PI * x) / (M_PI * x);
+
+        double t = (double)(n - center) / center;
+        double arg = 1.0 - t * t;
+        double w = bessel_I0(beta * sqrt(arg > 0.0 ? arg : 0.0)) / I0b;
+
+        h[n] = cutoff * sinc_val * w;
+        sum += h[n];
+    }
+
+    for (int n = 0; n < ntaps; n++)
+        h[n] /= sum;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
  * Per-stage tap count selection
  *
@@ -106,8 +129,14 @@ static void design_halfband_kaiser(double *h, int ntaps, double beta) {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static int get_stage_ntaps(int stage_idx, int num_stages, bool upsample,
-                            uint32_t fs_out) {
-    /* 127-tap first stage for →DSD512 upsample only.
+                            uint32_t fs_out, int stage_factor) {
+    /* 4x polyphase stage: 127 taps for quarter-band filter.
+     * Needs more taps than half-band because the transition band is narrower
+     * (passband is only 1/8 of output rate vs 1/4 for half-band). */
+    if (stage_factor == 4)
+        return 127;
+
+    /* 127-tap first stage for →DSD512 upsample only (2x stages).
      * 127 taps: 6.1% transition BW (vs 12.3% for 63). Halves noise leakage
      * from DSD noise near fs/4 on the first (lowest-rate) upsample stage.
      * Result: DSD128→512 broke 60 dB floor (60→89 dB).
@@ -125,29 +154,32 @@ static int get_stage_ntaps(int stage_idx, int num_stages, bool upsample,
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static int ipp_firmr_stage_init(fir_chain_t *chain, int stage_idx,
-                                 bool upsample, int ntaps) {
+                                 bool upsample, int ntaps, int factor) {
     double hd[IPP_HB_NTAPS_MAX];
-    design_halfband_kaiser(hd, ntaps, IPP_HB_KAISER_BETA);
+    if (factor == 4)
+        design_quarterband_kaiser(hd, ntaps, IPP_HB_KAISER_BETA);
+    else
+        design_halfband_kaiser(hd, ntaps, IPP_HB_KAISER_BETA);
 
     Ipp32f taps[IPP_HB_NTAPS_MAX];
     for (int i = 0; i < ntaps; i++)
         taps[i] = (Ipp32f)hd[i];
 
-    /* Cache 63-tap version globally for GPU backend */
-    if (!g_hb_taps_initialized && ntaps == IPP_HB_NTAPS) {
+    /* Cache 63-tap half-band version globally for GPU backend */
+    if (!g_hb_taps_initialized && ntaps == IPP_HB_NTAPS && factor == 2) {
         memcpy(g_hb_taps, taps, ntaps * sizeof(float));
         memcpy(g_hb_taps_d, hd, ntaps * sizeof(double));
         g_hb_taps_initialized = true;
     }
 
-    /* Upsample: pre-scale taps by 2 to compensate for polyphase energy split */
+    /* Upsample: pre-scale taps by factor to compensate for polyphase energy split */
     if (upsample) {
         for (int i = 0; i < ntaps; i++)
-            taps[i] *= 2.0f;
+            taps[i] *= (float)factor;
     }
 
-    int upFactor   = upsample ? 2 : 1;
-    int downFactor = upsample ? 1 : 2;
+    int upFactor   = upsample ? factor : 1;
+    int downFactor = upsample ? 1 : factor;
 
     int specSize = 0, bufSize = 0;
     IppStatus st = ippsFIRMRGetSize(ntaps, upFactor, downFactor,
@@ -278,30 +310,28 @@ static int ensure_demod_tmp(fir_chain_t *chain, size_t need) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- * Upsample / Downsample 2x via IPP FIRMR (polyphase)
+ * Upsample / Downsample via IPP FIRMR (polyphase, per-stage factor)
  *
  * No zero-stuffing or decimation needed — FIRMR handles polyphase
  * decomposition internally, only computing the output samples needed.
  * ═══════════════════════════════════════════════════════════════════════ */
 
-static size_t ipp_upsample2(fir_chain_t *chain, int stage_idx,
-                             const float *in, float *out, size_t count) {
-    /* FIRMR: numIters = input_count / downFactor = count / 1 = count.
-     * Each iteration consumes 1 input, produces 2 outputs. */
+static size_t ipp_upsample(fir_chain_t *chain, int stage_idx,
+                            const float *in, float *out, size_t count) {
+    int factor = chain->stage_factor[stage_idx];
     IppsFIRSpec_32f *spec = (IppsFIRSpec_32f *)chain->ipp_spec[stage_idx];
     Ipp32f *dly = chain->ipp_dly[stage_idx];
     Ipp8u *buf = (Ipp8u *)chain->ipp_buf[stage_idx];
 
     ippsFIRMR_32f(in, out, (int)count, spec, dly, dly, buf);
 
-    return count * 2;
+    return count * factor;
 }
 
-static size_t ipp_downsample2(fir_chain_t *chain, int stage_idx,
-                               const float *in, float *out, size_t in_count) {
-    /* FIRMR: numIters = input_count / downFactor = in_count / 2.
-     * Each iteration consumes 2 inputs, produces 1 output. */
-    size_t numIters = in_count / 2;
+static size_t ipp_downsample(fir_chain_t *chain, int stage_idx,
+                              const float *in, float *out, size_t in_count) {
+    int factor = chain->stage_factor[stage_idx];
+    size_t numIters = in_count / factor;
 
     IppsFIRSpec_32f *spec = (IppsFIRSpec_32f *)chain->ipp_spec[stage_idx];
     Ipp32f *dly = chain->ipp_dly[stage_idx];
@@ -338,26 +368,29 @@ static void ensure_hb_taps_d(void) {
 }
 
 static int ipp_firmr_stage_init_d(fir_chain_t *chain, int stage_idx,
-                                   bool upsample, int ntaps) {
+                                   bool upsample, int ntaps, int factor) {
     /* Ensure global 63-tap cache is populated for GPU backend */
     ensure_hb_taps_d();
 
-    /* Design filter fresh for this stage's tap count */
+    /* Design filter fresh for this stage's tap count and factor */
     double hd[IPP_HB_NTAPS_MAX];
-    design_halfband_kaiser(hd, ntaps, IPP_HB_KAISER_BETA);
+    if (factor == 4)
+        design_quarterband_kaiser(hd, ntaps, IPP_HB_KAISER_BETA);
+    else
+        design_halfband_kaiser(hd, ntaps, IPP_HB_KAISER_BETA);
 
     Ipp64f taps[IPP_HB_NTAPS_MAX];
     for (int i = 0; i < ntaps; i++)
         taps[i] = hd[i];
 
-    /* Upsample: pre-scale taps by 2 to compensate for polyphase energy split */
+    /* Upsample: pre-scale taps by factor to compensate for polyphase energy split */
     if (upsample) {
         for (int i = 0; i < ntaps; i++)
-            taps[i] *= 2.0;
+            taps[i] *= (double)factor;
     }
 
-    int upFactor   = upsample ? 2 : 1;
-    int downFactor = upsample ? 1 : 2;
+    int upFactor   = upsample ? factor : 1;
+    int downFactor = upsample ? 1 : factor;
 
     int specSize = 0, bufSize = 0;
     IppStatus st = ippsFIRMRGetSize(ntaps, upFactor, downFactor,
@@ -416,23 +449,25 @@ static void ipp_firmr_stage_free_d(fir_chain_t *chain, int stage_idx) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- * FP64 Upsample / Downsample 2x via IPP FIRMR (polyphase)
+ * FP64 Upsample / Downsample via IPP FIRMR (polyphase, per-stage factor)
  * ═══════════════════════════════════════════════════════════════════════ */
 
-static size_t ipp_upsample2_d(fir_chain_t *chain, int stage_idx,
-                               const double *in, double *out, size_t count) {
+static size_t ipp_upsample_d(fir_chain_t *chain, int stage_idx,
+                              const double *in, double *out, size_t count) {
+    int factor = chain->stage_factor[stage_idx];
     IppsFIRSpec_64f *spec = (IppsFIRSpec_64f *)chain->ipp_spec_d[stage_idx];
     Ipp64f *dly = chain->ipp_dly_d[stage_idx];
     Ipp8u *buf = (Ipp8u *)chain->ipp_buf_d[stage_idx];
 
     ippsFIRMR_64f(in, out, (int)count, spec, dly, dly, buf);
 
-    return count * 2;
+    return count * factor;
 }
 
-static size_t ipp_downsample2_d(fir_chain_t *chain, int stage_idx,
-                                 const double *in, double *out, size_t in_count) {
-    size_t numIters = in_count / 2;
+static size_t ipp_downsample_d(fir_chain_t *chain, int stage_idx,
+                                const double *in, double *out, size_t in_count) {
+    int factor = chain->stage_factor[stage_idx];
+    size_t numIters = in_count / factor;
 
     IppsFIRSpec_64f *spec = (IppsFIRSpec_64f *)chain->ipp_spec_d[stage_idx];
     Ipp64f *dly = chain->ipp_dly_d[stage_idx];
@@ -526,6 +561,21 @@ int fir_chain_init_ex(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out,
     if (stages > FIR_MAX_STAGES)
         return -1;
 
+    /* Determine per-stage factors.
+     * For 8x upsample to DSD512: use 4x+2x (2 stages) instead of 2x+2x+2x.
+     * Fewer stages = less inter-stage noise accumulation. The 4x polyphase
+     * stage uses a quarter-band filter that rejects all 3 spectral images. */
+    if (chain->upsample && ratio == 8 &&
+        (fs_out == 22579200u || fs_out == 24576000u)) {
+        stages = 2;
+        chain->stage_factor[0] = 4;  /* first stage: 4x */
+        chain->stage_factor[1] = 2;  /* second stage: 2x */
+    } else {
+        /* Standard: all 2x stages */
+        for (int i = 0; i < stages; i++)
+            chain->stage_factor[i] = 2;
+    }
+
     chain->num_stages = stages;
 
     /* Init per-stage IPP FIRMR specs (polyphase multi-rate).
@@ -533,8 +583,9 @@ int fir_chain_init_ex(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out,
      * lowest-rate stage (most DSD noise near fs/4). */
     if (use_fp64) {
         for (int i = 0; i < stages; i++) {
-            int ntaps = get_stage_ntaps(i, stages, chain->upsample, fs_out);
-            if (ipp_firmr_stage_init_d(chain, i, chain->upsample, ntaps) != 0) {
+            int factor = chain->stage_factor[i];
+            int ntaps = get_stage_ntaps(i, stages, chain->upsample, fs_out, factor);
+            if (ipp_firmr_stage_init_d(chain, i, chain->upsample, ntaps, factor) != 0) {
                 for (int j = 0; j < i; j++)
                     ipp_firmr_stage_free_d(chain, j);
                 return -1;
@@ -542,8 +593,9 @@ int fir_chain_init_ex(fir_chain_t *chain, uint32_t fs_in, uint32_t fs_out,
         }
     } else {
         for (int i = 0; i < stages; i++) {
-            int ntaps = get_stage_ntaps(i, stages, chain->upsample, fs_out);
-            if (ipp_firmr_stage_init(chain, i, chain->upsample, ntaps) != 0) {
+            int factor = chain->stage_factor[i];
+            int ntaps = get_stage_ntaps(i, stages, chain->upsample, fs_out, factor);
+            if (ipp_firmr_stage_init(chain, i, chain->upsample, ntaps, factor) != 0) {
                 for (int j = 0; j < i; j++)
                     ipp_firmr_stage_free(chain, j);
                 return -1;
@@ -585,17 +637,21 @@ size_t fir_chain_process(fir_chain_t *chain,
     /* Single stage: direct rate_in → out */
     if (chain->num_stages == 1) {
         if (chain->upsample)
-            return ipp_upsample2(chain, 0, rate_in, out, in_count);
+            return ipp_upsample(chain, 0, rate_in, out, in_count);
         else
-            return ipp_downsample2(chain, 0, rate_in, out, in_count);
+            return ipp_downsample(chain, 0, rate_in, out, in_count);
     }
 
-    /* Multi-stage: ping-pong between scratch and out */
+    /* Multi-stage: ping-pong between scratch and out.
+     * Compute max intermediate size accounting for per-stage factors. */
     size_t max_intermediate;
-    if (chain->upsample)
-        max_intermediate = in_count << (chain->num_stages - 1);
-    else
-        max_intermediate = in_count / 2;
+    if (chain->upsample) {
+        max_intermediate = in_count;
+        for (int i = 0; i < chain->num_stages - 1; i++)
+            max_intermediate *= chain->stage_factor[i];
+    } else {
+        max_intermediate = in_count / chain->stage_factor[0];
+    }
 
     if (ensure_scratch(chain, max_intermediate) != 0)
         return 0;
@@ -609,9 +665,9 @@ size_t fir_chain_process(fir_chain_t *chain,
         float *dst = bufs[remaining & 1];
 
         if (chain->upsample)
-            count = ipp_upsample2(chain, i, src, dst, count);
+            count = ipp_upsample(chain, i, src, dst, count);
         else
-            count = ipp_downsample2(chain, i, src, dst, count);
+            count = ipp_downsample(chain, i, src, dst, count);
 
         src = dst;
     }
@@ -630,17 +686,21 @@ size_t fir_chain_process_d(fir_chain_t *chain,
     /* Single stage: direct in -> out */
     if (chain->num_stages == 1) {
         if (chain->upsample)
-            return ipp_upsample2_d(chain, 0, in, out, in_count);
+            return ipp_upsample_d(chain, 0, in, out, in_count);
         else
-            return ipp_downsample2_d(chain, 0, in, out, in_count);
+            return ipp_downsample_d(chain, 0, in, out, in_count);
     }
 
-    /* Multi-stage: ping-pong between scratch_d and out */
+    /* Multi-stage: ping-pong between scratch_d and out.
+     * Compute max intermediate size accounting for per-stage factors. */
     size_t max_intermediate;
-    if (chain->upsample)
-        max_intermediate = in_count << (chain->num_stages - 1);
-    else
-        max_intermediate = in_count / 2;
+    if (chain->upsample) {
+        max_intermediate = in_count;
+        for (int i = 0; i < chain->num_stages - 1; i++)
+            max_intermediate *= chain->stage_factor[i];
+    } else {
+        max_intermediate = in_count / chain->stage_factor[0];
+    }
 
     if (ensure_scratch_d(chain, max_intermediate) != 0)
         return 0;
@@ -654,9 +714,9 @@ size_t fir_chain_process_d(fir_chain_t *chain,
         double *dst = bufs[remaining & 1];
 
         if (chain->upsample)
-            count = ipp_upsample2_d(chain, i, src, dst, count);
+            count = ipp_upsample_d(chain, i, src, dst, count);
         else
-            count = ipp_downsample2_d(chain, i, src, dst, count);
+            count = ipp_downsample_d(chain, i, src, dst, count);
 
         src = dst;
     }
