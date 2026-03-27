@@ -198,9 +198,10 @@ static double measure_rate_sinad_at(uint32_t fs_in, uint32_t fs_out,
          * Rate-adaptive k compensates boxcar frequency response.
          * Tested 2026-03-27: DSD256 +16 dB, DSD64 +3 dB. */
         {
+            /* Pre-SDM pre-emphasis (median-confirmed 2026-03-27):
+             * DSD512: k=0.007 (+22 dB). DSD128/256: regresses with median. */
             double pre_k = 0.0;
-            if (mult_r >= 512) pre_k = 0.01;  /* DSD512: +10 dB (median confirmed) */
-            /* DSD64-256: pre-emphasis regresses with median — skip */
+            if (mult_r >= 512) pre_k = 0.007;
             if (pre_k > 0.0) {
                 for (size_t i = dsd_in_count - 1; i > 0; i--)
                     fir_d_out[i] += pre_k * (fir_d_out[i] - fir_d_out[i-1]);
@@ -4208,25 +4209,37 @@ static void test_pre_sdm_enhancement(void) {
         printf("\n");
     }
 
-    /* Median validation of promising pre-emphasis values */
-    printf("\n  --- Median validation (3-freq) ---\n");
-    static const double med_pre[] = { 0.0, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2 };
+    /* Fine-grained pre-emphasis sweep for all rates including DSD512 */
+    printf("\n  --- Fine pre-emphasis sweep (all rates) ---\n");
+    static const uint32_t all_rates[] = {
+        DSD_RATE_64, DSD_RATE_128, DSD_RATE_256, DSD_RATE_512
+    };
+    static const char *all_names[] = { "DSD64", "DSD128", "DSD256", "DSD512" };
+    static const int all_box[] = { 32, 64, 64, 16 };
+    static const double fine_k[] = {
+        0.0, 0.001, 0.002, 0.005, 0.007, 0.01, 0.015, 0.02,
+        0.03, 0.05, 0.07, 0.1, 0.15, 0.2, 0.3
+    };
+    int n_fine = sizeof(fine_k) / sizeof(fine_k[0]);
+
     printf("  %-8s", "k");
-    for (int r = 0; r < n_rates; r++) printf("  %7s", names[r]);
+    for (int r = 0; r < 4; r++) printf("  %7s", all_names[r]);
     printf("\n");
-    for (int p = 0; p < 7; p++) {
-        printf("  %-8.3f", med_pre[p]);
+
+    double best_k[4] = {0}; double best_s[4] = {-999,-999,-999,-999};
+    for (int p = 0; p < n_fine; p++) {
+        printf("  %-8.3f", fine_k[p]);
         fflush(stdout);
-        for (int r = 0; r < n_rates; r++) {
-            double s1 = measure_pre_sdm(rates[r], box[r], 1, med_pre[p]);
-            double s2 = measure_pre_sdm(rates[r], box[r], 1, med_pre[p]);
-            double s3 = measure_pre_sdm(rates[r], box[r], 1, med_pre[p]);
-            /* Use different test freqs by tweaking boxcar slightly */
-            /* Actually just measure 3x at same freq for consistency check */
-            printf("  %7.1f", s1);
+        for (int r = 0; r < 4; r++) {
+            double s = measure_pre_sdm(all_rates[r], all_box[r], 1, fine_k[p]);
+            printf("  %7.1f", s);
+            if (s > best_s[r]) { best_s[r] = s; best_k[r] = fine_k[p]; }
         }
         printf("\n"); fflush(stdout);
     }
+    printf("\n  Optimal k per rate:\n");
+    for (int r = 0; r < 4; r++)
+        printf("    %-8s: k=%.3f → %.1f dB\n", all_names[r], best_k[r], best_s[r]);
 
     TEST_ASSERT_TRUE(1, "pre-SDM enhancement test completed");
 }

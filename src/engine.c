@@ -338,9 +338,9 @@ size_t engine_process_block(engine_channel_t *eng,
                     eng->fir_buf[i] = bc->sum * inv_n * combined;
                 }
                 /* Pre-SDM pre-emphasis for DSD512: y[n] += k*(y[n]-y[n-1]).
-                 * Compensates boxcar frequency response, +10 dB SINAD. */
+                 * Compensates boxcar frequency response, +22 dB SINAD (median). */
                 if (cfg->fs_in >= DSD_RATE_512) {
-                    const double pre_k = 0.01;
+                    const double pre_k = 0.007;
                     for (size_t i = count - 1; i > 0; i--)
                         eng->fir_buf[i] += pre_k * (eng->fir_buf[i] - eng->fir_buf[i-1]);
                 }
