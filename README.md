@@ -351,36 +351,36 @@ Boxcar DSD-Wide: N-tap running average of ±1.0 DSD samples → multi-bit (log2(
 
 **44.1 kHz family — upsample** (end-to-end: DSD→fp64 FIR→SDM→Goertzel at output rate):
 
-| Conversion | NTF | Gain | Lim | Cands | SINAD | A-wtd |
-|------------|-----|------|-----|-------|------:|------:|
-| DSD64→DSD128 | SDM-7 | 0.71 | off | 2 | 99.7 | 105.3 |
-| DSD64→DSD256 | CLANS-8 | 0.71 | off | 4 | 97.6 | 102.5 |
-| DSD64→DSD512 | SDM-8 | 0.71 | on | 4 | 60.2 | 62.6 |
-| DSD128→DSD256 | CLANS-6 | 0.71 | off | 4 | 105.9 | 111.9 |
-| DSD128→DSD512 | CLANS-6 | 0.71 | off | 2 | 89.4 | 95.5 |
-| DSD256→DSD512 | CLANS-8 | 0.71 | on | 2 | 114.2 | 120.0 |
+| Conversion | NTF | Gain | Lim | Cands | SINAD | A-wtd | MT | NMod |
+|------------|-----|------|-----|-------|------:|------:|---:|-----:|
+| DSD64→DSD128 | SDM-7 | 0.71 | off | 2 | 99.7 | 105.3 | 89.9 | 18.8 |
+| DSD64→DSD256 | CLANS-8 | 0.71 | off | 4 | 97.6 | 102.5 | 158.6 | 15.8 |
+| DSD64→DSD512 | SDM-8 | 0.71 | on | 4 | 60.2 | 62.6 | -2.3 | 0.4 |
+| DSD128→DSD256 | CLANS-6 | 0.71 | off | 4 | 105.9 | 111.9 | 117.7 | 11.2 |
+| DSD128→DSD512 | CLANS-6 | 0.71 | off | 2 | 89.4 | 95.5 | 130.7 | 14.4 |
+| DSD256→DSD512 | CLANS-8 | 0.71 | on | 2 | 114.2 | 120.0 | 147.3 | 21.0 |
 
 **44.1 kHz family — downsample** (end-to-end):
 
-| Conversion | NTF | Gain | Lim | Cands | SINAD | A-wtd |
-|------------|-----|------|-----|-------|------:|------:|
-| DSD128→DSD64 | SDM-5 | 0.71 | off | 4 | 71.8 | 77.9 |
-| DSD256→DSD64 | CLANS-8 | 0.71 | off | 8 | 73.0 | 78.3 |
-| DSD512→DSD64 | SDM-6 | 0.71 | off | 8 | 67.7 | 73.8 |
-| DSD256→DSD128 | CLANS-6 | 0.71 | off | 2 | 87.5 | 93.7 |
-| DSD512→DSD128 | SDM-6 | 0.71 | off | 8 | 101.0 | 107.6 |
-| DSD512→DSD256 | SDM-6 | 0.71 | on | 8 | 94.1 | 100.0 |
+| Conversion | NTF | Gain | Lim | Cands | SINAD | A-wtd | MT | NMod |
+|------------|-----|------|-----|-------|------:|------:|---:|-----:|
+| DSD128→DSD64 | SDM-5 | 0.71 | off | 4 | 71.8 | 77.9 | 85.9 | 20.9 |
+| DSD256→DSD64 | CLANS-8 | 0.71 | off | 8 | 73.0 | 78.3 | 99.7 | 8.6 |
+| DSD512→DSD64 | SDM-6 | 0.71 | off | 8 | 76.0 | 81.9 | 91.3 | 23.7 |
+| DSD256→DSD128 | CLANS-6 | 0.71 | off | 2 | 87.5 | 93.7 | 120.3 | 10.3 |
+| DSD512→DSD128 | SDM-6 | 0.71 | off | 8 | 101.0 | 107.6 | 95.1 | 21.8 |
+| DSD512→DSD256 | SDM-6 | 0.71 | on | 8 | 94.1 | 100.0 | 116.2 | 13.8 |
 
 **48 kHz family — rate conversion** (independently swept):
 
-| Conversion | NTF | Gain | Cands | SINAD | A-wtd |
-|------------|-----|------|-------|------:|------:|
-| DSD64/48→DSD128/48 (UP) | SDM-4 | 0.71 | 2 | 94.7 | — |
-| DSD64/48→DSD256/48 (UP) | SDM-7 | 0.71 | 8 | 82.9 | — |
-| DSD128/48→DSD256/48 (UP) | CLANS-6 | 0.71 | 4 | 107.2 | — |
-| DSD128/48→DSD64/48 (DN) | SDM-5 | 0.71 | 4 | 71.9 | — |
-| DSD256/48→DSD64/48 (DN) | CLANS-8 | 0.71 | 8 | 73.6 | — |
-| DSD256/48→DSD128/48 (DN) | SDM-6 | 0.71 | 8 | 92.3 | — |
+| Conversion | NTF | Gain | Cands | SINAD | A-wtd | MT | NMod |
+|------------|-----|------|-------|------:|------:|---:|-----:|
+| DSD64/48→DSD128/48 (UP) | SDM-4 | 0.71 | 2 | 94.7 | 100.1 | 107.9 | 3.3 |
+| DSD64/48→DSD256/48 (UP) | SDM-7 | 0.71 | 8 | 82.9 | 88.4 | 117.6 | 9.2 |
+| DSD128/48→DSD256/48 (UP) | CLANS-6 | 0.71 | 4 | 107.2 | 113.3 | 115.1 | 40.1 |
+| DSD128/48→DSD64/48 (DN) | SDM-5 | 0.71 | 4 | 71.9 | 77.4 | 93.7 | 21.8 |
+| DSD256/48→DSD64/48 (DN) | CLANS-8 | 0.71 | 8 | 73.6 | — | — | — |
+| DSD256/48→DSD128/48 (DN) | SDM-6 | 0.71 | 8 | 92.3 | 98.4 | 118.5 | 11.0 |
 
 **Key observations:**
 - Same-rate: 85–109 dB via boxcar DSD-Wide (+22 dB vs FIR lowpass at DSD64)
