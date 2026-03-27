@@ -338,8 +338,8 @@ Rate conversion uses production path_config values: per-path optimal NTF filter,
 
 | Conversion | NTF | Gain | Lim | Cands | SINAD |
 |------------|-----|------|-----|-------|------:|
-| DSD64→DSD128 | SDM-4 | 0.71 | off | 2 | 87.4 |
-| DSD64→DSD256 | CLANS-8 | 0.71 | off | 2 | 54.2 |
+| DSD64→DSD128 | SDM-7 | 0.71 | off | 2 | 99.7 |
+| DSD64→DSD256 | CLANS-8 | 0.71 | off | 4 | 97.6 |
 | DSD64→DSD512 | SDM-8 | 0.71 | on | 4 | 60.7 |
 | DSD128→DSD256 | CLANS-6 | 0.71 | off | 4 | 105.9 |
 | DSD128→DSD512 | CLANS-6 | 0.71 | off | 2 | 89.4 |
@@ -349,7 +349,7 @@ Rate conversion uses production path_config values: per-path optimal NTF filter,
 
 | Conversion | NTF | Gain | Lim | Cands | SINAD |
 |------------|-----|------|-----|-------|------:|
-| DSD128→DSD64 | CLANS-4 | 0.71 | off | 32 | 67.3 |
+| DSD128→DSD64 | SDM-5 | 0.71 | off | 4 | 71.8 |
 | DSD256→DSD64 | CLANS-8 | 0.71 | off | 8 | 73.0 |
 | DSD512→DSD64 | SDM-6 | 0.71 | off | 8 | 67.7 |
 | DSD256→DSD128 | CLANS-6 | 0.71 | off | 2 | 86.0 |
@@ -363,12 +363,12 @@ Rate conversion uses production path_config values: per-path optimal NTF filter,
 | DSD64/48→DSD128/48 (UP) | SDM-4 | 0.71 | 2 | 94.7 |
 | DSD64/48→DSD256/48 (UP) | SDM-7 | 0.71 | 8 | 82.9 |
 | DSD128/48→DSD256/48 (UP) | CLANS-6 | 0.71 | 4 | 107.2 |
-| DSD128/48→DSD64/48 (DN) | CLANS-4 | 0.71 | 32 | 71.1 |
+| DSD128/48→DSD64/48 (DN) | SDM-5 | 0.71 | 4 | 71.9 |
 | DSD256/48→DSD64/48 (DN) | CLANS-8 | 0.71 | 8 | 72.9 |
 | DSD256/48→DSD128/48 (DN) | SDM-6 | 0.71 | 8 | 81.2 |
 
 **Key observations:**
-- Upsample 2x paths: 87–106 dB SINAD — excellent quality
+- Upsample 2x paths: 98–106 dB SINAD — excellent quality
 - DSD128→DSD512: 89 dB — 127-tap first FIR stage broke the 60 dB floor (+29 dB)
 - DSD256→DSD512: 114 dB — single-step upsample preserves quality
 - DSD64→DSD512: 61 dB — 3-stage 8x chain fundamentally limited by DSD64 noise density
