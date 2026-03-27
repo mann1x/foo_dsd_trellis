@@ -55,22 +55,33 @@ static double goertzel_power(const float *x, size_t n, double freq_hz,
     return (real * real + imag * imag) / ((double)n * (double)n);
 }
 
-/* Measure in-band SINAD on a signal */
-static double measure_sinad(const float *x, size_t n, double freq_hz,
-                            double sample_rate) {
+/* Measure in-band SINAD on a signal (flat + A-weighted) */
+static double measure_sinad_ex(const float *x, size_t n, double freq_hz,
+                                double sample_rate, double *awtd_out) {
     double signal_power = goertzel_power(x, n, freq_hz, sample_rate);
 
     double bw = sample_rate / (double)n;
     unsigned max_bin = (unsigned)(22050.0 / bw);
     unsigned sig_bin = (unsigned)(freq_hz / bw + 0.5);
 
-    double noise = 0.0;
+    double noise = 0.0, noise_aw = 0.0;
+    double sig_aw = signal_power * a_weight_factor(freq_hz);
     for (unsigned b = 1; b <= max_bin; b++) {
         if (b >= sig_bin - 1 && b <= sig_bin + 1) continue;
-        noise += goertzel_power(x, n, b * bw, sample_rate);
+        double pwr = goertzel_power(x, n, b * bw, sample_rate);
+        noise += pwr;
+        noise_aw += pwr * a_weight_factor(b * bw);
     }
     if (noise <= 0.0) noise = 1e-30;
+    if (noise_aw <= 0.0) noise_aw = 1e-30;
+    if (awtd_out)
+        *awtd_out = 10.0 * log10(sig_aw / noise_aw);
     return 10.0 * log10(signal_power / noise);
+}
+
+static double measure_sinad(const float *x, size_t n, double freq_hz,
+                            double sample_rate) {
+    return measure_sinad_ex(x, n, freq_hz, sample_rate, NULL);
 }
 
 /* ─── Generate DSD-encoded sine at a given DSD rate ─── */
@@ -109,11 +120,13 @@ static size_t generate_dsd_sine(uint32_t dsd_rate, double freq_hz,
 
 /* ─── Measure SINAD for a rate conversion path ─── */
 
-/* Single-frequency measurement core (no printf). */
+/* Single-frequency measurement core (no printf).
+ * If awtd_out is non-NULL, stores A-weighted SINAD there. */
 static double measure_rate_sinad_at(uint32_t fs_in, uint32_t fs_out,
                                      double target_hz,
                                      const engine_path_info_t *pi,
-                                     int cands, int lat, int depth) {
+                                     int cands, int lat, int depth,
+                                     double *awtd_out) {
     unsigned base = rate_is_48k_family(fs_in) ? 48000 : 44100;
     unsigned mult_in = fs_in / base;
     size_t n_in;
@@ -257,8 +270,11 @@ static double measure_rate_sinad_at(uint32_t fs_in, uint32_t fs_out,
 
     /* Measure SINAD directly at DSD output rate (bin-by-bin Goertzel up to 22 kHz).
      * This is the correct end-to-end measurement: DSD→FIR→SDM→Goertzel. */
+    double awtd = -999.0;
     double sinad_db = (out_count > 1024) ?
-        measure_sinad(dsd_out, out_count, freq, (double)fs_out) : -999.0;
+        measure_sinad_ex(dsd_out, out_count, freq, (double)fs_out, &awtd) : -999.0;
+
+    if (awtd_out) *awtd_out = awtd;
 
     free(dsd_in);
     free(fir_buf);
@@ -298,10 +314,12 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     int depth = pi.depth > 0 ? pi.depth : SINAD_TRELLIS_DEPTH;
 
     /* Measure at 3 frequencies to average out SDM chaotic sensitivity */
-    double s1 = measure_rate_sinad_at(fs_in, fs_out, 900.0, &pi, cands, lat, depth);
-    double s2 = measure_rate_sinad_at(fs_in, fs_out, 1000.0, &pi, cands, lat, depth);
-    double s3 = measure_rate_sinad_at(fs_in, fs_out, 1100.0, &pi, cands, lat, depth);
+    double a1, a2, a3;
+    double s1 = measure_rate_sinad_at(fs_in, fs_out, 900.0, &pi, cands, lat, depth, &a1);
+    double s2 = measure_rate_sinad_at(fs_in, fs_out, 1000.0, &pi, cands, lat, depth, &a2);
+    double s3 = measure_rate_sinad_at(fs_in, fs_out, 1100.0, &pi, cands, lat, depth, &a3);
     double sinad_db = median3(s1, s2, s3);
+    double awtd_db = median3(a1, a2, a3);
 
     unsigned base_in  = rate_is_48k_family(fs_in)  ? 48000 : 44100;
     unsigned base_out = rate_is_48k_family(fs_out) ? 48000 : 44100;
@@ -311,13 +329,22 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     if (fs_out > fs_in) dir = "UP";
     else if (fs_out < fs_in) dir = "DN";
     else dir = "same";
-    printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB  [%s, gain=%.2f, lim=%s, cands=%d, depth=%d]\n",
-           rate_in_mult, rate_out_mult, dir, sinad_db,
-           pi.ntf_filter != NTF_AUTO ?
-               ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, fs_out)->name : "auto",
-           pi.fir_gain,
-           pi.state_limit > 0.0 ? "on" : "off",
-           cands, depth);
+    if (fs_in == fs_out) {
+        printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB A-wtd=%.1f"
+               "  [%s, gain=%.2f, cands=%d, depth=%d]\n",
+               rate_in_mult, rate_out_mult, dir, sinad_db, awtd_db,
+               pi.ntf_filter != NTF_AUTO ?
+                   ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, fs_out)->name : "auto",
+               pi.fir_gain, cands, depth);
+    } else {
+        printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB  [%s, gain=%.2f, lim=%s, cands=%d, depth=%d]\n",
+               rate_in_mult, rate_out_mult, dir, sinad_db,
+               pi.ntf_filter != NTF_AUTO ?
+                   ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, fs_out)->name : "auto",
+               pi.fir_gain,
+               pi.state_limit > 0.0 ? "on" : "off",
+               cands, depth);
+    }
 
     return sinad_db;
 }
@@ -3493,9 +3520,9 @@ static double measure_median_sweep(uint32_t fs_in, uint32_t fs_out,
     pi.state_limit = state_limit;
     pi.fir_gain = gain;
 
-    double s1 = measure_rate_sinad_at(fs_in, fs_out, 900.0, &pi, nc, lat, depth);
-    double s2 = measure_rate_sinad_at(fs_in, fs_out, 1000.0, &pi, nc, lat, depth);
-    double s3 = measure_rate_sinad_at(fs_in, fs_out, 1100.0, &pi, nc, lat, depth);
+    double s1 = measure_rate_sinad_at(fs_in, fs_out, 900.0, &pi, nc, lat, depth, NULL);
+    double s2 = measure_rate_sinad_at(fs_in, fs_out, 1000.0, &pi, nc, lat, depth, NULL);
+    double s3 = measure_rate_sinad_at(fs_in, fs_out, 1100.0, &pi, nc, lat, depth, NULL);
     return median3(s1, s2, s3);
 }
 
