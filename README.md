@@ -293,27 +293,27 @@ Parameters: `rate` (DSD rate in Hz), `nc` (candidates), `depth`, `lat` (latency)
 
 ### Trellis SDM (nc=2, production path_table NTFs)
 
-Full end-to-end pipeline: generate DSD → FIR lowpass → SDM re-encode → Goertzel (multi-frequency median). This measures the actual production same-rate path quality, including FIR lowpass smoothing and SDM re-encode noise.
+Full end-to-end pipeline: generate DSD → boxcar DSD-Wide → SDM re-encode → Goertzel (multi-frequency median). Same-rate uses **boxcar (DSD-Wide) 4-bit intermediate** instead of FIR lowpass — the boxcar preserves DSD shaped noise as natural dither for the trellis re-encoder, giving +22 dB over FIR lowpass at DSD64.
 
 **44.1 kHz family:**
 
-| Rate | NTF | Depth | Cands | SINAD |
-|------|-----|------:|------:|------:|
-| DSD64 | CLANS-6 | 16 | 2 | 62.2 |
-| DSD128 | CLANS-6 | 4 | 2 | 76.8 |
-| DSD256 | CLANS-6 | 4 | 2 | 97.2 |
-| DSD512 | SDM-6 | 4 | 2 | 112.9 |
+| Rate | NTF | Depth | Cands | SINAD | A-wtd |
+|------|-----|------:|------:|------:|------:|
+| DSD64 | CLANS-6 | 16 | 2 | 84.5 | 90.0 |
+| DSD128 | CLANS-6 | 4 | 2 | 99.5 | 105.6 |
+| DSD256 | CLANS-6 | 4 | 2 | 108.5 | 114.4 |
+| DSD512 | SDM-6 | 4 | 2 | 108.6 | 114.1 |
 
 **48 kHz family:**
 
-| Rate | NTF | Depth | Cands | SINAD |
-|------|-----|------:|------:|------:|
-| DSD64/48 | SDM-6 | 16 | 2 | 62.9 |
-| DSD128/48 | CLANS-6 | 4 | 2 | 83.4 |
-| DSD256/48 | SDM-4 | 16 | 2 | 98.7 |
-| DSD512/48 | SDM-4 | 16 | 2 | 111.9 |
+| Rate | NTF | Depth | Cands | SINAD | A-wtd |
+|------|-----|------:|------:|------:|------:|
+| DSD64/48 | SDM-6 | 16 | 2 | 84.6 | 91.0 |
+| DSD128/48 | CLANS-6 | 4 | 2 | 103.4 | 110.4 |
+| DSD256/48 | SDM-4 | 16 | 2 | 103.8 | 109.7 |
+| DSD512/48 | SDM-4 | 16 | 2 | 109.8 | 116.0 |
 
-Same-rate re-encode is limited by the FIR lowpass + SDM re-encode chain. Quality scales with OSR: ~15 dB per octave (DSD64: 62 dB, DSD512: 113 dB). Published references: SACD spec 120 dB (encoding only), Archimago ~110-116 dB, HQPlayer ASDM7 ~110 dB.
+Quality scales ~15 dB per octave of OSR (DSD64: 85 dB, DSD512: 109 dB). Published references: SACD spec 120 dB (encoding only), Archimago ~110-116 dB, HQPlayer ASDM7 ~110 dB.
 
 `/fp:precise` required — `/fp:fast` causes up to 13 dB quality variation from FMA reordering (same root cause as CUDA `--fmad=false`). PGO provides 0% improvement (trellis is dependency-chain-bound, not branch/layout-bound).
 
@@ -332,7 +332,20 @@ PreCorr outperforms Trellis at DSD64 (+6.5 dB) because its trained prediction ta
 
 ### DSD Rate Conversion — Path-Adaptive Tuning
 
-Rate conversion uses production path_config values: per-path optimal NTF filter, FIR gain (-3 dB uniform), state limiter, candidates, depth. All paths use 0.708 (-3 dB) FIR gain for consistent volume across rate transitions.
+Rate conversion uses production path_config values: per-path optimal NTF filter, FIR gain (-3 dB uniform), state limiter, candidates, depth.
+
+**Pre-SDM processing pipeline by path type:**
+
+| Path | Pre-SDM Processing | Why |
+|------|-------------------|-----|
+| **Same-rate** | Boxcar DSD-Wide (4-bit) | Preserves DSD noise as natural dither (+22 dB vs FIR LP) |
+| **Upsample** | Raw DSD ±1.0 → fp64 FIR polyphase | DSD noise acts as dither; FIR handles anti-imaging |
+| **→DSD512 upsample** | Raw DSD → 127-tap first stage FIR | Narrower transition band reduces noise accumulation |
+| **Downsample** | Raw DSD ±1.0 → fp64 FIR polyphase | DSD noise as dither is optimal |
+| **DSD256→128 DN** | 32-tap boxcar → fp64 FIR | Pre-smooth removes noise spikes (+11 dB /48) |
+| **DSD→PCM** | FIR decimation only (no SDM) | Multi-bit output, no re-encoding needed |
+
+Boxcar DSD-Wide: N-tap running average of ±1.0 DSD samples → multi-bit (log2(N)-bit) intermediate at DSD rate. Rate-adaptive taps: DSD64=32, DSD128/256=64, DSD512=128. The multi-bit intermediate preserves shaped noise as natural dither that the trellis SDM re-encoder tracks efficiently.
 
 **44.1 kHz family — upsample** (end-to-end: DSD→fp64 FIR→SDM→Goertzel at output rate):
 
@@ -340,7 +353,7 @@ Rate conversion uses production path_config values: per-path optimal NTF filter,
 |------------|-----|------|-----|-------|------:|
 | DSD64→DSD128 | SDM-7 | 0.71 | off | 2 | 99.7 |
 | DSD64→DSD256 | CLANS-8 | 0.71 | off | 4 | 97.6 |
-| DSD64→DSD512 | SDM-8 | 0.71 | on | 4 | 60.7 |
+| DSD64→DSD512 | SDM-8 | 0.71 | on | 4 | 60.2 |
 | DSD128→DSD256 | CLANS-6 | 0.71 | off | 4 | 105.9 |
 | DSD128→DSD512 | CLANS-6 | 0.71 | off | 2 | 89.4 |
 | DSD256→DSD512 | CLANS-8 | 0.71 | on | 2 | 114.2 |
@@ -352,8 +365,8 @@ Rate conversion uses production path_config values: per-path optimal NTF filter,
 | DSD128→DSD64 | SDM-5 | 0.71 | off | 4 | 71.8 |
 | DSD256→DSD64 | CLANS-8 | 0.71 | off | 8 | 73.0 |
 | DSD512→DSD64 | SDM-6 | 0.71 | off | 8 | 67.7 |
-| DSD256→DSD128 | CLANS-6 | 0.71 | off | 2 | 86.0 |
-| DSD512→DSD128 | SDM-6 | 0.71 | off | 8 | 93.2 |
+| DSD256→DSD128 | CLANS-6 | 0.71 | off | 2 | 87.5 |
+| DSD512→DSD128 | SDM-6 | 0.71 | off | 8 | 101.0 |
 | DSD512→DSD256 | SDM-6 | 0.71 | on | 8 | 94.1 |
 
 **48 kHz family — rate conversion** (independently swept):
@@ -364,19 +377,19 @@ Rate conversion uses production path_config values: per-path optimal NTF filter,
 | DSD64/48→DSD256/48 (UP) | SDM-7 | 0.71 | 8 | 82.9 |
 | DSD128/48→DSD256/48 (UP) | CLANS-6 | 0.71 | 4 | 107.2 |
 | DSD128/48→DSD64/48 (DN) | SDM-5 | 0.71 | 4 | 71.9 |
-| DSD256/48→DSD64/48 (DN) | CLANS-8 | 0.71 | 8 | 72.9 |
-| DSD256/48→DSD128/48 (DN) | SDM-6 | 0.71 | 8 | 81.2 |
+| DSD256/48→DSD64/48 (DN) | CLANS-8 | 0.71 | 8 | 73.6 |
+| DSD256/48→DSD128/48 (DN) | SDM-6 | 0.71 | 8 | 92.3 |
 
 **Key observations:**
-- Upsample 2x paths: 98–106 dB SINAD — excellent quality
+- Same-rate: 85–109 dB via boxcar DSD-Wide (+22 dB vs FIR lowpass at DSD64)
+- Upsample 2x paths: 95–106 dB — excellent quality
 - DSD128→DSD512: 89 dB — 127-tap first FIR stage broke the 60 dB floor (+29 dB)
 - DSD256→DSD512: 114 dB — single-step upsample preserves quality
-- DSD64→DSD512: 61 dB — 3-stage 8x chain fundamentally limited by DSD64 noise density
-- Downsample paths: 67–94 dB. fp64 FIR is critical (fp32 loses 3–40 dB on multi-stage paths)
-- 48k family independently swept — SDM-6/nc=8 for DSD256/48→DSD128/48: 81 dB
-- Per-stage FIR taps: 127-tap first stage for →DSD512 upsample, 63-tap elsewhere
+- DSD64→DSD512: 60 dB — 4x+2x hybrid, fundamentally limited by DSD64 noise density
+- Downsample paths: 68–101 dB. fp64 FIR critical (fp32 loses 3–40 dB on multi-stage)
+- DSD256/48→DSD128/48: 92 dB — boxcar pre-smooth +11 dB over raw DSD input
 
-**Measurement methodology**: End-to-end pipeline (generate DSD at input rate → fp64 FIR rate conversion → SDM re-encode → Goertzel at output DSD rate, audio band 0–22 kHz). fp64 FIR matches production (Auto=fp64). Multi-frequency median (900/1000/1100 Hz) used for robustness against SDM limit-cycle sensitivity.
+**Measurement methodology**: End-to-end pipeline (generate DSD → boxcar or FIR → SDM re-encode → Goertzel, audio band 0–22 kHz). fp64 FIR matches production (Auto=fp64). Multi-frequency median (900/1000/1100 Hz) for robustness against SDM limit-cycle sensitivity.
 
 ### DSD to PCM Decimation
 
@@ -456,10 +469,10 @@ Each filter contains:
 - `order` -- Filter order (4-8)
 
 **Trellis auto-selection** (via path_table in engine.c):
-- DSD64/44: CLANS-6/d=16/lat=32 (62 dB). DSD64/48: SDM-6/d=16/lat=64 (63 dB).
-- DSD128: CLANS-6/d=4/lat=128 (77 dB). DSD256: CLANS-6/d=4/lat=128 (97 dB).
-- DSD512: SDM-6/d=4/lat=32 (113 dB). Depth=16 critical for DSD64 (4-bit dedup mask kills path diversity at low OSR).
-- Values are end-to-end (DSD→FIR lowpass→SDM→Goertzel), not encoding-only.
+- DSD64/44: CLANS-6/d=16/lat=32 (85 dB). DSD64/48: SDM-6/d=16/lat=64 (85 dB).
+- DSD128: CLANS-6/d=4/lat=128 (100 dB). DSD256: CLANS-6/d=4/lat=128 (109 dB).
+- DSD512: SDM-6/d=4/lat=32 (109 dB). Depth=16 critical for DSD64 (4-bit dedup mask kills path diversity at low OSR).
+- Values are end-to-end (DSD→boxcar DSD-Wide→SDM→Goertzel), not encoding-only.
 - 48k family: independently swept — SDM-4 dominates at DSD256/48 (143.4) and DSD512/48 (139.2).
 
 **PreCorr auto-selection**: CLANS-6 for DSD64, CLANS-7 for DSD128/DSD256/DSD512. (CLANS-8 is unstable with PreCorr's greedy quantizer at DSD256 boxcar input.)
