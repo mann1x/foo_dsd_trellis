@@ -3865,6 +3865,127 @@ static void test_boxcar_vs_lowpass(void) {
     TEST_ASSERT_TRUE(1, "boxcar vs lowpass completed");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * Boxcar pre-smoothing for rate conversion paths
+ * Test: boxcar → FIR → SDM vs raw DSD → FIR → SDM
+ * ═══════════════════════════════════════════════════════════════════════ */
+static double measure_rateconv_boxcar(uint32_t fs_in, uint32_t fs_out, int box_taps) {
+    unsigned base = rate_is_48k_family(fs_in) ? 48000 : 44100;
+    unsigned mult_in = fs_in / base;
+    size_t n_in = (mult_in <= 64) ? 262144 : (mult_in <= 128) ? 524288 :
+                  (mult_in <= 256) ? 1048576 : 2097152;
+    size_t max_out = (fs_out >= fs_in) ?
+        n_in * (fs_out / fs_in) + 4096 : n_in / 2 + 4096;
+
+    dsd_config_t cfg; memset(&cfg, 0, sizeof(cfg));
+    cfg.fs_in = fs_in; cfg.fs_out = fs_out;
+    engine_path_info_t pi;
+    engine_get_path_info(fs_in, fs_out, NTF_AUTO, SDM_MODE_TRELLIS, &cfg, &pi);
+    int cands = pi.cands > 0 ? pi.cands : 2;
+    int lat = pi.lat > 0 ? pi.lat : 128;
+    int depth = pi.depth > 0 ? pi.depth : 4;
+
+    size_t est_in = n_in - 512;
+    size_t est_fir = (fs_out >= fs_in) ?
+        est_in * (fs_out / fs_in) : est_in / (fs_in / fs_out);
+    size_t est_sdm = (est_fir > (size_t)lat) ? est_fir - (size_t)lat : 512;
+    double freq = bin_align_freq(1000.0, (double)fs_out, est_sdm);
+
+    /* Generate DSD input */
+    float *dsd_in = (float *)malloc(n_in * sizeof(float));
+    float *dsd_out = (float *)malloc(max_out * sizeof(float));
+    if (!dsd_in || !dsd_out) { free(dsd_in); free(dsd_out); return -999.0; }
+    size_t dsd_count = generate_dsd_sine(fs_in, freq, 0.5, n_in, dsd_in);
+    if (dsd_count < 1024) { free(dsd_in); free(dsd_out); return -999.0; }
+
+    /* Boxcar pre-smooth → multi-bit at input rate */
+    double *smooth = (double *)malloc(dsd_count * sizeof(double));
+    if (!smooth) { free(dsd_in); free(dsd_out); return -999.0; }
+    if (box_taps > 0) {
+        double bsum = 0.0;
+        double *ring = (double *)calloc(box_taps, sizeof(double));
+        int bpos = 0;
+        double inv = 1.0 / (double)box_taps;
+        for (size_t i = 0; i < dsd_count; i++) {
+            double s = (double)dsd_in[i];
+            bsum -= ring[bpos]; ring[bpos] = s; bsum += s;
+            bpos = (bpos + 1) % box_taps;
+            smooth[i] = bsum * inv;
+        }
+        free(ring);
+    } else {
+        /* No boxcar — raw DSD (baseline) */
+        for (size_t i = 0; i < dsd_count; i++)
+            smooth[i] = (double)dsd_in[i];
+    }
+
+    /* FIR rate conversion (fp64) */
+    fir_chain_t fir;
+    if (fir_chain_init_ex(&fir, fs_in, fs_out, true) != 0) {
+        free(smooth); free(dsd_in); free(dsd_out); return -999.0;
+    }
+    double *fir_out = (double *)calloc(max_out, sizeof(double));
+    if (!fir_out) { free(smooth); free(dsd_in); free(dsd_out); fir_chain_free(&fir); return -999.0; }
+    size_t fir_count = fir_chain_process_d(&fir, smooth, fir_out, dsd_count);
+    free(smooth);
+    fir_chain_free(&fir);
+    if (fir_count < 512) { free(fir_out); free(dsd_in); free(dsd_out); return -999.0; }
+
+    /* Apply gain */
+    double gain = (double)pi.fir_gain;
+    if (gain != 1.0) for (size_t i = 0; i < fir_count; i++) fir_out[i] *= gain;
+
+    /* SDM re-encode */
+    const ntf_filter_t *f = (pi.ntf_filter != NTF_AUTO) ?
+        ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, fs_out) : ntf_auto_select(fs_out);
+    if (!f) { free(fir_out); free(dsd_in); free(dsd_out); return -999.0; }
+    sdm_context_t sdm;
+    if (sdm_context_init(&sdm, f, depth, cands, lat) != 0) {
+        free(fir_out); free(dsd_in); free(dsd_out); return -999.0;
+    }
+    if (pi.state_limit > 0.0) sdm.state_limit = pi.state_limit;
+    size_t out_count = sdm_process_block(&sdm, fir_out, dsd_out, fir_count);
+    free(fir_out);
+    sdm_context_free(&sdm);
+
+    freq = bin_align_freq(freq, (double)fs_out, out_count);
+    double sinad = (out_count > 512) ?
+        measure_sinad(dsd_out, out_count, freq, (double)fs_out) : -999.0;
+    free(dsd_in); free(dsd_out);
+    return sinad;
+}
+
+static void test_boxcar_rateconv(void) {
+    typedef struct { uint32_t fs_in, fs_out; const char *name; } path_t;
+    static const path_t paths[] = {
+        { DSD_RATE_64,  DSD_RATE_128, "64->128" },
+        { DSD_RATE_64,  DSD_RATE_256, "64->256" },
+        { DSD_RATE_128, DSD_RATE_256, "128->256" },
+        { DSD_RATE_128, DSD_RATE_64,  "128->64"  },
+        { DSD_RATE_256, DSD_RATE_128, "256->128" },
+    };
+    static const int n_paths = 5;
+    static const int box_vals[] = { 0, 4, 8, 16, 32 };
+    static const int n_box = 5;
+
+    printf("\n=== Boxcar pre-smooth for rate conversion ===\n");
+    printf("  %-8s", "box");
+    for (int p = 0; p < n_paths; p++) printf(" %9s", paths[p].name);
+    printf("\n");
+
+    for (int b = 0; b < n_box; b++) {
+        printf("  %3d:   ", box_vals[b]);
+        fflush(stdout);
+        for (int p = 0; p < n_paths; p++) {
+            double s = measure_rateconv_boxcar(
+                paths[p].fs_in, paths[p].fs_out, box_vals[b]);
+            printf("  %8.1f", s);
+        }
+        printf("\n"); fflush(stdout);
+    }
+    TEST_ASSERT_TRUE(1, "boxcar rateconv completed");
+}
+
 void test_downsample_sweep_suite(void) {
     TEST_SUITE("Downsample Sweep");
     TEST_RUN(test_downsample_sweep);
@@ -3876,6 +3997,7 @@ void test_downsample_sweep_suite(void) {
     TEST_RUN(test_median_resweep);
     TEST_RUN(test_lowpass_cutoff_sweep);
     TEST_RUN(test_boxcar_vs_lowpass);
+    TEST_RUN(test_boxcar_rateconv);
 }
 
 void test_rate_sweep_suite(void) {
