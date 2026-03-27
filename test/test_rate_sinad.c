@@ -3608,6 +3608,104 @@ static void test_median_resweep(void) {
     TEST_ASSERT_TRUE(1, "median re-sweep completed");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * Lowpass cutoff sweep for same-rate re-encode quality
+ * ═══════════════════════════════════════════════════════════════════════ */
+static double measure_samerate_with_lp(uint32_t rate, double cutoff_hz, int ntaps) {
+    unsigned base = rate_is_48k_family(rate) ? 48000 : 44100;
+    unsigned mult = rate / base;
+    size_t n_in = (mult <= 64) ? 262144 : (mult <= 128) ? 524288 :
+                  (mult <= 256) ? 1048576 : 2097152;
+    size_t max_out = n_in + 4096;
+
+    /* Get path config */
+    dsd_config_t cfg; memset(&cfg, 0, sizeof(cfg));
+    cfg.fs_in = rate; cfg.fs_out = rate;
+    engine_path_info_t pi;
+    engine_get_path_info(rate, rate, NTF_AUTO, SDM_MODE_TRELLIS, &cfg, &pi);
+    int cands = pi.cands > 0 ? pi.cands : 2;
+    int lat = pi.lat > 0 ? pi.lat : 32;
+    int depth = pi.depth > 0 ? pi.depth : 4;
+
+    size_t est_out = n_in - 512 - (size_t)lat;
+    double freq = bin_align_freq(1000.0, (double)rate, est_out);
+
+    /* Generate DSD input */
+    float *dsd_in = (float *)malloc(n_in * sizeof(float));
+    float *dsd_out = (float *)malloc(max_out * sizeof(float));
+    if (!dsd_in || !dsd_out) { free(dsd_in); free(dsd_out); return -999.0; }
+    size_t dsd_in_count = generate_dsd_sine(rate, freq, 0.5, n_in, dsd_in);
+    if (dsd_in_count < 1024) { free(dsd_in); free(dsd_out); return -999.0; }
+
+    /* FIR lowpass with custom cutoff */
+    fir_lowpass_t lp;
+    if (fir_lowpass_init_ex(&lp, rate, cutoff_hz, ntaps) != 0) {
+        free(dsd_in); free(dsd_out); return -999.0;
+    }
+    double *lp_in = (double *)malloc(dsd_in_count * sizeof(double));
+    double *lp_out = (double *)malloc(max_out * sizeof(double));
+    if (!lp_in || !lp_out) {
+        free(lp_in); free(lp_out); free(dsd_in); free(dsd_out);
+        fir_lowpass_free(&lp); return -999.0;
+    }
+    for (size_t i = 0; i < dsd_in_count; i++) lp_in[i] = (double)dsd_in[i];
+    size_t fir_count = fir_lowpass_process(&lp, lp_in, lp_out, dsd_in_count);
+    free(lp_in);
+    fir_lowpass_free(&lp);
+    if (fir_count < 1024) { free(lp_out); free(dsd_in); free(dsd_out); return -999.0; }
+
+    /* Apply gain */
+    double gain = (double)pi.fir_gain;
+    if (gain != 1.0) for (size_t i = 0; i < fir_count; i++) lp_out[i] *= gain;
+
+    /* SDM re-encode */
+    const ntf_filter_t *f = (pi.ntf_filter != NTF_AUTO) ?
+        ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, rate) : ntf_auto_select(rate);
+    if (!f) { free(lp_out); free(dsd_in); free(dsd_out); return -999.0; }
+    sdm_context_t sdm;
+    if (sdm_context_init(&sdm, f, depth, cands, lat) != 0) {
+        free(lp_out); free(dsd_in); free(dsd_out); return -999.0;
+    }
+    size_t out_count = sdm_process_block(&sdm, lp_out, dsd_out, fir_count);
+    free(lp_out);
+    sdm_context_free(&sdm);
+
+    freq = bin_align_freq(freq, (double)rate, out_count);
+    double sinad = (out_count > 1024) ?
+        measure_sinad(dsd_out, out_count, freq, (double)rate) : -999.0;
+    free(dsd_in); free(dsd_out);
+    return sinad;
+}
+
+static void test_lowpass_cutoff_sweep(void) {
+    static const uint32_t rates[] = {
+        DSD_RATE_64, DSD_RATE_128, DSD_RATE_256, DSD_RATE_512
+    };
+    static const char *names[] = { "DSD64", "DSD128", "DSD256", "DSD512" };
+    static const double cutoffs[] = { 22000, 25000, 30000, 35000, 40000, 50000 };
+    static const int ntaps_vals[] = { 127, 255 };
+    static const int n_rates = 4, n_cutoffs = 6, n_ntaps = 2;
+
+    printf("\n=== Lowpass cutoff sweep (same-rate, single 1kHz) ===\n");
+    printf("  %-8s", "cutoff");
+    for (int r = 0; r < n_rates; r++) printf(" %8s", names[r]);
+    printf("\n");
+
+    for (int t = 0; t < n_ntaps; t++) {
+        printf("\n  --- %d taps ---\n", ntaps_vals[t]);
+        for (int c = 0; c < n_cutoffs; c++) {
+            printf("  %5.0f Hz:", cutoffs[c]);
+            fflush(stdout);
+            for (int r = 0; r < n_rates; r++) {
+                double s = measure_samerate_with_lp(rates[r], cutoffs[c], ntaps_vals[t]);
+                printf("  %7.1f", s);
+            }
+            printf("\n"); fflush(stdout);
+        }
+    }
+    TEST_ASSERT_TRUE(1, "lowpass cutoff sweep completed");
+}
+
 void test_downsample_sweep_suite(void) {
     TEST_SUITE("Downsample Sweep");
     TEST_RUN(test_downsample_sweep);
@@ -3617,6 +3715,7 @@ void test_downsample_sweep_suite(void) {
     TEST_RUN(test_dsd512_limiter_sweep);
     TEST_RUN(test_dsd64_to_512_sweep);
     TEST_RUN(test_median_resweep);
+    TEST_RUN(test_lowpass_cutoff_sweep);
 }
 
 void test_rate_sweep_suite(void) {

@@ -792,19 +792,20 @@ const char *fir_ipp_kernel_name(void) {
 #define LP_NTAPS 127         /* more taps = sharper transition, less noise leakage */
 #define LP_KAISER_BETA 10.0  /* ~100 dB stopband */
 
-int fir_lowpass_init(fir_lowpass_t *lp, uint32_t dsd_rate) {
+int fir_lowpass_init_ex(fir_lowpass_t *lp, uint32_t dsd_rate,
+                        double cutoff_hz, int ntaps) {
     memset(lp, 0, sizeof(*lp));
 
-    /* Design lowpass kernel: cutoff at 50 kHz.
-     * With 127 taps the transition band is ~22 kHz (50-72 kHz),
-     * rejecting most ultrasonic noise while preserving SDM headroom.
-     * 22 kHz cutoff caused Gibbs ringing artifacts (pops). */
-    double fc = 50000.0 / ((double)dsd_rate / 2.0);  /* normalized cutoff */
-    if (fc > 0.5) fc = 0.5;  /* can't exceed Nyquist/2 */
+    if (ntaps < 3) ntaps = 3;
+    if (ntaps > IPP_HB_NTAPS_MAX) ntaps = IPP_HB_NTAPS_MAX;
+    if (ntaps % 2 == 0) ntaps++;  /* must be odd */
 
-    double taps_d[LP_NTAPS];
-    float taps_f[LP_NTAPS];
-    int M = LP_NTAPS - 1;
+    double fc = cutoff_hz / ((double)dsd_rate / 2.0);  /* normalized cutoff */
+    if (fc > 0.5) fc = 0.5;
+
+    double taps_d[IPP_HB_NTAPS_MAX];
+    float taps_f[IPP_HB_NTAPS_MAX];
+    int M = ntaps - 1;
     double I0_beta = bessel_I0(LP_KAISER_BETA);
 
     for (int n = 0; n <= M; n++) {
@@ -815,47 +816,48 @@ int fir_lowpass_init(fir_lowpass_t *lp, uint32_t dsd_rate) {
         taps_d[n] = sinc * w;
     }
 
-    /* Normalize to unity gain at DC (fp64) */
     double sum = 0.0;
-    for (int n = 0; n < LP_NTAPS; n++) sum += taps_d[n];
+    for (int n = 0; n < ntaps; n++) sum += taps_d[n];
     if (sum > 0.0)
-        for (int n = 0; n < LP_NTAPS; n++) taps_d[n] /= sum;
+        for (int n = 0; n < ntaps; n++) taps_d[n] /= sum;
 
-    /* Keep fp32 copy for GPU upload */
-    for (int n = 0; n < LP_NTAPS; n++) taps_f[n] = (float)taps_d[n];
+    for (int n = 0; n < ntaps; n++) taps_f[n] = (float)taps_d[n];
 
-    /* Create IPP FIRSR spec (fp64) */
     int specSize = 0, bufSize = 0;
-    if (ippsFIRSRGetSize(LP_NTAPS, ipp64f, &specSize, &bufSize) != ippStsNoErr)
+    if (ippsFIRSRGetSize(ntaps, ipp64f, &specSize, &bufSize) != ippStsNoErr)
         return -1;
 
     lp->spec = ippsMalloc_8u(specSize);
     lp->buf = ippsMalloc_8u(bufSize);
-    lp->dly = ippsMalloc_64f(LP_NTAPS - 1);
+    lp->dly = ippsMalloc_64f(ntaps - 1);
     if (!lp->spec || !lp->buf || !lp->dly) {
         fir_lowpass_free(lp);
         return -1;
     }
 
-    ippsZero_64f(lp->dly, LP_NTAPS - 1);
+    ippsZero_64f(lp->dly, ntaps - 1);
 
-    if (ippsFIRSRInit_64f(taps_d, LP_NTAPS, ippAlgAuto,
+    if (ippsFIRSRInit_64f(taps_d, ntaps, ippAlgAuto,
                            (IppsFIRSpec_64f *)lp->spec) != ippStsNoErr) {
         fir_lowpass_free(lp);
         return -1;
     }
 
-    lp->coeffs = (float *)malloc(LP_NTAPS * sizeof(float));
+    lp->coeffs = (float *)malloc(ntaps * sizeof(float));
     if (lp->coeffs)
-        memcpy(lp->coeffs, taps_f, LP_NTAPS * sizeof(float));
+        memcpy(lp->coeffs, taps_f, ntaps * sizeof(float));
 
-    lp->coeffs_d = (double *)malloc(LP_NTAPS * sizeof(double));
+    lp->coeffs_d = (double *)malloc(ntaps * sizeof(double));
     if (lp->coeffs_d)
-        memcpy(lp->coeffs_d, taps_d, LP_NTAPS * sizeof(double));
+        memcpy(lp->coeffs_d, taps_d, ntaps * sizeof(double));
 
-    lp->taps = LP_NTAPS;
+    lp->taps = ntaps;
     lp->initialized = true;
     return 0;
+}
+
+int fir_lowpass_init(fir_lowpass_t *lp, uint32_t dsd_rate) {
+    return fir_lowpass_init_ex(lp, dsd_rate, 50000.0, LP_NTAPS);
 }
 
 size_t fir_lowpass_process(fir_lowpass_t *lp, const double *in, double *out, size_t count) {

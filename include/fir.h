@@ -97,6 +97,8 @@ typedef struct {
 } fir_lowpass_t;
 
 int fir_lowpass_init(fir_lowpass_t *lp, uint32_t dsd_rate);
+int fir_lowpass_init_ex(fir_lowpass_t *lp, uint32_t dsd_rate,
+                         double cutoff_hz, int ntaps);
 size_t fir_lowpass_process(fir_lowpass_t *lp, const double *in, double *out, size_t count);
 void fir_lowpass_reset(fir_lowpass_t *lp);
 void fir_lowpass_free(fir_lowpass_t *lp);
