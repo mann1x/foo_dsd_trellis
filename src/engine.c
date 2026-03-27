@@ -59,8 +59,8 @@ static const path_config_t path_table[] = {
     { DSD_RATE_512, DSD_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
     /* Upsample paths: gain=0.708 (-3 dB) to prevent FIR overload.
      * FIR upsampling of ±1 DSD produces peaks at ±2.24. */
-    { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },
-    { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  2,  0, 4, 0.708f },
+    { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_7,   0.0,  2,  0, 4, 0.708f },  /* median sweep: 99.7 dB (was sdm-4/nc=2: 87) */
+    { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  4,  0, 4, 0.708f },  /* median sweep: 97.6 dB (was clans-8/nc=2: 54) */
     { DSD_RATE_64,  DSD_RATE_512, NTF_SDM_8,   16.0, 4,  64, 8, 0.708f },  /* sweep: 68.1 dB (was clans-6/lim=10/nc=2: 59) */
     { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_6, 0.0,  4,  0, 4, 0.708f },  /* fp64 sweep: 127.3 dB (was clans-8/nc=2: 54 dB) */
     { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },  /* limiter sweep: 120.3 dB (was clans-8/lim=12: 60 dB) */
@@ -68,7 +68,7 @@ static const path_config_t path_table[] = {
     /* Downsample paths — re-swept for fp64 FIR pipeline (2026-03-26).
      * →DSD64 paths are FIR-limited (~72-85 dB). SDM params have minimal effect.
      * SDM-8 is unstable at DSD64 (51 dB — avoid). */
-    { DSD_RATE_128, DSD_RATE_64,  NTF_CLANS_4, 0.0,  32, 0, 0, 0.708f },
+    { DSD_RATE_128, DSD_RATE_64,  NTF_SDM_5,   0.0,  4,  0, 4, 0.708f },  /* median sweep: 88.7 dB (was clans-4/nc=32: 67) */
     { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  0, 0, 0.708f },
     { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },  /* fp64 sweep: 95.8 dB (was clans-4/nc=8: 80 dB) */
     { DSD_RATE_512, DSD_RATE_64,  NTF_SDM_6,   0.0,  8,  0, 0, 0.708f },
@@ -85,7 +85,7 @@ static const path_config_t path_table[] = {
     { DSD48_RATE_256, DSD48_RATE_256, NTF_SDM_4,   0.0,  2, 128, 16, 0.708f },
     { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_4,   0.0,  2, 128, 16, 0.708f },
     /* DSD/48 upsample */
-    { DSD48_RATE_64,  DSD48_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_64,  DSD48_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },  /* /48 independent — sdm-7 mirror regresses */
     { DSD48_RATE_64,  DSD48_RATE_256, NTF_SDM_7,   0.0,  8,  0, 4, 0.708f },  /* fp64 sweep: 91.3 dB (was clans-8/nc=2: 54.6 dB) */
     { DSD48_RATE_64,  DSD48_RATE_512, NTF_SDM_8,   16.0, 4,  64, 8, 0.708f },  /* mirror /44 sweep */
     { DSD48_RATE_128, DSD48_RATE_256, NTF_CLANS_6, 0.0,  4,  0, 4, 0.708f },  /* fp64 sweep: 118.6 dB (was clans-8/nc=2: 97 dB) */
@@ -94,7 +94,7 @@ static const path_config_t path_table[] = {
     /* DSD/48 downsample — re-swept for fp64 FIR pipeline (2026-03-26).
      *   256/48→128/48: SDM-6/nc=8/d=8 (fp64 sweep: 101.5 dB)
      *   →64/48 paths: /44 mirror retained */
-    { DSD48_RATE_128, DSD48_RATE_64,  NTF_CLANS_4, 0.0,  32, 0, 0, 0.708f },
+    { DSD48_RATE_128, DSD48_RATE_64,  NTF_SDM_5,   0.0,  4,  0, 4, 0.708f },  /* mirror /44 median sweep */
     { DSD48_RATE_256, DSD48_RATE_64,  NTF_CLANS_8, 0.0,   8, 0, 0, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_128, NTF_SDM_6,   0.0,   8, 0, 8, 0.708f },  /* fp64 sweep: 101.5 dB (was sdm-7/nc=2: 48 dB) */
     { DSD48_RATE_512, DSD48_RATE_64,  NTF_SDM_6,   0.0,   8, 0, 0, 0.708f },

@@ -3467,6 +3467,112 @@ static void test_dsd64_to_512_sweep(void) {
     TEST_ASSERT_TRUE(1, "DSD64->512 sweep completed");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * Median-aware re-sweep: uses rate-suite sample sizes + 3-freq median
+ * for paths that regressed with multi-frequency median measurement.
+ * ═══════════════════════════════════════════════════════════════════════ */
+static double measure_median_sweep(uint32_t fs_in, uint32_t fs_out,
+                                    ntf_filter_id_t filter_id,
+                                    int nc, int depth, int lat,
+                                    double state_limit, float gain) {
+    /* Build a fake path_info for measure_rate_sinad_at */
+    engine_path_info_t pi;
+    memset(&pi, 0, sizeof(pi));
+    pi.ntf_filter = (int)filter_id;
+    pi.cands = nc;
+    pi.lat = lat;
+    pi.depth = depth;
+    pi.state_limit = state_limit;
+    pi.fir_gain = gain;
+
+    double s1 = measure_rate_sinad_at(fs_in, fs_out, 900.0, &pi, nc, lat, depth);
+    double s2 = measure_rate_sinad_at(fs_in, fs_out, 1000.0, &pi, nc, lat, depth);
+    double s3 = measure_rate_sinad_at(fs_in, fs_out, 1100.0, &pi, nc, lat, depth);
+    return median3(s1, s2, s3);
+}
+
+static void test_median_resweep(void) {
+    typedef struct { uint32_t fs_in, fs_out; const char *name; } path_t;
+    static const path_t paths[] = {
+        { DSD_RATE_64,  DSD_RATE_256,  "64->256 /44"  },
+        { DSD_RATE_128, DSD_RATE_64,   "128->64 /44"  },
+        { DSD_RATE_64,  DSD_RATE_128,  "64->128 /44"  },
+    };
+    static const int n_paths = 3;
+
+    static const ntf_filter_id_t filters[] = {
+        NTF_CLANS_4, NTF_SDM_4, NTF_CLANS_5, NTF_SDM_5,
+        NTF_CLANS_6, NTF_SDM_6, NTF_CLANS_7, NTF_SDM_7,
+        NTF_CLANS_8, NTF_SDM_8
+    };
+    static const int n_filters = 10;
+    static const int nc_vals[] = { 2, 4, 8, 16 };
+    static const int n_nc = 4;
+
+    printf("\n=== Median re-sweep (rate-suite samples, 3-freq median) ===\n");
+
+    struct { ntf_filter_id_t filter; int nc; double sinad; } best[3];
+    for (int p = 0; p < n_paths; p++) best[p].sinad = -999.0;
+
+    for (int f = 0; f < n_filters; f++) {
+        const ntf_filter_t *ft = ntf_get_filter(filters[f], DSD_RATE_128);
+        for (int n = 0; n < n_nc; n++) {
+            printf("  %-9s nc=%-2d:", ft ? ft->name : "?", nc_vals[n]);
+            fflush(stdout);
+            for (int p = 0; p < n_paths; p++) {
+                double s = measure_median_sweep(
+                    paths[p].fs_in, paths[p].fs_out,
+                    filters[f], nc_vals[n], 4, 128, 0.0, 0.708f);
+                printf("  %6.1f", s);
+                if (s > best[p].sinad) {
+                    best[p].sinad = s;
+                    best[p].filter = filters[f];
+                    best[p].nc = nc_vals[n];
+                }
+            }
+            printf("\n"); fflush(stdout);
+        }
+    }
+
+    printf("\n  Phase 1 winners:\n");
+    for (int p = 0; p < n_paths; p++) {
+        const ntf_filter_t *ft = ntf_get_filter(best[p].filter, DSD_RATE_128);
+        printf("    %-14s %-10s nc=%-2d  %.1f dB\n",
+               paths[p].name, ft ? ft->name : "?", best[p].nc, best[p].sinad);
+    }
+
+    /* Phase 2: depth x lat on winners */
+    static const int depths[] = { 4, 8, 16 };
+    static const int lats[] = { 32, 64, 128 };
+    struct { int depth; int lat; double sinad; } best2[3];
+    for (int p = 0; p < n_paths; p++) { best2[p].sinad = best[p].sinad; best2[p].depth = 4; best2[p].lat = 128; }
+
+    printf("\n  Phase 2: depth x lat\n");
+    for (int d = 0; d < 3; d++) {
+        for (int l = 0; l < 3; l++) {
+            printf("  d=%-2d lat=%-3d:", depths[d], lats[l]);
+            fflush(stdout);
+            for (int p = 0; p < n_paths; p++) {
+                double s = measure_median_sweep(
+                    paths[p].fs_in, paths[p].fs_out,
+                    best[p].filter, best[p].nc, depths[d], lats[l], 0.0, 0.708f);
+                printf("  %6.1f", s);
+                if (s > best2[p].sinad) { best2[p].sinad = s; best2[p].depth = depths[d]; best2[p].lat = lats[l]; }
+            }
+            printf("\n"); fflush(stdout);
+        }
+    }
+
+    printf("\n  Final winners (median, rate-suite samples):\n");
+    for (int p = 0; p < n_paths; p++) {
+        const ntf_filter_t *ft = ntf_get_filter(best[p].filter, DSD_RATE_128);
+        printf("    %-14s %-10s nc=%-2d d=%-2d lat=%-3d  %.1f dB\n",
+               paths[p].name, ft ? ft->name : "?", best[p].nc,
+               best2[p].depth, best2[p].lat, best2[p].sinad);
+    }
+    TEST_ASSERT_TRUE(1, "median re-sweep completed");
+}
+
 void test_downsample_sweep_suite(void) {
     TEST_SUITE("Downsample Sweep");
     TEST_RUN(test_downsample_sweep);
@@ -3475,6 +3581,7 @@ void test_downsample_sweep_suite(void) {
     TEST_RUN(test_64_48_to_256_48_sweep);
     TEST_RUN(test_dsd512_limiter_sweep);
     TEST_RUN(test_dsd64_to_512_sweep);
+    TEST_RUN(test_median_resweep);
 }
 
 void test_rate_sweep_suite(void) {
