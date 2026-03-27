@@ -4329,6 +4329,123 @@ static void test_pre_sdm_enhancement(void) {
     TEST_ASSERT_TRUE(1, "pre-SDM enhancement test completed");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * CLI evaluator for CMA-ES optimizer: --preemph <rate_hz> <freq_hz> [taps...]
+ * Outputs: single SINAD value (machine-parseable)
+ * Pipeline: generate DSD sine → boxcar → apply FIR taps → SDM → Goertzel
+ * ═══════════════════════════════════════════════════════════════════════ */
+int preemph_eval_main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: test.exe --preemph <rate_hz> <freq_hz> [tap0 tap1 ...]\n");
+        fprintf(stderr, "  rate_hz: DSD rate (2822400, 5644800, 11289600, 22579200)\n");
+        fprintf(stderr, "  freq_hz: test frequency (e.g. 1000)\n");
+        fprintf(stderr, "  taps: FIR pre-emphasis taps (default: 1.0 = identity)\n");
+        fprintf(stderr, "Output: SINAD in dB (single number)\n");
+        return 1;
+    }
+
+    uint32_t rate = (uint32_t)atoi(argv[1]);
+    double freq_hz = argc >= 3 ? atof(argv[2]) : 1000.0;
+
+    /* Parse FIR taps */
+    int num_taps = argc - 3;
+    double taps[64] = {0};
+    if (num_taps <= 0) {
+        taps[0] = 1.0;
+        num_taps = 1;
+    } else {
+        if (num_taps > 64) num_taps = 64;
+        for (int i = 0; i < num_taps; i++)
+            taps[i] = atof(argv[3 + i]);
+    }
+
+    /* Determine boxcar taps */
+    unsigned base = rate_is_48k_family(rate) ? 48000 : 44100;
+    unsigned mult = rate / base;
+    int box_taps = (mult >= 512) ? 16 : (mult >= 128) ? 64 : 32;
+
+    /* Get path config */
+    dsd_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.fs_in = rate; cfg.fs_out = rate;
+    engine_path_info_t pi;
+    engine_get_path_info(rate, rate, NTF_AUTO, SDM_MODE_TRELLIS, &cfg, &pi);
+    int cands = pi.cands > 0 ? pi.cands : 2;
+    int lat = pi.lat > 0 ? pi.lat : 32;
+    int depth = pi.depth > 0 ? pi.depth : 4;
+
+    /* Sample count */
+    size_t n_in = (mult <= 64) ? 262144 : (mult <= 128) ? 524288 :
+                  (mult <= 256) ? 1048576 : 2097152;
+    size_t est = n_in - 512 - (size_t)lat;
+    double freq = bin_align_freq(freq_hz, (double)rate, est);
+
+    /* Generate DSD sine */
+    float *dsd_in = (float *)malloc(n_in * sizeof(float));
+    float *dsd_out = (float *)malloc(n_in * sizeof(float));
+    if (!dsd_in || !dsd_out) { free(dsd_in); free(dsd_out); fprintf(stderr, "OOM\n"); return 1; }
+    size_t dsd_count = generate_dsd_sine(rate, freq, 0.5, n_in, dsd_in);
+    if (dsd_count < 1024) { free(dsd_in); free(dsd_out); fprintf(stderr, "gen fail\n"); return 1; }
+
+    /* Boxcar smoothing */
+    double *smooth = (double *)calloc(dsd_count, sizeof(double));
+    if (!smooth) { free(dsd_in); free(dsd_out); return 1; }
+    {
+        double bsum = 0.0;
+        double *ring = (double *)calloc(box_taps, sizeof(double));
+        int bp = 0;
+        double inv = 1.0 / (double)box_taps;
+        double gain = (double)pi.fir_gain;
+        for (size_t i = 0; i < dsd_count; i++) {
+            double s = (double)dsd_in[i];
+            bsum -= ring[bp]; ring[bp] = s; bsum += s;
+            bp = (bp + 1) % box_taps;
+            smooth[i] = bsum * inv * gain;
+        }
+        free(ring);
+    }
+
+    /* Apply FIR pre-emphasis (causal convolution) */
+    if (num_taps > 1 || taps[0] != 1.0) {
+        double *tmp = (double *)malloc(dsd_count * sizeof(double));
+        if (tmp) {
+            for (size_t i = 0; i < dsd_count; i++) {
+                double y = 0.0;
+                for (int t = 0; t < num_taps; t++) {
+                    if (i >= (size_t)t)
+                        y += taps[t] * smooth[i - t];
+                }
+                tmp[i] = y;
+            }
+            memcpy(smooth, tmp, dsd_count * sizeof(double));
+            free(tmp);
+        }
+    }
+
+    /* SDM re-encode */
+    const ntf_filter_t *f = (pi.ntf_filter != NTF_AUTO) ?
+        ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, rate) : ntf_auto_select(rate);
+    if (!f) { free(smooth); free(dsd_in); free(dsd_out); return 1; }
+    sdm_context_t sdm;
+    if (sdm_context_init(&sdm, f, depth, cands, lat) != 0) {
+        free(smooth); free(dsd_in); free(dsd_out); return 1;
+    }
+    size_t out_count = sdm_process_block(&sdm, smooth, dsd_out, dsd_count);
+    free(smooth);
+    sdm_context_free(&sdm);
+
+    /* Measure SINAD */
+    freq = bin_align_freq(freq, (double)rate, out_count);
+    double sinad = (out_count > 1024) ?
+        measure_sinad(dsd_out, out_count, freq, (double)rate) : -999.0;
+
+    /* Output just the number */
+    printf("%.2f\n", sinad);
+
+    free(dsd_in); free(dsd_out);
+    return 0;
+}
+
 void test_downsample_sweep_suite(void) {
     TEST_SUITE("Downsample Sweep");
     TEST_RUN(test_downsample_sweep);

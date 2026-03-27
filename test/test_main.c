@@ -194,6 +194,10 @@ int main(int argc, char **argv) {
     extern int dsd_reencode_main(int, char **);
     if (argc >= 2 && strcmp(argv[1], "--reencode") == 0)
         return dsd_reencode_main(argc - 1, argv + 1);
+    /* Dispatch to pre-SDM pre-emphasis evaluator (for CMA-ES optimizer) */
+    extern int preemph_eval_main(int, char **);
+    if (argc >= 2 && strcmp(argv[1], "--preemph") == 0)
+        return preemph_eval_main(argc - 1, argv + 1);
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
