@@ -337,13 +337,9 @@ size_t engine_process_block(engine_channel_t *eng,
                     bc->pos = (bc->pos + 1) % bc->taps;
                     eng->fir_buf[i] = bc->sum * inv_n * combined;
                 }
-                /* Pre-SDM pre-emphasis for DSD512: y[n] += k*(y[n]-y[n-1]).
-                 * Compensates boxcar frequency response, +22 dB SINAD (median). */
-                if (cfg->fs_in >= DSD_RATE_512) {
-                    const double pre_k = 0.007;
-                    for (size_t i = count - 1; i > 0; i--)
-                        eng->fir_buf[i] += pre_k * (eng->fir_buf[i] - eng->fir_buf[i-1]);
-                }
+                /* Pre-SDM pre-emphasis DISABLED: optimal k is signal-dependent.
+                 * k=0.007 gives +22 dB for 1kHz test tone but hurts 10kHz (-10 dB).
+                 * Needs adaptive ML model for real music content. */
             }
             /* Re-encode via SDM (CPU only) */
             size_t sdm_out;
@@ -567,12 +563,7 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
                 bc->pos = (bc->pos + 1) % bc->taps;
                 eng->fir_buf[i] = bc->sum * inv_n * combined;
             }
-            /* Pre-SDM pre-emphasis for DSD512 */
-            if (cfg->fs_in >= DSD_RATE_512) {
-                const double pre_k = 0.01;
-                for (size_t i = count - 1; i > 0; i--)
-                    eng->fir_buf[i] += pre_k * (eng->fir_buf[i] - eng->fir_buf[i-1]);
-            }
+            /* Pre-SDM pre-emphasis DISABLED (signal-dependent — see above) */
         }
         fir_count = count;
     } else if (eng->fir.use_fp64) {

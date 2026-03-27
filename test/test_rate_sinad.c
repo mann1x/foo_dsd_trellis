@@ -194,19 +194,10 @@ static double measure_rate_sinad_at(uint32_t fs_in, uint32_t fs_out,
         }
         free(ring);
 
-        /* Pre-SDM pre-emphasis: y[n] += k * (y[n] - y[n-1]).
-         * Rate-adaptive k compensates boxcar frequency response.
-         * Tested 2026-03-27: DSD256 +16 dB, DSD64 +3 dB. */
-        {
-            /* Pre-SDM pre-emphasis (median-confirmed 2026-03-27):
-             * DSD512: k=0.007 (+22 dB). DSD128/256: regresses with median. */
-            double pre_k = 0.0;
-            if (mult_r >= 512) pre_k = 0.007;
-            if (pre_k > 0.0) {
-                for (size_t i = dsd_in_count - 1; i > 0; i--)
-                    fir_d_out[i] += pre_k * (fir_d_out[i] - fir_d_out[i-1]);
-            }
-        }
+        /* Pre-SDM pre-emphasis DISABLED: optimal k is signal-dependent
+         * (k=0.007 for 1kHz, k=0.05 for 100Hz, k=0.02 for 10kHz).
+         * Fixed k helps test tones but hurts diverse music content.
+         * Needs adaptive ML model — see train_pre_sdm.py. */
 
         fir_count = dsd_in_count;
     } else {
@@ -4240,6 +4231,100 @@ static void test_pre_sdm_enhancement(void) {
     printf("\n  Optimal k per rate:\n");
     for (int r = 0; r < 4; r++)
         printf("    %-8s: k=%.3f → %.1f dB\n", all_names[r], best_k[r], best_s[r]);
+
+    /* Signal-type dependency test: does optimal k vary with signal content?
+     * If yes → adaptive ML is worth pursuing. If no → parametric is optimal. */
+    printf("\n  --- Signal-type dependency (DSD512, k sweep) ---\n");
+    {
+        uint32_t rate = DSD_RATE_512;
+        int btap = 16;
+        size_t n = 2097152;
+        dsd_config_t cfg2; memset(&cfg2, 0, sizeof(cfg2));
+        cfg2.fs_in = rate; cfg2.fs_out = rate;
+        engine_path_info_t pi2;
+        engine_get_path_info(rate, rate, NTF_AUTO, SDM_MODE_TRELLIS, &cfg2, &pi2);
+        int c2 = pi2.cands > 0 ? pi2.cands : 2;
+        int l2 = pi2.lat > 0 ? pi2.lat : 32;
+        int d2 = pi2.depth > 0 ? pi2.depth : 4;
+
+        /* Test signals: sine, multitone, noise */
+        static const char *sig_names[] = { "1kHz sine", "100Hz sine", "10kHz sine", "multitone 8" };
+        static const double sig_freqs[] = { 1000, 100, 10000, 0 };  /* 0 = multitone */
+        static const double test_k[] = { 0.0, 0.005, 0.007, 0.01, 0.02, 0.05 };
+
+        printf("  %-14s", "signal\\k");
+        for (int ki = 0; ki < 6; ki++) printf("  %7.3f", test_k[ki]);
+        printf("\n");
+
+        for (int si = 0; si < 4; si++) {
+            printf("  %-14s", sig_names[si]);
+            fflush(stdout);
+            for (int ki = 0; ki < 6; ki++) {
+                /* Generate signal */
+                float *din = (float *)malloc(n * sizeof(float));
+                float *dout = (float *)malloc(n * sizeof(float));
+                double *smooth = (double *)calloc(n, sizeof(double));
+
+                size_t est = n - 512 - (size_t)l2;
+                double freq = bin_align_freq(sig_freqs[si] > 0 ? sig_freqs[si] : 1000.0, (double)rate, est);
+
+                size_t dc;
+                if (sig_freqs[si] > 0) {
+                    dc = generate_dsd_sine(rate, freq, 0.5, n, din);
+                } else {
+                    /* Multitone: 8 tones */
+                    const ntf_filter_t *fi = ntf_auto_select(rate);
+                    sdm_context_t gen;
+                    sdm_context_init(&gen, fi, 8, 16, 512);
+                    double *mt = (double *)malloc(n * sizeof(double));
+                    double amp = 0.5 / sqrt(8.0);
+                    double freqs[8] = {100, 300, 1000, 2000, 4000, 7000, 10000, 14000};
+                    for (size_t i = 0; i < n; i++) {
+                        mt[i] = 0;
+                        for (int t = 0; t < 8; t++)
+                            mt[i] += amp * sin(2.0 * 3.14159265358979 * freqs[t] * (double)i / (double)rate);
+                    }
+                    dc = sdm_process_block(&gen, mt, din, n);
+                    free(mt);
+                    sdm_context_free(&gen);
+                }
+
+                /* Boxcar */
+                double bsum = 0.0;
+                double rng[128] = {0};
+                int bp = 0;
+                double inv = 1.0 / (double)btap;
+                double gain = (double)pi2.fir_gain;
+                for (size_t i = 0; i < dc; i++) {
+                    double s = (double)din[i];
+                    bsum -= rng[bp]; rng[bp] = s; bsum += s;
+                    bp = (bp + 1) % btap;
+                    smooth[i] = bsum * inv * gain;
+                }
+
+                /* Pre-emphasis */
+                if (test_k[ki] > 0) {
+                    for (size_t i = dc - 1; i > 0; i--)
+                        smooth[i] += test_k[ki] * (smooth[i] - smooth[i-1]);
+                }
+
+                /* SDM */
+                const ntf_filter_t *fo = (pi2.ntf_filter != NTF_AUTO) ?
+                    ntf_get_filter((ntf_filter_id_t)pi2.ntf_filter, rate) : ntf_auto_select(rate);
+                sdm_context_t sdm;
+                sdm_context_init(&sdm, fo, d2, c2, l2);
+                size_t oc = sdm_process_block(&sdm, smooth, dout, dc);
+                sdm_context_free(&sdm);
+
+                freq = bin_align_freq(freq, (double)rate, oc);
+                double sinad = measure_sinad(dout, oc, freq, (double)rate);
+                printf("  %7.1f", sinad);
+
+                free(din); free(dout); free(smooth);
+            }
+            printf("\n"); fflush(stdout);
+        }
+    }
 
     TEST_ASSERT_TRUE(1, "pre-SDM enhancement test completed");
 }
