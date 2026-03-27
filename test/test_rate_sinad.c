@@ -363,15 +363,21 @@ static double measure_rate_sinad(uint32_t fs_in, uint32_t fs_out) {
     else if (fs_out < fs_in) dir = "DN";
     else dir = "same";
     if (fs_in == fs_out) {
-        printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB A-wtd=%.1f"
+        /* Same-rate: also compute MT and NMod via encoding-quality sinad_measure */
+        int ntf_id = pi.ntf_filter;
+        sinad_result_t r;
+        memset(&r, 0, sizeof(r));
+        sinad_measure(fs_in, ntf_id, cands, depth, lat, 1, pi.fir_gain, &r);
+        printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB A-wtd=%.1f MT=%.1f NMod=%.1f"
                "  [%s, gain=%.2f, cands=%d, depth=%d]\n",
                rate_in_mult, rate_out_mult, dir, sinad_db, awtd_db,
+               r.multitone_sinad_db, r.noise_mod_db,
                pi.ntf_filter != NTF_AUTO ?
                    ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, fs_out)->name : "auto",
                pi.fir_gain, cands, depth);
     } else {
-        printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB  [%s, gain=%.2f, lim=%s, cands=%d, depth=%d]\n",
-               rate_in_mult, rate_out_mult, dir, sinad_db,
+        printf("    [SINAD] DSD%u->DSD%u (%s): SINAD=%.1f dB A-wtd=%.1f  [%s, gain=%.2f, lim=%s, cands=%d, depth=%d]\n",
+               rate_in_mult, rate_out_mult, dir, sinad_db, awtd_db,
                pi.ntf_filter != NTF_AUTO ?
                    ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, fs_out)->name : "auto",
                pi.fir_gain,
