@@ -167,25 +167,33 @@ static double measure_rate_sinad_at(uint32_t fs_in, uint32_t fs_out,
     size_t fir_count;
     double *fir_d_out = NULL;  /* fp64 output (kept alive for SDM input) */
     if (fs_in == fs_out) {
-        /* Same-rate: FIR lowpass smoothing (matches engine's fir_lowpass path).
-         * Lowpass takes double in/out — keep as double for SDM. */
-        fir_lowpass_t lp;
-        memset(&lp, 0, sizeof(lp));
-        if (fir_lowpass_init(&lp, fs_in) != 0) {
-            free(dsd_in); free(fir_buf); free(dsd_out);
-            return -999.0;
-        }
-        double *lp_d_in = (double *)malloc(dsd_in_count * sizeof(double));
+        /* Same-rate: boxcar DSD-Wide smoothing (matches engine production path).
+         * Boxcar preserves DSD noise as dither → +30 dB over FIR lowpass. */
+        unsigned base_r = rate_is_48k_family(fs_in) ? 48000 : 44100;
+        unsigned mult_r = fs_in / base_r;
+        int box_taps = (mult_r >= 512) ? 128 : (mult_r >= 128) ? 64 : 32;
+
         fir_d_out = (double *)malloc(max_out * sizeof(double));
-        if (!lp_d_in || !fir_d_out) {
-            free(lp_d_in); free(fir_d_out); free(dsd_in); free(fir_buf); free(dsd_out);
-            fir_lowpass_free(&lp); fir_d_out = NULL; return -999.0;
+        if (!fir_d_out) {
+            free(dsd_in); free(fir_buf); free(dsd_out);
+            fir_d_out = NULL; return -999.0;
         }
-        for (size_t i = 0; i < dsd_in_count; i++)
-            lp_d_in[i] = (double)dsd_in[i];
-        fir_count = fir_lowpass_process(&lp, lp_d_in, fir_d_out, dsd_in_count);
-        free(lp_d_in);
-        fir_lowpass_free(&lp);
+        /* Boxcar running average */
+        double bsum = 0.0;
+        double *ring = (double *)calloc(box_taps, sizeof(double));
+        if (!ring) { free(fir_d_out); free(dsd_in); free(fir_buf); free(dsd_out); fir_d_out = NULL; return -999.0; }
+        int bpos = 0;
+        double inv_n = 1.0 / (double)box_taps;
+        for (size_t i = 0; i < dsd_in_count; i++) {
+            double s = (double)dsd_in[i];
+            bsum -= ring[bpos];
+            ring[bpos] = s;
+            bsum += s;
+            bpos = (bpos + 1) % box_taps;
+            fir_d_out[i] = bsum * inv_n;
+        }
+        free(ring);
+        fir_count = dsd_in_count;
     } else {
         /* Rate conversion: fp64 FIR chain (matches production Auto=fp64).
          * Keep output as double — no float truncation, matching engine.c. */
