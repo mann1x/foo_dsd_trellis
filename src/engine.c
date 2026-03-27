@@ -122,11 +122,12 @@ int engine_channel_init(engine_channel_t *eng, int channel,
      * not at init time, so FIR+SDM are always available for gain control */
     eng->passthrough = false;
 
-    /* Rate-adaptive boxcar (PreCorr fallback) */
+    /* Rate-adaptive boxcar taps for DSD-Wide smoothing.
+     * Trellis same-rate: DSD64=32 (94 dB), DSD128/256=64 (100-109 dB),
+     * DSD512=16 (118 dB — fewer taps preserve more dither at high OSR).
+     * Also used as PreCorr fallback. */
     if (cfg->fs_in >= DSD_RATE_512)
-        eng->boxcar.taps = 128;
-    else if (cfg->fs_in >= DSD_RATE_256)
-        eng->boxcar.taps = 64;
+        eng->boxcar.taps = 16;
     else if (cfg->fs_in >= DSD_RATE_128)
         eng->boxcar.taps = 64;
     else

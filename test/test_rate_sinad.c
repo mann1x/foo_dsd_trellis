@@ -171,7 +171,7 @@ static double measure_rate_sinad_at(uint32_t fs_in, uint32_t fs_out,
          * Boxcar preserves DSD noise as dither → +30 dB over FIR lowpass. */
         unsigned base_r = rate_is_48k_family(fs_in) ? 48000 : 44100;
         unsigned mult_r = fs_in / base_r;
-        int box_taps = (mult_r >= 512) ? 128 : (mult_r >= 128) ? 64 : 32;
+        int box_taps = (mult_r >= 512) ? 16 : (mult_r >= 128) ? 64 : 32;
 
         fir_d_out = (double *)malloc(max_out * sizeof(double));
         if (!fir_d_out) {

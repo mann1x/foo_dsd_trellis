@@ -379,7 +379,7 @@ Boxcar DSD-Wide: N-tap running average of ±1.0 DSD samples → multi-bit (log2(
 | DSD64/48→DSD256/48 (UP) | SDM-7 | 0.71 | 8 | 82.9 | 88.4 | 117.6 | 9.2 |
 | DSD128/48→DSD256/48 (UP) | CLANS-6 | 0.71 | 4 | 107.2 | 113.3 | 115.1 | 40.1 |
 | DSD128/48→DSD64/48 (DN) | SDM-5 | 0.71 | 4 | 71.9 | 77.4 | 93.7 | 21.8 |
-| DSD256/48→DSD64/48 (DN) | CLANS-8 | 0.71 | 8 | 73.6 | — | — | — |
+| DSD256/48→DSD64/48 (DN) | CLANS-8 | 0.71 | 8 | 73.6 | 79.4 | 85.3 | 11.1 |
 | DSD256/48→DSD128/48 (DN) | SDM-6 | 0.71 | 8 | 92.3 | 98.4 | 118.5 | 11.0 |
 
 **Key observations:**
