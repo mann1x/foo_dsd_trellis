@@ -3706,6 +3706,157 @@ static void test_lowpass_cutoff_sweep(void) {
     TEST_ASSERT_TRUE(1, "lowpass cutoff sweep completed");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * Boxcar (DSD-Wide) vs FIR lowpass for same-rate re-encode
+ * Tests whether 4-bit DSD-Wide intermediate improves over FIR lowpass
+ * ═══════════════════════════════════════════════════════════════════════ */
+static double measure_samerate_boxcar(uint32_t rate, int box_taps) {
+    unsigned base = rate_is_48k_family(rate) ? 48000 : 44100;
+    unsigned mult = rate / base;
+    size_t n_in = (mult <= 64) ? 262144 : (mult <= 128) ? 524288 :
+                  (mult <= 256) ? 1048576 : 2097152;
+
+    /* Get path config */
+    dsd_config_t cfg; memset(&cfg, 0, sizeof(cfg));
+    cfg.fs_in = rate; cfg.fs_out = rate;
+    engine_path_info_t pi;
+    engine_get_path_info(rate, rate, NTF_AUTO, SDM_MODE_TRELLIS, &cfg, &pi);
+    int cands = pi.cands > 0 ? pi.cands : 2;
+    int lat = pi.lat > 0 ? pi.lat : 32;
+    int depth = pi.depth > 0 ? pi.depth : 4;
+
+    size_t est_out = n_in - 512 - (size_t)lat;
+    double freq = bin_align_freq(1000.0, (double)rate, est_out);
+
+    /* Generate DSD input */
+    float *dsd_in = (float *)malloc(n_in * sizeof(float));
+    float *dsd_out = (float *)malloc(n_in * sizeof(float));
+    if (!dsd_in || !dsd_out) { free(dsd_in); free(dsd_out); return -999.0; }
+    size_t dsd_count = generate_dsd_sine(rate, freq, 0.5, n_in, dsd_in);
+    if (dsd_count < 1024) { free(dsd_in); free(dsd_out); return -999.0; }
+
+    /* Boxcar smoothing (DSD-Wide) — running average of box_taps 1-bit samples */
+    double *smooth = (double *)calloc(dsd_count, sizeof(double));
+    if (!smooth) { free(dsd_in); free(dsd_out); return -999.0; }
+    double bsum = 0.0;
+    double *ring = (double *)calloc(box_taps, sizeof(double));
+    if (!ring) { free(smooth); free(dsd_in); free(dsd_out); return -999.0; }
+    int bpos = 0;
+    double inv_n = 1.0 / (double)box_taps;
+    double gain = (double)pi.fir_gain;
+
+    for (size_t i = 0; i < dsd_count; i++) {
+        double s = (double)dsd_in[i];
+        bsum -= ring[bpos];
+        ring[bpos] = s;
+        bsum += s;
+        bpos = (bpos + 1) % box_taps;
+        smooth[i] = bsum * inv_n * gain;
+    }
+    free(ring);
+
+    /* SDM re-encode */
+    const ntf_filter_t *f = (pi.ntf_filter != NTF_AUTO) ?
+        ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, rate) : ntf_auto_select(rate);
+    if (!f) { free(smooth); free(dsd_in); free(dsd_out); return -999.0; }
+    sdm_context_t sdm;
+    if (sdm_context_init(&sdm, f, depth, cands, lat) != 0) {
+        free(smooth); free(dsd_in); free(dsd_out); return -999.0;
+    }
+    size_t out_count = sdm_process_block(&sdm, smooth, dsd_out, dsd_count);
+    free(smooth);
+    sdm_context_free(&sdm);
+
+    freq = bin_align_freq(freq, (double)rate, out_count);
+    double sinad = (out_count > 1024) ?
+        measure_sinad(dsd_out, out_count, freq, (double)rate) : -999.0;
+    free(dsd_in); free(dsd_out);
+    return sinad;
+}
+
+static void test_boxcar_vs_lowpass(void) {
+    static const uint32_t rates[] = {
+        DSD_RATE_64, DSD_RATE_128, DSD_RATE_256, DSD_RATE_512
+    };
+    static const char *names[] = { "DSD64", "DSD128", "DSD256", "DSD512" };
+    static const int box_taps[] = { 8, 16, 32, 64 };
+    static const int n_rates = 4, n_box = 4;
+
+    printf("\n=== Boxcar (DSD-Wide) vs FIR lowpass for same-rate ===\n");
+    printf("  %-12s", "method");
+    for (int r = 0; r < n_rates; r++) printf(" %8s", names[r]);
+    printf("\n");
+
+    /* FIR lowpass baseline (current production) */
+    printf("  FIR LP 50k:");
+    fflush(stdout);
+    for (int r = 0; r < n_rates; r++) {
+        double s = measure_samerate_with_lp(rates[r], 50000.0, 127);
+        printf("  %7.1f", s);
+    }
+    printf("\n"); fflush(stdout);
+
+    /* Boxcar at different tap counts */
+    for (int b = 0; b < n_box; b++) {
+        printf("  Box %3d:   ", box_taps[b]);
+        fflush(stdout);
+        for (int r = 0; r < n_rates; r++) {
+            double s = measure_samerate_boxcar(rates[r], box_taps[b]);
+            printf("  %7.1f", s);
+        }
+        printf("\n"); fflush(stdout);
+    }
+
+    /* Also test boxcar with higher nc (nc=4, nc=8) at DSD64 */
+    printf("\n  --- DSD64 boxcar nc sweep ---\n");
+    static const int nc_vals[] = { 2, 4, 8, 16 };
+    for (int n = 0; n < 4; n++) {
+        /* Quick inline test with custom nc */
+        size_t n_in = 262144;
+        dsd_config_t cfg; memset(&cfg, 0, sizeof(cfg));
+        cfg.fs_in = DSD_RATE_64; cfg.fs_out = DSD_RATE_64;
+        engine_path_info_t pi;
+        engine_get_path_info(DSD_RATE_64, DSD_RATE_64, NTF_AUTO, SDM_MODE_TRELLIS, &cfg, &pi);
+        int lat = pi.lat > 0 ? pi.lat : 32;
+        int depth = pi.depth > 0 ? pi.depth : 16;
+
+        size_t est = n_in - 512 - (size_t)lat;
+        double freq = bin_align_freq(1000.0, (double)DSD_RATE_64, est);
+
+        float *din = (float *)malloc(n_in * sizeof(float));
+        float *dout = (float *)malloc(n_in * sizeof(float));
+        size_t dc = generate_dsd_sine(DSD_RATE_64, freq, 0.5, n_in, din);
+
+        /* Boxcar 32 taps */
+        double *sm = (double *)calloc(dc, sizeof(double));
+        double *rng = (double *)calloc(32, sizeof(double));
+        double bs = 0.0; int bp = 0;
+        for (size_t i = 0; i < dc; i++) {
+            double v = (double)din[i];
+            bs -= rng[bp]; rng[bp] = v; bs += v;
+            bp = (bp + 1) % 32;
+            sm[i] = bs / 32.0 * (double)pi.fir_gain;
+        }
+        free(rng);
+
+        const ntf_filter_t *f = (pi.ntf_filter != NTF_AUTO) ?
+            ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, DSD_RATE_64) : ntf_auto_select(DSD_RATE_64);
+        sdm_context_t sdm;
+        sdm_context_init(&sdm, f, depth, nc_vals[n], lat);
+        size_t oc = sdm_process_block(&sdm, sm, dout, dc);
+        free(sm);
+        sdm_context_free(&sdm);
+
+        freq = bin_align_freq(freq, (double)DSD_RATE_64, oc);
+        double sinad = measure_sinad(dout, oc, freq, (double)DSD_RATE_64);
+        printf("  Box32 nc=%-2d: %.1f dB\n", nc_vals[n], sinad);
+        fflush(stdout);
+        free(din); free(dout);
+    }
+
+    TEST_ASSERT_TRUE(1, "boxcar vs lowpass completed");
+}
+
 void test_downsample_sweep_suite(void) {
     TEST_SUITE("Downsample Sweep");
     TEST_RUN(test_downsample_sweep);
@@ -3716,6 +3867,7 @@ void test_downsample_sweep_suite(void) {
     TEST_RUN(test_dsd64_to_512_sweep);
     TEST_RUN(test_median_resweep);
     TEST_RUN(test_lowpass_cutoff_sweep);
+    TEST_RUN(test_boxcar_vs_lowpass);
 }
 
 void test_rate_sweep_suite(void) {

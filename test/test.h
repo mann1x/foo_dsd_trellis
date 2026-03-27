@@ -53,9 +53,13 @@ extern int test_should_run_suite(const char *suite_tag);
 #define TEST_ASSERT_FLOAT_EQ(a, b, eps, msg) \
     TEST_ASSERT(fabs((double)(a) - (double)(b)) < (eps), msg)
 
+extern int test_should_run_test(const char *test_name);
+
 #define TEST_RUN(fn) do {                          \
-    printf("  %s...\n", #fn);                      \
-    fn();                                          \
+    if (test_should_run_test(#fn)) {               \
+        printf("  %s...\n", #fn);                  \
+        fn();                                      \
+    }                                              \
 } while (0)
 
 #define TEST_SUITE(name) \

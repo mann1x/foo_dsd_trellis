@@ -73,6 +73,8 @@ static int g_include_count = 0;
 static const char *g_includes[MAX_FILTERS];
 static int g_exclude_count = 0;
 static const char *g_excludes[MAX_FILTERS];
+static int g_test_filter_count = 0;
+static const char *g_test_filters[MAX_FILTERS];
 
 /* Case-insensitive substring match */
 static int stricasestr(const char *haystack, const char *needle) {
@@ -89,6 +91,16 @@ static int stricasestr(const char *haystack, const char *needle) {
             if (h != n) { match = 0; break; }
         }
         if (match) return 1;
+    }
+    return 0;
+}
+
+int test_should_run_test(const char *test_name) {
+    if (g_test_filter_count == 0)
+        return 1;  /* no filter = run all */
+    for (int i = 0; i < g_test_filter_count; i++) {
+        if (stricasestr(test_name, g_test_filters[i]))
+            return 1;
     }
     return 0;
 }
@@ -118,6 +130,7 @@ static void print_usage(void) {
     printf("  --all              Run all suites including extended\n");
     printf("  --suite NAME       Run only suites matching NAME (repeatable)\n");
     printf("  --exclude NAME     Skip suites matching NAME (repeatable)\n");
+    printf("  --test NAME        Run only tests whose name contains NAME (repeatable)\n");
     printf("  --list             List available suites and exit\n");
     printf("  --help             Show this help\n");
 }
@@ -193,6 +206,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--exclude") == 0 && i + 1 < argc) {
             if (g_exclude_count < MAX_FILTERS)
                 g_excludes[g_exclude_count++] = argv[++i];
+        } else if (strcmp(argv[i], "--test") == 0 && i + 1 < argc) {
+            if (g_test_filter_count < MAX_FILTERS)
+                g_test_filters[g_test_filter_count++] = argv[++i];
         } else if (strcmp(argv[i], "--list") == 0) {
             list_suites();
             return 0;
