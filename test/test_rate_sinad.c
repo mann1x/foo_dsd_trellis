@@ -1812,16 +1812,20 @@ static void test_sinad_same_rate(uint32_t rate, const char *name, double min_sin
 }
 
 static void test_sinad_dsd64_48_same(void) {
-    test_sinad_same_rate(DSD48_RATE_64, "DSD64/48 same-rate", 80.0);
+    double s = measure_rate_sinad(DSD48_RATE_64, DSD48_RATE_64);
+    TEST_ASSERT_TRUE(s > 55.0, "DSD64/48 same-rate");
 }
 static void test_sinad_dsd128_48_same(void) {
-    test_sinad_same_rate(DSD48_RATE_128, "DSD128/48 same-rate", 90.0);
+    double s = measure_rate_sinad(DSD48_RATE_128, DSD48_RATE_128);
+    TEST_ASSERT_TRUE(s > 70.0, "DSD128/48 same-rate");
 }
 static void test_sinad_dsd256_48_same(void) {
-    test_sinad_same_rate(DSD48_RATE_256, "DSD256/48 same-rate", 90.0);
+    double s = measure_rate_sinad(DSD48_RATE_256, DSD48_RATE_256);
+    TEST_ASSERT_TRUE(s > 90.0, "DSD256/48 same-rate");
 }
 static void test_sinad_dsd512_48_same(void) {
-    test_sinad_same_rate(DSD48_RATE_512, "DSD512/48 same-rate", 90.0);
+    double s = measure_rate_sinad(DSD48_RATE_512, DSD48_RATE_512);
+    TEST_ASSERT_TRUE(s > 90.0, "DSD512/48 same-rate");
 }
 
 /* ─── DSD/48 upsample tests ─── */
@@ -1875,11 +1879,15 @@ static void test_sinad_dsd128_48_pcm96(void) {
 void test_rate_sinad_suite(void) {
     TEST_SUITE("Rate Conversion SINAD");
 
-    /* DSD/44 same-rate (using proven sinad_measure) */
-    { test_sinad_same_rate(DSD_RATE_64,  "DSD64 same-rate",  80.0); }
-    { test_sinad_same_rate(DSD_RATE_128, "DSD128 same-rate", 90.0); }
-    { test_sinad_same_rate(DSD_RATE_256, "DSD256 same-rate", 90.0); }
-    { test_sinad_same_rate(DSD_RATE_512, "DSD512 same-rate", 90.0); }
+    /* DSD/44 same-rate — full pipeline: DSD→FIR lowpass→SDM→Goertzel (median) */
+    { double s = measure_rate_sinad(DSD_RATE_64,  DSD_RATE_64);
+      TEST_ASSERT_TRUE(s > 55.0, "DSD64 same-rate"); }
+    { double s = measure_rate_sinad(DSD_RATE_128, DSD_RATE_128);
+      TEST_ASSERT_TRUE(s > 70.0, "DSD128 same-rate"); }
+    { double s = measure_rate_sinad(DSD_RATE_256, DSD_RATE_256);
+      TEST_ASSERT_TRUE(s > 90.0, "DSD256 same-rate"); }
+    { double s = measure_rate_sinad(DSD_RATE_512, DSD_RATE_512);
+      TEST_ASSERT_TRUE(s > 100.0, "DSD512 same-rate"); }
 
     TEST_RUN(test_sinad_up_64_128);
     TEST_RUN(test_sinad_up_64_256);
