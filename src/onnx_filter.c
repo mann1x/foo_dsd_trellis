@@ -1,17 +1,16 @@
 /*
- * foo_dsd_trellis — ONNX Runtime ML post-filter implementation
+ * foo_dsd_trellis — ONNX Runtime ML filter implementation
  *
  * Fully runtime-loaded: no compile-time dependency on ONNX Runtime SDK.
  * Uses LoadLibraryW + GetProcAddress to resolve OrtGetApiBase at runtime.
  * Plugin builds and runs without onnxruntime.dll — the ML filter is
  * simply unavailable.
  *
- * Model expects:
- *   Input:  [1, 1, hist_len + count] float32 (±1.0 DSD with causal history)
- *   Output: [1, 1, count] float32 (refined DSD, requantized to ±1.0)
+ * Two modes:
+ *   Post-SDM: Input [1,1,hist+N] → Output [1,1,N] (requantized ±1.0)
+ *   Pre-SDM:  Input [1,1,N] → Output [1,1,N] (continuous, no requantize)
  *
- * Causal padding: last (receptive_field - 1) samples saved per-channel,
- * prepended to next block's input.
+ * Supports CUDA, DirectML, and CPU execution providers with fallback.
  */
 
 #include "../include/onnx_filter.h"
@@ -96,6 +95,17 @@ typedef OrtStatus *(*ort_DisableMemPattern_fn)(OrtSessionOptions *);
 
 /* DirectML EP — exported directly from onnxruntime.dll (not vtable) */
 typedef OrtStatus *(*OrtDmlAppendEP_fn)(OrtSessionOptions *, int);
+
+/* CUDA EP — vtable slot for ORT 1.16+ */
+#define ORT_SLOT_CREATE_CUDA_OPTIONS         148
+#define ORT_SLOT_SESSION_OPTIONS_APPEND_EP   149
+#define ORT_SLOT_RELEASE_CUDA_OPTIONS        150
+typedef OrtStatus *(*ort_CreateCudaOptions_fn)(void **);
+typedef OrtStatus *(*ort_SessionOptionsAppendEP_fn)(OrtSessionOptions *, const char *, const void *, size_t);
+
+/* CUDA provider options — direct export from onnxruntime.dll */
+typedef OrtStatus *(*OrtCudaAppendEP_fn)(OrtSessionOptions *, const void *);
+
 typedef OrtStatus *(*ort_SessionGetName_fn)(OrtSession *, size_t, OrtAllocator *, char **);
 typedef OrtStatus *(*ort_CreateTensorWithData_fn)(OrtMemoryInfo *, void *, size_t, const int64_t *, size_t, int, OrtValue **);
 typedef OrtStatus *(*ort_GetTensorMutableData_fn)(OrtValue *, void **);
@@ -151,10 +161,43 @@ struct onnx_filter {
     size_t          block_alloc;   /* allocated block capacity */
     bool            noncausal;     /* true if model uses symmetric context */
     bool            primed;        /* non-causal: have we output delayed samples yet? */
+    bool            preemph;       /* true if model is pre-SDM full pipeline */
     char           *input_name;    /* model input tensor name */
     char           *output_name;   /* model output tensor name */
+    const char     *ep_name;       /* "CUDA", "DirectML", or "CPU" */
     HMODULE         hort;          /* onnxruntime.dll handle */
 };
+
+/* ─── Resolve onnxruntime.dll path from component folder ───
+ * Uses the same directory as foo_dsd_trellis.dll to avoid picking up
+ * a wrong system-wide onnxruntime.dll (e.g. C:\Windows\System32). */
+
+static bool resolve_ort_path(wchar_t *path, size_t path_size) {
+    HMODULE hmod = GetModuleHandleW(L"foo_dsd_trellis.dll");
+    if (!hmod) {
+        /* Test exe fallback: try bare name */
+        wcsncpy_s(path, path_size, L"onnxruntime.dll", _TRUNCATE);
+        return true;
+    }
+    DWORD len = GetModuleFileNameW(hmod, path, (DWORD)path_size);
+    if (len == 0 || len >= path_size)
+        return false;
+    wchar_t *sep = wcsrchr(path, L'\\');
+    if (!sep) sep = wcsrchr(path, L'/');
+    if (sep)
+        sep[1] = L'\0';
+    else
+        path[0] = L'\0';
+    wcscat_s(path, path_size, L"onnxruntime.dll");
+    return true;
+}
+
+static HMODULE load_ort_dll(void) {
+    wchar_t path[MAX_PATH];
+    if (resolve_ort_path(path, MAX_PATH))
+        return LoadLibraryW(path);
+    return LoadLibraryW(L"onnxruntime.dll");
+}
 
 /* ─── DLL availability probe ─── */
 
@@ -165,13 +208,17 @@ bool onnx_runtime_available(void) {
     if (InterlockedCompareExchange(&g_ort_checked, 0, 0))
         return InterlockedCompareExchange(&g_ort_available, 0, 0) != 0;
 
-    HMODULE h = LoadLibraryW(L"onnxruntime.dll");
+    HMODULE h = load_ort_dll();
     if (h) {
+        /* Verify it's a real ORT build (has OrtGetApiBase) */
+        OrtGetApiBase_fn get_base =
+            (OrtGetApiBase_fn)GetProcAddress(h, "OrtGetApiBase");
+        if (get_base)
+            InterlockedExchange(&g_ort_available, 1);
         FreeLibrary(h);
-        InterlockedExchange(&g_ort_available, 1);
     }
     InterlockedExchange(&g_ort_checked, 1);
-    return h != NULL;
+    return InterlockedCompareExchange(&g_ort_available, 0, 0) != 0;
 }
 
 /* ─── Helper: check ORT status and release ─── */
@@ -183,6 +230,27 @@ static bool ort_ok(const OrtApi *api, OrtStatus *status) {
     return false;
 }
 
+/* Like ort_ok but saves the last error message for logging */
+static char g_ort_last_error[256] = {0};
+
+static bool ort_ok_log(const OrtApi *api, OrtStatus *status, const char *context) {
+    if (status == NULL)
+        return true;  /* don't clear previous error on success */
+    const char *msg = ORT_FN(api, ORT_SLOT_GET_ERROR_MESSAGE, ort_GetErrorMessage_fn)(status);
+    if (msg)
+        snprintf(g_ort_last_error, sizeof(g_ort_last_error), "%s: %.200s", context, msg);
+    else
+        snprintf(g_ort_last_error, sizeof(g_ort_last_error), "%s: unknown error", context);
+    OutputDebugStringA(g_ort_last_error);
+    OutputDebugStringA("\n");
+    ORT_FN(api, ORT_SLOT_RELEASE_STATUS, ort_Release_fn)(status);
+    return false;
+}
+
+const char *onnx_filter_last_error(void) {
+    return g_ort_last_error[0] ? g_ort_last_error : NULL;
+}
+
 /* ─── Create ─── */
 
 onnx_filter_t *onnx_filter_create(const wchar_t *model_path,
@@ -192,8 +260,8 @@ onnx_filter_t *onnx_filter_create(const wchar_t *model_path,
     if (!onnx_runtime_available())
         return NULL;
 
-    /* Load DLL and resolve OrtGetApiBase */
-    HMODULE hort = LoadLibraryW(L"onnxruntime.dll");
+    /* Load DLL from component folder and resolve OrtGetApiBase */
+    HMODULE hort = load_ort_dll();
     if (!hort)
         return NULL;
 
@@ -211,12 +279,18 @@ onnx_filter_t *onnx_filter_create(const wchar_t *model_path,
         return NULL;
     }
 
-    /* Resolve DirectML EP export (may not exist in CPU-only builds) */
+    /* Resolve GPU EP exports (may not exist in CPU-only ORT builds).
+     * ML_EP_AUTO tries CUDA → DirectML → CPU. */
     OrtDmlAppendEP_fn dml_append = NULL;
+    OrtCudaAppendEP_fn cuda_append = NULL;
+
+    if (ep == ML_EP_CUDA || ep == ML_EP_AUTO) {
+        cuda_append = (OrtCudaAppendEP_fn)GetProcAddress(
+            hort, "OrtSessionOptionsAppendExecutionProvider_CUDA");
+    }
     if (ep == ML_EP_DIRECTML || ep == ML_EP_AUTO) {
         dml_append = (OrtDmlAppendEP_fn)GetProcAddress(
             hort, "OrtSessionOptionsAppendExecutionProvider_DML");
-        /* AUTO with no DirectML support → fall back to CPU silently */
     }
 
     onnx_filter_t *f = (onnx_filter_t *)calloc(1, sizeof(onnx_filter_t));
@@ -226,6 +300,7 @@ onnx_filter_t *onnx_filter_create(const wchar_t *model_path,
     }
     f->api.vt = (void **)api_ptr;
     f->hort = hort;
+    f->ep_name = "CPU";
 
     const OrtApi *api = &f->api;
 
@@ -245,21 +320,37 @@ onnx_filter_t *onnx_filter_create(const wchar_t *model_path,
     ORT_FN(api, ORT_SLOT_SET_GRAPH_OPT_LEVEL, ort_SetGraphOptLevel_fn)(
             opts, ORT_ENABLE_ALL);
 
-    /* DirectML execution provider: requires sequential mode + no mem pattern */
-    if (dml_append) {
-        ORT_FN(api, ORT_SLOT_DISABLE_MEM_PATTERN, ort_DisableMemPattern_fn)(opts);
-        ORT_FN(api, ORT_SLOT_SET_SESSION_EXECUTION_MODE,
-               ort_SetSessionExecutionMode_fn)(opts, ORT_SEQUENTIAL);
-        /* device_id 0 = primary GPU adapter */
-        if (!ort_ok(api, dml_append(opts, 0))) {
-            /* DirectML failed — fall back to CPU silently */
-            dml_append = NULL;
+    /* GPU execution provider fallback chain: CUDA → DirectML → CPU.
+     * CUDA EP: pass NULL for default options (device 0, default streams).
+     * DirectML EP: requires sequential mode + disabled mem pattern. */
+    {
+        bool gpu_ok = false;
+
+        /* Try CUDA first */
+        if (cuda_append && !gpu_ok) {
+            OrtStatus *cs = cuda_append(opts, NULL);  /* NULL = default CUDA options */
+            if (ort_ok_log(api, cs, "CUDA EP")) {
+                f->ep_name = "CUDA";
+                gpu_ok = true;
+            }
         }
+
+        /* Try DirectML */
+        if (dml_append && !gpu_ok) {
+            ORT_FN(api, ORT_SLOT_DISABLE_MEM_PATTERN, ort_DisableMemPattern_fn)(opts);
+            ORT_FN(api, ORT_SLOT_SET_SESSION_EXECUTION_MODE,
+                   ort_SetSessionExecutionMode_fn)(opts, ORT_SEQUENTIAL);
+            if (ort_ok_log(api, dml_append(opts, 0), "DirectML EP")) {
+                f->ep_name = "DirectML";
+                gpu_ok = true;
+            }
+        }
+        /* CPU is always the final fallback — no action needed */
     }
 
     /* Create session from model file */
-    if (!ort_ok(api, ORT_FN(api, ORT_SLOT_CREATE_SESSION, ort_CreateSession_fn)(
-            f->env, model_path, opts, &f->session))) {
+    if (!ort_ok_log(api, ORT_FN(api, ORT_SLOT_CREATE_SESSION, ort_CreateSession_fn)(
+            f->env, model_path, opts, &f->session), "CreateSession")) {
         ORT_FN(api, ORT_SLOT_RELEASE_SESSION_OPTIONS, ort_Release_fn)(opts);
         goto fail;
     }
@@ -309,18 +400,31 @@ onnx_filter_t *onnx_filter_create(const wchar_t *model_path,
                 allocator, out_name);
     }
 
-    /* Read model metadata: receptive_field, noncausal, look_ahead */
+    /* Read model metadata: model_type, receptive_field, noncausal, look_ahead */
     size_t rf = DEFAULT_RECEPTIVE_FIELD;
     bool model_noncausal = false;
+    bool model_preemph = false;
     size_t model_look_ahead = 0;
     {
         void *metadata = NULL;
         OrtStatus *ms = ORT_FN(api, ORT_SLOT_SESSION_GET_MODEL_METADATA,
                 ort_SessionGetModelMetadata_fn)(f->session, &metadata);
         if (ort_ok(api, ms) && metadata) {
+            /* model_type: "preemph_full_pipeline" = pre-SDM mode */
+            char *mt_str = NULL;
+            OrtStatus *ls = ORT_FN(api, ORT_SLOT_MODEL_METADATA_LOOKUP_KEY,
+                    ort_ModelMetadataLookup_fn)(
+                    metadata, allocator, "model_type", &mt_str);
+            if (ort_ok(api, ls) && mt_str) {
+                if (strcmp(mt_str, "preemph_full_pipeline") == 0 ||
+                    strcmp(mt_str, "preemph_taps") == 0)
+                    model_preemph = true;
+                ORT_FN(api, ORT_SLOT_ALLOCATOR_FREE, ort_AllocatorFree_fn)(
+                        allocator, mt_str);
+            }
             /* receptive_field */
             char *rf_str = NULL;
-            OrtStatus *ls = ORT_FN(api, ORT_SLOT_MODEL_METADATA_LOOKUP_KEY,
+            ls = ORT_FN(api, ORT_SLOT_MODEL_METADATA_LOOKUP_KEY,
                     ort_ModelMetadataLookup_fn)(
                     metadata, allocator, "receptive_field", &rf_str);
             if (ort_ok(api, ls) && rf_str) {
@@ -357,23 +461,28 @@ onnx_filter_t *onnx_filter_create(const wchar_t *model_path,
         }
     }
 
+    f->preemph = model_preemph;
     f->noncausal = model_noncausal;
-    if (model_noncausal) {
-        /* Non-causal: symmetric context.  hist_len = left context,
-         * look_ahead = right context (future samples).
-         * For RF=8191: hist_len=4095, look_ahead=4095 */
+
+    if (model_preemph) {
+        /* Pre-SDM full pipeline: no history needed — stateless model.
+         * Input is (1,1,N), output is (1,1,N). */
+        f->hist_len = 0;
+        f->look_ahead = 0;
+    } else if (model_noncausal) {
         f->look_ahead = model_look_ahead > 0 ? model_look_ahead : rf / 2;
         f->hist_len = rf - 1 - f->look_ahead;
     } else {
-        /* Causal: all context is history (left side) */
         f->hist_len = rf - 1;
         f->look_ahead = 0;
     }
 
     /* Context buffers (initialized to zero = silence) */
-    f->history = (float *)calloc(f->hist_len, sizeof(float));
-    if (!f->history)
-        goto fail;
+    if (f->hist_len > 0) {
+        f->history = (float *)calloc(f->hist_len, sizeof(float));
+        if (!f->history)
+            goto fail;
+    }
     if (f->look_ahead > 0) {
         f->delay_buf = (float *)calloc(f->look_ahead, sizeof(float));
         if (!f->delay_buf)
@@ -381,10 +490,8 @@ onnx_filter_t *onnx_filter_create(const wchar_t *model_path,
     }
     f->primed = false;
 
-    /* Pre-allocate inference buffers.
-     * Non-causal input: [hist_len + block + look_ahead] = RF-1 + block
-     * Causal input: [hist_len + block] */
-    f->block_alloc = 8192;
+    /* Pre-allocate inference buffers */
+    f->block_alloc = model_preemph ? 262144 : 8192;  /* preemph: 256K for DSD512 chunks */
     {
         size_t max_input = f->hist_len + f->block_alloc + f->look_ahead;
         f->infer_buf = (float *)malloc(max_input * sizeof(float));
@@ -593,4 +700,120 @@ void onnx_filter_free(onnx_filter_t *f) {
         FreeLibrary(f->hort);
 
     free(f);
+}
+
+/* ─── Pre-SDM processing (full pipeline on GPU) ─── */
+
+void onnx_filter_process_preemph(onnx_filter_t *f, double *buf, size_t count) {
+    if (!f || !f->session || count == 0)
+        return;
+
+    /* Grow inference buffer if needed */
+    if (count > f->block_alloc) {
+        float *new_infer = (float *)realloc(f->infer_buf, count * sizeof(float));
+        float *new_out = (float *)realloc(f->out_buf, count * sizeof(float));
+        if (!new_infer || !new_out)
+            return;
+        f->infer_buf = new_infer;
+        f->out_buf = new_out;
+        f->block_alloc = count;
+    }
+
+    /* Convert double → float for ONNX tensor */
+    for (size_t i = 0; i < count; i++)
+        f->infer_buf[i] = (float)buf[i];
+
+    /* Build input tensor: (1, 1, N) */
+    const OrtApi *api = &f->api;
+    int64_t input_shape[3] = { 1, 1, (int64_t)count };
+    OrtValue *input_tensor = NULL;
+    if (!ort_ok(api, ORT_FN(api, ORT_SLOT_CREATE_TENSOR_WITH_DATA,
+            ort_CreateTensorWithData_fn)(
+            f->mem_info, f->infer_buf,
+            count * sizeof(float),
+            input_shape, 3, ONNX_TENSOR_ELEMENT_FLOAT,
+            &input_tensor)))
+        return;
+
+    const char *input_names[] = { f->input_name };
+    const char *output_names[] = { f->output_name };
+    OrtValue *output_tensor = NULL;
+
+    OrtStatus *run_status = ORT_FN(api, ORT_SLOT_RUN, ort_Run_fn)(
+            f->session, NULL,
+            input_names,
+            (const OrtValue *const *)&input_tensor, 1,
+            output_names, 1, &output_tensor);
+    ORT_FN(api, ORT_SLOT_RELEASE_VALUE, ort_Release_fn)(input_tensor);
+
+    if (!ort_ok(api, run_status))
+        return;
+
+    /* Read output and convert float → double back to buf */
+    float *out_data = NULL;
+    if (ort_ok(api, ORT_FN(api, ORT_SLOT_GET_TENSOR_MUTABLE_DATA,
+            ort_GetTensorMutableData_fn)(output_tensor, (void **)&out_data))) {
+        for (size_t i = 0; i < count; i++)
+            buf[i] = (double)out_data[i];
+    }
+
+    ORT_FN(api, ORT_SLOT_RELEASE_VALUE, ort_Release_fn)(output_tensor);
+}
+
+/* ─── Tap prediction (lightweight MLP on GPU) ─── */
+
+void onnx_filter_predict_taps(onnx_filter_t *f, const float features[3],
+                               float taps_out[3]) {
+    if (!f || !f->session) {
+        taps_out[0] = 1.0f; taps_out[1] = 0.0f; taps_out[2] = 0.0f;
+        return;
+    }
+
+    const OrtApi *api = &f->api;
+    float input_data[3] = { features[0], features[1], features[2] };
+    int64_t input_shape[2] = { 1, 3 };
+    OrtValue *input_tensor = NULL;
+
+    if (!ort_ok(api, ORT_FN(api, ORT_SLOT_CREATE_TENSOR_WITH_DATA,
+            ort_CreateTensorWithData_fn)(
+            f->mem_info, input_data, sizeof(input_data),
+            input_shape, 2, ONNX_TENSOR_ELEMENT_FLOAT,
+            &input_tensor))) {
+        taps_out[0] = 1.0f; taps_out[1] = 0.0f; taps_out[2] = 0.0f;
+        return;
+    }
+
+    const char *input_names[] = { f->input_name };
+    const char *output_names[] = { f->output_name };
+    OrtValue *output_tensor = NULL;
+
+    OrtStatus *run_status = ORT_FN(api, ORT_SLOT_RUN, ort_Run_fn)(
+            f->session, NULL,
+            input_names,
+            (const OrtValue *const *)&input_tensor, 1,
+            output_names, 1, &output_tensor);
+    ORT_FN(api, ORT_SLOT_RELEASE_VALUE, ort_Release_fn)(input_tensor);
+
+    if (!ort_ok(api, run_status)) {
+        taps_out[0] = 1.0f; taps_out[1] = 0.0f; taps_out[2] = 0.0f;
+        return;
+    }
+
+    float *out_data = NULL;
+    if (ort_ok(api, ORT_FN(api, ORT_SLOT_GET_TENSOR_MUTABLE_DATA,
+            ort_GetTensorMutableData_fn)(output_tensor, (void **)&out_data))) {
+        taps_out[0] = out_data[0];
+        taps_out[1] = out_data[1];
+        taps_out[2] = out_data[2];
+    } else {
+        taps_out[0] = 1.0f; taps_out[1] = 0.0f; taps_out[2] = 0.0f;
+    }
+
+    ORT_FN(api, ORT_SLOT_RELEASE_VALUE, ort_Release_fn)(output_tensor);
+}
+
+/* ─── EP name query ─── */
+
+const char *onnx_filter_ep_name(const onnx_filter_t *f) {
+    return f ? f->ep_name : "none";
 }

@@ -407,8 +407,10 @@ void plugin_destroy(plugin_state_t *s) {
 }
 
 /* Resolve ML model path from DLL directory.
+ * filename: model filename (e.g., "foo_dsd_trellis_ml.onnx").
  * Returns true if path was built; does not check if file exists. */
-static bool resolve_ml_model_path(wchar_t *path, size_t path_size) {
+static bool resolve_ml_model_path_ex(wchar_t *path, size_t path_size,
+                                      const wchar_t *filename) {
     HMODULE hmod = GetModuleHandleW(L"foo_dsd_trellis.dll");
     if (!hmod)
         return false;
@@ -422,8 +424,12 @@ static bool resolve_ml_model_path(wchar_t *path, size_t path_size) {
         sep[1] = L'\0';
     else
         path[0] = L'\0';
-    wcscat_s(path, path_size, L"foo_dsd_trellis_ml.onnx");
+    wcscat_s(path, path_size, filename);
     return true;
+}
+
+static bool resolve_ml_model_path(wchar_t *path, size_t path_size) {
+    return resolve_ml_model_path_ex(path, path_size, L"foo_dsd_trellis_ml.onnx");
 }
 
 /* Warm up full pipeline (FIR + SDM) with DSD silence to settle
@@ -701,15 +707,63 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     /* io_pool disabled — use main pool for unpack/pack too.
      * Separate unpinned io_pool causes those tasks to land on LP0/LP1. */
 
-    /* Create ML post-filters if enabled and ONNX Runtime is available */
+    /* Create ML filters if enabled and ONNX Runtime is available.
+     * DSD512 same-rate: load pre-SDM preemph model (features → MLP → FIR on GPU).
+     * Other rates: load post-SDM model if present. */
     if (s->config.ml_enabled && onnx_runtime_available()) {
         wchar_t model_path[MAX_PATH];
-        if (resolve_ml_model_path(model_path, MAX_PATH)) {
-            uint32_t fs_out = s->config.fs_out ? s->config.fs_out : dsd_rate;
+        bool have_model = false;
+        uint32_t fs_out = s->config.fs_out ? s->config.fs_out : dsd_rate;
+
+        /* Try preemph taps model first (for DSD512 same-rate pre-SDM).
+         * Taps model: lightweight MLP only. Features + FIR on CPU. */
+        if (dsd_rate >= DSD_RATE_512) {
+            /* Prefer taps model (2.8 KB, fast) over full pipeline (8.9 KB, slow) */
+            have_model = resolve_ml_model_path_ex(model_path, MAX_PATH,
+                L"foo_dsd_trellis_preemph_taps.onnx");
+            if (have_model && GetFileAttributesW(model_path) == INVALID_FILE_ATTRIBUTES)
+                have_model = false;
+            if (!have_model) {
+                have_model = resolve_ml_model_path_ex(model_path, MAX_PATH,
+                    L"foo_dsd_trellis_preemph.onnx");
+                if (have_model && GetFileAttributesW(model_path) == INVALID_FILE_ATTRIBUTES)
+                    have_model = false;
+            }
+        }
+
+        /* Fall back to post-SDM model */
+        if (!have_model) {
+            have_model = resolve_ml_model_path(model_path, MAX_PATH);
+            if (have_model && GetFileAttributesW(model_path) == INVALID_FILE_ATTRIBUTES)
+                have_model = false;
+        }
+
+        if (have_model) {
             for (int i = 0; i < num_channels; i++) {
                 s->channels[i].ml_filter = onnx_filter_create(
                     model_path, fs_out, (ml_ep_t)s->config.ml_ep);
-                /* NULL is fine — filter is just unavailable */
+            }
+            /* Log which EP was selected */
+            {
+                extern void trellis_log_c(const char *);
+                extern const char *onnx_filter_last_error(void);
+                if (s->channels[0].ml_filter) {
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "ML filter loaded (EP: %s)",
+                             onnx_filter_ep_name(s->channels[0].ml_filter));
+                    trellis_log_c(msg);
+                    const char *err = onnx_filter_last_error();
+                    if (err) {
+                        snprintf(msg, sizeof(msg), "ML EP fallback: %s", err);
+                        trellis_log_c(msg);
+                    }
+                } else {
+                    const char *err = onnx_filter_last_error();
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "ML filter failed: %s",
+                             err ? err : "unknown");
+                    trellis_log_c(msg);
+                }
             }
         }
     }

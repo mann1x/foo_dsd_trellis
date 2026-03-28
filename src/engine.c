@@ -338,18 +338,22 @@ size_t engine_process_block(engine_channel_t *eng,
                     bc->pos = (bc->pos + 1) % bc->taps;
                     eng->fir_buf[i] = bc->sum * inv_n * combined;
                 }
-                /* Adaptive pre-SDM pre-emphasis (ML model, DSD512 only).
-                 * Embedded MLP predicts optimal 3-tap FIR from signal features.
-                 * Features computed on first 4096 samples only (avoid full-buffer scan). */
-                if (cfg->ml_enabled && cfg->fs_in >= DSD_RATE_512) {
-                    size_t feat_n = count < 4096 ? count : 4096;
-                    float centroid = preemph_spectral_centroid(eng->fir_buf, feat_n, (double)cfg->fs_in);
-                    float rms = preemph_rms(eng->fir_buf, feat_n);
-                    float crest = preemph_crest_factor(eng->fir_buf, feat_n);
-                    float taps[3];
+            }
+            /* Pre-SDM pre-emphasis (ML model, DSD512 only).
+             * Features on CPU (subsampled), MLP via ONNX on GPU, FIR on CPU. */
+            if (cfg->ml_enabled && cfg->fs_in >= DSD_RATE_512) {
+                size_t feat_n = count < 4096 ? count : 4096;
+                float centroid = preemph_spectral_centroid(eng->fir_buf, feat_n, (double)cfg->fs_in);
+                float rms = preemph_rms(eng->fir_buf, feat_n);
+                float crest = preemph_crest_factor(eng->fir_buf, feat_n);
+                float taps[3];
+                if (eng->ml_filter) {
+                    float features[3] = { centroid, rms, crest };
+                    onnx_filter_predict_taps(eng->ml_filter, features, taps);
+                } else {
                     preemph_predict_taps(centroid, rms, crest, taps);
-                    preemph_apply(eng->fir_buf, count, taps);
                 }
+                preemph_apply(eng->fir_buf, count, taps);
             }
             /* Re-encode via SDM (CPU only) */
             size_t sdm_out;
@@ -357,8 +361,6 @@ size_t engine_process_block(engine_channel_t *eng,
                 sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
             else
                 sdm_out = (eng->sdm_fast ? sdm_process_block_fast : sdm_process_block)(&eng->sdm, eng->fir_buf, out, count);
-            if (eng->ml_filter)
-                onnx_filter_process(eng->ml_filter, out, sdm_out);
             return sdm_out;
         }
     }
@@ -465,8 +467,6 @@ size_t engine_process_block(engine_channel_t *eng,
         sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, fir_out);
     else
         sdm_out = (eng->sdm_fast ? sdm_process_block_fast : sdm_process_block)(&eng->sdm, eng->fir_buf, out, fir_out);
-    if (eng->ml_filter)
-        onnx_filter_process(eng->ml_filter, out, sdm_out);
     return sdm_out;
 }
 
@@ -573,16 +573,21 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
                 bc->pos = (bc->pos + 1) % bc->taps;
                 eng->fir_buf[i] = bc->sum * inv_n * combined;
             }
-            /* Adaptive pre-SDM pre-emphasis (parallel/DAS path) */
-            if (cfg->ml_enabled && cfg->fs_in >= DSD_RATE_512) {
-                size_t feat_n = count < 4096 ? count : 4096;
-                float centroid = preemph_spectral_centroid(eng->fir_buf, feat_n, (double)cfg->fs_in);
-                float rms = preemph_rms(eng->fir_buf, feat_n);
-                float crest = preemph_crest_factor(eng->fir_buf, feat_n);
-                float taps[3];
+        }
+        /* Pre-SDM pre-emphasis (parallel/DAS path) */
+        if (cfg->ml_enabled && cfg->fs_in >= DSD_RATE_512) {
+            size_t feat_n = count < 4096 ? count : 4096;
+            float centroid = preemph_spectral_centroid(eng->fir_buf, feat_n, (double)cfg->fs_in);
+            float rms = preemph_rms(eng->fir_buf, feat_n);
+            float crest = preemph_crest_factor(eng->fir_buf, feat_n);
+            float taps[3];
+            if (eng->ml_filter) {
+                float features[3] = { centroid, rms, crest };
+                onnx_filter_predict_taps(eng->ml_filter, features, taps);
+            } else {
                 preemph_predict_taps(centroid, rms, crest, taps);
-                preemph_apply(eng->fir_buf, count, taps);
             }
+            preemph_apply(eng->fir_buf, count, taps);
         }
         fir_count = count;
     } else if (eng->fir.use_fp64) {

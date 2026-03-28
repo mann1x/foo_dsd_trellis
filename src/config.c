@@ -450,7 +450,7 @@ void config_validate(dsd_config_t *cfg) {
     }
 
     /* Validate ML settings */
-    if (cfg->ml_ep < 0 || cfg->ml_ep > 2)
+    if (cfg->ml_ep < 0 || cfg->ml_ep > 3)
         cfg->ml_ep = 2;  /* ML_EP_AUTO */
 
     /* Validate per-rate NTF overrides */

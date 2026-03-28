@@ -38,7 +38,7 @@ typedef struct {
     bool             sdm_fast;   /* true: use fast trellis (no /fp:precise) */
     bool             passthrough;/* true if no processing needed */
     bool             fir_only;   /* true for DSD→PCM decimation (no SDM) */
-    onnx_filter_t   *ml_filter;  /* ONNX ML post-filter (NULL if disabled) */
+    onnx_filter_t   *ml_filter;  /* ONNX ML filter: pre-SDM preemph or post-SDM (NULL if disabled) */
     gpu_context_t   *gpu;        /* GPU compute context (shared, NULL if disabled) */
 } engine_channel_t;
 

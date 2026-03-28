@@ -374,7 +374,7 @@ typedef struct {
     int8_t    rate_limiter[RATE_MAP_COUNT]; /* Per-input-rate state limiter: -1=Auto, 0=Off, 1-20=limit */
     bool      antipop;        /* Enable anti-pop lead-in silence */
     bool      ml_enabled;     /* Enable ONNX ML post-filter */
-    int       ml_ep;          /* ml_ep_t: CPU (0) or DirectML (1) */
+    int       ml_ep;          /* ml_ep_t: CPU(0)/DirectML(1)/Auto(2)/CUDA(3) */
     int8_t    fir_gain_db;    /* Global FIR gain limit in dB (0 to -12). FIR_GAIN_AUTO = use path_config */
     bool      gpu_enabled;   /* Enable GPU compute offload */
     int       gpu_backend;   /* gpu_backend_t: None(0)/DirectX(1)/CUDA(2)/Auto(3) */

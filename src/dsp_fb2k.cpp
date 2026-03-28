@@ -429,13 +429,14 @@ static dsd_config_t parse_preset(const dsp_preset &in) {
 }
 
 /* ─── ML EP combo ↔ enum mapping ─── */
-/* Combo order: Auto(0), CPU(1), DirectML(2) */
-/* Enum order:  CPU(0), DirectML(1), Auto(2) */
+/* Combo order: Auto(0), CPU(1), DirectML(2), CUDA(3) */
+/* Enum order:  CPU(0), DirectML(1), Auto(2), CUDA(3) */
 static int ml_ep_to_combo(int ep) {
     switch (ep) {
     case 2:  return 0;  /* Auto → first */
     case 0:  return 1;  /* CPU → second */
     case 1:  return 2;  /* DirectML → third */
+    case 3:  return 3;  /* CUDA → fourth */
     default: return 0;
     }
 }
@@ -444,6 +445,7 @@ static int combo_to_ml_ep(int idx) {
     case 0:  return 2;  /* first → Auto */
     case 1:  return 0;  /* second → CPU */
     case 2:  return 1;  /* third → DirectML */
+    case 3:  return 3;  /* fourth → CUDA */
     default: return 2;
     }
 }
@@ -665,10 +667,11 @@ private:
         CheckDlgButton(IDC_CHECK_ML_ENABLED, m_cfg.ml_enabled ? BST_CHECKED : BST_UNCHECKED);
         {
             CComboBox mlep(GetDlgItem(IDC_COMBO_ML_EP));
-            /* Display order: Auto(0), CPU(1), DirectML(2) */
+            /* Display order: Auto(0), CPU(1), DirectML(2), CUDA(3) */
             mlep.AddString(L"Auto");
             mlep.AddString(L"CPU");
             mlep.AddString(L"DirectML (GPU)");
+            mlep.AddString(L"CUDA (GPU)");
             mlep.SetCurSel(ml_ep_to_combo(m_cfg.ml_ep));
             mlep.EnableWindow(m_cfg.ml_enabled);
         }
@@ -799,18 +802,39 @@ private:
             } else {
                 int ep = combo_to_ml_ep(
                     CComboBox(GetDlgItem(IDC_COMBO_ML_EP)).GetCurSel());
-                bool has_dml = false;
-                if (ep == 1 || ep == 2) {  /* DirectML or Auto */
-                    HMODULE hort = LoadLibraryW(L"onnxruntime.dll");
-                    if (hort) {
-                        has_dml = (GetProcAddress(hort,
-                            "OrtSessionOptionsAppendExecutionProvider_DML") != NULL);
-                        FreeLibrary(hort);
+                bool has_dml = false, has_cuda = false;
+                if (ep != 0) {  /* Any GPU option: probe DLL from component folder */
+                    extern bool onnx_runtime_available(void);
+                    /* Use the same DLL that onnx_filter_create will use.
+                     * Probe the already-cached availability + check EP exports. */
+                    if (onnx_runtime_available()) {
+                        /* DLL is in our component folder — re-load to check EPs */
+                        wchar_t ort_path[MAX_PATH];
+                        HMODULE hmod = GetModuleHandleW(L"foo_dsd_trellis.dll");
+                        HMODULE hort = NULL;
+                        if (hmod) {
+                            DWORD len = GetModuleFileNameW(hmod, ort_path, MAX_PATH);
+                            if (len > 0 && len < MAX_PATH) {
+                                wchar_t *sep = wcsrchr(ort_path, L'\\');
+                                if (sep) sep[1] = L'\0';
+                                wcscat_s(ort_path, MAX_PATH, L"onnxruntime.dll");
+                                hort = LoadLibraryW(ort_path);
+                            }
+                        }
+                        if (!hort) hort = LoadLibraryW(L"onnxruntime.dll");
+                        if (hort) {
+                            has_dml = (GetProcAddress(hort,
+                                "OrtSessionOptionsAppendExecutionProvider_DML") != NULL);
+                            has_cuda = (GetProcAddress(hort,
+                                "OrtSessionOptionsAppendExecutionProvider_CUDA") != NULL);
+                            FreeLibrary(hort);
+                        }
                     }
                 }
                 if (ep == 0)       status = "Ready (CPU)";
-                else if (ep == 1)  status = has_dml ? "Ready (GPU)" : "Ready (CPU)";
-                else               status = has_dml ? "Ready (GPU)" : "Ready (CPU)";
+                else if (ep == 3)  status = has_cuda ? "Ready (CUDA)" : "Ready (CPU)";
+                else if (ep == 1)  status = has_dml ? "Ready (DirectML)" : "Ready (CPU)";
+                else               status = (has_cuda || has_dml) ? "Ready (GPU)" : "Ready (CPU)";
             }
         }
         ::uSetDlgItemText(*this, IDC_STATIC_ML_STATUS, status);
