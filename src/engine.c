@@ -340,11 +340,12 @@ size_t engine_process_block(engine_channel_t *eng,
                 }
                 /* Adaptive pre-SDM pre-emphasis (ML model, DSD512 only).
                  * Embedded MLP predicts optimal 3-tap FIR from signal features.
-                 * Trained via CMA-ES across 20 signal types: +11 dB worst-case. */
+                 * Features computed on first 4096 samples only (avoid full-buffer scan). */
                 if (cfg->ml_enabled && cfg->fs_in >= DSD_RATE_512) {
-                    float centroid = preemph_spectral_centroid(eng->fir_buf, count, (double)cfg->fs_in);
-                    float rms = preemph_rms(eng->fir_buf, count);
-                    float crest = preemph_crest_factor(eng->fir_buf, count);
+                    size_t feat_n = count < 4096 ? count : 4096;
+                    float centroid = preemph_spectral_centroid(eng->fir_buf, feat_n, (double)cfg->fs_in);
+                    float rms = preemph_rms(eng->fir_buf, feat_n);
+                    float crest = preemph_crest_factor(eng->fir_buf, feat_n);
                     float taps[3];
                     preemph_predict_taps(centroid, rms, crest, taps);
                     preemph_apply(eng->fir_buf, count, taps);
@@ -574,9 +575,10 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
             }
             /* Adaptive pre-SDM pre-emphasis (parallel/DAS path) */
             if (cfg->ml_enabled && cfg->fs_in >= DSD_RATE_512) {
-                float centroid = preemph_spectral_centroid(eng->fir_buf, count, (double)cfg->fs_in);
-                float rms = preemph_rms(eng->fir_buf, count);
-                float crest = preemph_crest_factor(eng->fir_buf, count);
+                size_t feat_n = count < 4096 ? count : 4096;
+                float centroid = preemph_spectral_centroid(eng->fir_buf, feat_n, (double)cfg->fs_in);
+                float rms = preemph_rms(eng->fir_buf, feat_n);
+                float crest = preemph_crest_factor(eng->fir_buf, feat_n);
                 float taps[3];
                 preemph_predict_taps(centroid, rms, crest, taps);
                 preemph_apply(eng->fir_buf, count, taps);
