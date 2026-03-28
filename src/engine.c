@@ -7,6 +7,7 @@
 
 #include "../include/engine.h"
 #include "../include/ntf.h"
+#include "../include/preemph.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ipps.h>
@@ -337,9 +338,17 @@ size_t engine_process_block(engine_channel_t *eng,
                     bc->pos = (bc->pos + 1) % bc->taps;
                     eng->fir_buf[i] = bc->sum * inv_n * combined;
                 }
-                /* Pre-SDM pre-emphasis DISABLED: optimal k is signal-dependent.
-                 * k=0.007 gives +22 dB for 1kHz test tone but hurts 10kHz (-10 dB).
-                 * Needs adaptive ML model for real music content. */
+                /* Adaptive pre-SDM pre-emphasis (ML model, DSD512 only).
+                 * Embedded MLP predicts optimal 3-tap FIR from signal features.
+                 * Trained via CMA-ES across 20 signal types: +11 dB worst-case. */
+                if (cfg->ml_enabled && cfg->fs_in >= DSD_RATE_512) {
+                    float centroid = preemph_spectral_centroid(eng->fir_buf, count, (double)cfg->fs_in);
+                    float rms = preemph_rms(eng->fir_buf, count);
+                    float crest = preemph_crest_factor(eng->fir_buf, count);
+                    float taps[3];
+                    preemph_predict_taps(centroid, rms, crest, taps);
+                    preemph_apply(eng->fir_buf, count, taps);
+                }
             }
             /* Re-encode via SDM (CPU only) */
             size_t sdm_out;
@@ -563,7 +572,15 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
                 bc->pos = (bc->pos + 1) % bc->taps;
                 eng->fir_buf[i] = bc->sum * inv_n * combined;
             }
-            /* Pre-SDM pre-emphasis DISABLED (signal-dependent — see above) */
+            /* Adaptive pre-SDM pre-emphasis (parallel/DAS path) */
+            if (cfg->ml_enabled && cfg->fs_in >= DSD_RATE_512) {
+                float centroid = preemph_spectral_centroid(eng->fir_buf, count, (double)cfg->fs_in);
+                float rms = preemph_rms(eng->fir_buf, count);
+                float crest = preemph_crest_factor(eng->fir_buf, count);
+                float taps[3];
+                preemph_predict_taps(centroid, rms, crest, taps);
+                preemph_apply(eng->fir_buf, count, taps);
+            }
         }
         fir_count = count;
     } else if (eng->fir.use_fp64) {

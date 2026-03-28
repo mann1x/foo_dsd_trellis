@@ -211,6 +211,9 @@
     <ClCompile Include="src\cpuset.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\preemph.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\sinad_measure.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <WholeProgramOptimization>false</WholeProgramOptimization>

@@ -170,6 +170,7 @@
     <ClCompile Include="src\ntf.c" />
     <ClCompile Include="src\threadpool.c" />
     <ClCompile Include="src\resample.c" />
+    <ClCompile Include="src\preemph.c" />
     <ClCompile Include="src\sinad_measure.c" />
     <ClCompile Include="src\simd_detect.c" />
     <ClCompile Include="src\cpuset.c" />
