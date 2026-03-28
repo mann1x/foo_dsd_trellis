@@ -54,6 +54,18 @@ void preemph_predict_taps(float spectral_centroid, float rms, float crest_factor
             sum += preemph_w2[i * PREEMPH_HIDDEN + j] * h2[j];
         taps_out[i] = sum;
     }
+
+    /* Normalize: force tap[0] = 1.0 to prevent gain changes.
+     * Scale all taps so the DC gain (sum of taps) = 1.0.
+     * This preserves the pre-emphasis shape without volume pumping. */
+    float dc_gain = 0.0f;
+    for (int i = 0; i < PREEMPH_TAPS; i++)
+        dc_gain += taps_out[i];
+    if (dc_gain > 0.01f) {
+        float scale = 1.0f / dc_gain;
+        for (int i = 0; i < PREEMPH_TAPS; i++)
+            taps_out[i] *= scale;
+    }
 }
 
 
