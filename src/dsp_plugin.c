@@ -1819,36 +1819,14 @@ size_t plugin_process(plugin_state_t *s,
             }
         }
 
-        /* Per-segment overlap: increase for quiet boundaries.
-         * Above RMS 0.005: standard overlap (32x lat).
-         * Below 0.002: 4x overlap for more warmup convergence. */
-        size_t seg_overlap[64];
-        for (int seg = 0; seg < segments_per_ch; seg++)
-            seg_overlap[seg] = overlap;
-        if (segments_per_ch > 2) {
-            size_t fir_count_0 = fir_counts[0];
-            for (int seg = 2; seg < segments_per_ch; seg++) {
-                size_t boundary = seg_nominal_start[0][seg];
-                if (boundary < 1024 || boundary + 1024 >= fir_count_0)
-                    continue;
-                double sum_sq = 0.0;
-                for (size_t i = boundary - 1024; i < boundary + 1024; i++)
-                    sum_sq += fir_data[0][i] * fir_data[0][i];
-                double rms = sqrt(sum_sq / 2048.0);
-                if (rms < 0.002)
-                    seg_overlap[seg] = overlap * 4;  /* 4x overlap for very quiet */
-                else if (rms < 0.005)
-                    seg_overlap[seg] = overlap * 2;  /* 2x overlap for moderate */
-            }
-        }
-        size_t max_overlap = overlap * 4;  /* for buffer sizing */
+        /* (dynamic per-segment overlap removed — caused DAS scan misalignment) */
 
 
 
         /* Ensure cached segment output buffers are large enough.
          * Reused across chunks to avoid malloc/free contention. */
         int total_all_segs = num_channels * segments_per_ch;
-        size_t max_seg_samples = fir_counts[0] / (size_t)segments_per_ch + max_overlap + 4096;
+        size_t max_seg_samples = fir_counts[0] / (size_t)segments_per_ch + overlap + 4096;
         if (s->cached_seg_buf_count < total_all_segs ||
             s->cached_seg_buf_sz < max_seg_samples) {
             /* Grow cached buffers */
@@ -2073,14 +2051,12 @@ size_t plugin_process(plugin_state_t *s,
                 size_t nom_size = seg_nominal_size[ch][seg];
                 bool extend_fwd = (seg < segments_per_ch - 1);
 
-                size_t this_ovl = seg_overlap[seg];
-                size_t next_ovl = extend_fwd ? seg_overlap[seg + 1] : 0;
-                size_t input_start = (nom_start >= this_ovl) ? nom_start - this_ovl : 0;
+                size_t input_start = (nom_start >= overlap) ? nom_start - overlap : 0;
                 size_t input_count = nom_start + nom_size - input_start;
-                if (extend_fwd && nom_start + nom_size + next_ovl <= fir_count)
-                    input_count += next_ovl;
-                size_t warmup_discard = (nom_start >= this_ovl) ?
-                    this_ovl - (size_t)s->config.trellis_lat : 0;
+                if (extend_fwd && nom_start + nom_size + overlap <= fir_count)
+                    input_count += overlap;
+                size_t warmup_discard = (nom_start >= overlap) ?
+                    overlap - (size_t)s->config.trellis_lat : 0;
 
                 int temp_idx = ch * temps_per_ch + (seg - 1);
                 sdm_context_copy_state(&temp_sdms[temp_idx], &s->channels[ch].sdm);
@@ -2202,9 +2178,8 @@ size_t plugin_process(plugin_state_t *s,
                     continue;
                 }
 
-                /* Seg2+: DAS overlap stitching (per-segment overlap) */
-                size_t this_seg_ovl = seg_overlap[seg];
-                size_t prev_ovl_start = (write_pos >= this_seg_ovl) ? write_pos - this_seg_ovl : 0;
+                /* Seg2+: DAS overlap stitching */
+                size_t prev_ovl_start = (write_pos >= overlap) ? write_pos - overlap : 0;
                 float *prev_ovl = s->ch_out[ch] + prev_ovl_start;
                 float *this_ovl = seg_bufs[buf_idx];
                 size_t ovl_len = write_pos - prev_ovl_start;
@@ -2293,19 +2268,49 @@ size_t plugin_process(plugin_state_t *s,
 
                 size_t stitch_at = prev_ovl_start + (size_t)best_pos;
                 size_t copy_count = seg_out - (size_t)best_pos;
+
+                /* Normal stitch: copy seg_next from best_pos onward */
                 memcpy(s->ch_out[ch] + stitch_at,
                        seg_bufs[buf_idx] + best_pos,
                        copy_count * sizeof(float));
                 write_pos = stitch_at + copy_count;
 
+                /* Quality check: if density is too low, replace samples
+                 * at the stitch point with random DSD noise.
+                 * Replaces 32 from seg_prev + 32 from seg_next = 64 total.
+                 * No sample count change — just overwrites existing bits.
+                 * Random ±1 noise spreads energy as broadband ultrasonic
+                 * noise instead of concentrating it as a pop. */
+                /* Recount unweighted density at actual stitch position
+                 * (weighted scan picks different position than unweighted peak) */
+                int stitch_density = 0;
+                {
+                    int sw_start = (best_pos >= half_w) ? best_pos - half_w : 0;
+                    int sw_end = (best_pos + half_w < (int)ovl_len) ? best_pos + half_w : (int)ovl_len;
+                    for (int w = sw_start; w < sw_end; w++)
+                        if (prev_ovl[w] == this_ovl[w]) stitch_density++;
+                    cur_matches = stitch_density;  /* update for logging */
+                }
+                int density_pct = (half_w * 2 > 0) ? (stitch_density * 100) / (half_w * 2) : 0;
+                int dither_len = 0;
+                if (density_pct < 55 && stitch_at >= 2) {
+                    dither_len = 4;
+                    uint32_t rng = (uint32_t)(stitch_at ^ 0xDEADBEEF);
+                    size_t dither_start = stitch_at - 2;  /* 2 before + 2 after */
+                    for (int d = 0; d < 4; d++) {
+                        rng = rng * 1664525u + 1013904223u;
+                        s->ch_out[ch][dither_start + d] = (rng & 0x80000000) ? 1.0f : -1.0f;
+                    }
+                }
+
                 {
                     char msg[256];
                     snprintf(msg, sizeof(msg),
-                             "stitch seg%d: ovl=%zu density=%d/%d wdensity=%.2f "
-                             "pos=%d run=%d wp=%zu stitch_at=%zu",
-                             seg, ovl_len, cur_matches, half_w * 2,
+                             "stitch seg%d: ovl=%zu density=%d/%d (%d%%) wdensity=%.2f "
+                             "pos=%d run=%d dither=%d wp=%zu stitch_at=%zu",
+                             seg, ovl_len, cur_matches, half_w * 2, density_pct,
                              best_density,
-                             best_pos, found_match,
+                             best_pos, found_match, dither_len,
                              write_pos, stitch_at);
                     extern void trellis_log_c(const char *);
                     trellis_log_c(msg);
@@ -2331,8 +2336,7 @@ size_t plugin_process(plugin_state_t *s,
                            seg_bufs[buf_idx], seg_out * sizeof(float));
                     write_pos += seg_out;
                 } else {
-                    size_t ch_seg_ovl = seg_overlap[seg];
-                    size_t prev_ovl_start = (write_pos >= ch_seg_ovl) ? write_pos - ch_seg_ovl : 0;
+                    size_t prev_ovl_start = (write_pos >= overlap) ? write_pos - overlap : 0;
                     int bp = stitch_positions[seg];
                     size_t stitch_at = prev_ovl_start + (size_t)bp;
                     size_t copy_count = seg_out - (size_t)bp;
