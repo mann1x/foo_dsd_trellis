@@ -50,10 +50,10 @@ void onnx_filter_process(onnx_filter_t *f, float *buf, size_t count);
 void onnx_filter_process_preemph(onnx_filter_t *f, double *buf, size_t count);
 
 /* Predict pre-emphasis taps from signal features (tap-prediction mode).
- * features: [spectral_centroid, rms, crest_factor] (3 floats).
+ * features: [spectral_centroid, rms, crest_factor, rate_mhz] (4 floats).
  * taps_out: [tap0, tap1, tap2] (3 floats, DC-gain-normalized).
  * Runs the tiny MLP on GPU — sub-millisecond inference. */
-void onnx_filter_predict_taps(onnx_filter_t *f, const float features[3],
+void onnx_filter_predict_taps(onnx_filter_t *f, const float features[4],
                                float taps_out[3]);
 
 /* Query which execution provider the session is actually using.

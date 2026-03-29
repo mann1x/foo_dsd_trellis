@@ -30,6 +30,36 @@ typedef struct {
     int extended;           /* 1 = only runs with --all or explicit --suite */
 } suite_entry_t;
 
+/* Forward declarations for suites defined in other TUs */
+void test_dop_suite(void);
+void test_ntf_suite(void);
+void test_fir_suite(void);
+void test_trellis_suite(void);
+void test_config_suite(void);
+void test_simd_suite(void);
+void test_rate_sinad_suite(void);
+void test_precorr_suite(void);
+void test_hardening_suite(void);
+void test_threadpool_suite(void);
+void test_rate_sweep_suite(void);
+void test_depth16_suite(void);
+void test_onnx_filter_suite(void);
+void test_gpu_suite(void);
+void test_gpu_sinad_comparison(void);
+void test_lat_sweep(void);
+void test_pipeline_sinad(void);
+void test_sinad_diag_suite(void);
+void test_resample_suite(void);
+void test_validation_suite(void);
+void test_dither_suite(void);
+void test_quality_suite(void);
+void test_stitch_suite(void);
+void test_gpu_kernel_debug_suite(void);
+void test_dsf_compare(void);
+void test_1_5bit_suite(void);
+void test_mt_sweep_suite(void);
+void test_downsample_sweep_suite(void);
+
 static const suite_entry_t suites[] = {
     { "dop",       "DoP",               test_dop_suite,        0 },
     { "ntf",       "NTF",               test_ntf_suite,        0 },
@@ -57,6 +87,7 @@ static const suite_entry_t suites[] = {
     { "gpudebug",  "GPU Kernel Debug",  test_gpu_kernel_debug_suite, 1 },
     { "dsfcompare","DSF A/B Compare",   test_dsf_compare,            1 },
     { "1.5bit",    "1.5-bit SDM",       test_1_5bit_suite,           1 },
+    { "mtsweep",   "MT Pipeline Sweep", test_mt_sweep_suite,         1 },
     { "dnsweep",   "Downsample Sweep",  test_downsample_sweep_suite, 1 },
     { "firexp",    "FIR Experiment",    test_fir_experiment_suite,   1 },
 };

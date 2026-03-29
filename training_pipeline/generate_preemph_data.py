@@ -38,13 +38,9 @@ TEST_EXE = os.path.normpath(os.path.join(os.path.dirname(__file__), '..',
 AFFINITY_MASK = 0xFFFF0000  # cores 8-15
 
 DSD_RATES = {
-    'dsd64': 2822400,
-    'dsd128': 5644800,
-    'dsd256': 11289600,
-    'dsd512': 22579200,
+    'dsd64': 2822400, 'dsd128': 5644800, 'dsd256': 11289600, 'dsd512': 22579200,
+    'dsd64_48': 3072000, 'dsd128_48': 6144000, 'dsd256_48': 12288000, 'dsd512_48': 24576000,
 }
-
-BOX_TAPS = {'dsd64': 32, 'dsd128': 64, 'dsd256': 64, 'dsd512': 16}
 
 
 def evaluate_taps(rate_hz, freq_hz, taps):
@@ -62,7 +58,8 @@ def evaluate_taps(rate_hz, freq_hz, taps):
         stdout, _ = proc.communicate(timeout=120)
         if proc.returncode != 0:
             return -999.0
-        return float(stdout.decode().strip())
+        parts = stdout.decode().strip().split()
+        return float(parts[1]) if len(parts) > 1 else float(parts[0])  # A-wtd
     except:
         try: proc.kill()
         except: pass
@@ -155,7 +152,7 @@ SIGNAL_CONFIGS = [
 def main():
     parser = argparse.ArgumentParser(description='Generate pre-SDM training data')
     parser.add_argument('--rate', default='dsd512',
-                        choices=['dsd64', 'dsd128', 'dsd256', 'dsd512'])
+                        choices=list(DSD_RATES.keys()))
     parser.add_argument('--taps', type=int, default=3)
     parser.add_argument('--generations', type=int, default=15,
                         help='CMA-ES generations per signal type')

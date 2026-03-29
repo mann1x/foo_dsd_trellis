@@ -36,6 +36,10 @@ DSD_RATES = {
     'dsd128': 5644800,
     'dsd256': 11289600,
     'dsd512': 22579200,
+    'dsd64_48': 3072000,
+    'dsd128_48': 6144000,
+    'dsd256_48': 12288000,
+    'dsd512_48': 24576000,
 }
 
 # Test frequencies for robust evaluation (diverse content simulation)
@@ -47,12 +51,16 @@ TEST_FREQS = [100, 300, 1000, 3000, 7000, 10000, 14000]
 AFFINITY_MASK = 0xFFFF0000
 
 
-def evaluate_taps(rate_hz, freq_hz, taps):
-    """Evaluate pre-emphasis FIR taps using the real C trellis SDM.
+def evaluate_taps(rate_hz, freq_hz, taps, use_precorr=False, metric='mt'):
+    """Evaluate pre-emphasis FIR taps using the real C SDM.
 
-    Returns SINAD in dB, or -999 on error.
+    metric: 'sinad' (flat), 'awtd' (A-weighted), 'mt' (multitone).
+    Returns metric value in dB, or -999 on error.
     """
-    cmd = [TEST_EXE, '--preemph', str(rate_hz), str(freq_hz)]
+    cmd = [TEST_EXE, '--preemph']
+    if use_precorr:
+        cmd.append('--precorr')
+    cmd.extend([str(rate_hz), str(freq_hz)])
     cmd.extend(str(t) for t in taps)
 
     try:
@@ -70,7 +78,10 @@ def evaluate_taps(rate_hz, freq_hz, taps):
         stdout, _ = proc.communicate(timeout=120)
         if proc.returncode != 0:
             return -999.0
-        return float(stdout.decode().strip())
+        # Output format: "SINAD A-wtd"
+        parts = stdout.decode().strip().split()
+        idx = {'sinad': 0, 'awtd': 1}.get(metric, 0)
+        return float(parts[idx]) if len(parts) > idx else float(parts[0])
     except (subprocess.TimeoutExpired, ValueError, Exception):
         try:
             proc.kill()
@@ -79,14 +90,14 @@ def evaluate_taps(rate_hz, freq_hz, taps):
         return -999.0
 
 
-def evaluate_robust(rate_hz, taps, freqs=TEST_FREQS):
+def evaluate_robust(rate_hz, taps, freqs=TEST_FREQS, use_precorr=False, metric='mt'):
     """Evaluate taps across multiple frequencies (sequential).
 
-    Returns: (median_sinad, min_sinad, per_freq_results)
+    Returns: (median, min, per_freq_results)
     """
     results = []
     for f in freqs:
-        s = evaluate_taps(rate_hz, f, taps)
+        s = evaluate_taps(rate_hz, f, taps, use_precorr=use_precorr, metric=metric)
         results.append(s)
 
     valid = [r for r in results if r > -900]
@@ -98,7 +109,8 @@ def evaluate_robust(rate_hz, taps, freqs=TEST_FREQS):
     return median, minimum, results
 
 
-def evaluate_population_parallel(rate_hz, population, freqs=TEST_FREQS, max_workers=16):
+def evaluate_population_parallel(rate_hz, population, freqs=TEST_FREQS,
+                                  max_workers=16, use_precorr=False, metric='mt'):
     """Evaluate entire CMA-ES population in parallel.
 
     Launches all (candidate × frequency) evaluations concurrently.
@@ -112,12 +124,13 @@ def evaluate_population_parallel(rate_hz, population, freqs=TEST_FREQS, max_work
         for fi, freq in enumerate(freqs):
             jobs.append((ci, fi, freq, taps))
 
-    results = {}  # (ci, fi) → sinad
+    results = {}  # (ci, fi) → metric value
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
         for ci, fi, freq, taps in jobs:
-            future = executor.submit(evaluate_taps, rate_hz, freq, taps)
+            future = executor.submit(evaluate_taps, rate_hz, freq, taps,
+                                     use_precorr=use_precorr, metric=metric)
             futures[future] = (ci, fi)
 
         for future in as_completed(futures):
@@ -141,11 +154,17 @@ def cmaes_optimize(args):
     rate_hz = DSD_RATES[args.rate]
     num_taps = args.taps
 
+    use_precorr = args.sdm == 'precorr'
+    sdm_name = 'PreCorr' if use_precorr else 'Trellis'
+    metric = args.metric
+
     print(f"=== CMA-ES Pre-SDM Optimization ===")
     print(f"Rate: {args.rate.upper()} ({rate_hz} Hz)")
+    print(f"SDM: {sdm_name}")
+    print(f"Metric: {metric.upper()}")
     print(f"FIR taps: {num_taps}")
     print(f"Test frequencies: {TEST_FREQS}")
-    print(f"Fitness: {'worst-case' if args.robust else 'median'} SINAD")
+    print(f"Fitness: {'worst-case' if args.robust else 'median'} {metric.upper()}")
     print(f"Generations: {args.generations}")
     print(f"Population: {args.population}")
     print()
@@ -153,7 +172,9 @@ def cmaes_optimize(args):
     # Baseline: identity (no pre-emphasis)
     identity = np.zeros(num_taps)
     identity[0] = 1.0
-    base_med, base_min, base_results = evaluate_robust(rate_hz, identity)
+    base_med, base_min, base_results = evaluate_robust(rate_hz, identity,
+                                                        use_precorr=use_precorr,
+                                                        metric=metric)
     print(f"Baseline (identity): median={base_med:.1f} dB, min={base_min:.1f} dB")
     print(f"  Per-freq: {['%.1f' % r for r in base_results]}")
     print()
@@ -181,7 +202,8 @@ def cmaes_optimize(args):
 
         # Evaluate entire population in parallel
         eval_results = evaluate_population_parallel(
-            rate_hz, population, TEST_FREQS, max_workers=args.workers)
+            rate_hz, population, TEST_FREQS, max_workers=args.workers,
+            use_precorr=use_precorr, metric=metric)
 
         # Build solutions for CMA-ES
         solutions = []
@@ -200,7 +222,9 @@ def cmaes_optimize(args):
 
         if gen % args.log_interval == 0 or gen == args.generations - 1:
             # Evaluate current best
-            med, mn, pf = evaluate_robust(rate_hz, best_taps)
+            med, mn, pf = evaluate_robust(rate_hz, best_taps,
+                                           use_precorr=use_precorr,
+                                           metric=metric)
             taps_str = ', '.join(f'{t:.6f}' for t in best_taps)
             print(f"  Gen {gen:3d}: fitness={best_fitness:.1f} dB "
                   f"(med={med:.1f} min={mn:.1f}) "
@@ -210,7 +234,9 @@ def cmaes_optimize(args):
 
     # Final evaluation
     print(f"\n=== Final Result ===")
-    final_med, final_min, final_pf = evaluate_robust(rate_hz, best_taps)
+    final_med, final_min, final_pf = evaluate_robust(rate_hz, best_taps,
+                                                      use_precorr=use_precorr,
+                                                      metric=metric)
     print(f"Best taps: {best_taps.tolist()}")
     print(f"Median SINAD: {final_med:.1f} dB (baseline: {base_med:.1f}, delta: {final_med-base_med:+.1f})")
     print(f"Min SINAD:    {final_min:.1f} dB (baseline: {base_min:.1f}, delta: {final_min-base_min:+.1f})")
@@ -222,7 +248,8 @@ def cmaes_optimize(args):
     # Save
     out_dir = args.output_dir
     os.makedirs(out_dir, exist_ok=True)
-    out_file = os.path.join(out_dir, f'best_taps_{args.rate}_{num_taps}tap.npz')
+    sdm_suffix = '_precorr' if use_precorr else '_trellis'
+    out_file = os.path.join(out_dir, f'best_taps_{args.rate}{sdm_suffix}_{num_taps}tap.npz')
     np.savez(out_file,
              taps=best_taps,
              rate=rate_hz,
@@ -241,7 +268,11 @@ def cmaes_optimize(args):
 def main():
     parser = argparse.ArgumentParser(description='CMA-ES pre-SDM FIR optimization')
     parser.add_argument('--rate', default='dsd512',
-                        choices=['dsd64', 'dsd128', 'dsd256', 'dsd512'])
+                        choices=list(DSD_RATES.keys()))
+    parser.add_argument('--sdm', default='trellis', choices=['trellis', 'precorr'],
+                        help='SDM engine: trellis (default) or precorr')
+    parser.add_argument('--metric', default='mt', choices=['sinad', 'awtd', 'mt'],
+                        help='Fitness metric: mt (default), awtd, or sinad')
     parser.add_argument('--taps', type=int, default=3,
                         help='Number of FIR taps (3=minimal, 7=standard)')
     parser.add_argument('--generations', type=int, default=30)

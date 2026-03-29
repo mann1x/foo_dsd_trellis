@@ -4336,19 +4336,36 @@ static void test_pre_sdm_enhancement(void) {
  * ═══════════════════════════════════════════════════════════════════════ */
 int preemph_eval_main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: test.exe --preemph <rate_hz> <freq_hz> [tap0 tap1 ...]\n");
-        fprintf(stderr, "  rate_hz: DSD rate (2822400, 5644800, 11289600, 22579200)\n");
+        fprintf(stderr, "Usage: test.exe --preemph [--precorr] <rate_hz> <freq_hz> [tap0 tap1 ...]\n");
+        fprintf(stderr, "  --precorr: use PreCorr SDM instead of Trellis\n");
+        fprintf(stderr, "  rate_hz: DSD rate (2822400, 5644800, 11289600, 22579200, + /48 variants)\n");
         fprintf(stderr, "  freq_hz: test frequency (e.g. 1000)\n");
         fprintf(stderr, "  taps: FIR pre-emphasis taps (default: 1.0 = identity)\n");
         fprintf(stderr, "Output: SINAD in dB (single number)\n");
         return 1;
     }
 
-    uint32_t rate = (uint32_t)atoi(argv[1]);
-    double freq_hz = argc >= 3 ? atof(argv[2]) : 1000.0;
+    /* Check for flags */
+    int use_precorr = 0;
+    int arg_start = 1;
+    while (arg_start < argc && argv[arg_start][0] == '-') {
+        if (strcmp(argv[arg_start], "--precorr") == 0)
+            use_precorr = 1;
+        else
+            break;
+        arg_start++;
+    }
+
+    if (argc - arg_start < 1) {
+        fprintf(stderr, "Missing rate_hz\n");
+        return 1;
+    }
+
+    uint32_t rate = (uint32_t)atoi(argv[arg_start]);
+    double freq_hz = (argc - arg_start) >= 2 ? atof(argv[arg_start + 1]) : 1000.0;
 
     /* Parse FIR taps */
-    int num_taps = argc - 3;
+    int num_taps = argc - arg_start - 2;
     double taps[64] = {0};
     if (num_taps <= 0) {
         taps[0] = 1.0;
@@ -4356,7 +4373,7 @@ int preemph_eval_main(int argc, char **argv) {
     } else {
         if (num_taps > 64) num_taps = 64;
         for (int i = 0; i < num_taps; i++)
-            taps[i] = atof(argv[3 + i]);
+            taps[i] = atof(argv[arg_start + 2 + i]);
     }
 
     /* Determine boxcar taps */
@@ -4365,11 +4382,12 @@ int preemph_eval_main(int argc, char **argv) {
     int box_taps = (mult >= 512) ? 16 : (mult >= 128) ? 64 : 32;
 
     /* Get path config */
+    int sdm_mode = use_precorr ? SDM_MODE_PRECORR : SDM_MODE_TRELLIS;
     dsd_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.fs_in = rate; cfg.fs_out = rate;
     engine_path_info_t pi;
-    engine_get_path_info(rate, rate, NTF_AUTO, SDM_MODE_TRELLIS, &cfg, &pi);
+    engine_get_path_info(rate, rate, NTF_AUTO, sdm_mode, &cfg, &pi);
     int cands = pi.cands > 0 ? pi.cands : 2;
     int lat = pi.lat > 0 ? pi.lat : 32;
     int depth = pi.depth > 0 ? pi.depth : 4;
@@ -4423,27 +4441,382 @@ int preemph_eval_main(int argc, char **argv) {
     }
 
     /* SDM re-encode */
-    const ntf_filter_t *f = (pi.ntf_filter != NTF_AUTO) ?
-        ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, rate) : ntf_auto_select(rate);
-    if (!f) { free(smooth); free(dsd_in); free(dsd_out); return 1; }
-    sdm_context_t sdm;
-    if (sdm_context_init(&sdm, f, depth, cands, lat) != 0) {
-        free(smooth); free(dsd_in); free(dsd_out); return 1;
+    size_t out_count;
+    {
+        const ntf_filter_t *f;
+        if (use_precorr) {
+            f = ntf_auto_select_precorr(rate);
+        } else {
+            f = (pi.ntf_filter != NTF_AUTO) ?
+                ntf_get_filter((ntf_filter_id_t)pi.ntf_filter, rate) : ntf_auto_select(rate);
+        }
+        if (!f) { free(smooth); free(dsd_in); free(dsd_out); return 1; }
+
+        if (use_precorr) {
+            precorr_context_t pc;
+            if (precorr_context_init(&pc, f) != 0) {
+                free(smooth); free(dsd_in); free(dsd_out); return 1;
+            }
+            out_count = precorr_process_block(&pc, smooth, dsd_out, dsd_count);
+            free(smooth);
+            precorr_context_free(&pc);
+        } else {
+            sdm_context_t sdm;
+            if (sdm_context_init(&sdm, f, depth, cands, lat) != 0) {
+                free(smooth); free(dsd_in); free(dsd_out); return 1;
+            }
+            out_count = sdm_process_block(&sdm, smooth, dsd_out, dsd_count);
+            free(smooth);
+            sdm_context_free(&sdm);
+        }
     }
-    size_t out_count = sdm_process_block(&sdm, smooth, dsd_out, dsd_count);
-    free(smooth);
-    sdm_context_free(&sdm);
 
-    /* Measure SINAD */
+    /* Measure SINAD (flat + A-weighted) — end-to-end pipeline */
     freq = bin_align_freq(freq, (double)rate, out_count);
+    double awtd = -999.0;
     double sinad = (out_count > 1024) ?
-        measure_sinad(dsd_out, out_count, freq, (double)rate) : -999.0;
+        measure_sinad_ex(dsd_out, out_count, freq, (double)rate, &awtd) : -999.0;
 
-    /* Output just the number */
-    printf("%.2f\n", sinad);
+    /* Output: SINAD A-wtd */
+    printf("%.2f %.2f\n", sinad, awtd);
 
     free(dsd_in); free(dsd_out);
     return 0;
+}
+
+/* ─── Full-pipeline MT sweep: NTF × nc × depth × lat for same-rate ───
+ * Real pipeline: DSD multitone → boxcar → SDM re-encode → MT measurement.
+ * Sweeps Trellis and PreCorr. Ranks by MT. */
+
+static const double g_mt_freqs[32] = {
+    17, 21, 27, 34, 42, 53, 67, 85, 107, 134, 169, 213, 268, 337,
+    424, 534, 672, 846, 1065, 1340, 1687, 2124, 2674, 3366, 4237,
+    5334, 6714, 8452, 10640, 13396, 16863, 21228
+};
+
+/* Measure MT through full boxcar pipeline for a given SDM config.
+ * Returns MT SINAD in dB. Also fills awtd_out with A-weighted single-tone SINAD. */
+static double measure_pipeline_mt(uint32_t rate, ntf_filter_id_t ntf_id,
+                                   int nc, int depth, int lat, int use_precorr,
+                                   double *awtd_out) {
+    unsigned base = rate_is_48k_family(rate) ? 48000 : 44100;
+    unsigned mult = rate / base;
+    unsigned n_dsd = (mult <= 64) ? 262144u : (mult <= 128) ? 524288u :
+                     (mult <= 256) ? 1048576u : 2097152u;
+    int box_taps = (mult >= 512) ? 16 : (mult >= 128) ? 64 : 32;
+
+    /* Use a safe low-order NTF for the source SDM generator.
+     * ntf_auto_select may return aggressive NTFs that diverge on multitone.
+     * CLANS-4 is stable at all rates with nc=16 and high-amplitude input. */
+    const ntf_filter_t *f_gen = ntf_get_filter(NTF_CLANS_4, rate);
+    if (!f_gen) f_gen = ntf_auto_select(rate);
+    if (!f_gen) return -999.0;
+
+    const ntf_filter_t *f_re = ntf_get_filter(ntf_id, rate);
+    if (!f_re) {
+        if (use_precorr)
+            f_re = ntf_auto_select_precorr(rate);
+        else
+            f_re = ntf_auto_select(rate);
+    }
+    if (!f_re) return -999.0;
+
+    float  *dsd_src = (float *)malloc(n_dsd * sizeof(float));
+    float  *dsd_out = (float *)malloc(n_dsd * sizeof(float));
+    double *smooth  = (double *)calloc(n_dsd, sizeof(double));
+    if (!dsd_src || !dsd_out || !smooth) {
+        free(dsd_src); free(dsd_out); free(smooth);
+        return -999.0;
+    }
+
+    /* Bin-align frequencies to the CANDIDATE SDM output count.
+     * This ensures Goertzel measures at exact bin centers. */
+    #define GEN_LAT 512
+    size_t out_est = n_dsd - GEN_LAT - (unsigned)lat;  /* source removes GEN_LAT, candidate removes lat */
+    if (use_precorr) out_est = n_dsd - GEN_LAT;  /* PreCorr has no latency */
+    double out_bw = (double)rate / (double)out_est;
+
+    double aligned_freqs[32];
+    unsigned aligned_bins[32];
+    for (int t = 0; t < 32; t++) {
+        aligned_bins[t] = (unsigned)(g_mt_freqs[t] / out_bw + 0.5);
+        aligned_freqs[t] = aligned_bins[t] * out_bw;
+    }
+
+    /* ── Generate DSD multitone source ── */
+    size_t gen_count;
+    {
+        sdm_context_t gen;
+        if (sdm_context_init(&gen, f_gen, 8, 16, GEN_LAT) != 0) {
+            free(dsd_src); free(dsd_out); free(smooth); return -999.0;
+        }
+        double *pcm = (double *)malloc(n_dsd * sizeof(double));
+        if (!pcm) { sdm_context_free(&gen); free(dsd_src); free(dsd_out); free(smooth); return -999.0; }
+        double amp = 0.3 / sqrt(32.0);  /* Conservative: peak ~0.6, safe for all NTFs */
+        for (unsigned i = 0; i < n_dsd; i++) {
+            double s = 0.0;
+            for (int t = 0; t < 32; t++)
+                s += amp * sin(2.0 * M_PI * aligned_freqs[t] * (double)i / (double)rate);
+            pcm[i] = s;
+        }
+        gen_count = sdm_process_block(&gen, pcm, dsd_src, n_dsd);
+        free(pcm);
+        sdm_context_free(&gen);
+        if (gen_count < 1024) { free(dsd_src); free(dsd_out); free(smooth); return -999.0; }
+    }
+
+    /* ── Boxcar smooth with -3 dB gain (matches production pipeline) ── */
+    {
+        double bsum = 0.0, inv = 1.0 / (double)box_taps;
+        double *ring = (double *)calloc(box_taps, sizeof(double));
+        int bp = 0;
+        double gain = 0.708;  /* -3 dB, production default */
+        for (size_t i = 0; i < gen_count; i++) {
+            double s = (double)dsd_src[i];
+            bsum -= ring[bp]; ring[bp] = s; bsum += s;
+            bp = (bp + 1) % box_taps;
+            smooth[i] = bsum * inv * gain;
+        }
+        free(ring);
+    }
+
+    /* ── SDM re-encode ── */
+    size_t produced;
+    if (use_precorr) {
+        precorr_context_t pc;
+        if (precorr_context_init(&pc, f_re) != 0) {
+            free(dsd_src); free(dsd_out); free(smooth); return -999.0;
+        }
+        produced = precorr_process_block(&pc, smooth, dsd_out, gen_count);
+        precorr_context_free(&pc);
+    } else {
+        sdm_context_t sdm;
+        if (sdm_context_init(&sdm, f_re, (unsigned)depth, (unsigned)nc, (unsigned)lat) != 0) {
+            free(dsd_src); free(dsd_out); free(smooth); return -999.0;
+        }
+        produced = sdm_process_block(&sdm, smooth, dsd_out, gen_count);
+        sdm_context_free(&sdm);
+    }
+
+    if (produced < 1024) {
+        free(dsd_src); free(dsd_out); free(smooth); return -999.0;
+    }
+
+    /* ── Measure MT on output ── */
+    double actual_bw = (double)rate / (double)produced;
+    unsigned max_bin = (unsigned)(20000.0 / actual_bw);
+    double total_signal = 0.0;
+    unsigned sig_bins[32];
+    for (int t = 0; t < 32; t++) {
+        /* Re-align to actual produced bin grid */
+        sig_bins[t] = (unsigned)(aligned_freqs[t] / actual_bw + 0.5);
+        double meas_freq = sig_bins[t] * actual_bw;
+        total_signal += goertzel_power(dsd_out, produced, meas_freq, (double)rate);
+    }
+    double noise = 0.0;
+    for (unsigned b = 1; b <= max_bin; b++) {
+        int is_sig = 0;
+        for (int t = 0; t < 32; t++) {
+            if (b >= sig_bins[t] - 1 && b <= sig_bins[t] + 1) { is_sig = 1; break; }
+        }
+        if (!is_sig)
+            noise += goertzel_power(dsd_out, produced, b * actual_bw, (double)rate);
+    }
+    double mt = (noise > 0.0) ? 10.0 * log10(total_signal / noise) : -999.0;
+
+    /* Debug: print per-tone signal power for DSD128 to diagnose MT floor */
+    if (rate == 5644800 && mt < 60.0) {
+        printf("\n      [MT-DBG] produced=%zu actual_bw=%.4f max_bin=%u sig=%.1f noise=%.1f mt=%.1f\n",
+               produced, actual_bw, max_bin, 10.0*log10(total_signal), 10.0*log10(noise > 0 ? noise : 1e-30), mt);
+        for (int t = 0; t < 32; t++) {
+            double mf = sig_bins[t] * actual_bw;
+            double pwr = goertzel_power(dsd_out, produced, mf, (double)rate);
+            printf("      [MT-DBG]  f=%.1f bin=%u pwr=%.1e (%.1f dB)\n",
+                   g_mt_freqs[t], sig_bins[t], pwr, 10.0*log10(pwr > 0 ? pwr : 1e-30));
+        }
+    }
+
+    /* ── Also measure single-tone A-weighted SINAD ── */
+    if (awtd_out) {
+        /* Re-run with 1kHz sine through the same pipeline */
+        double freq = bin_align_freq(1000.0, (double)rate, out_est);
+        size_t gen2_count;
+        {
+            sdm_context_t gen2;
+            sdm_context_init(&gen2, f_gen, 8, 16, GEN_LAT);
+            double *pcm1k = (double *)malloc(n_dsd * sizeof(double));
+            for (unsigned i = 0; i < n_dsd; i++)
+                pcm1k[i] = 0.5 * sin(2.0 * M_PI * freq * (double)i / (double)rate);
+            gen2_count = sdm_process_block(&gen2, pcm1k, dsd_src, n_dsd);
+            free(pcm1k);
+            sdm_context_free(&gen2);
+        }
+        /* Boxcar with -3 dB gain */
+        {
+            double bsum = 0.0, inv = 1.0 / (double)box_taps;
+            double *ring = (double *)calloc(box_taps, sizeof(double));
+            int bp = 0;
+            for (size_t i = 0; i < gen2_count; i++) {
+                double s = (double)dsd_src[i];
+                bsum -= ring[bp]; ring[bp] = s; bsum += s;
+                bp = (bp + 1) % box_taps;
+                smooth[i] = bsum * inv * 0.708;
+            }
+            free(ring);
+        }
+        /* Re-encode */
+        if (use_precorr) {
+            precorr_context_t pc2;
+            precorr_context_init(&pc2, f_re);
+            produced = precorr_process_block(&pc2, smooth, dsd_out, gen2_count);
+            precorr_context_free(&pc2);
+        } else {
+            sdm_context_t sdm2;
+            sdm_context_init(&sdm2, f_re, (unsigned)depth, (unsigned)nc, (unsigned)lat);
+            produced = sdm_process_block(&sdm2, smooth, dsd_out, gen2_count);
+            sdm_context_free(&sdm2);
+        }
+        freq = bin_align_freq(freq, (double)rate, produced);
+        measure_sinad_ex(dsd_out, produced, freq, (double)rate, awtd_out);
+    }
+    #undef GEN_LAT
+
+    free(dsd_src); free(dsd_out); free(smooth);
+    return mt;
+}
+
+/* Two-pass smart sweep:
+ * Pass 1: NTF × lat (nc=2, depth=4) — find best NTF and lat
+ * Pass 2: depth × nc for winning NTF+lat — fine-tune
+ * Skips unstable combos: order-8 NTFs at DSD64, sdm-8 everywhere. */
+static void test_mt_pipeline_sweep(void) {
+    uint32_t rates[] = {
+        DSD_RATE_64, DSD_RATE_128, DSD_RATE_256, DSD_RATE_512,
+        DSD48_RATE_64, DSD48_RATE_128, DSD48_RATE_256, DSD48_RATE_512,
+    };
+    const char *rate_names[] = {
+        "DSD64", "DSD128", "DSD256", "DSD512",
+        "DSD64/48", "DSD128/48", "DSD256/48", "DSD512/48",
+    };
+    ntf_filter_id_t ntfs[] = {
+        NTF_CLANS_4, NTF_SDM_4, NTF_CLANS_5, NTF_SDM_5,
+        NTF_CLANS_6, NTF_SDM_6, NTF_CLANS_7, NTF_SDM_7,
+        NTF_CLANS_8,
+    };
+    const char *ntf_names[] = {
+        "clans-4", "sdm-4", "clans-5", "sdm-5",
+        "clans-6", "sdm-6", "clans-7", "sdm-7",
+        "clans-8",
+    };
+    int n_ntfs = sizeof(ntfs) / sizeof(ntfs[0]);
+    int n_rates = sizeof(rates) / sizeof(rates[0]);
+
+    int pass1_lats[] = { 32, 64, 128, 256 };
+    int n_p1_lats = sizeof(pass1_lats) / sizeof(pass1_lats[0]);
+
+    int pass2_depths[] = { 4, 8, 16 };
+    int pass2_nc[] = { 2, 4, 8 };
+    int n_p2_depths = sizeof(pass2_depths) / sizeof(pass2_depths[0]);
+    int n_p2_nc = sizeof(pass2_nc) / sizeof(pass2_nc[0]);
+
+    for (int sdm = 0; sdm < 2; sdm++) {
+        int use_precorr = (sdm == 0) ? 0 : 1;
+        printf("\n=== %s Full-Pipeline MT Sweep ===\n",
+               use_precorr ? "PRECORR" : "TRELLIS");
+
+        for (int r = 0; r < n_rates; r++) {
+            unsigned base = rate_is_48k_family(rates[r]) ? 48000 : 44100;
+            unsigned mult = rates[r] / base;
+
+            printf("\n  %s:\n", rate_names[r]);
+
+            double best_mt = -999.0, best_awtd = -999.0;
+            int best_ntf_idx = -1, best_nc = 2, best_depth = 4, best_lat = 32;
+
+            if (use_precorr) {
+                /* PreCorr: sweep NTF only (no nc/depth/lat) */
+                printf("    Pass 1: NTF sweep\n");
+                for (int fi = 0; fi < n_ntfs; fi++) {
+                    const ntf_filter_t *fcheck = ntf_get_filter(ntfs[fi], rates[r]);
+                    if (!fcheck) continue;
+                    /* Skip order-8 at DSD64 (unstable) */
+                    if (mult <= 64 && fcheck->order >= 8) continue;
+
+                    double awtd = -999.0;
+                    double mt = measure_pipeline_mt(rates[r], ntfs[fi],
+                        2, 4, 32, 1, &awtd);
+                    printf("      %-9s: MT=%6.1f A-wtd=%6.1f\n",
+                           ntf_names[fi], mt, awtd);
+                    if (mt > best_mt) {
+                        best_mt = mt; best_awtd = awtd;
+                        best_ntf_idx = fi;
+                    }
+                }
+            } else {
+                /* Trellis Pass 1: NTF × lat (nc=2, depth=4) */
+                printf("    Pass 1: NTF x lat (nc=2, d=4)\n");
+                for (int fi = 0; fi < n_ntfs; fi++) {
+                    const ntf_filter_t *fcheck = ntf_get_filter(ntfs[fi], rates[r]);
+                    if (!fcheck) continue;
+                    if (mult <= 64 && fcheck->order >= 8) continue;
+
+                    for (int li = 0; li < n_p1_lats; li++) {
+                        double awtd = -999.0;
+                        double mt = measure_pipeline_mt(rates[r], ntfs[fi],
+                            2, 4, pass1_lats[li], 0, &awtd);
+                        printf("      %-9s lat=%3d: MT=%6.1f A-wtd=%6.1f%s\n",
+                               ntf_names[fi], pass1_lats[li], mt, awtd,
+                               mt > best_mt ? " *" : "");
+                        if (mt > best_mt) {
+                            best_mt = mt; best_awtd = awtd;
+                            best_ntf_idx = fi; best_lat = pass1_lats[li];
+                        }
+                    }
+                }
+
+                /* Trellis Pass 2: depth × nc for winning NTF+lat */
+                if (best_ntf_idx >= 0) {
+                    printf("    Pass 2: depth x nc (NTF=%s, lat=%d)\n",
+                           ntf_names[best_ntf_idx], best_lat);
+                    for (int di = 0; di < n_p2_depths; di++) {
+                        for (int ni = 0; ni < n_p2_nc; ni++) {
+                            if (pass2_depths[di] == 4 && pass2_nc[ni] == 2)
+                                continue;  /* already tested in pass 1 */
+                            double awtd = -999.0;
+                            double mt = measure_pipeline_mt(rates[r], ntfs[best_ntf_idx],
+                                pass2_nc[ni], pass2_depths[di], best_lat, 0, &awtd);
+                            printf("      d=%2d nc=%d: MT=%6.1f A-wtd=%6.1f%s\n",
+                                   pass2_depths[di], pass2_nc[ni], mt, awtd,
+                                   mt > best_mt ? " *" : "");
+                            if (mt > best_mt) {
+                                best_mt = mt; best_awtd = awtd;
+                                best_nc = pass2_nc[ni]; best_depth = pass2_depths[di];
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* Print winner */
+            if (use_precorr) {
+                printf("    >>> BEST: %-9s MT=%.1f A-wtd=%.1f\n",
+                       best_ntf_idx >= 0 ? ntf_names[best_ntf_idx] : "?",
+                       best_mt, best_awtd);
+            } else {
+                printf("    >>> BEST: %-9s nc=%d d=%d lat=%d MT=%.1f A-wtd=%.1f\n",
+                       best_ntf_idx >= 0 ? ntf_names[best_ntf_idx] : "?",
+                       best_nc, best_depth, best_lat,
+                       best_mt, best_awtd);
+            }
+        }
+    }
+
+    TEST_ASSERT_TRUE(1, "MT pipeline sweep completed");
+}
+
+void test_mt_sweep_suite(void) {
+    TEST_SUITE("MT Pipeline Sweep");
+    TEST_RUN(test_mt_pipeline_sweep);
 }
 
 void test_downsample_sweep_suite(void) {

@@ -55,9 +55,12 @@ def train(args):
     names = data['names']
     num_taps = int(data['num_taps'])
 
-    print(f"Training data: {len(features)} examples, {num_taps} taps")
-    print(f"Feature range: centroid=[{features[:,0].min():.0f}-{features[:,0].max():.0f}], "
-          f"rms=[{features[:,1].min():.2f}-{features[:,1].max():.2f}]")
+    num_features = features.shape[1]
+    print(f"Training data: {len(features)} examples, {num_features} features, {num_taps} taps")
+    print(f"Feature ranges:")
+    feat_names = ['centroid', 'rms', 'crest', 'rate_mhz'][:num_features]
+    for i, fn in enumerate(feat_names):
+        print(f"  {fn}: [{features[:,i].min():.3f} - {features[:,i].max():.3f}]")
 
     # Normalize features for training
     feat_mean = features.mean(axis=0)
@@ -126,7 +129,7 @@ def train(args):
     export_model = ExportModel(model, feat_mean, feat_std)
     export_model.eval()
 
-    dummy_raw = torch.tensor([[5000.0, 0.5, 0.5]])  # example raw features
+    dummy_raw = torch.randn(1, features.shape[1])  # match feature count
     # Use legacy exporter to avoid Unicode issues on Windows
     torch.onnx.export(
         export_model, dummy_raw, onnx_path,
@@ -141,7 +144,7 @@ def train(args):
     import onnx
     onnx_model = onnx.load(onnx_path)
     onnx_model.metadata_props.append(
-        onnx.StringStringEntryProto(key='model_type', value='adaptive_fir'))
+        onnx.StringStringEntryProto(key='model_type', value='preemph_taps'))
     onnx_model.metadata_props.append(
         onnx.StringStringEntryProto(key='num_taps', value=str(num_taps)))
     onnx_model.metadata_props.append(

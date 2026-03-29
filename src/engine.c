@@ -45,19 +45,13 @@ static const path_config_t path_table[] = {
      * by reducing the signal to ~7% of the quantizer range on same-rate paths.
      * lat = 0 means "auto" (computed as cands * 8 at runtime).
      * Optimal lat from nc×lat sweep: nc=2→16, nc=4→32, nc=8→64. */
-    /* Same-rate re-encode: boxcar DSD-Wide → trellis SDM (2026-03-27).
-     * Boxcar taps: DSD64=32, DSD128/256=64, DSD512=16.
-     * End-to-end SINAD (boxcar + SDM, multi-freq median):
-     *   DSD64:  CLANS6/d=16/lat=32 → 84.5 dB
-     *   DSD128: CLANS6/d=4/lat=128 → 99.5 dB
-     *   DSD256: CLANS6/d=4/lat=128 → 108.5 dB
-     *   DSD512: SDM6/d=4/lat=32    → 108.6 dB
-     * nc=2 avoids candidate collapse and is 2x cheaper.
-     * DSD64 needs depth=16: 4-bit dedup mask kills path diversity at low OSR. */
-    { DSD_RATE_64,  DSD_RATE_64,  NTF_CLANS_6, 0.0,  2,  0, 16, 0.708f },
-    { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
-    { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
-    { DSD_RATE_512, DSD_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
+    /* Same-rate re-encode: boxcar DSD-Wide → trellis SDM.
+     * MT-optimized sweep (2026-03-28, end-to-end boxcar pipeline).
+     * Pre-emphasis taps from CMA-ES A-wtd optimization. */
+    { DSD_RATE_64,  DSD_RATE_64,  NTF_SDM_6,   0.0,  2, 128,  4, 0.708f },
+    { DSD_RATE_128, DSD_RATE_128, NTF_SDM_7,   0.0,  2,  64,  4, 0.708f },
+    { DSD_RATE_256, DSD_RATE_256, NTF_SDM_6,   0.0,  4, 128,  4, 0.708f },
+    { DSD_RATE_512, DSD_RATE_512, NTF_SDM_6,   0.0,  8, 256,  4, 0.708f },
     /* Upsample paths: gain=0.708 (-3 dB) to prevent FIR overload.
      * FIR upsampling of ±1 DSD produces peaks at ±2.24. */
     { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_7,   0.0,  2,  0, 4, 0.708f },  /* median sweep: 99.7 dB (was sdm-4/nc=2: 87) */
@@ -76,15 +70,12 @@ static const path_config_t path_table[] = {
     { DSD_RATE_512, DSD_RATE_128, NTF_SDM_6,   0.0,  8, 16, 16, 0.708f },  /* fp64 sweep: 92.8 dB, d=16/lat=16 (was sdm-4/nc=16: 79 dB) */
     { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 0.708f },
     /* ─── DSD/48 paths (independently swept, NOT mirrored from /44) ─── */
-    /* Same-rate re-encode /48: boxcar DSD-Wide → trellis SDM (2026-03-27):
-     *   DSD64/48:  SDM-6/d=16/lat=64  → 84.6 dB
-     *   DSD128/48: CLANS-6/d=4/lat=32 → 103.4 dB
-     *   DSD256/48: SDM-4/d=16/lat=128 → 103.8 dB
-     *   DSD512/48: SDM-4/d=16/lat=128 → 109.8 dB */
-    { DSD48_RATE_64,  DSD48_RATE_64,  NTF_SDM_6,   0.0,  2,  64, 16, 0.708f },
-    { DSD48_RATE_128, DSD48_RATE_128, NTF_CLANS_6, 0.0,  2,  32,  4, 0.708f },
-    { DSD48_RATE_256, DSD48_RATE_256, NTF_SDM_4,   0.0,  2, 128, 16, 0.708f },
-    { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_4,   0.0,  2, 128, 16, 0.708f },
+    /* Same-rate re-encode /48: MT-optimized sweep (2026-03-28).
+     * Pre-emphasis taps from CMA-ES A-wtd optimization. */
+    { DSD48_RATE_64,  DSD48_RATE_64,  NTF_SDM_7,   0.0,  8,  32, 16, 0.708f },
+    { DSD48_RATE_128, DSD48_RATE_128, NTF_SDM_7,   0.0,  2,  64,  4, 0.708f },
+    { DSD48_RATE_256, DSD48_RATE_256, NTF_SDM_6,   0.0,  2,  32,  4, 0.708f },
+    { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_4,   0.0,  4,  64,  8, 0.708f },
     /* DSD/48 upsample */
     { DSD48_RATE_64,  DSD48_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },  /* /48 independent — sdm-7 mirror regresses */
     { DSD48_RATE_64,  DSD48_RATE_256, NTF_SDM_7,   0.0,  8,  0, 4, 0.708f },  /* fp64 sweep: 91.3 dB (was clans-8/nc=2: 54.6 dB) */
@@ -339,20 +330,19 @@ size_t engine_process_block(engine_channel_t *eng,
                     eng->fir_buf[i] = bc->sum * inv_n * combined;
                 }
             }
-            /* Pre-SDM pre-emphasis (ML model, DSD512 only).
-             * Features on CPU (subsampled), MLP via ONNX on GPU, FIR on CPU. */
-            if (cfg->ml_enabled && cfg->fs_in >= DSD_RATE_512) {
+            /* Pre-SDM adaptive pre-emphasis (all same-rate DSD).
+             * Features on CPU (subsampled), MLP via ONNX on GPU, FIR on CPU.
+             * 4 features: [centroid, rms, crest, rate_mhz]. */
+            if (cfg->ml_enabled && eng->ml_filter) {
                 size_t feat_n = count < 4096 ? count : 4096;
-                float centroid = preemph_spectral_centroid(eng->fir_buf, feat_n, (double)cfg->fs_in);
-                float rms = preemph_rms(eng->fir_buf, feat_n);
-                float crest = preemph_crest_factor(eng->fir_buf, feat_n);
+                float features[4] = {
+                    preemph_spectral_centroid(eng->fir_buf, feat_n, (double)cfg->fs_in),
+                    preemph_rms(eng->fir_buf, feat_n),
+                    preemph_crest_factor(eng->fir_buf, feat_n),
+                    (float)cfg->fs_in / 1e6f,
+                };
                 float taps[3];
-                if (eng->ml_filter) {
-                    float features[3] = { centroid, rms, crest };
-                    onnx_filter_predict_taps(eng->ml_filter, features, taps);
-                } else {
-                    preemph_predict_taps(centroid, rms, crest, taps);
-                }
+                onnx_filter_predict_taps(eng->ml_filter, features, taps);
                 preemph_apply(eng->fir_buf, count, taps);
             }
             /* Re-encode via SDM (CPU only) */
@@ -574,19 +564,17 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
                 eng->fir_buf[i] = bc->sum * inv_n * combined;
             }
         }
-        /* Pre-SDM pre-emphasis (parallel/DAS path) */
-        if (cfg->ml_enabled && cfg->fs_in >= DSD_RATE_512) {
+        /* Pre-SDM adaptive pre-emphasis (parallel/DAS path) */
+        if (cfg->ml_enabled && eng->ml_filter) {
             size_t feat_n = count < 4096 ? count : 4096;
-            float centroid = preemph_spectral_centroid(eng->fir_buf, feat_n, (double)cfg->fs_in);
-            float rms = preemph_rms(eng->fir_buf, feat_n);
-            float crest = preemph_crest_factor(eng->fir_buf, feat_n);
+            float features[4] = {
+                preemph_spectral_centroid(eng->fir_buf, feat_n, (double)cfg->fs_in),
+                preemph_rms(eng->fir_buf, feat_n),
+                preemph_crest_factor(eng->fir_buf, feat_n),
+                (float)cfg->fs_in / 1e6f,
+            };
             float taps[3];
-            if (eng->ml_filter) {
-                float features[3] = { centroid, rms, crest };
-                onnx_filter_predict_taps(eng->ml_filter, features, taps);
-            } else {
-                preemph_predict_taps(centroid, rms, crest, taps);
-            }
+            onnx_filter_predict_taps(eng->ml_filter, features, taps);
             preemph_apply(eng->fir_buf, count, taps);
         }
         fir_count = count;

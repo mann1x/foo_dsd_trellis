@@ -291,46 +291,50 @@ Parameters: `rate` (DSD rate in Hz), `nc` (candidates), `depth`, `lat` (latency)
 
 ## SINAD Results
 
-### Trellis SDM (nc=2, production path_table NTFs)
+### Trellis SDM (MT-optimized, production path_table)
 
-Full end-to-end pipeline: generate DSD → boxcar DSD-Wide → SDM re-encode → Goertzel (multi-frequency median). Same-rate uses **boxcar (DSD-Wide) 4-bit intermediate** instead of FIR lowpass — the boxcar preserves DSD shaped noise as natural dither for the trellis re-encoder, giving +22 dB over FIR lowpass at DSD64.
+Full end-to-end pipeline: generate DSD → boxcar DSD-Wide → SDM re-encode → measure. Path table optimized for **multitone SINAD (MT)** — the most representative metric for complex music signals. Same-rate uses boxcar (DSD-Wide) 4-bit intermediate instead of FIR lowpass.
 
 **44.1 kHz family:**
 
-| Rate | NTF | Depth | Cands | SINAD | A-wtd | MT | NMod |
-|------|-----|------:|------:|------:|------:|---:|-----:|
-| DSD64 | CLANS-6 | 16 | 2 | 84.5 | 90.0 | 95.5 | 4.8 |
-| DSD128 | CLANS-6 | 4 | 2 | 99.5 | 105.6 | 120.3 | 10.3 |
-| DSD256 | CLANS-6 | 4 | 2 | 108.5 | 114.4 | 123.7 | 2.1 |
-| DSD512 | SDM-6 | 4 | 2 | 108.6 | 114.1 | 119.8 | 20.0 |
+| Rate | NTF | Depth | Cands | Lat | MT | A-wtd |
+|------|-----|------:|------:|----:|---:|------:|
+| DSD64 | SDM-6 | 4 | 2 | 128 | 79.0 | 89.2 |
+| DSD128 | SDM-7 | 4 | 2 | 64 | 72.5 | 87.7 |
+| DSD256 | SDM-6 | 4 | 4 | 128 | 93.3 | 117.3 |
+| DSD512 | SDM-6 | 4 | 8 | 256 | 147.2 | 144.9 |
 
 **48 kHz family:**
 
-| Rate | NTF | Depth | Cands | SINAD | A-wtd | MT | NMod |
-|------|-----|------:|------:|------:|------:|---:|-----:|
-| DSD64/48 | SDM-6 | 16 | 2 | 84.6 | 91.0 | 108.4 | 12.3 |
-| DSD128/48 | CLANS-6 | 4 | 2 | 103.4 | 110.4 | 109.7 | 10.3 |
-| DSD256/48 | SDM-4 | 16 | 2 | 103.8 | 109.7 | 114.6 | 6.6 |
-| DSD512/48 | SDM-4 | 16 | 2 | 109.8 | 116.0 | 138.7 | 32.1 |
+| Rate | NTF | Depth | Cands | Lat | MT | A-wtd |
+|------|-----|------:|------:|----:|---:|------:|
+| DSD64/48 | SDM-7 | 16 | 8 | 32 | 77.9 | 91.5 |
+| DSD128/48 | SDM-7 | 4 | 2 | 64 | 76.2 | 99.4 |
+| DSD256/48 | SDM-6 | 4 | 2 | 32 | 97.9 | 119.1 |
+| DSD512/48 | SDM-4 | 8 | 4 | 64 | 149.3 | 130.9 |
 
-SINAD/A-wtd: end-to-end boxcar pipeline (median). MT/NMod: encoding quality (PCM→SDM).
-
-Quality scales ~15 dB per octave of OSR (DSD64: 85 dB, DSD512: 109 dB). Published references: SACD spec 120 dB (encoding only), Archimago ~110-116 dB, HQPlayer ASDM7 ~110 dB.
+MT and A-wtd measured end-to-end through the boxcar pipeline (DSD → boxcar → SDM re-encode → Goertzel). MT is the primary optimization target (32-tone multitone SINAD). SDM-type NTFs outperform CLANS for MT because they have smoother in-band response.
 
 `/fp:precise` required — `/fp:fast` causes up to 13 dB quality variation from FMA reordering (same root cause as CUDA `--fmad=false`). PGO provides 0% improvement (trellis is dependency-chain-bound, not branch/layout-bound).
 
-### PreCorr SDM (greedy + prediction correction)
+### PreCorr SDM (MT-optimized, greedy + prediction correction)
 
 Greedy quantiser with trained prediction correction table. Near-zero CPU (~0.01x realtime).
 
-| Rate | NTF Filter | SINAD | A-wtd |
-|------|------------|------:|------:|
-| DSD64 | CLANS-6 (order 6) | 117.2 | — |
-| DSD128 | CLANS-7 (order 7) | 115.3 | — |
-| DSD256 | CLANS-7 (order 7) | 135.7 | — |
-| DSD512 | CLANS-7 (order 7) | 137.5 | — |
+End-to-end same-rate pipeline (DSD → boxcar → PreCorr re-encode), MT-optimized NTF selection:
 
-PreCorr outperforms Trellis at DSD64 (+6.5 dB) because its trained prediction table avoids the candidate collapse that degrades Trellis at low OSR. Trellis catches up at DSD128+ where higher OSR gives the look-ahead more room to work.
+| Rate | NTF | MT | A-wtd |
+|------|-----|---:|------:|
+| DSD64 | CLANS-4 | 70.2 | 89.2 |
+| DSD128 | SDM-5 | 69.0 | 105.5 |
+| DSD256 | SDM-6 | 87.5 | 112.2 |
+| DSD512 | SDM-4 | 148.0 | 134.3 |
+| DSD64/48 | SDM-6 | 72.1 | 99.1 |
+| DSD128/48 | CLANS-8 | 70.2 | 114.5 |
+| DSD256/48 | CLANS-7 | 88.9 | 113.5 |
+| DSD512/48 | SDM-7 | 137.0 | 131.0 |
+
+PreCorr MT is within 2-10 dB of Trellis at most rates. The main quality difference is at DSD512 where Trellis look-ahead provides better noise shaping.
 
 ### DSD Rate Conversion — Path-Adaptive Tuning
 
@@ -587,9 +591,86 @@ Runtime parameters serialized to foobar2000 config store (version 16):
 | Debug log | bool | on/off | off |
 | REST API port | int | 0 (disabled) - 65535 | 8881 |
 
-### ONNX ML Post-Filter (`onnx_filter.c`)
+### Adaptive Pre-SDM Pre-Emphasis (`onnx_filter.c`, `preemph.c`)
 
-Optional non-causal CNN post-filter for DSD noise reduction. Delay-loads `onnxruntime.dll` — plugin works without it. Supports CPU and DirectML (GPU) execution providers. Model file: `foo_dsd_trellis_ml.onnx` next to the DLL.
+Signal-adaptive 3-tap FIR pre-emphasis applied after boxcar smoothing, before SDM re-encoding. An ONNX MLP predicts optimal FIR taps from the signal's spectral characteristics and DSD rate, then applies the FIR on CPU.
+
+**Architecture:**
+
+```
+Boxcar output (fp64) → extract features (4096 samples) → ONNX MLP → 3 taps → FIR apply → SDM
+```
+
+- **Feature extraction** (CPU, subsampled to 4096 samples):
+  - Spectral centroid: ZCR-based O(n) approximation (Hz)
+  - RMS: sqrt(mean(x^2))
+  - Crest factor: peak / RMS
+  - Rate: DSD sample rate in MHz (e.g., 2.82 for DSD64)
+- **MLP** (ONNX on DirectML GPU, sub-ms inference):
+  - Input: (1, 4) float32 — [centroid, rms, crest, rate_mhz]
+  - Architecture: Linear(4→16) → ReLU → Linear(16→16) → ReLU → Linear(16→3)
+  - Output: (1, 3) float32 — [tap0, tap1, tap2], DC-gain-normalized (sum=1.0)
+  - Parameters: 419, model size: 2.8 KB
+  - Feature normalization baked into the ONNX graph
+- **FIR apply** (CPU, in-place on boxcar output):
+  - `out[n] = t0*x[n] + t1*x[n-1] + t2*x[n-2]`
+  - Trivial cost: 3 multiply-adds per sample
+
+**Training methodology:**
+
+The MLP is trained on per-signal-type optimal taps found by CMA-ES black-box optimization:
+
+1. **Signal diversity**: 20 signal types per rate — single tones at 12 frequencies (50 Hz to 14 kHz), multi-frequency mixes (bass/mid/high/full-range), amplitude variants (quiet/loud)
+2. **Black-box fitness**: Each CMA-ES evaluation runs the real C trellis SDM via `foo_dsd_trellis_test.exe --preemph`. No differentiable proxy — the actual production SDM is the fitness evaluator
+3. **Fitness metric**: A-weighted SINAD (end-to-end boxcar pipeline)
+4. **Per-signal optimization**: CMA-ES finds distinct optimal taps for each signal type at each rate (160 total: 20 types × 8 rates)
+5. **MLP generalization**: The MLP learns to map signal features to optimal taps, interpolating between the 160 training examples for unseen signals
+
+**CMA-ES training results** (worst-case A-weighted SINAD improvement):
+
+| Rate | Baseline | Optimized | Delta |
+|------|---------|-----------|-------|
+| DSD64 | 70.1 dB | 75.9 dB | +5.8 |
+| DSD128 | 45.0 dB | 73.0 dB | +28.1 |
+| DSD256 | 84.9 dB | 90.1 dB | +5.2 |
+| DSD512 | 62.1 dB | 116.1 dB | +54.0 |
+| DSD64/48 | 73.4 dB | 74.3 dB | +1.0 |
+| DSD128/48 | 48.3 dB | 73.9 dB | +25.5 |
+| DSD256/48 | 87.1 dB | 92.7 dB | +5.6 |
+| DSD512/48 | 116.9 dB | 122.2 dB | +5.3 |
+
+MLP training accuracy: max_err=0.054 (tap coefficient error), mean_err=0.010.
+
+**Runtime behavior:**
+
+- Enabled via "ML Noise Filter" checkbox in DSP settings
+- Active on all same-rate DSD paths (DSD64 through DSD512, both /44 and /48)
+- Requires `foo_dsd_trellis_preemph_taps.onnx` in the component folder
+- Requires `onnxruntime.dll` + `DirectML.dll` in the component folder
+- Execution provider fallback: CUDA → DirectML → CPU
+- CPU overhead: ~1ms per chunk (feature extraction + FIR apply)
+- GPU overhead: sub-ms (MLP inference via DirectML)
+- Falls back gracefully: if ONNX unavailable, pre-emphasis is skipped (identity FIR)
+- No effect on rate conversion paths (upsample/downsample)
+
+**Retraining:**
+
+```bash
+# Full pipeline: generate CMA-ES data + train MLP + export ONNX
+python -u training_pipeline/train_all_rates.py
+
+# Retrain MLP only (reuse existing CMA-ES data)
+python -u training_pipeline/train_all_rates.py --skip-generate
+
+# Single rate only
+python -u training_pipeline/train_all_rates.py --rates dsd512
+
+# Custom parameters
+python -u training_pipeline/train_all_rates.py \
+  --generations 20 --population 12 --workers 16 --epochs 3000
+```
+
+Full training takes ~5 hours (CMA-ES data generation dominates). Retraining MLP only takes seconds.
 
 ### TUSBAudio Integration (`tusbaudio.c`)
 

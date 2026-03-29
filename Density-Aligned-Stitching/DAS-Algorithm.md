@@ -38,7 +38,7 @@ Where:
 - The **feedback DAC** is trivial for 1-bit (just the previous output ±1)
 - The **integrator state vector** `s[n]` accumulates the error history across all filter orders
 
-The NTF determines the noise-shaping profile. Higher-order NTFs push more quantization noise above the audio band, achieving better in-band Signal-to-Noise-and-Distortion Ratio (SINAD). Per-rate optimal NTFs: CLANS-6 (order 6, depth=16) for DSD64, CLANS-6 (order 6) for DSD128/256, SDM-6 (order 6) for DSD512. Measured SINAD: 111 dB (DSD64), 122 dB (DSD128), 129 dB (DSD256), 141 dB (DSD512).
+The NTF determines the noise-shaping profile. Higher-order NTFs push more quantization noise above the audio band, achieving better in-band quality. Per-rate optimal NTFs (MT-optimized, end-to-end pipeline): SDM-6 for DSD64/DSD256, SDM-7 for DSD128. End-to-end MT: 79 dB (DSD64), 73 dB (DSD128), 93 dB (DSD256), 147 dB (DSD512).
 
 ### 1.2 The Sequential Dependency Problem
 
