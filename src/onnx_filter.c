@@ -762,7 +762,7 @@ void onnx_filter_process_preemph(onnx_filter_t *f, double *buf, size_t count) {
 
 /* ─── Tap prediction (lightweight MLP on GPU) ─── */
 
-void onnx_filter_predict_taps(onnx_filter_t *f, const float features[4],
+void onnx_filter_predict_taps(onnx_filter_t *f, const float features[3],
                                float taps_out[3]) {
     if (!f || !f->session) {
         taps_out[0] = 1.0f; taps_out[1] = 0.0f; taps_out[2] = 0.0f;
@@ -770,8 +770,8 @@ void onnx_filter_predict_taps(onnx_filter_t *f, const float features[4],
     }
 
     const OrtApi *api = &f->api;
-    float input_data[4] = { features[0], features[1], features[2], features[3] };
-    int64_t input_shape[2] = { 1, 4 };
+    float input_data[3] = { features[0], features[1], features[2] };
+    int64_t input_shape[2] = { 1, 3 };
     OrtValue *input_tensor = NULL;
 
     if (!ort_ok(api, ORT_FN(api, ORT_SLOT_CREATE_TENSOR_WITH_DATA,

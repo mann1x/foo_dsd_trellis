@@ -163,9 +163,7 @@
     <ClCompile Include="src\config.c" />
     <ClCompile Include="src\dop.c" />
     <ClCompile Include="src\bitpack.c" />
-    <ClCompile Include="src\engine.c">
-      <WholeProgramOptimization>false</WholeProgramOptimization>
-    </ClCompile>
+    <ClCompile Include="src\engine.c" />
     <ClCompile Include="src\fir.c" />
     <ClCompile Include="src\trellis.c" />
     <ClCompile Include="src\trellis_fast.c" />

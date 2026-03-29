@@ -1167,17 +1167,20 @@ size_t plugin_process(plugin_state_t *s,
             par_mode = (int)s->config.rate_parallel[map_idx];
     }
 
-    /* Auto: Sequential for DSD64 same-rate, Parallel for higher rates.
-     * Par2-Par8: explicit segment count override. */
+    /* Sequential for DSD64-256 (hard cut stitching produces audible pops).
+     * DSD128/256 fit in real-time sequentially (0.44x / 0.88x RT).
+     * DSD512+ needs parallel (1.74x RT sequential doesn't fit).
+     * Par2-Par8 override only applies at DSD512+. */
     bool use_parallel;
     int par_segments = 0; /* 0 = auto-compute from thread count */
-    if (par_mode == TRELLIS_PAR_SEQUENTIAL)
+    bool rate_allows_parallel = (fs_out >= DSD_RATE_512);
+    if (!rate_allows_parallel || par_mode == TRELLIS_PAR_SEQUENTIAL)
         use_parallel = false;
     else if (par_mode >= TRELLIS_PAR_PAR2) {
         use_parallel = true;
         par_segments = par_mode; /* explicit segment count */
     } else /* Auto */
-        use_parallel = (fs_out > DSD_RATE_64) ||
+        use_parallel = rate_allows_parallel ||
                        (s->config.gpu_sdm_enabled && s->gpu &&
                         s->config.sdm_mode == SDM_MODE_TRELLIS);
 

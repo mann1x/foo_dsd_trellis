@@ -187,7 +187,6 @@
     </ClCompile>
     <ClCompile Include="src\engine.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <WholeProgramOptimization>false</WholeProgramOptimization>
     </ClCompile>
     <ClCompile Include="src\fir.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
