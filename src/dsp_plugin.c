@@ -1173,14 +1173,13 @@ size_t plugin_process(plugin_state_t *s,
      * Par2-Par8 override only applies at DSD512+. */
     bool use_parallel;
     int par_segments = 0; /* 0 = auto-compute from thread count */
-    bool rate_allows_parallel = (fs_out >= DSD_RATE_512);
-    if (!rate_allows_parallel || par_mode == TRELLIS_PAR_SEQUENTIAL)
+    if (par_mode == TRELLIS_PAR_SEQUENTIAL)
         use_parallel = false;
     else if (par_mode >= TRELLIS_PAR_PAR2) {
         use_parallel = true;
         par_segments = par_mode; /* explicit segment count */
     } else /* Auto */
-        use_parallel = rate_allows_parallel ||
+        use_parallel = (fs_out >= DSD_RATE_512) ||
                        (s->config.gpu_sdm_enabled && s->gpu &&
                         s->config.sdm_mode == SDM_MODE_TRELLIS);
 
@@ -1743,10 +1742,113 @@ size_t plugin_process(plugin_state_t *s,
             seg0_nominal[ch] = seg_nominal_size[ch][0];
         }
 
+        /* Strategy B: Reposition DAS boundaries to avoid quiet regions.
+         * Seg0-2 boundaries are fixed (sequential/DIRECT chain).
+         * Seg3+ boundaries shift to nearest loud region where DAS converges.
+         * Only reposition on channel 0 — all channels share boundaries. */
+        if (segments_per_ch > 2) {
+            size_t fir_count = fir_counts[0];
+            size_t base_seg_sz = fir_count / (size_t)segments_per_ch;
+            size_t max_shift = base_seg_sz * 2 / 5;  /* allow +-40% shift */
+            if (max_shift > 200000) max_shift = 200000;
+            size_t rms_window = 2048;
+            double rms_loud = 0.005;  /* above this = good for DAS */
+            double rms_quiet = 0.002; /* below this = dangerous, need more overlap */
+
+            for (int seg = 2; seg < segments_per_ch; seg++) {
+                size_t boundary = seg_nominal_start[0][seg];
+                if (boundary < rms_window || boundary + rms_window >= fir_count)
+                    continue;
+
+                /* Compute RMS at current boundary */
+                double sum_sq = 0.0;
+                for (size_t i = boundary - rms_window/2; i < boundary + rms_window/2; i++)
+                    sum_sq += fir_data[0][i] * fir_data[0][i];
+                double cur_rms = sqrt(sum_sq / (double)rms_window);
+
+                if (cur_rms > rms_loud) continue;
+
+                /* Scan left and right for a louder region */
+                size_t best_pos = boundary;
+                double best_rms = cur_rms;
+                size_t step = rms_window / 2;
+
+                for (size_t offset = step; offset <= max_shift; offset += step) {
+                    for (int dir = -1; dir <= 1; dir += 2) {
+                        size_t candidate = (dir < 0)
+                            ? (boundary > offset ? boundary - offset : 0)
+                            : boundary + offset;
+                        if (candidate < rms_window/2 || candidate + rms_window/2 >= fir_count)
+                            continue;
+                        if (seg > 0 && candidate <= seg_nominal_start[0][seg-1] + overlap * 2)
+                            continue;
+                        if (seg < segments_per_ch - 1 &&
+                            candidate >= seg_nominal_start[0][seg+1] - overlap * 2)
+                            continue;
+
+                        sum_sq = 0.0;
+                        for (size_t i = candidate - rms_window/2; i < candidate + rms_window/2; i++)
+                            sum_sq += fir_data[0][i] * fir_data[0][i];
+                        double rms = sqrt(sum_sq / (double)rms_window);
+                        if (rms > best_rms) {
+                            best_rms = rms;
+                            best_pos = candidate;
+                        }
+                    }
+                    if (best_rms > rms_loud) break;
+                }
+
+                if (best_pos != boundary) {
+                    for (int ch2 = 0; ch2 < num_channels; ch2++) {
+                        seg_nominal_start[ch2][seg] = best_pos;
+                        seg_nominal_size[ch2][seg-1] = best_pos - seg_nominal_start[ch2][seg-1];
+                        if (seg < segments_per_ch - 1)
+                            seg_nominal_size[ch2][seg] = seg_nominal_start[ch2][seg+1] - best_pos;
+                        else
+                            seg_nominal_size[ch2][seg] = fir_counts[ch2] - best_pos;
+                    }
+                    if (s->config.debug_log) {
+                        char msg[128];
+                        snprintf(msg, sizeof(msg),
+                            "reposition seg%d: %zu -> %zu (rms %.4f -> %.4f)",
+                            seg, boundary, best_pos, cur_rms, best_rms);
+                        extern void trellis_log_c(const char *);
+                        trellis_log_c(msg);
+                    }
+                }
+            }
+        }
+
+        /* Per-segment overlap: increase for quiet boundaries.
+         * Above RMS 0.005: standard overlap (32x lat).
+         * Below 0.002: 4x overlap for more warmup convergence. */
+        size_t seg_overlap[64];
+        for (int seg = 0; seg < segments_per_ch; seg++)
+            seg_overlap[seg] = overlap;
+        if (segments_per_ch > 2) {
+            size_t fir_count_0 = fir_counts[0];
+            for (int seg = 2; seg < segments_per_ch; seg++) {
+                size_t boundary = seg_nominal_start[0][seg];
+                if (boundary < 1024 || boundary + 1024 >= fir_count_0)
+                    continue;
+                double sum_sq = 0.0;
+                for (size_t i = boundary - 1024; i < boundary + 1024; i++)
+                    sum_sq += fir_data[0][i] * fir_data[0][i];
+                double rms = sqrt(sum_sq / 2048.0);
+                if (rms < 0.002)
+                    seg_overlap[seg] = overlap * 4;  /* 4x overlap for very quiet */
+                else if (rms < 0.005)
+                    seg_overlap[seg] = overlap * 2;  /* 2x overlap for moderate */
+            }
+        }
+        size_t max_overlap = overlap * 4;  /* for buffer sizing */
+
+
+
         /* Ensure cached segment output buffers are large enough.
          * Reused across chunks to avoid malloc/free contention. */
         int total_all_segs = num_channels * segments_per_ch;
-        size_t max_seg_samples = fir_counts[0] / (size_t)segments_per_ch + overlap + 4096;
+        size_t max_seg_samples = fir_counts[0] / (size_t)segments_per_ch + max_overlap + 4096;
         if (s->cached_seg_buf_count < total_all_segs ||
             s->cached_seg_buf_sz < max_seg_samples) {
             /* Grow cached buffers */
@@ -1874,19 +1976,67 @@ size_t plugin_process(plugin_state_t *s,
             }
         }
 
-        /* ── Phase 2a½: State-estimation pass ──
-         * Run nc=1 greedy SDM pre-pass to estimate integrator state at segment
-         * boundaries. Channels dispatched in parallel on threadpool. */
+        /* ── Phase 2a: Run seg0 first, then seg1 DIRECT ──
+         * seg0: no extension, true state at seg0 nominal end.
+         * seg1: true state from seg0, with extension for DAS with seg2. */
+        {
+            channel_block_t seq_blocks[8];
+            memset(seq_blocks, 0, sizeof(seq_blocks));
+            for (int ch = 0; ch < num_channels; ch++) {
+                int buf_idx = ch * segments_per_ch;
+                seq_blocks[ch].mode    = BLOCK_MODE_SDM;
+                seq_blocks[ch].sdm_ctx = &s->channels[ch].sdm;
+                seq_blocks[ch].in      = fir_data[ch];
+                seq_blocks[ch].out     = seg_bufs[buf_idx];
+                seq_blocks[ch].count   = seg_nominal_size[ch][0]; /* no extension */
+                seq_blocks[ch].discard = 0;
+                seq_blocks[ch].channel = ch;
+                threadpool_submit(s->pool, &seq_blocks[ch]);
+            }
+            threadpool_wait(s->pool);
+            for (int ch = 0; ch < num_channels; ch++)
+                seg_out_counts[ch * segments_per_ch] = seq_blocks[ch].out_count;
+
+            /* seg1: true state from seg0, with extension */
+            if (segments_per_ch > 1) {
+                memset(seq_blocks, 0, sizeof(seq_blocks));
+                for (int ch = 0; ch < num_channels; ch++) {
+                    int buf_idx = ch * segments_per_ch + 1;
+                    int temp_idx = ch * temps_per_ch;
+                    sdm_context_copy_state(&temp_sdms[temp_idx], &s->channels[ch].sdm);
+                    size_t nom_start = seg_nominal_start[ch][1];
+                    size_t nom_size = seg_nominal_size[ch][1];
+                    size_t input_count = nom_size;
+                    bool extend_fwd = (segments_per_ch > 2);
+                    if (extend_fwd && nom_start + nom_size + overlap <= fir_counts[ch])
+                        input_count += overlap;
+                    seq_blocks[ch].mode    = BLOCK_MODE_SDM;
+                    seq_blocks[ch].sdm_ctx = &temp_sdms[temp_idx];
+                    seq_blocks[ch].in      = fir_data[ch] + nom_start;
+                    seq_blocks[ch].out     = seg_bufs[buf_idx];
+                    seq_blocks[ch].count   = input_count;
+                    seq_blocks[ch].discard = 0;
+                    seq_blocks[ch].channel = ch;
+                    threadpool_submit(s->pool, &seq_blocks[ch]);
+                }
+                threadpool_wait(s->pool);
+                for (int ch = 0; ch < num_channels; ch++)
+                    seg_out_counts[ch * segments_per_ch + 1] = seq_blocks[ch].out_count;
+            }
+        }
+
+        /* ── Phase 2a½: Re-estimate from seg0's TRUE state for seg2+ ── */
         double est_states[32][MAX_NTF_ORDER];
         memset(est_states, 0, sizeof(est_states));
-        if (segments_per_ch > 1) {
+        if (segments_per_ch > 2) {
             channel_block_t est_blocks[8];
             memset(est_blocks, 0, sizeof(est_blocks));
             for (int ch = 0; ch < num_channels; ch++) {
                 const sdm_context_t *sdm = &s->channels[ch].sdm;
                 est_blocks[ch].mode = BLOCK_MODE_ESTIMATE;
-                est_blocks[ch].in = fir_data[ch];
-                est_blocks[ch].count = fir_counts[ch];
+                size_t est_start = seg_nominal_start[ch][1];
+                est_blocks[ch].in = fir_data[ch] + est_start;
+                est_blocks[ch].count = fir_counts[ch] - est_start;
                 est_blocks[ch].channel = ch;
                 est_blocks[ch].cfg = &s->config;
                 est_blocks[ch].est_filter = sdm->filter;
@@ -1897,72 +2047,57 @@ size_t plugin_process(plugin_state_t *s,
                     for (int i = 0; i < sdm->filter->order; i++)
                         est_blocks[ch].est_init[i] = sdm->trellis[bank].act[0]->state[i];
                 }
-                for (int seg = 1; seg < segments_per_ch; seg++)
-                    est_blocks[ch].est_boundaries[seg] = seg_nominal_start[ch][seg];
+                for (int seg = 2; seg < segments_per_ch; seg++)
+                    est_blocks[ch].est_boundaries[seg] =
+                        seg_nominal_start[ch][seg] - est_start;
                 threadpool_submit(s->pool, &est_blocks[ch]);
             }
             threadpool_wait(s->pool);
-
-            /* Copy results to est_states */
             for (int ch = 0; ch < num_channels; ch++)
-                for (int seg = 1; seg < segments_per_ch; seg++)
+                for (int seg = 2; seg < segments_per_ch; seg++)
                     for (int i = 0; i < MAX_NTF_ORDER; i++)
                         est_states[ch * segments_per_ch + seg][i] =
                             est_blocks[ch].est_result[seg][i];
         }
 
-        /* ── Phase 2b: Configure CPU segment blocks ── */
+        /* ── Phase 2b: Launch seg2+ in parallel (all DAS) ── */
         channel_block_t all_blocks[32];
         int all_block_count = 0;
         memset(all_blocks, 0, sizeof(all_blocks));
 
         for (int ch = 0; ch < num_channels; ch++) {
             size_t fir_count = fir_counts[ch];
-            for (int seg = 0; seg < cpu_segs; seg++) {
+            for (int seg = 2; seg < cpu_segs; seg++) {
                 int buf_idx = ch * segments_per_ch + seg;
                 size_t nom_start = seg_nominal_start[ch][seg];
                 size_t nom_size = seg_nominal_size[ch][seg];
-
-                size_t input_start, input_count, warmup_discard;
                 bool extend_fwd = (seg < segments_per_ch - 1);
-                if (seg == 0) {
-                    input_start = 0;
-                    input_count = nom_size;
-                    if (extend_fwd && nom_size + overlap <= fir_count)
-                        input_count += overlap;
-                    warmup_discard = 0;
-                } else {
-                    input_start = (nom_start >= overlap) ? nom_start - overlap : 0;
-                    input_count = nom_start + nom_size - input_start;
-                    if (extend_fwd && nom_start + nom_size + overlap <= fir_count)
-                        input_count += overlap;
-                    warmup_discard = (nom_start >= overlap) ?
-                        overlap - (size_t)s->config.trellis_lat : 0;
-                }
 
-                sdm_context_t *ctx;
-                if (seg == 0) {
-                    ctx = &s->channels[ch].sdm;
-                } else {
-                    int temp_idx = ch * temps_per_ch + (seg - 1);
-                    sdm_context_copy_state(&temp_sdms[temp_idx], &s->channels[ch].sdm);
-                    /* Overlay estimated integrator state from the pre-pass.
-                     * All candidates get the estimated state; costs reset to 0.
-                     * The overlap warmup lets candidates re-diverge before output. */
-                    int est_idx = ch * segments_per_ch + seg;
-                    int bank = temp_sdms[temp_idx].idx & 1;
-                    int order = temp_sdms[temp_idx].filter->order;
-                    for (unsigned c = 0; c < temp_sdms[temp_idx].num_cands; c++) {
-                        sdm_state_t *st = temp_sdms[temp_idx].trellis[bank].act[c];
-                        if (st) {
-                            for (int k = 0; k < order; k++)
-                                st->state[k] = est_states[est_idx][k];
-                            st->cost = 0.0;
-                        }
+                size_t this_ovl = seg_overlap[seg];
+                size_t next_ovl = extend_fwd ? seg_overlap[seg + 1] : 0;
+                size_t input_start = (nom_start >= this_ovl) ? nom_start - this_ovl : 0;
+                size_t input_count = nom_start + nom_size - input_start;
+                if (extend_fwd && nom_start + nom_size + next_ovl <= fir_count)
+                    input_count += next_ovl;
+                size_t warmup_discard = (nom_start >= this_ovl) ?
+                    this_ovl - (size_t)s->config.trellis_lat : 0;
+
+                int temp_idx = ch * temps_per_ch + (seg - 1);
+                sdm_context_copy_state(&temp_sdms[temp_idx], &s->channels[ch].sdm);
+
+                int est_idx = ch * segments_per_ch + seg;
+                int bank = temp_sdms[temp_idx].idx & 1;
+                int order = temp_sdms[temp_idx].filter->order;
+                for (unsigned c = 0; c < temp_sdms[temp_idx].num_cands; c++) {
+                    sdm_state_t *st = temp_sdms[temp_idx].trellis[bank].act[c];
+                    if (st) {
+                        for (int k = 0; k < order; k++)
+                            st->state[k] = est_states[est_idx][k];
+                        st->cost = 0.0;
                     }
-                    ctx = &temp_sdms[temp_idx];
                 }
 
+                sdm_context_t *ctx = &temp_sdms[temp_idx];
                 all_blocks[all_block_count].mode     = BLOCK_MODE_SDM;
                 all_blocks[all_block_count].sdm_ctx  = ctx;
                 all_blocks[all_block_count].in       = fir_data[ch] + input_start;
@@ -1974,17 +2109,17 @@ size_t plugin_process(plugin_state_t *s,
             }
         }
 
-        /* Launch CPU segments (runs concurrently with GPU) */
         for (int i = 0; i < all_block_count; i++)
             threadpool_submit_to(s->pool, i % num_threads, &all_blocks[i]);
         threadpool_wait(s->pool);
 
-        /* Record CPU output counts */
-        for (int i = 0; i < all_block_count; i++) {
-            int ch = all_blocks[i].channel;
-            int seg = i - ch * cpu_segs;
-            int idx = ch * segments_per_ch + seg;
-            seg_out_counts[idx] = all_blocks[i].out_count;
+        {
+            int bi = 0;
+            for (int ch = 0; ch < num_channels; ch++)
+                for (int seg = 2; seg < cpu_segs; seg++)
+                    if (bi < all_block_count)
+                        seg_out_counts[ch * segments_per_ch + seg] =
+                            all_blocks[bi++].out_count;
         }
 
         /* ── Phase 2c: GPU pass 2 + download ── */
@@ -2040,6 +2175,8 @@ size_t plugin_process(plugin_state_t *s,
         {
             int ch = 0;
             int buf0 = ch * segments_per_ch;
+            /* Seg0: copy nominal output only (no overlap extension in output).
+             * The extension was produced for DAS comparison only. */
             size_t seg0_out = seg_out_counts[buf0];
             memcpy(s->ch_out[ch], seg_bufs[buf0], seg0_out * sizeof(float));
             size_t write_pos = seg0_out;
@@ -2049,48 +2186,78 @@ size_t plugin_process(plugin_state_t *s,
                 size_t seg_out = seg_out_counts[buf_idx];
                 if (seg_out == 0) { stitch_positions[seg] = 0; continue; }
 
-                size_t prev_ovl_start = (write_pos >= overlap) ? write_pos - overlap : 0;
+                /* Seg1: direct concatenation (true state from seg0) */
+                if (seg == 1) {
+                    stitch_positions[seg] = 0;
+                    memcpy(s->ch_out[ch] + write_pos,
+                           seg_bufs[buf_idx], seg_out * sizeof(float));
+                    write_pos += seg_out;
+                    if (s->config.debug_log) {
+                        char msg[128];
+                        snprintf(msg, sizeof(msg),
+                                 "stitch seg1: DIRECT (true state) wp=%zu", write_pos);
+                        extern void trellis_log_c(const char *);
+                        trellis_log_c(msg);
+                    }
+                    continue;
+                }
+
+                /* Seg2+: DAS overlap stitching (per-segment overlap) */
+                size_t this_seg_ovl = seg_overlap[seg];
+                size_t prev_ovl_start = (write_pos >= this_seg_ovl) ? write_pos - this_seg_ovl : 0;
                 float *prev_ovl = s->ch_out[ch] + prev_ovl_start;
                 float *this_ovl = seg_bufs[buf_idx];
                 size_t ovl_len = write_pos - prev_ovl_start;
                 if (ovl_len > seg_out) ovl_len = seg_out;
                 if (ovl_len > overlap) ovl_len = overlap;
 
-                /* Step 1: Windowed match density — find region of best
-                 * convergence.  Window size = 2 × trellis_lat. */
+                /* Step 1: Amplitude-weighted windowed match density.
+                 * Matches in loud signal regions count more than quiet regions.
+                 * This steers the stitch point to where signal content dominates
+                 * the DSD bitstream (good convergence), avoiding noise-dominated
+                 * quiet passages (poor convergence). */
                 int half_w = s->config.trellis_lat;
                 if (half_w > (int)ovl_len / 2) half_w = (int)ovl_len / 2;
                 if (half_w < 4) half_w = 4;
 
-                /* O(n) sliding window density scan.
-                 * Window for position p: [max(0, p-half_w), min(ovl_len, p+half_w))
-                 * Seed at p=0 with [0, half_w), then slide right. */
-                int best_density = 0, best_density_pos = 0;
-                int cur_matches = 0;
-                /* Seed: count matches in [0, min(half_w, ovl_len)) for p=0 */
+                /* Get FIR data pointer for amplitude weighting.
+                 * prev_ovl_start is the output position = FIR data position. */
+                const double *fir_weights = fir_data[ch] + prev_ovl_start;
+
+                /* O(n) sliding window weighted density scan. */
+                double best_density = 0.0;
+                int best_density_pos = 0;
+                double cur_weighted = 0.0;
+                int cur_matches = 0;  /* unweighted count for logging */
                 int init_end = half_w < (int)ovl_len ? half_w : (int)ovl_len;
                 for (int w = 0; w < init_end; w++) {
-                    if (prev_ovl[w] == this_ovl[w])
+                    if (prev_ovl[w] == this_ovl[w]) {
+                        double amp = fabs(fir_weights[w]) + 0.001;  /* floor prevents zero weight */
+                        cur_weighted += amp;
                         cur_matches++;
+                    }
                 }
-                best_density = cur_matches;
+                best_density = cur_weighted;
                 best_density_pos = 0;
-                /* Slide window across all positions */
                 for (int p = 1; p < (int)ovl_len; p++) {
-                    /* Right edge expands: add sample at p+half_w-1 */
                     int add_idx = p + half_w - 1;
                     if (add_idx >= 0 && add_idx < (int)ovl_len) {
-                        if (prev_ovl[add_idx] == this_ovl[add_idx])
+                        if (prev_ovl[add_idx] == this_ovl[add_idx]) {
+                            double amp = fabs(fir_weights[add_idx]) + 0.001;
+                            cur_weighted += amp;
                             cur_matches++;
+                        }
                     }
-                    /* Left edge contracts: remove sample at p-half_w-1 */
                     int rem_idx = p - half_w - 1;
                     if (rem_idx >= 0 && rem_idx < (int)ovl_len) {
-                        if (prev_ovl[rem_idx] == this_ovl[rem_idx])
+                        if (prev_ovl[rem_idx] == this_ovl[rem_idx]) {
+                            double amp = fabs(fir_weights[rem_idx]) + 0.001;
+                            cur_weighted -= amp;
                             cur_matches--;
+                        }
                     }
-                    if (cur_matches > best_density) {
-                        best_density = cur_matches;
+                    if (cur_weighted > best_density) {
+                        best_density = cur_weighted;
                         best_density_pos = p;
                     }
                 }
@@ -2134,9 +2301,10 @@ size_t plugin_process(plugin_state_t *s,
                 {
                     char msg[256];
                     snprintf(msg, sizeof(msg),
-                             "stitch seg%d: ovl=%zu density=%d/%d pos=%d run=%d "
-                             "wp=%zu stitch_at=%zu",
-                             seg, ovl_len, best_density, half_w * 2,
+                             "stitch seg%d: ovl=%zu density=%d/%d wdensity=%.2f "
+                             "pos=%d run=%d wp=%zu stitch_at=%zu",
+                             seg, ovl_len, cur_matches, half_w * 2,
+                             best_density,
                              best_pos, found_match,
                              write_pos, stitch_at);
                     extern void trellis_log_c(const char *);
@@ -2149,30 +2317,36 @@ size_t plugin_process(plugin_state_t *s,
         /* Pass 2: apply same stitch positions to all other channels */
         for (int ch = 1; ch < num_channels; ch++) {
             int buf0 = ch * segments_per_ch;
-            size_t seg0_out = seg_out_counts[buf0];
-            memcpy(s->ch_out[ch], seg_bufs[buf0], seg0_out * sizeof(float));
-            size_t write_pos = seg0_out;
+            size_t seg0_out_ch = seg_out_counts[buf0];
+            memcpy(s->ch_out[ch], seg_bufs[buf0], seg0_out_ch * sizeof(float));
+            size_t write_pos = seg0_out_ch;
 
             for (int seg = 1; seg < segments_per_ch; seg++) {
                 int buf_idx = ch * segments_per_ch + seg;
                 size_t seg_out = seg_out_counts[buf_idx];
                 if (seg_out == 0) continue;
 
-                size_t prev_ovl_start = (write_pos >= overlap) ? write_pos - overlap : 0;
-                int bp = stitch_positions[seg];
-                size_t stitch_at = prev_ovl_start + (size_t)bp;
-                size_t copy_count = seg_out - (size_t)bp;
-                memcpy(s->ch_out[ch] + stitch_at,
-                       seg_bufs[buf_idx] + bp,
-                       copy_count * sizeof(float));
-                write_pos = stitch_at + copy_count;
+                if (seg == 1) {
+                    memcpy(s->ch_out[ch] + write_pos,
+                           seg_bufs[buf_idx], seg_out * sizeof(float));
+                    write_pos += seg_out;
+                } else {
+                    size_t ch_seg_ovl = seg_overlap[seg];
+                    size_t prev_ovl_start = (write_pos >= ch_seg_ovl) ? write_pos - ch_seg_ovl : 0;
+                    int bp = stitch_positions[seg];
+                    size_t stitch_at = prev_ovl_start + (size_t)bp;
+                    size_t copy_count = seg_out - (size_t)bp;
+                    memcpy(s->ch_out[ch] + stitch_at,
+                           seg_bufs[buf_idx] + bp,
+                           copy_count * sizeof(float));
+                    write_pos = stitch_at + copy_count;
+                }
             }
         }
 
         /* Copy last segment's final state back into persistent SDM.
-         * seg0 uses persistent directly, seg1+ use temps at index (seg-1).
-         * Last segment = segments_per_ch-1, its temp index = segments_per_ch-2.
-         * This is correct regardless of use_fir_tail (extra temps are unused). */
+         * Needed for correct estimation distance in the next chunk.
+         * seg0 used persistent directly, seg1+ use temps at index (seg-1). */
         if (segments_per_ch > 1) {
             for (int ch = 0; ch < num_channels; ch++) {
                 int last_temp = ch * temps_per_ch + (segments_per_ch - 2);
