@@ -46,12 +46,12 @@ static const path_config_t path_table[] = {
      * lat = 0 means "auto" (computed as cands * 8 at runtime).
      * Optimal lat from nc×lat sweep: nc=2→16, nc=4→32, nc=8→64. */
     /* Same-rate re-encode: boxcar DSD-Wide → trellis SDM.
-     * MT-optimized sweep (2026-03-28, end-to-end boxcar pipeline).
-     * Pre-emphasis taps from CMA-ES A-wtd optimization. */
+     * MT-optimized NTFs from sweep (2026-03-28). nc/lat constrained
+     * by RT budget: nc=2 for DSD256+ (Par5 = 0.86x at nc=2). */
     { DSD_RATE_64,  DSD_RATE_64,  NTF_SDM_6,   0.0,  2, 128,  4, 0.708f },
     { DSD_RATE_128, DSD_RATE_128, NTF_SDM_7,   0.0,  2,  64,  4, 0.708f },
-    { DSD_RATE_256, DSD_RATE_256, NTF_SDM_6,   0.0,  4, 128,  4, 0.708f },
-    { DSD_RATE_512, DSD_RATE_512, NTF_SDM_6,   0.0,  8, 256,  4, 0.708f },
+    { DSD_RATE_256, DSD_RATE_256, NTF_SDM_6,   0.0,  2, 128,  4, 0.708f },
+    { DSD_RATE_512, DSD_RATE_512, NTF_SDM_6,   0.0,  2,  32,  4, 0.708f },
     /* Upsample paths: gain=0.708 (-3 dB) to prevent FIR overload.
      * FIR upsampling of ±1 DSD produces peaks at ±2.24. */
     { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_7,   0.0,  2,  0, 4, 0.708f },  /* median sweep: 99.7 dB (was sdm-4/nc=2: 87) */
@@ -70,12 +70,11 @@ static const path_config_t path_table[] = {
     { DSD_RATE_512, DSD_RATE_128, NTF_SDM_6,   0.0,  8, 16, 16, 0.708f },  /* fp64 sweep: 92.8 dB, d=16/lat=16 (was sdm-4/nc=16: 79 dB) */
     { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 0.708f },
     /* ─── DSD/48 paths (independently swept, NOT mirrored from /44) ─── */
-    /* Same-rate re-encode /48: MT-optimized sweep (2026-03-28).
-     * Pre-emphasis taps from CMA-ES A-wtd optimization. */
-    { DSD48_RATE_64,  DSD48_RATE_64,  NTF_SDM_7,   0.0,  8,  32, 16, 0.708f },
+    /* Same-rate re-encode /48: MT-optimized NTFs, RT-constrained nc/depth. */
+    { DSD48_RATE_64,  DSD48_RATE_64,  NTF_SDM_7,   0.0,  2,  32,  4, 0.708f },
     { DSD48_RATE_128, DSD48_RATE_128, NTF_SDM_7,   0.0,  2,  64,  4, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_256, NTF_SDM_6,   0.0,  2,  32,  4, 0.708f },
-    { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_4,   0.0,  4,  64,  8, 0.708f },
+    { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_4,   0.0,  2,  32,  4, 0.708f },
     /* DSD/48 upsample */
     { DSD48_RATE_64,  DSD48_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },  /* /48 independent — sdm-7 mirror regresses */
     { DSD48_RATE_64,  DSD48_RATE_256, NTF_SDM_7,   0.0,  8,  0, 4, 0.708f },  /* fp64 sweep: 91.3 dB (was clans-8/nc=2: 54.6 dB) */
