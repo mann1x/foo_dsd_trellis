@@ -15,6 +15,9 @@ Release/
 *.obj
 *.o
 
+# Exceptions: bundled runtime dependencies
+!deps/**/*.dll
+
 # Visual Studio
 *.user
 *.suo

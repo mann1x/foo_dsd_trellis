@@ -2,6 +2,8 @@
 
 A native foobar2000 DSP plugin that converts PCM and DSD audio to DSD using sigma-delta modulation. Supports two SDM modes: **Trellis** (Viterbi look-ahead, highest quality) and **PreCorr** (greedy + prediction correction, near-zero CPU). FIR rate conversion uses Intel IPP with automatic SSE2/AVX2/AVX-512 dispatch.
 
+**[Changelog](CHANGELOG.md)** | **[DAS Algorithm](Density-Aligned-Stitching/DAS-Algorithm.md)**
+
 ## Features
 
 | Feature | Description |
