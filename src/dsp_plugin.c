@@ -1194,9 +1194,9 @@ size_t plugin_process(plugin_state_t *s,
         if (fs_out > s->config.fs_in)
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);
 
-        /* Overlap for SDM convergence: 32x lat.
-         * DSD128 lat=128 → overlap=4096. */
-        overlap = 32 * (size_t)s->config.trellis_lat;
+        /* Overlap for SDM convergence: 64x lat.
+         * Wider overlap gives quality-search more candidate space. */
+        overlap = 64 * (size_t)s->config.trellis_lat;
         if (par_segments > 0) {
             /* Explicit Par2-Par8: user-specified segment count */
             segments_per_ch = par_segments;
@@ -2215,8 +2215,11 @@ size_t plugin_process(plugin_state_t *s,
                     }
                 }
 
-                /* Pass 2: collect candidate positions (run >= 4, density >= 70% peak) */
-                int density_floor = peak_density * 7 / 10;
+                /* Pass 2: collect candidate positions (run >= 4, density >= 90% peak).
+                 * Tight floor ensures we only consider high-convergence regions.
+                 * Low-density positions cause wider noise-shaping context changes
+                 * that the DAC's long decimation filter amplifies into pops. */
+                int density_floor = peak_density * 9 / 10;
                 int min_spacing = half_w;
                 typedef struct { int pos; int run; int density; double quality; } qcand_t;
                 #define MAX_QCANDS 32
@@ -2238,16 +2241,45 @@ size_t plugin_process(plugin_state_t *s,
                     n_qcands++;
                 }
 
-                /* Fallback: peak density position if no candidates found */
-                if (n_qcands == 0) {
+                /* Always include peak-density position as baseline candidate.
+                 * Find its nearest matching run. */
+                {
                     int pp = 0;
                     if (density_map)
                         for (int p = 1; p < (int)ovl_len; p++)
                             if (density_map[p] > density_map[pp]) pp = p;
-                    qcands[0].pos = pp;
-                    qcands[0].run = 1;
-                    qcands[0].density = density_map ? density_map[pp] : 0;
-                    qcands[0].quality = 0;
+                    /* Find nearest run >= 4 near peak density */
+                    int peak_run_pos = pp, peak_run_len = 1;
+                    for (int mr = 8; mr >= 1 && peak_run_len < 4; mr >>= 1) {
+                        for (int r = 0; r <= half_w && peak_run_len < 4; r++) {
+                            int try_p[2] = { pp - r, pp + r };
+                            for (int t = 0; t < 2 && peak_run_len < 4; t++) {
+                                int tp = try_p[t];
+                                if (tp < 0 || tp + mr > (int)ovl_len) continue;
+                                int rl = 0;
+                                for (int k = 0; k < mr; k++) {
+                                    if (prev_ovl[tp+k] == this_ovl[tp+k]) rl++;
+                                    else break;
+                                }
+                                if (rl >= mr) { peak_run_pos = tp; peak_run_len = mr; }
+                            }
+                        }
+                    }
+                    /* Add if not already present */
+                    int dup = 0;
+                    for (int ci = 0; ci < n_qcands; ci++)
+                        if (abs(qcands[ci].pos - peak_run_pos) < min_spacing) { dup = 1; break; }
+                    if (!dup && n_qcands < MAX_QCANDS) {
+                        qcands[n_qcands].pos = peak_run_pos;
+                        qcands[n_qcands].run = peak_run_len;
+                        qcands[n_qcands].density = density_map ? density_map[peak_run_pos] : 0;
+                        qcands[n_qcands].quality = 1e30;
+                        n_qcands++;
+                    }
+                }
+                if (n_qcands == 0) {
+                    qcands[0].pos = 0; qcands[0].run = 1;
+                    qcands[0].density = 0; qcands[0].quality = 0;
                     n_qcands = 1;
                 }
 
@@ -2259,30 +2291,47 @@ size_t plugin_process(plugin_state_t *s,
                  * quality = max |FIR(diff)| near the stitch point.
                  * The candidate with minimum quality = smallest pop. */
                 if (n_qcands > 1) {
-                    /* 63-tap FIR lowpass for pop detection (computed once) */
-                    static double qfir[64];
+                    /* 255-tap FIR lowpass at 20kHz for pop detection.
+                     * Matches what the DAC's decimation filter passes to audio.
+                     * Longer filter = sees wider context = better pop prediction. */
+                    static double qfir[256];
                     static int qfir_n = 0;
                     if (qfir_n == 0) {
-                        int N = 63;
-                        double fc = 100000.0 / (5644800.0 / 2.0);
+                        int N = 255;
+                        double fc = 20000.0 / (5644800.0 / 2.0);
                         double sum = 0;
                         for (int i = 0; i < N; i++) {
-                            double n = i - 31.0;
+                            double n = i - 127.0;
                             if (n > -0.001 && n < 0.001)
                                 qfir[i] = 2.0 * fc;
                             else
                                 qfir[i] = sin(2.0 * 3.14159265358979 * fc * n)
                                          / (3.14159265358979 * n);
-                            qfir[i] *= 0.54 - 0.46 * cos(2.0 * 3.14159265358979 * i / (N - 1));
+                            /* Kaiser window, beta=8 for good stopband */
+                            double x = 2.0 * i / (N - 1) - 1.0;
+                            double kb = 8.0;
+                            /* I0(kb*sqrt(1-x^2)) / I0(kb) approximation */
+                            double arg = kb * sqrt(1.0 - x * x > 0 ? 1.0 - x * x : 0);
+                            double i0_arg = 1.0, term = 1.0;
+                            for (int m = 1; m <= 20; m++) {
+                                term *= (arg / 2.0 / m) * (arg / 2.0 / m);
+                                i0_arg += term;
+                            }
+                            double i0_kb = 1.0; term = 1.0;
+                            for (int m = 1; m <= 20; m++) {
+                                term *= (kb / 2.0 / m) * (kb / 2.0 / m);
+                                i0_kb += term;
+                            }
+                            qfir[i] *= i0_arg / i0_kb;
                             sum += qfir[i];
                         }
                         for (int i = 0; i < N; i++) qfir[i] /= sum;
                         qfir_n = N;
                     }
 
-                    int fh = qfir_n / 2;  /* 31 */
-                    /* Evaluate ±128 decoded samples around each stitch point */
-                    int eval_range = 128;
+                    int fh = qfir_n / 2;  /* 127 */
+                    /* Evaluate ±512 decoded samples around each stitch point */
+                    int eval_range = 512;
 
                     for (int ci = 0; ci < n_qcands; ci++) {
                         int sp = qcands[ci].pos;
@@ -2299,15 +2348,28 @@ size_t plugin_process(plugin_state_t *s,
                             double ad = fabs(val);
                             if (ad > max_d) max_d = ad;
                         }
-                        qcands[ci].quality = max_d;
+                        /* Scale pop by density penalty: lower density → higher score (worse).
+                         * A candidate with 70% of peak density must have 1.43x lower pop
+                         * to beat a candidate at peak density. */
+                        double d_ratio = (double)qcands[ci].density / (double)(peak_density > 0 ? peak_density : 1);
+                        if (d_ratio < 0.5) d_ratio = 0.5;  /* cap penalty */
+                        qcands[ci].quality = max_d / d_ratio;
                     }
                 }
 
-                /* Pick candidate with minimum pop */
+                /* Pick candidate with minimum pop.
+                 * Tiebreaker: if pop values within 20%, prefer higher density. */
                 int best_ci = 0;
-                for (int ci = 1; ci < n_qcands; ci++)
-                    if (qcands[ci].quality < qcands[best_ci].quality)
+                for (int ci = 1; ci < n_qcands; ci++) {
+                    double ratio_q = qcands[ci].quality / (qcands[best_ci].quality + 1e-15);
+                    if (ratio_q < 0.8) {
+                        /* Clearly better pop — take it */
                         best_ci = ci;
+                    } else if (ratio_q < 1.2 && qcands[ci].density > qcands[best_ci].density) {
+                        /* Similar pop — prefer higher density */
+                        best_ci = ci;
+                    }
+                }
 
                 int best_pos = qcands[best_ci].pos;
                 int found_match = qcands[best_ci].run;
@@ -2329,10 +2391,12 @@ size_t plugin_process(plugin_state_t *s,
 
                 {
                     char msg[256];
+                    int peak_pct = (half_w * 2 > 0) ? (peak_density * 100) / (half_w * 2) : 0;
                     snprintf(msg, sizeof(msg),
-                             "stitch seg%d: ovl=%zu density=%d/%d (%d%%) "
+                             "stitch seg%d: ovl=%zu density=%d/%d (%d%%) peak=%d%% "
                              "pos=%d run=%d cands=%d pop=%.5f wp=%zu",
                              seg, ovl_len, cur_matches, half_w * 2, density_pct,
+                             peak_pct,
                              best_pos, found_match, n_qcands, best_quality,
                              write_pos);
                     extern void trellis_log_c(const char *);
