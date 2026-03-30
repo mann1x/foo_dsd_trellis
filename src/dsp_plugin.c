@@ -1206,9 +1206,9 @@ size_t plugin_process(plugin_state_t *s,
             segments_per_ch = num_threads / num_channels;
             if (segments_per_ch < 1) segments_per_ch = 1;
             int max_seg;
-            /* DSD512: 8 segments needed for RT (seg0+seg1 sequential = 25%).
-             * DSD128-256: 2 segments (1 DAS boundary) for minimal pops. */
-            if (fs_out >= DSD_RATE_512) max_seg = 8;
+            /* DSD512: Par4 is fastest (0.52x RT, less cache contention than Par8).
+             * DSD128-256: Par2 (1 DAS boundary) for minimal pops. */
+            if (fs_out >= DSD_RATE_512) max_seg = 4;
             else max_seg = 2;
             if (segments_per_ch > max_seg) segments_per_ch = max_seg;
         }
