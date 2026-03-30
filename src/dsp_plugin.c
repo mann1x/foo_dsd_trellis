@@ -1195,7 +1195,8 @@ size_t plugin_process(plugin_state_t *s,
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);
 
         /* Overlap for SDM convergence: 64x lat.
-         * Wider overlap gives quality-search more candidate space. */
+         * DSD128 lat=128 → overlap=8192. Sweet spot for quality-search:
+         * enough candidate space without reaching into worse regions. */
         overlap = 64 * (size_t)s->config.trellis_lat;
         if (par_segments > 0) {
             /* Explicit Par2-Par8: user-specified segment count */
@@ -1751,7 +1752,7 @@ size_t plugin_process(plugin_state_t *s,
             if (max_shift > 200000) max_shift = 200000;
             size_t rms_window = 2048;
             double rms_loud = 0.005;  /* above this = good for DAS */
-            double rms_quiet = 0.002; /* below this = dangerous, need more overlap */
+            double rms_quiet = 0.002; /* below this = dangerous */
 
             for (int seg = 2; seg < segments_per_ch; seg++) {
                 size_t boundary = seg_nominal_start[0][seg];
