@@ -70,7 +70,7 @@ jobs:
     - name: Package fb2k component
       shell: bash
       run: |
-        STAGE="stage/foo_dsd_trellis"
+        STAGE="stage"
         mkdir -p "$STAGE"
 
         # Main plugin DLL
@@ -84,10 +84,11 @@ jobs:
         # ML models
         cp models/*.onnx "$STAGE/"
 
-        # Create .fb2k-component (zip archive)
+        # Create .fb2k-component (files at zip root, no subdirectory)
+        # fb2k extracts into user-components-x64/foo_dsd_trellis/
         cd stage
         7z a -tzip "../foo_dsd_trellis-${{ steps.version.outputs.version }}-x64.fb2k-component" \
-          foo_dsd_trellis/
+          .
 
     - name: Upload component artifact
       uses: actions/upload-artifact@v4
