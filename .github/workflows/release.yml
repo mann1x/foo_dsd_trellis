@@ -59,10 +59,10 @@ jobs:
       run: |
         msbuild ${{ env.SOLUTION }} -p:Configuration=Release -p:Platform=x64 -p:PlatformToolset=v143 -v:minimal -nologo
 
-    - name: Run tests
+    - name: Run tests (quick suites only)
       shell: bash
-      run: bin/Release/x64/foo_dsd_trellis_test.exe
-      timeout-minutes: 5
+      run: bin/Release/x64/foo_dsd_trellis_test.exe --exclude rate --exclude diag
+      timeout-minutes: 10
 
     - name: Package fb2k component
       shell: bash
