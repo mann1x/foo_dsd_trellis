@@ -53,7 +53,7 @@ jobs:
           -OutputDirectory packages
         ORT_DIR="packages/Microsoft.ML.OnnxRuntime.DirectML.${{ env.ONNXRUNTIME_VERSION }}"
         cp "$ORT_DIR/runtimes/win-x64/native/onnxruntime.dll" deps/x64/
-        cp "$ORT_DIR/runtimes/win-x64/native/onnxruntime_providers_shared.dll" deps/x64/
+        # onnxruntime_providers_shared.dll is bundled in deps/x64/ (not in NuGet package)
 
     - name: Build x64 Release
       run: |
