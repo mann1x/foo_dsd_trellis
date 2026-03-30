@@ -1194,10 +1194,8 @@ size_t plugin_process(plugin_state_t *s,
         if (fs_out > s->config.fs_in)
             fir_out_est = dsd_in_count * (fs_out / s->config.fs_in);
 
-        /* Overlap for SDM convergence: 32x lat, capped at 1024.
-         * Matches validated config (commit 4e00224) that had zero artifacts.
-         * DSD128 lat=128 → overlap=1024 (8×lat). Uncapping to 4096 didn't
-         * improve audible quality (pops are ultrasonic, not overlap-related). */
+        /* Overlap for SDM convergence: 32x lat.
+         * DSD128 lat=128 → overlap=4096. */
         overlap = 32 * (size_t)s->config.trellis_lat;
         if (par_segments > 0) {
             /* Explicit Par2-Par8: user-specified segment count */
@@ -2186,132 +2184,157 @@ size_t plugin_process(plugin_state_t *s,
                 if (ovl_len > seg_out) ovl_len = seg_out;
                 if (ovl_len > overlap) ovl_len = overlap;
 
-                /* Step 1: Amplitude-weighted windowed match density.
-                 * Matches in loud signal regions count more than quiet regions.
-                 * This steers the stitch point to where signal content dominates
-                 * the DSD bitstream (good convergence), avoiding noise-dominated
-                 * quiet passages (poor convergence). */
+                /* ── Post-DAS quality search ──
+                 * 1. Density scan → full density map
+                 * 2. Find candidate stitch positions (density >= 70% peak, run >= 4)
+                 * 3. FIR-decode each candidate, measure pop via difference metric
+                 * 4. Pick candidate with minimum pop */
                 int half_w = s->config.trellis_lat;
                 if (half_w > (int)ovl_len / 2) half_w = (int)ovl_len / 2;
                 if (half_w < 4) half_w = 4;
 
-                /* Get FIR data pointer for amplitude weighting.
-                 * prev_ovl_start is the output position = FIR data position. */
-                const double *fir_weights = fir_data[ch] + prev_ovl_start;
-
-                /* O(n) sliding window weighted density scan. */
-                double best_density = 0.0;
-                int best_density_pos = 0;
-                double cur_weighted = 0.0;
-                int cur_matches = 0;  /* unweighted count for logging */
-                int init_end = half_w < (int)ovl_len ? half_w : (int)ovl_len;
-                for (int w = 0; w < init_end; w++) {
-                    if (prev_ovl[w] == this_ovl[w]) {
-                        double amp = fabs(fir_weights[w]) + 0.001;  /* floor prevents zero weight */
-                        cur_weighted += amp;
-                        cur_matches++;
-                    }
-                }
-                best_density = cur_weighted;
-                best_density_pos = 0;
-                for (int p = 1; p < (int)ovl_len; p++) {
-                    int add_idx = p + half_w - 1;
-                    if (add_idx >= 0 && add_idx < (int)ovl_len) {
-                        if (prev_ovl[add_idx] == this_ovl[add_idx]) {
-                            double amp = fabs(fir_weights[add_idx]) + 0.001;
-                            cur_weighted += amp;
-                            cur_matches++;
-                        }
-                    }
-                    int rem_idx = p - half_w - 1;
-                    if (rem_idx >= 0 && rem_idx < (int)ovl_len) {
-                        if (prev_ovl[rem_idx] == this_ovl[rem_idx]) {
-                            double amp = fabs(fir_weights[rem_idx]) + 0.001;
-                            cur_weighted -= amp;
-                            cur_matches--;
-                        }
-                    }
-                    if (cur_weighted > best_density) {
-                        best_density = cur_weighted;
-                        best_density_pos = p;
+                /* Pass 1: sliding window density at every position */
+                int *density_map = (int *)calloc(ovl_len, sizeof(int));
+                int peak_density = 0;
+                {
+                    int cur = 0;
+                    int ie = half_w < (int)ovl_len ? half_w : (int)ovl_len;
+                    for (int w = 0; w < ie; w++)
+                        if (prev_ovl[w] == this_ovl[w]) cur++;
+                    if (density_map) density_map[0] = cur;
+                    if (cur > peak_density) peak_density = cur;
+                    for (int p = 1; p < (int)ovl_len; p++) {
+                        int add = p + half_w - 1;
+                        if (add >= 0 && add < (int)ovl_len)
+                            if (prev_ovl[add] == this_ovl[add]) cur++;
+                        int rem = p - half_w - 1;
+                        if (rem >= 0 && rem < (int)ovl_len)
+                            if (prev_ovl[rem] == this_ovl[rem]) cur--;
+                        if (density_map) density_map[p] = cur;
+                        if (cur > peak_density) peak_density = cur;
                     }
                 }
 
-                /* Step 2: Within the best-density region, find nearest
-                 * run of consecutive matching samples. Longer runs produce
-                 * smoother transitions between different noise-shaping patterns.
-                 * Try min_run=8, then 4, then 2, then 1 (single match). */
-                int best_pos = best_density_pos;  /* fallback: density peak */
-                int search_r = half_w;
-                int found_match = 0;
-                for (int min_run = 8; min_run >= 1 && !found_match; min_run >>= 1) {
-                    for (int r = 0; r <= search_r && !found_match; r++) {
-                        int candidates[2] = { best_density_pos - r, best_density_pos + r };
-                        for (int c = 0; c < 2 && !found_match; c++) {
-                            int p = candidates[c];
-                            if (c == 1 && p == candidates[0]) continue;
-                            if (p < 0 || p + min_run > (int)ovl_len) continue;
-                            int run = 0;
-                            for (int k = 0; k < min_run; k++) {
-                                if (prev_ovl[p + k] == this_ovl[p + k]) run++;
-                                else break;
-                            }
-                            if (run >= min_run) {
-                                best_pos = p;
-                                found_match = min_run;
-                            }
+                /* Pass 2: collect candidate positions (run >= 4, density >= 70% peak) */
+                int density_floor = peak_density * 7 / 10;
+                int min_spacing = half_w;
+                typedef struct { int pos; int run; int density; double quality; } qcand_t;
+                #define MAX_QCANDS 32
+                qcand_t qcands[MAX_QCANDS];
+                int n_qcands = 0;
+
+                for (int p = 0; p < (int)ovl_len - 3 && n_qcands < MAX_QCANDS; ) {
+                    if (prev_ovl[p] != this_ovl[p] ||
+                        (density_map && density_map[p] < density_floor)) { p++; continue; }
+                    int rs = p;
+                    int rl = 0;
+                    while (p < (int)ovl_len && prev_ovl[p] == this_ovl[p]) { rl++; p++; }
+                    if (rl < 4) continue;
+                    if (n_qcands > 0 && rs - qcands[n_qcands-1].pos < min_spacing) continue;
+                    qcands[n_qcands].pos = rs;
+                    qcands[n_qcands].run = rl;
+                    qcands[n_qcands].density = density_map ? density_map[rs] : 0;
+                    qcands[n_qcands].quality = 1e30;
+                    n_qcands++;
+                }
+
+                /* Fallback: peak density position if no candidates found */
+                if (n_qcands == 0) {
+                    int pp = 0;
+                    if (density_map)
+                        for (int p = 1; p < (int)ovl_len; p++)
+                            if (density_map[p] > density_map[pp]) pp = p;
+                    qcands[0].pos = pp;
+                    qcands[0].run = 1;
+                    qcands[0].density = density_map ? density_map[pp] : 0;
+                    qcands[0].quality = 0;
+                    n_qcands = 1;
+                }
+
+                /* Pass 3: FIR-decode quality evaluation.
+                 * For each candidate, measure the pop it would create:
+                 * FIR-decode the DIFFERENCE between stitched and unstitched signals.
+                 * diff[i] = 0 for i < stitch_pos (prev in both cases)
+                 * diff[i] = this_ovl[i] - prev_ovl[i] for i >= stitch_pos
+                 * quality = max |FIR(diff)| near the stitch point.
+                 * The candidate with minimum quality = smallest pop. */
+                if (n_qcands > 1) {
+                    /* 63-tap FIR lowpass for pop detection (computed once) */
+                    static double qfir[64];
+                    static int qfir_n = 0;
+                    if (qfir_n == 0) {
+                        int N = 63;
+                        double fc = 100000.0 / (5644800.0 / 2.0);
+                        double sum = 0;
+                        for (int i = 0; i < N; i++) {
+                            double n = i - 31.0;
+                            if (n > -0.001 && n < 0.001)
+                                qfir[i] = 2.0 * fc;
+                            else
+                                qfir[i] = sin(2.0 * 3.14159265358979 * fc * n)
+                                         / (3.14159265358979 * n);
+                            qfir[i] *= 0.54 - 0.46 * cos(2.0 * 3.14159265358979 * i / (N - 1));
+                            sum += qfir[i];
                         }
+                        for (int i = 0; i < N; i++) qfir[i] /= sum;
+                        qfir_n = N;
+                    }
+
+                    int fh = qfir_n / 2;  /* 31 */
+                    /* Evaluate ±128 decoded samples around each stitch point */
+                    int eval_range = 128;
+
+                    for (int ci = 0; ci < n_qcands; ci++) {
+                        int sp = qcands[ci].pos;
+                        double max_d = 0;
+                        for (int j = -eval_range; j < eval_range; j++) {
+                            double val = 0;
+                            for (int k = 0; k < qfir_n; k++) {
+                                int idx = sp + j - fh + k;
+                                if (idx >= sp && idx >= 0 && idx < (int)ovl_len) {
+                                    double diff = (double)this_ovl[idx] - (double)prev_ovl[idx];
+                                    val += qfir[k] * diff;
+                                }
+                            }
+                            double ad = fabs(val);
+                            if (ad > max_d) max_d = ad;
+                        }
+                        qcands[ci].quality = max_d;
                     }
                 }
+
+                /* Pick candidate with minimum pop */
+                int best_ci = 0;
+                for (int ci = 1; ci < n_qcands; ci++)
+                    if (qcands[ci].quality < qcands[best_ci].quality)
+                        best_ci = ci;
+
+                int best_pos = qcands[best_ci].pos;
+                int found_match = qcands[best_ci].run;
+                int cur_matches = qcands[best_ci].density;
+                double best_quality = qcands[best_ci].quality;
+                free(density_map);
 
                 stitch_positions[seg] = best_pos;
 
                 size_t stitch_at = prev_ovl_start + (size_t)best_pos;
                 size_t copy_count = seg_out - (size_t)best_pos;
 
-                /* Normal stitch: copy seg_next from best_pos onward */
                 memcpy(s->ch_out[ch] + stitch_at,
                        seg_bufs[buf_idx] + best_pos,
                        copy_count * sizeof(float));
                 write_pos = stitch_at + copy_count;
 
-                /* Quality check: if density is too low, replace samples
-                 * at the stitch point with random DSD noise.
-                 * Replaces 32 from seg_prev + 32 from seg_next = 64 total.
-                 * No sample count change — just overwrites existing bits.
-                 * Random ±1 noise spreads energy as broadband ultrasonic
-                 * noise instead of concentrating it as a pop. */
-                /* Recount unweighted density at actual stitch position
-                 * (weighted scan picks different position than unweighted peak) */
-                int stitch_density = 0;
-                {
-                    int sw_start = (best_pos >= half_w) ? best_pos - half_w : 0;
-                    int sw_end = (best_pos + half_w < (int)ovl_len) ? best_pos + half_w : (int)ovl_len;
-                    for (int w = sw_start; w < sw_end; w++)
-                        if (prev_ovl[w] == this_ovl[w]) stitch_density++;
-                    cur_matches = stitch_density;  /* update for logging */
-                }
-                int density_pct = (half_w * 2 > 0) ? (stitch_density * 100) / (half_w * 2) : 0;
-                int dither_len = 0;
-                if (density_pct < 55 && stitch_at >= 2) {
-                    dither_len = 4;
-                    uint32_t rng = (uint32_t)(stitch_at ^ 0xDEADBEEF);
-                    size_t dither_start = stitch_at - 2;  /* 2 before + 2 after */
-                    for (int d = 0; d < 4; d++) {
-                        rng = rng * 1664525u + 1013904223u;
-                        s->ch_out[ch][dither_start + d] = (rng & 0x80000000) ? 1.0f : -1.0f;
-                    }
-                }
+                int density_pct = (half_w * 2 > 0) ? (cur_matches * 100) / (half_w * 2) : 0;
 
                 {
                     char msg[256];
                     snprintf(msg, sizeof(msg),
-                             "stitch seg%d: ovl=%zu density=%d/%d (%d%%) wdensity=%.2f "
-                             "pos=%d run=%d dither=%d wp=%zu stitch_at=%zu",
+                             "stitch seg%d: ovl=%zu density=%d/%d (%d%%) "
+                             "pos=%d run=%d cands=%d pop=%.5f wp=%zu",
                              seg, ovl_len, cur_matches, half_w * 2, density_pct,
-                             best_density,
-                             best_pos, found_match, dither_len,
-                             write_pos, stitch_at);
+                             best_pos, found_match, n_qcands, best_quality,
+                             write_pos);
                     extern void trellis_log_c(const char *);
                     trellis_log_c(msg);
                 }
@@ -2344,6 +2367,7 @@ size_t plugin_process(plugin_state_t *s,
                            seg_bufs[buf_idx] + bp,
                            copy_count * sizeof(float));
                     write_pos = stitch_at + copy_count;
+
                 }
             }
         }
