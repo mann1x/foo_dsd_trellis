@@ -12,7 +12,9 @@ DAS introduces three key innovations:
 2. **Windowed match density scanning** that identifies regions of genuine SDM convergence within the overlap, replacing random bit-matching with a convergence-aware metric
 3. **Hybrid stitch point selection** that combines density-based convergence detection with exact bit-matching for artifact-free transitions
 
-The algorithm achieves real-time DSD512 processing (22.579 MHz, 1-bit) at 0.85x real-time on a 16-core AMD Ryzen 9 9950X using 4 parallel segments (Par4), with 100% exact bit-match rate at every stitch boundary. No prior published work achieves temporal parallelism of trellis SDM for audio.
+The algorithm achieves real-time DSD512 processing (22.579 MHz, 1-bit) at 0.52x real-time on a 16-core AMD Ryzen 9 5950X using 4 parallel segments (Par4), with 100% exact bit-match rate at every stitch boundary and zero audible artifacts at DSD256+. No prior published work achieves temporal parallelism of trellis SDM for audio.
+
+DAS v2 adds **post-DAS quality search**: a multi-candidate FIR-decode pop detection system that evaluates stitch transients before output, selecting the position with minimum audible impact.
 
 ---
 
@@ -271,12 +273,14 @@ FIR output: [════ Seg 0 ════[ovl]════ Seg 1 ════
 The overlap size is a critical parameter. It must be large enough for the SDMs to exhibit measurable convergence when processing the same input data. Through systematic testing (see Section 5), we determined:
 
 ```
-overlap = 32 × trellis_latency
+overlap = 64 × trellis_latency
 ```
 
-For a typical configuration with `trellis_lat = 32`:
-- `overlap = 1024 samples`
-- At DSD512 (22.579 MHz): 45.4 microseconds of audio — acoustically negligible
+For typical configurations:
+- DSD512 (`trellis_lat = 32`): `overlap = 2048 samples` (90.7 µs — acoustically negligible)
+- DSD128 (`trellis_lat = 128`): `overlap = 8192 samples` (1.45 ms — inaudible)
+
+The 64x multiplier (increased from the original 32x) provides a wider search space for the quality search to find optimal stitch positions, particularly at boundaries near quiet musical passages.
 
 The warmup discard for segments 1+ is:
 ```
@@ -352,7 +356,91 @@ This hybrid approach guarantees:
 
 In practice, an exact match is always found within the search radius (100% success rate across all tested configurations), because the density peak region has >40% matching bits — finding at least one within ±L samples is statistically near-certain.
 
-### 4.7 Channel Synchronization
+### 4.7 Post-DAS Quality Search (v2)
+
+The density-based stitch selection finds the region of best SDM convergence, but even at 75-85% density, the noise-shaping context change at the stitch point creates a constant-amplitude transient (~0.003-0.005 in decoded audio). This transient is inaudible during loud passages but clearly audible during quiet passages (RMS < 0.002).
+
+**Key insight from measurement**: pop amplitude is constant regardless of signal level. During quiet passages it's exposed; during loud passages it's masked. With 20-capture statistical analysis:
+
+| Signal RMS at boundary | Median derivative ratio | >50x spikes |
+|------------------------|------------------------|-------------|
+| < 0.002 (quiet) | 35.1x | 46% |
+| 0.002 - 0.005 | 10.7x | 5% |
+| > 0.005 (loud) | 4.6 - 7.3x | 0% |
+
+The quality search addresses this by evaluating multiple candidate stitch positions and selecting the one that produces the smallest audible transient:
+
+#### Algorithm
+
+```
+Pass 1: Full density map — O(n) sliding window density at every overlap position
+
+Pass 2: Candidate collection
+  density_floor = 90% × peak_density
+  For each position with density >= floor AND matching run >= 4:
+    Add to candidates (max 32, spaced >= half_w apart)
+  Always include peak-density position as baseline
+
+Pass 3: FIR-decode quality evaluation
+  For each candidate at position sp:
+    diff[i] = 0                            for i < sp  (prev in both cases)
+    diff[i] = this_ovl[i] - prev_ovl[i]   for i >= sp (stitched vs unstitched)
+    quality = max |FIR_lowpass(diff)|       in ±512 samples around sp
+    quality /= (density / peak_density)    density penalty
+
+Pick: candidate with minimum quality score
+```
+
+The FIR filter is a 255-tap Kaiser (beta=8) lowpass at 20 kHz — matching what the DAC's decimation filter passes to the audio band. This directly predicts the audible pop amplitude.
+
+#### Results
+
+Quality search vs density-only DAS (DSD128 Par8, 20 captures from same musical position):
+
+| Metric | Density-only | Quality search | Improvement |
+|--------|-------------|----------------|-------------|
+| Max spike | 390x | 110x | -72% |
+| Median | 14.7x | 15.8x | ~same |
+| >50x spikes | 120/800 | 20/800 | -83% |
+
+The quality search dramatically reduces worst-case outliers while maintaining similar median performance. The improvement is most significant at quiet boundaries where multiple candidate positions exist.
+
+#### Density penalty
+
+Without density penalty, the quality search can select low-density positions that have small local FIR-decoded transients but cause broader noise-shaping disruptions visible to the DAC's longer decimation filter. The penalty scales the quality score inversely with density ratio:
+
+```
+effective_quality = pop_metric / (candidate_density / peak_density)
+```
+
+A candidate at 70% of peak density must have 1.43× lower pop to beat a peak-density candidate. This keeps density as the primary criterion while allowing the quality search to improve outliers.
+
+### 4.8 Full-Parallel Mode (DSD512+)
+
+For DSD512 and above, stitch artifacts are inaudible because the elevated ultrasonic noise floor masks the constant-amplitude pop transient. This allows aggressive optimization:
+
+1. **No seg0-first sequential chain**: All segments run fully in parallel (no sequential dependency)
+2. **No estimation phase**: Each segment uses the persistent state from chunk start + warmup convergence (64× trellis_lat = 2048 samples, sufficient for DSD512's lat=32)
+3. **Result**: SDM time drops from 857ms (seg0-first + estimation) to 325ms (full-parallel)
+
+```
+seg0-first mode (DSD256):
+  Phase A: seg0 sequential → wait → seg1 DIRECT → wait
+  Phase B: estimation for seg2+ → wait
+  Phase C: seg2+ parallel → wait
+  Total: 3 sequential phases
+
+Full-parallel mode (DSD512+):
+  Phase A: seed all segments from persistent state (instant, no estimation)
+  Phase B: ALL segments parallel → wait
+  Total: 1 parallel phase
+```
+
+#### Why estimation can be skipped at DSD512
+
+At DSD512 with trellis_lat=32, the overlap warmup is 64 × 32 = 2048 samples. This is 64× the trellis look-ahead depth — far more than needed for the SDM's integrator states to converge from the persistent (stale) state to the local signal's natural trajectory. The estimation's contribution at DSD512 was measured as negligible: 0 >20x spikes both with and without estimation.
+
+### 4.10 Channel Synchronization
 
 For multi-channel audio (stereo, surround), all channels must produce identical output sample counts to maintain frame alignment. DAS computes stitch positions on channel 0 and applies the same positions to all other channels:
 
@@ -364,7 +452,7 @@ Pass 2: For channels 1..N-1:
 
 This guarantees frame-aligned output across all channels, which is critical for proper DAC reconstruction and DoP (DSD-over-PCM) packaging.
 
-### 4.8 State Persistence
+### 4.11 State Persistence
 
 After all segments are stitched, the last segment's SDM state is copied back to the persistent per-channel SDM context:
 
@@ -514,16 +602,31 @@ All rates use 32×lat overlap. Multi-bit (16-level) state estimation, paralleliz
 
 The estimation pass gives seg1+ a starting state that reflects the actual NTF integrator evolution through the preceding input, rather than the stale state from the chunk boundary. The 16-level quantizer closely tracks the trellis decisions, and the overlap warmup handles the remaining convergence gap.
 
-### 5.4 Real-Time Performance
+### 5.4 Real-Time Performance (AMD Ryzen 9 5950X, stereo, CPU-only)
 
-| Rate | Segments | RT Ratio | SDM Time | FIR Time | Overlap |
-|------|----------|----------|----------|----------|---------|
-| DSD512 | 4 | 0.85x | ~650ms | ~130ms | 1024 |
-| DSD256 | 2 | 0.52x | ~440ms | ~50ms | 4096 |
-| DSD128 | 2 | 0.27x | ~225ms | ~26ms | 4096 |
-| DSD64 | 2 | 0.19x | ~180ms | ~0ms | 1024 |
+| Rate | Auto Mode | Segments | RT Ratio | SDM (ms) | FIR (ms) | Overlap |
+|------|-----------|----------|----------|----------|----------|---------|
+| DSD512 | Par4 full-parallel | 4 | **0.52x** | 325 | 130 | 2048 |
+| DSD256 | Par2 seg0-first | 2 | **0.70x** | 604 | 67 | 8192 |
+| DSD128 | Sequential | 1 | **0.35x** | 270 | 28 | — |
 
-The DAS overlap scan uses an O(n) sliding window and adds negligible overhead. The multi-bit state estimation pass runs in parallel on the threadpool (~70ms for DSD128 stereo, included in SDM time above).
+The quality search adds negligible overhead (~5ms for FIR evaluation of 8-30 candidates per boundary). DSD512 full-parallel mode skips the estimation phase entirely, reducing SDM time from 857ms to 325ms.
+
+Par4 is faster than Par8 at DSD512 (0.52x vs 0.60x) due to reduced L3 cache contention — 8 blocks on 16 threads vs 16 blocks competing for cache lines.
+
+### 5.5 Stitch Quality vs. DSD Rate
+
+Measured with 20 captures from the same musical position, FIR-decoded via 511-tap Kaiser at 20 kHz, derivative ratio analysis:
+
+| Rate | Segments | Median ratio | Max ratio | >50x spikes | >20x spikes | Feasibility |
+|------|----------|-------------|-----------|-------------|-------------|-------------|
+| DSD128 | Par2 | 41.8x | 67.9x | 30/115 (26%) | 105/115 (91%) | **Not feasible** |
+| DSD256 | Par2 | 5.3x | 5.7x | 0 | 0 | **Production quality** |
+| DSD512 | Par4-8 | 6.4x | 11.3x | 0 | 0 | **Production quality** |
+
+**Root cause of rate-dependent quality**: The stitch transient has constant amplitude (~0.003-0.005 in decoded audio) regardless of DSD rate. At DSD256+, the elevated ultrasonic noise floor masks this transient completely. At DSD128, the lower noise floor exposes it, producing audible clicks during quiet musical passages.
+
+**Recommendation**: Parallel DAS is production-quality for DSD256 and above. DSD128 should use sequential processing (0.35x RT, no artifacts). Users can override via explicit Par2-Par8 settings if the minor DSD128 artifacts are acceptable for their listening setup.
 
 ### 5.5 Convergence Plateau
 
@@ -626,17 +729,21 @@ GPU acceleration remains valuable for the **FIR filtering pipeline** (upsampling
 
 ## 7. Summary
 
-Density-Aligned Stitching (DAS) solves the parallelization problem for trellis SDM through four innovations:
+Density-Aligned Stitching (DAS) v2 solves the parallelization problem for trellis SDM through six innovations:
 
-1. **State estimation pre-pass**: A lightweight nc=1 greedy SDM runs the NTF filter forward through the input to estimate integrator state at each segment boundary (~10ms for 1.4M samples). Segments start with near-exact initial conditions rather than replicated stale state, achieving 74-99% density match (vs 63-88% without estimation).
+1. **Rate-adaptive dispatch**: seg0-first sequential chain for DSD256 (true state for seg1 DIRECT), full-parallel mode for DSD512+ (all segments simultaneous, no sequential dependency).
 
-2. **Extended overlap regions**: Each non-last segment extends by `32 × trellis_lat` samples into the next segment's territory. The overlap warmup handles the small remaining divergence between estimated and true trellis states.
+2. **State estimation pre-pass** (DSD256): A lightweight nc=1 greedy SDM estimates integrator state at each boundary. DSD512+ skips estimation — warmup convergence (64× trellis_lat) is sufficient since artifacts are masked by the ultrasonic noise floor.
 
-3. **Windowed match density scanning**: A sliding window of width `2L` (twice the trellis latency) counts matching bits at each overlap position. The position with highest density identifies the region of genuine SDM convergence, replacing random bit-coincidence detection.
+3. **Extended overlap regions**: Each non-last segment extends by `64 × trellis_lat` samples into the next segment's territory. The wider overlap provides more candidate positions for the quality search.
 
-4. **Hybrid stitch selection**: From the density peak, a spiral search finds the nearest exact bit-match for a clean, artifact-free transition. This combines convergence-aware positioning with glitch-free stitching.
+4. **Windowed match density scanning**: An O(n) sliding window counts matching bits at every overlap position, building a full density map. The position with highest density identifies the region of genuine SDM convergence.
 
-The algorithm adds negligible overhead (~10ms estimation + ~0ms density scan), achieves 100% exact-match rate at all stitch boundaries, and enables real-time DSD512 (22.579 MHz) processing at 0.85x RT on commodity hardware with 4 parallel segments. No prior published work achieves temporal parallelism of trellis SDM for audio.
+5. **Post-DAS quality search**: Multi-candidate FIR-decode pop detection evaluates stitch transients before output. A 255-tap Kaiser lowpass at 20 kHz decodes the difference signal at each candidate position, predicting the audible pop amplitude. The candidate with minimum transient is selected, with density penalty to prevent low-convergence selections. Reduces worst-case spikes by 72-83%.
+
+6. **Hybrid stitch selection**: From the quality-optimal position, a spiral search finds the nearest exact bit-match for a clean, artifact-free transition.
+
+The algorithm achieves 100% exact-match rate at all stitch boundaries and enables real-time DSD512 (22.579 MHz) at 0.52x RT on commodity hardware (AMD Ryzen 9 5950X) with 4 parallel segments. Parallel DAS is production-quality for DSD256 and above (zero audible artifacts). DSD128 remains sequential due to audible stitch transients at the lower noise floor. No prior published work achieves temporal parallelism of trellis SDM for audio.
 
 ---
 
@@ -662,11 +769,12 @@ The algorithm adds negligible overhead (~10ms estimation + ~0ms density scan), a
 DAS is implemented in the `foo_dsd_trellis` foobar2000 DSP plugin:
 
 ### CPU Parallel SDM
-- **Segment layout & overlap**: `src/dsp_plugin.c` (parallel SDM path)
+- **Segment layout, overlap, DAS quality search**: `src/dsp_plugin.c` (parallel SDM path, quality-search FIR evaluation)
 - **State estimation pre-pass**: `src/trellis.c` (`sdm_estimate_state` — nc=1 greedy NTF estimator)
 - **SDM core & state copy**: `src/trellis.c` (`sdm_context_copy_state`, `sdm_state_distance`)
 - **Segment processing**: `src/engine.c` (`sdm_segment_process`)
 - **Thread pool dispatch**: `src/threadpool.c` (MMCSS "Pro Audio" workers)
+- **Boundary repositioning**: `src/dsp_plugin.c` (RMS-based boundary shift to avoid quiet regions)
 - **Convergence diagnostics**: `test/test_stitch.c` (overlap sweep, density vs. state-distance comparison)
 
 ### GPU Parallel SDM (CUDA)

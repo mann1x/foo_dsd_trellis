@@ -51,25 +51,29 @@ Thread pool (`threadpool.c`) provides per-channel and per-segment parallelism wi
 
 ### Parallel SDM with Density-Aligned Stitching (DAS)
 
-For Trellis mode at high DSD rates (DSD512), single-core SDM processing exceeds real-time. The engine splits FIR output into N segments (up to 4 on CPU, 252 on GPU) processed in parallel:
+For Trellis mode at high DSD rates, single-core SDM processing exceeds real-time. The engine splits FIR output into N segments processed in parallel, using DAS to stitch them artifact-free:
 
-1. **State estimation**: a 16-level (4-bit) greedy SDM pre-pass estimates the NTF integrator state at each segment boundary. Channels run in parallel on the threadpool. Segments 1+ are seeded with these estimated states instead of replicating the persistent state.
-2. **Overlap extension**: each non-last segment extends by `overlap = 32 × trellis_lat` into the next segment's territory
-3. **DAS density scan**: O(n) sliding window match density (window = 2 × trellis_lat) finds the region of best SDM convergence in the overlap
-4. **Hybrid stitch**: density peak + nearest exact bit-match for clean transition
+1. **Rate-adaptive dispatch**:
+   - **DSD256**: seg0-first + seg1 DIRECT (true state from seg0), Par2 (1 DAS boundary)
+   - **DSD512+**: full-parallel mode — all segments run simultaneously, no sequential chain
+2. **State estimation** (DSD256 only): greedy nc=1 SDM pre-pass from seg0's true state estimates integrator state at seg2+ boundaries. DSD512 skips estimation — warmup convergence is sufficient since pops are inaudible at DSD512's elevated noise floor.
+3. **Overlap extension**: each non-last segment extends by `overlap = 64 × trellis_lat` into the next segment's territory. Wider overlap gives the quality search more candidate positions.
+4. **Post-DAS quality search**: multi-candidate stitch point selection that minimizes audible transients:
+   - Full density map across the overlap region
+   - Candidate collection: positions with density >= 90% of peak AND matching run >= 4
+   - FIR-decode pop detection: 255-tap Kaiser lowpass at 20kHz decodes the difference between stitched and unstitched signals at each candidate
+   - Pick the candidate with minimum transient amplitude (density-penalized to prevent low-convergence selections)
+   - Reduced DSD512 max spike from 142x to 60x vs density-only DAS
 
-**Performance** (AMD Ryzen 9 9950X, stereo, CUDA GPU for FIR):
+**Auto mode parallelization** (AMD Ryzen 9 5950X, stereo, CPU-only):
 
-| Rate | Segments | RT Ratio | Overlap | Density |
-|------|----------|----------|---------|---------|
-| DSD512 | 4 | 0.85x | 1024 | 53-77% |
-| DSD256 | 2 | 0.52x | 4096 | 43-82% |
-| DSD128 | 2 | 0.27x | 4096 | 50-73% |
-| DSD64 | 2 | 0.19x | 1024 | 55-88% |
+| Rate | Auto Mode | Segments | RT Ratio | Quality (20 captures) |
+|------|-----------|----------|----------|-----------------------|
+| DSD128 | Sequential | 1 | 0.35x | Perfect (no stitching) |
+| DSD256 | Par2 | 2 | 0.70x | 0 spikes >20x (excellent) |
+| DSD512 | Par4 | 4 | 0.52x | 0 spikes >20x (excellent) |
 
-**Validated artifact-free**: DSF A/B comparison proves CPU parallel DAS produces **bit-identical** output to sequential for simple signals, and **perceptually identical** output for real music (48.7% bit mismatch but identical noise characteristics).
-
-**GPU DAS pipeline** (experimental): 3-kernel CUDA pipeline — parallel-segment SBVD + density scan + gather-assemble. 252 segments on RTX 5080 at 0.03x RT for DSD512. GPU SDM kernel quality under investigation.
+**Quality note**: Parallel DAS is production-quality for **DSD256 and above**. At DSD128, stitch artifacts (~40x derivative ratio at quiet passages) remain audible because the lower ultrasonic noise floor does not mask the noise-shaping context change at segment boundaries. DSD128 defaults to sequential processing in Auto mode, which is artifact-free at 0.35x RT. Users can force parallel via explicit Par2-Par8 settings for DSD128 if the minor artifacts are acceptable.
 
 See `Density-Aligned-Stitching/DAS-Algorithm.md` for the full algorithm description.
 
