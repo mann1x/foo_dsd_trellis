@@ -1178,8 +1178,8 @@ size_t plugin_process(plugin_state_t *s,
     else if (par_mode >= TRELLIS_PAR_PAR2) {
         use_parallel = true;
         par_segments = par_mode; /* explicit segment count */
-    } else /* Auto */
-        use_parallel = (fs_out >= DSD_RATE_512) ||
+    } else /* Auto: parallel for DSD256+ (DSD128 pops still audible) */
+        use_parallel = (fs_out >= DSD_RATE_256) ||
                        (s->config.gpu_sdm_enabled && s->gpu &&
                         s->config.sdm_mode == SDM_MODE_TRELLIS);
 
@@ -1206,10 +1206,10 @@ size_t plugin_process(plugin_state_t *s,
             segments_per_ch = num_threads / num_channels;
             if (segments_per_ch < 1) segments_per_ch = 1;
             int max_seg;
-            /* DSD512: allow more segments — stitch pops less audible at high
-             * rates where ultrasonic noise floor is already elevated.
-             * DSD64-256: 2 segments (1 stitch/sec) minimizes audible pops. */
-            max_seg = (fs_out >= DSD_RATE_512) ? 4 : 2;
+            /* DSD512: 8 segments needed for RT (seg0+seg1 sequential = 25%).
+             * DSD128-256: 2 segments (1 DAS boundary) for minimal pops. */
+            if (fs_out >= DSD_RATE_512) max_seg = 8;
+            else max_seg = 2;
             if (segments_per_ch > max_seg) segments_per_ch = max_seg;
         }
 
@@ -1953,10 +1953,14 @@ size_t plugin_process(plugin_state_t *s,
             }
         }
 
-        /* ── Phase 2a: Run seg0 first, then seg1 DIRECT ──
-         * seg0: no extension, true state at seg0 nominal end.
-         * seg1: true state from seg0, with extension for DAS with seg2. */
-        {
+        /* ── Phase 2a: seg0-first + seg1 DIRECT (DSD256 and below).
+         * DSD512+ skips this — runs all segments fully parallel for RT. */
+        bool seg0_first = (fs_out < DSD_RATE_512);
+        double est_states[32][MAX_NTF_ORDER];
+        memset(est_states, 0, sizeof(est_states));
+
+        if (seg0_first) {
+            /* seg0: no extension, true state at seg0 nominal end. */
             channel_block_t seq_blocks[8];
             memset(seq_blocks, 0, sizeof(seq_blocks));
             for (int ch = 0; ch < num_channels; ch++) {
@@ -2000,55 +2004,89 @@ size_t plugin_process(plugin_state_t *s,
                 for (int ch = 0; ch < num_channels; ch++)
                     seg_out_counts[ch * segments_per_ch + 1] = seq_blocks[ch].out_count;
             }
-        }
 
-        /* ── Phase 2a½: Re-estimate from seg0's TRUE state for seg2+ ── */
-        double est_states[32][MAX_NTF_ORDER];
-        memset(est_states, 0, sizeof(est_states));
-        if (segments_per_ch > 2) {
-            channel_block_t est_blocks[8];
-            memset(est_blocks, 0, sizeof(est_blocks));
+            /* Re-estimate from seg0's TRUE state for seg2+ */
+            if (segments_per_ch > 2) {
+                channel_block_t est_blocks[8];
+                memset(est_blocks, 0, sizeof(est_blocks));
+                for (int ch = 0; ch < num_channels; ch++) {
+                    const sdm_context_t *sdm = &s->channels[ch].sdm;
+                    est_blocks[ch].mode = BLOCK_MODE_ESTIMATE;
+                    size_t est_start = seg_nominal_start[ch][1];
+                    est_blocks[ch].in = fir_data[ch] + est_start;
+                    est_blocks[ch].count = fir_counts[ch] - est_start;
+                    est_blocks[ch].channel = ch;
+                    est_blocks[ch].cfg = &s->config;
+                    est_blocks[ch].est_filter = sdm->filter;
+                    est_blocks[ch].est_state_limit = sdm->state_limit;
+                    est_blocks[ch].est_num_segs = segments_per_ch;
+                    if (sdm->filter) {
+                        int bank = sdm->idx & 1;
+                        for (int i = 0; i < sdm->filter->order; i++)
+                            est_blocks[ch].est_init[i] = sdm->trellis[bank].act[0]->state[i];
+                    }
+                    for (int seg = 2; seg < segments_per_ch; seg++)
+                        est_blocks[ch].est_boundaries[seg] =
+                            seg_nominal_start[ch][seg] - est_start;
+                    threadpool_submit(s->pool, &est_blocks[ch]);
+                }
+                threadpool_wait(s->pool);
+                for (int ch = 0; ch < num_channels; ch++)
+                    for (int seg = 2; seg < segments_per_ch; seg++)
+                        for (int i = 0; i < MAX_NTF_ORDER; i++)
+                            est_states[ch * segments_per_ch + seg][i] =
+                                est_blocks[ch].est_result[seg][i];
+            }
+        } else {
+            /* DSD512+: skip estimation entirely.
+             * Each segment uses persistent state + warmup (64× trellis_lat).
+             * Warmup convergence is sufficient — DSD512 pops are inaudible.
+             * Copy persistent state values into est_states so the segment
+             * dispatch seeds from the right starting point. */
             for (int ch = 0; ch < num_channels; ch++) {
                 const sdm_context_t *sdm = &s->channels[ch].sdm;
-                est_blocks[ch].mode = BLOCK_MODE_ESTIMATE;
-                size_t est_start = seg_nominal_start[ch][1];
-                est_blocks[ch].in = fir_data[ch] + est_start;
-                est_blocks[ch].count = fir_counts[ch] - est_start;
-                est_blocks[ch].channel = ch;
-                est_blocks[ch].cfg = &s->config;
-                est_blocks[ch].est_filter = sdm->filter;
-                est_blocks[ch].est_state_limit = sdm->state_limit;
-                est_blocks[ch].est_num_segs = segments_per_ch;
                 if (sdm->filter) {
                     int bank = sdm->idx & 1;
-                    for (int i = 0; i < sdm->filter->order; i++)
-                        est_blocks[ch].est_init[i] = sdm->trellis[bank].act[0]->state[i];
+                    for (int seg = 1; seg < segments_per_ch; seg++)
+                        for (int i = 0; i < sdm->filter->order; i++)
+                            est_states[ch * segments_per_ch + seg][i] =
+                                sdm->trellis[bank].act[0]->state[i];
                 }
-                for (int seg = 2; seg < segments_per_ch; seg++)
-                    est_blocks[ch].est_boundaries[seg] =
-                        seg_nominal_start[ch][seg] - est_start;
-                threadpool_submit(s->pool, &est_blocks[ch]);
             }
-            threadpool_wait(s->pool);
-            for (int ch = 0; ch < num_channels; ch++)
-                for (int seg = 2; seg < segments_per_ch; seg++)
-                    for (int i = 0; i < MAX_NTF_ORDER; i++)
-                        est_states[ch * segments_per_ch + seg][i] =
-                            est_blocks[ch].est_result[seg][i];
         }
 
-        /* ── Phase 2b: Launch seg2+ in parallel (all DAS) ── */
+        /* ── Phase 2b: Launch remaining segments in parallel ──
+         * seg0-first mode: seg2+ only (seg0,seg1 already done).
+         * Full-parallel mode: ALL segments including seg0,seg1. */
+        int first_parallel_seg = seg0_first ? 2 : 0;
         channel_block_t all_blocks[32];
         int all_block_count = 0;
         memset(all_blocks, 0, sizeof(all_blocks));
 
         for (int ch = 0; ch < num_channels; ch++) {
             size_t fir_count = fir_counts[ch];
-            for (int seg = 2; seg < cpu_segs; seg++) {
+            for (int seg = first_parallel_seg; seg < cpu_segs; seg++) {
                 int buf_idx = ch * segments_per_ch + seg;
                 size_t nom_start = seg_nominal_start[ch][seg];
                 size_t nom_size = seg_nominal_size[ch][seg];
                 bool extend_fwd = (seg < segments_per_ch - 1);
+
+                /* seg0 in full-parallel: uses persistent state, no warmup.
+                 * Needs extension for DAS with seg1. */
+                if (seg == 0) {
+                    size_t input_count = nom_size;
+                    if (extend_fwd && nom_size + overlap <= fir_count)
+                        input_count += overlap;
+                    all_blocks[all_block_count].mode     = BLOCK_MODE_SDM;
+                    all_blocks[all_block_count].sdm_ctx  = &s->channels[ch].sdm;
+                    all_blocks[all_block_count].in       = fir_data[ch];
+                    all_blocks[all_block_count].out      = seg_bufs[buf_idx];
+                    all_blocks[all_block_count].count    = input_count;
+                    all_blocks[all_block_count].discard  = 0;
+                    all_blocks[all_block_count].channel  = ch;
+                    all_block_count++;
+                    continue;
+                }
 
                 size_t input_start = (nom_start >= overlap) ? nom_start - overlap : 0;
                 size_t input_count = nom_start + nom_size - input_start;
@@ -2091,7 +2129,7 @@ size_t plugin_process(plugin_state_t *s,
         {
             int bi = 0;
             for (int ch = 0; ch < num_channels; ch++)
-                for (int seg = 2; seg < cpu_segs; seg++)
+                for (int seg = first_parallel_seg; seg < cpu_segs; seg++)
                     if (bi < all_block_count)
                         seg_out_counts[ch * segments_per_ch + seg] =
                             all_blocks[bi++].out_count;
@@ -2150,9 +2188,12 @@ size_t plugin_process(plugin_state_t *s,
         {
             int ch = 0;
             int buf0 = ch * segments_per_ch;
-            /* Seg0: copy nominal output only (no overlap extension in output).
-             * The extension was produced for DAS comparison only. */
+            /* Seg0: copy nominal output only. In full-parallel mode,
+             * seg0 has extension for DAS — only copy nominal part. */
             size_t seg0_out = seg_out_counts[buf0];
+            size_t seg0_nominal = seg_nominal_size[ch][0];
+            if (!seg0_first && seg0_out > seg0_nominal)
+                seg0_out = seg0_nominal;  /* trim extension from copy */
             memcpy(s->ch_out[ch], seg_bufs[buf0], seg0_out * sizeof(float));
             size_t write_pos = seg0_out;
 
@@ -2161,8 +2202,9 @@ size_t plugin_process(plugin_state_t *s,
                 size_t seg_out = seg_out_counts[buf_idx];
                 if (seg_out == 0) { stitch_positions[seg] = 0; continue; }
 
-                /* Seg1: direct concatenation (true state from seg0) */
-                if (seg == 1) {
+                /* Seg1: DIRECT if seg0-first mode (true state from seg0),
+                 * otherwise DAS like other segments. */
+                if (seg == 1 && seg0_first) {
                     stitch_positions[seg] = 0;
                     memcpy(s->ch_out[ch] + write_pos,
                            seg_bufs[buf_idx], seg_out * sizeof(float));
@@ -2283,6 +2325,10 @@ size_t plugin_process(plugin_state_t *s,
                     qcands[0].density = 0; qcands[0].quality = 0;
                     n_qcands = 1;
                 }
+
+                /* Single candidate: no comparison needed */
+                if (n_qcands == 1)
+                    qcands[0].quality = 0;
 
                 /* Pass 3: FIR-decode quality evaluation.
                  * For each candidate, measure the pop it would create:
@@ -2411,6 +2457,8 @@ size_t plugin_process(plugin_state_t *s,
         for (int ch = 1; ch < num_channels; ch++) {
             int buf0 = ch * segments_per_ch;
             size_t seg0_out_ch = seg_out_counts[buf0];
+            if (!seg0_first && seg0_out_ch > seg_nominal_size[ch][0])
+                seg0_out_ch = seg_nominal_size[ch][0];
             memcpy(s->ch_out[ch], seg_bufs[buf0], seg0_out_ch * sizeof(float));
             size_t write_pos = seg0_out_ch;
 
@@ -2419,7 +2467,7 @@ size_t plugin_process(plugin_state_t *s,
                 size_t seg_out = seg_out_counts[buf_idx];
                 if (seg_out == 0) continue;
 
-                if (seg == 1) {
+                if (seg == 1 && seg0_first) {
                     memcpy(s->ch_out[ch] + write_pos,
                            seg_bufs[buf_idx], seg_out * sizeof(float));
                     write_pos += seg_out;
