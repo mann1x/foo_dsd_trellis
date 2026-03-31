@@ -1801,8 +1801,8 @@ public:
 
         trellis_log("initialized (fir=%s)", fir_ipp_kernel_name());
 
-        /* Start REST API server */
-        if (m_config.api_port > 0) {
+        /* Start REST API server (only when debug log is enabled) */
+        if (m_config.api_port > 0 && m_config.debug_log) {
             m_httpapi = httpapi_create(m_config.api_port, &m_config);
             if (m_httpapi)
                 trellis_log("REST API listening on 127.0.0.1:%u", (unsigned)m_config.api_port);
