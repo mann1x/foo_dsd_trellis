@@ -34,6 +34,7 @@ typedef struct {
     size_t           fir_buf_sz; /* Allocated size of fir_buf in bytes */
     int              channel;    /* Channel index (0=L, 1=R, ...) */
     float            fir_gain;   /* FIR output attenuation (path-adaptive) */
+    double           prev_gain;  /* Previous volume gain for smooth ramping */
     int              sdm_mode;   /* Cached sdm_mode_t for dispatch */
     bool             sdm_fast;   /* true: use fast trellis (no /fp:precise) */
     bool             passthrough;/* true if no processing needed */

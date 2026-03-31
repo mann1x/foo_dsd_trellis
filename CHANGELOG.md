@@ -5,6 +5,12 @@ All notable changes to foo_dsd_trellis will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-03-31
+
+### Fixed
+- **Smooth volume control**: Gain ramping across batch boundaries eliminates clicks/pops on volume changes. Linear interpolation from previous to current gain applied per-sample in all processing paths (same-rate boxcar/FIR lowpass, rate-conversion FP64/FP32).
+- **Async batch size tuned to 200ms**: 100ms batches caused garbled audio on volume changes due to insufficient processing margin. 200ms provides 60ms slack while keeping volume response acceptable.
+
 ## [1.0.1] - 2026-03-31
 
 ### Fixed
@@ -76,5 +82,6 @@ Initial public release.
 - ONNX model runtime-loaded via DirectML
 - Causal dilated CNN for DSD quantization noise reduction
 
+[1.0.2]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.2
 [1.0.1]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.1
 [1.0.0]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.0

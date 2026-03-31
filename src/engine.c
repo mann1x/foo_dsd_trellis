@@ -340,22 +340,32 @@ size_t engine_process_block(engine_channel_t *eng,
                 for (size_t i = 0; i < count; i++)
                     tls_lp_in[i] = in[i] >= 0.0f ? 1.0 : -1.0;
                 fir_lowpass_process(&eng->lowpass, tls_lp_in, eng->fir_buf, count);
-                double combined = (double)eng->fir_gain * (double)cfg->gain;
+                /* Smooth gain ramp from previous to current */
+                double g_start = (double)eng->fir_gain * eng->prev_gain;
+                double g_end   = (double)eng->fir_gain * (double)cfg->gain;
+                if (g_start == 0.0) g_start = g_end; /* first chunk */
+                double g_step = (count > 1) ? (g_end - g_start) / (double)(count - 1) : 0.0;
                 for (size_t i = 0; i < count; i++)
-                    eng->fir_buf[i] *= combined;
+                    eng->fir_buf[i] *= g_start + g_step * (double)i;
+                eng->prev_gain = (double)cfg->gain;
             } else {
                 /* Boxcar: CPU fp64 */
                 boxcar_t *bc = &eng->boxcar;
                 const double inv_n = 1.0 / (double)bc->taps;
-                double combined = (double)eng->fir_gain * (double)cfg->gain;
+                /* Smooth gain ramp from previous to current */
+                double g_start = (double)eng->fir_gain * eng->prev_gain;
+                double g_end   = (double)eng->fir_gain * (double)cfg->gain;
+                if (g_start == 0.0) g_start = g_end;
+                double g_step = (count > 1) ? (g_end - g_start) / (double)(count - 1) : 0.0;
                 for (size_t i = 0; i < count; i++) {
                     double s = in[i] >= 0.0f ? 1.0 : -1.0;
                     bc->sum -= bc->ring[bc->pos];
                     bc->ring[bc->pos] = s;
                     bc->sum += s;
                     bc->pos = (bc->pos + 1) % bc->taps;
-                    eng->fir_buf[i] = bc->sum * inv_n * combined;
+                    eng->fir_buf[i] = bc->sum * inv_n * (g_start + g_step * (double)i);
                 }
+                eng->prev_gain = (double)cfg->gain;
             }
             /* Pre-SDM pre-emphasis (ML model, all DSD rates).
              * Features on CPU (subsampled), MLP via ONNX on GPU, FIR on CPU. */
@@ -405,7 +415,10 @@ size_t engine_process_block(engine_channel_t *eng,
         return 0;
 
     size_t fir_out;
-    double combined_gain = (double)eng->fir_gain * (double)cfg->gain;
+    /* Gain ramp: interpolate from previous to current for smooth volume */
+    double g_start = (double)eng->fir_gain * eng->prev_gain;
+    double g_end   = (double)eng->fir_gain * (double)cfg->gain;
+    if (g_start == 0.0) g_start = g_end;
 
     if (eng->fir.use_fp64) {
         /* FP64 path: widen float DSD input to double, FIR in fp64, output double directly */
@@ -444,11 +457,13 @@ size_t engine_process_block(engine_channel_t *eng,
 
         fir_out = fir_chain_process_d(&eng->fir, tls_fir_d, eng->fir_buf, count);
 
-        /* Apply gain in fp64 */
-        if (combined_gain != 1.0) {
+        /* Apply gain with smooth ramp */
+        if (g_start != 1.0 || g_end != 1.0) {
+            double step = (fir_out > 1) ? (g_end - g_start) / (double)(fir_out - 1) : 0.0;
             for (size_t i = 0; i < fir_out; i++)
-                eng->fir_buf[i] *= combined_gain;
+                eng->fir_buf[i] *= g_start + step * (double)i;
         }
+        eng->prev_gain = (double)cfg->gain;
     } else {
         /* FP32 path: FIR in fp32, then widen to double */
         static __declspec(thread) float *tls_fir_f = NULL;
@@ -462,9 +477,13 @@ size_t engine_process_block(engine_channel_t *eng,
 
         fir_out = fir_chain_process(&eng->fir, in, tls_fir_f, count);
 
-        /* Widen to double and apply gain in one pass */
-        for (size_t i = 0; i < fir_out; i++)
-            eng->fir_buf[i] = (double)tls_fir_f[i] * combined_gain;
+        /* Widen to double and apply gain ramp in one pass */
+        {
+            double step = (fir_out > 1) ? (g_end - g_start) / (double)(fir_out - 1) : 0.0;
+            for (size_t i = 0; i < fir_out; i++)
+                eng->fir_buf[i] = (double)tls_fir_f[i] * (g_start + step * (double)i);
+        }
+        eng->prev_gain = (double)cfg->gain;
     }
 
     /* SDM (CPU only) */
@@ -550,7 +569,10 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
     uint32_t fs_out_actual = cfg->fs_out ? cfg->fs_out : cfg->fs_in;
     if (cfg->fs_in == fs_out_actual) {
         /* Same-rate: smooth ±1.0 → multi-bit (fp64 pipeline) */
-        double combined = (double)eng->fir_gain * (double)cfg->gain;
+        double gs = (double)eng->fir_gain * eng->prev_gain;
+        double ge = (double)eng->fir_gain * (double)cfg->gain;
+        if (gs == 0.0) gs = ge;
+        double gstep = (count > 1) ? (ge - gs) / (double)(count - 1) : 0.0;
         if (eng->lowpass.initialized) {
             /* FIR lowpass fp64 */
             static __declspec(thread) double *tls_lp_in2 = NULL;
@@ -565,7 +587,7 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
                     tls_lp_in2[i] = in[i] >= 0.0f ? 1.0 : -1.0;
                 fir_lowpass_process(&eng->lowpass, tls_lp_in2, eng->fir_buf, count);
                 for (size_t i = 0; i < count; i++)
-                    eng->fir_buf[i] *= combined;
+                    eng->fir_buf[i] *= gs + gstep * (double)i;
             }
         } else {
             /* Boxcar fp64 */
@@ -577,9 +599,10 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
                 bc->ring[bc->pos] = s;
                 bc->sum += s;
                 bc->pos = (bc->pos + 1) % bc->taps;
-                eng->fir_buf[i] = bc->sum * inv_n * combined;
+                eng->fir_buf[i] = bc->sum * inv_n * (gs + gstep * (double)i);
             }
         }
+        eng->prev_gain = (double)cfg->gain;
         /* Pre-SDM pre-emphasis (parallel/DAS path) */
         if (cfg->ml_enabled)
             engine_apply_preemph(eng, cfg, count);
@@ -612,16 +635,18 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
             eng->fir_buf[i] = (double)tls_fir_f2[i];
     }
 
-    /* Apply gain in double precision — rate-conversion path only.
-     * Same-rate path already applied gain inside the lowpass/boxcar block.
-     * Previously applied twice for same-rate, but this overdrives the SDM.
-     * Sequential path (engine_process_block) applies gain once. */
+    /* Apply gain ramp — rate-conversion path only.
+     * Same-rate path already applied gain inside the lowpass/boxcar block. */
     if (cfg->fs_in != fs_out_actual) {
-        double combined_gain = (double)eng->fir_gain * (double)cfg->gain;
-        if (combined_gain != 1.0) {
+        double gs2 = (double)eng->fir_gain * eng->prev_gain;
+        double ge2 = (double)eng->fir_gain * (double)cfg->gain;
+        if (gs2 == 0.0) gs2 = ge2;
+        if (gs2 != 1.0 || ge2 != 1.0) {
+            double step2 = (fir_count > 1) ? (ge2 - gs2) / (double)(fir_count - 1) : 0.0;
             for (size_t i = 0; i < fir_count; i++)
-                eng->fir_buf[i] *= combined_gain;
+                eng->fir_buf[i] *= gs2 + step2 * (double)i;
         }
+        eng->prev_gain = (double)cfg->gain;
     }
 
     *fir_out_ptr = eng->fir_buf;

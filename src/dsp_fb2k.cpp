@@ -2908,7 +2908,7 @@ private:
         m_async.channels = channels;
         m_async.pcm_rate = pcm_rate;
         m_async.out_pcm_rate = out_pcm_rate;
-        m_async.batch_frames = (int)(pcm_rate / 2); /* ~500ms */
+        m_async.batch_frames = (int)(pcm_rate / 5); /* ~200ms — safe margin for volume changes */
         m_async.batch_in_bytes = m_async.batch_frames * channels * (int)sizeof(float);
         m_async.batch_out_bytes = m_async.batch_frames * channels * 3;
 
