@@ -715,9 +715,9 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         bool have_model = false;
         uint32_t fs_out = s->config.fs_out ? s->config.fs_out : dsd_rate;
 
-        /* Try preemph taps model first (for DSD512 same-rate pre-SDM).
+        /* Try preemph taps model first (all DSD rates).
          * Taps model: lightweight MLP only. Features + FIR on CPU. */
-        if (dsd_rate >= DSD_RATE_512) {
+        {
             /* Prefer taps model (2.8 KB, fast) over full pipeline (8.9 KB, slow) */
             have_model = resolve_ml_model_path_ex(model_path, MAX_PATH,
                 L"foo_dsd_trellis_preemph_taps.onnx");

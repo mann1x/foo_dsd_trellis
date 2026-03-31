@@ -282,6 +282,24 @@ void engine_channel_warmup(engine_channel_t *eng, const float *in,
     free(tmp);
 }
 
+/* Pre-SDM pre-emphasis: extract features, predict adaptive FIR taps, apply.
+ * Uses ONNX GPU inference if available, falls back to embedded CPU MLP. */
+static void engine_apply_preemph(engine_channel_t *eng,
+                                  const dsd_config_t *cfg, size_t count) {
+    size_t feat_n = count < 4096 ? count : 4096;
+    float centroid = preemph_spectral_centroid(eng->fir_buf, feat_n, (double)cfg->fs_in);
+    float rms = preemph_rms(eng->fir_buf, feat_n);
+    float crest = preemph_crest_factor(eng->fir_buf, feat_n);
+    float taps[3];
+    if (eng->ml_filter) {
+        float features[3] = { centroid, rms, crest };
+        onnx_filter_predict_taps(eng->ml_filter, features, taps);
+    } else {
+        preemph_predict_taps(centroid, rms, crest, taps);
+    }
+    preemph_apply(eng->fir_buf, count, taps);
+}
+
 size_t engine_process_block(engine_channel_t *eng,
                             const float *in, float *out,
                             size_t count, const dsd_config_t *cfg) {
@@ -339,22 +357,10 @@ size_t engine_process_block(engine_channel_t *eng,
                     eng->fir_buf[i] = bc->sum * inv_n * combined;
                 }
             }
-            /* Pre-SDM pre-emphasis (ML model, DSD512 only).
+            /* Pre-SDM pre-emphasis (ML model, all DSD rates).
              * Features on CPU (subsampled), MLP via ONNX on GPU, FIR on CPU. */
-            if (cfg->ml_enabled && cfg->fs_in >= DSD_RATE_512) {
-                size_t feat_n = count < 4096 ? count : 4096;
-                float centroid = preemph_spectral_centroid(eng->fir_buf, feat_n, (double)cfg->fs_in);
-                float rms = preemph_rms(eng->fir_buf, feat_n);
-                float crest = preemph_crest_factor(eng->fir_buf, feat_n);
-                float taps[3];
-                if (eng->ml_filter) {
-                    float features[3] = { centroid, rms, crest };
-                    onnx_filter_predict_taps(eng->ml_filter, features, taps);
-                } else {
-                    preemph_predict_taps(centroid, rms, crest, taps);
-                }
-                preemph_apply(eng->fir_buf, count, taps);
-            }
+            if (cfg->ml_enabled)
+                engine_apply_preemph(eng, cfg, count);
             /* Re-encode via SDM (CPU only) */
             size_t sdm_out;
             if (eng->sdm_mode == SDM_MODE_PRECORR)
@@ -575,20 +581,8 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
             }
         }
         /* Pre-SDM pre-emphasis (parallel/DAS path) */
-        if (cfg->ml_enabled && cfg->fs_in >= DSD_RATE_512) {
-            size_t feat_n = count < 4096 ? count : 4096;
-            float centroid = preemph_spectral_centroid(eng->fir_buf, feat_n, (double)cfg->fs_in);
-            float rms = preemph_rms(eng->fir_buf, feat_n);
-            float crest = preemph_crest_factor(eng->fir_buf, feat_n);
-            float taps[3];
-            if (eng->ml_filter) {
-                float features[3] = { centroid, rms, crest };
-                onnx_filter_predict_taps(eng->ml_filter, features, taps);
-            } else {
-                preemph_predict_taps(centroid, rms, crest, taps);
-            }
-            preemph_apply(eng->fir_buf, count, taps);
-        }
+        if (cfg->ml_enabled)
+            engine_apply_preemph(eng, cfg, count);
         fir_count = count;
     } else if (eng->fir.use_fp64) {
         /* Rate conversion: FP64 path — widen input, FIR in fp64, output double directly */
