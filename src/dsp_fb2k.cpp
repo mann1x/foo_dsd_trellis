@@ -79,6 +79,30 @@ int    config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size
 void   config_validate(dsd_config_t *cfg);
 }
 
+/* ─── Advanced Preferences: HTTP REST API ─── */
+
+// {F8A3B1C2-4D5E-6F70-8192-A3B4C5D6E7F8}
+static const GUID guid_advconfig_branch_trellis =
+    { 0xf8a3b1c2, 0x4d5e, 0x6f70, { 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8 } };
+// {F8A3B1C2-4D5E-6F70-8192-A3B4C5D6E7F9}
+static const GUID guid_advconfig_api_enabled =
+    { 0xf8a3b1c2, 0x4d5e, 0x6f70, { 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf9 } };
+// {F8A3B1C2-4D5E-6F70-8192-A3B4C5D6E7FA}
+static const GUID guid_advconfig_api_port =
+    { 0xf8a3b1c2, 0x4d5e, 0x6f70, { 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xfa } };
+
+static advconfig_branch_factory g_adv_branch(
+    "DSD Trellis", guid_advconfig_branch_trellis,
+    advconfig_entry::guid_branch_tools, 0);
+
+static advconfig_checkbox_factory g_adv_api_enabled(
+    "Enable HTTP REST API", guid_advconfig_api_enabled,
+    guid_advconfig_branch_trellis, 0, false);
+
+static advconfig_integer_factory_<uint64_t> g_adv_api_port(
+    "HTTP REST API port", guid_advconfig_api_port,
+    guid_advconfig_branch_trellis, 1, 8881, 1024, 65535);
+
 /* ─── Rate map display helpers ─── */
 
 static const wchar_t *g_rate_names[RATE_MAP_COUNT] = {
@@ -1801,13 +1825,14 @@ public:
 
         trellis_log("initialized (fir=%s)", fir_ipp_kernel_name());
 
-        /* Start REST API server (only when debug log is enabled) */
-        if (m_config.api_port > 0 && m_config.debug_log) {
-            m_httpapi = httpapi_create(m_config.api_port, &m_config);
+        /* Start REST API server (Advanced Preferences) */
+        if (g_adv_api_enabled.get()) {
+            uint16_t api_port = (uint16_t)g_adv_api_port.get();
+            m_httpapi = httpapi_create(api_port, &m_config);
             if (m_httpapi)
-                trellis_log("REST API listening on 127.0.0.1:%u", (unsigned)m_config.api_port);
+                trellis_log("REST API listening on 127.0.0.1:%u", (unsigned)api_port);
             else
-                trellis_log("REST API failed to start on port %u", (unsigned)m_config.api_port);
+                trellis_log("REST API failed to start on port %u", (unsigned)api_port);
         }
     }
 
