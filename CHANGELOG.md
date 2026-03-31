@@ -5,6 +5,24 @@ All notable changes to foo_dsd_trellis will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-03-31
+
+### Fixed
+- **DSD256+ stutter on small-chunk ASIO outputs**: Some foobar2000 installs deliver 13.3ms chunks instead of 1-second chunks. The parallel SDM processing blocked `on_chunk()` for ~350ms, starving the ASIO output. Now uses a dedicated processing thread with lock-free SPSC ring buffers — `on_chunk()` returns in <1ms, batches process asynchronously on a background thread with ~500ms latency.
+
+### Added
+- **Lock-free SPSC ring buffer** (`include/ringbuf.h`): PortAudio-style byte ring buffer with monotonic atomic counters, power-of-two capacity, no locks in hot path.
+- **Async batch processor**: Dedicated thread with THREAD_PRIORITY_HIGHEST processes ~500ms batches while the audio thread handles I/O. Double-buffered: processing fills output ring while `on_chunk()` drains it.
+- **Pre-SDM ML pre-emphasis for all DSD rates**: Previously DSD512-only, now enabled at all rates. Training data and model already supported all rates.
+- **Advanced Preferences**: HTTP REST API enable/disable and port configuration under Tools → DSD Trellis (default: disabled).
+- **MIT License**
+
+### Changed
+- **HTTP REST API**: No longer starts automatically. Must be explicitly enabled in Advanced Preferences.
+- **DSD512 Auto mode**: Par4 (was Par8) — faster due to less L3 cache contention (0.52x vs 0.60x RT).
+- **DSD256 Auto mode**: Par2 with quality-search DAS (0 >20x spikes measured).
+- **Engine code cleanup**: Pre-emphasis logic deduplicated into `engine_apply_preemph()` helper.
+
 ## [1.0.0] - 2026-03-30
 
 Initial public release.
@@ -58,4 +76,5 @@ Initial public release.
 - ONNX model runtime-loaded via DirectML
 - Causal dilated CNN for DSD quantization noise reduction
 
+[1.0.1]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.1
 [1.0.0]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.0

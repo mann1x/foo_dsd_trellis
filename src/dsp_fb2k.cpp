@@ -25,6 +25,7 @@ extern "C" {
 #include "../include/fir.h"
 #include "../include/cpuset.h"
 #include "../include/httpapi.h"
+#include "../include/ringbuf.h"
 #include "../include/dop.h"
 #include "../include/engine.h"
 #include "../include/ntf.h"
@@ -1838,6 +1839,7 @@ public:
 
     ~dsp_dsd_trellis() {
         trellis_log("shutting down");
+        async_shutdown();
         httpapi_destroy(m_httpapi);
         log_set_enabled(false);
         plugin_destroy(m_state);
@@ -2100,8 +2102,66 @@ public:
                 }
             }
 
-            out_frames = plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
-                                        pcm_frames, (int)channels, pcm_rate);
+            /* Check for small chunks — use async batch processing */
+            double chunk_ms = (double)pcm_frames / (double)pcm_rate * 1000.0;
+
+            if (chunk_ms >= 100.0) {
+                /* Large chunk: direct processing (test install / normal path) */
+                if (m_async.active) async_shutdown();
+                out_frames = plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
+                                            pcm_frames, (int)channels, pcm_rate);
+            } else {
+                /* Small chunk: async batch processing.
+                 * on_chunk returns in <1ms. Processing on dedicated thread. */
+                uint32_t dop_pcm_rate = chunk_cfg.fs_out ? chunk_cfg.fs_out / 16 : pcm_rate;
+
+                if (!m_async.active) {
+                    async_init((int)channels, pcm_rate, dop_pcm_rate);
+                    /* Emit initial silence for latency fill (~500ms) */
+                    int sil_ms = (int)((double)m_async.batch_frames / pcm_rate * 1000.0);
+                    insert_silence_chunk((int)channels, dop_pcm_rate, true, sil_ms);
+                    trellis_log("async: initial %dms silence lead-in", sil_ms);
+                }
+
+                /* Push input to ring buffer (<0.1ms) */
+                int in_bytes = (int)(pcm_frames * channels * sizeof(float));
+                ringbuf_write(&m_async.input, in_f32.get_ptr(), in_bytes);
+
+                /* Signal proc thread if batch accumulated */
+                if (ringbuf_available(&m_async.input) >= m_async.batch_in_bytes)
+                    SetEvent(m_async.input_ready);
+
+                /* Pull output from ring buffer */
+                int out_bytes_needed = (int)(pcm_frames * channels * 3);
+                if (ringbuf_available(&m_async.output) >= out_bytes_needed) {
+                    pfc::array_staticsize_t<uint8_t> drain_buf;
+                    drain_buf.set_size_discard((size_t)out_bytes_needed);
+                    ringbuf_read(&m_async.output, drain_buf.get_ptr(), out_bytes_needed);
+
+                    /* Insert processed output chunk */
+                    audio_chunk_impl out_chunk;
+                    out_chunk.set_data_fixedpoint_ex(
+                        drain_buf.get_ptr(), (size_t)out_bytes_needed,
+                        dop_pcm_rate, channels, 24,
+                        audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
+                        audio_chunk::g_guess_channel_config(channels));
+                    insert_chunk(out_chunk);
+                } else {
+                    /* No output yet (filling) or underrun: emit silence */
+                    insert_silence_chunk((int)channels, dop_pcm_rate, true,
+                                          (int)(chunk_ms + 0.5));
+                }
+
+                /* Track output state for anti-pop */
+                m_last_out_pcm_rate = dop_pcm_rate;
+                m_last_out_is_dop = true;
+                m_last_channels = (int)channels;
+                m_last_pcm_rate = pcm_rate;
+                m_last_is_dop_input = true;
+                m_chunk_count++;
+                m_logged_processing = true;
+                return false; /* drop original chunk — we inserted output above */
+            }
 
         } else if (is_dop && dsd_pcm_cross) {
             /* Cross-family DSD→PCM: 2-stage pipeline
@@ -2470,6 +2530,37 @@ public:
         if (!m_state || m_channels == 0)
             return;
 
+        /* Drain async processor */
+        if (m_async.active && m_async.thread) {
+            InterlockedExchange(&m_async.state, ASYNC_DRAINING);
+            SetEvent(m_async.input_ready);
+            /* Wait for processing thread to finish draining */
+            WaitForSingleObject(m_async.thread, 3000);
+
+            /* Emit remaining output via insert_chunk */
+            int ch = m_async.channels;
+            int frame_bytes = ch * 3;
+            while (ringbuf_available(&m_async.output) >= frame_bytes) {
+                int avail = ringbuf_available(&m_async.output);
+                int emit_frames = avail / frame_bytes;
+                if (emit_frames > 8192) emit_frames = 8192;
+                int emit_bytes = emit_frames * frame_bytes;
+
+                pfc::array_staticsize_t<uint8_t> buf;
+                buf.set_size_discard((size_t)emit_bytes);
+                ringbuf_read(&m_async.output, buf.get_ptr(), emit_bytes);
+
+                audio_chunk_impl out;
+                out.set_data_fixedpoint_ex(
+                    buf.get_ptr(), (size_t)emit_bytes,
+                    m_async.out_pcm_rate, (unsigned)ch, 24,
+                    audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
+                    audio_chunk::g_guess_channel_config((unsigned)ch));
+                insert_chunk(out);
+            }
+            async_shutdown();
+        }
+
         /* Drain SDM latency — but NOT when antipop preserves SDM state,
          * because sdm_drain feeds zeros and sets draining=1, corrupting
          * the preserved state for the next play (crash on rapid stop→play). */
@@ -2519,6 +2610,7 @@ public:
     void on_endoftrack(abort_callback & /*abort*/) override {}
 
     void flush() override {
+        async_shutdown();
         plugin_flush(m_state);
         m_logged_passthrough = false;
         m_logged_processing = false;
@@ -2527,7 +2619,15 @@ public:
     }
 
     double get_latency() override {
-        return plugin_get_latency(m_state);
+        double lat = plugin_get_latency(m_state);
+        if (m_async.active && m_async.out_pcm_rate > 0) {
+            int in_bytes = ringbuf_available(&m_async.input);
+            int out_bytes = ringbuf_available(&m_async.output);
+            int in_frames = in_bytes / (m_async.channels * (int)sizeof(float));
+            int out_frames = out_bytes / (m_async.channels * 3);
+            lat += (double)(in_frames + out_frames) / m_async.out_pcm_rate;
+        }
+        return lat;
     }
 
     bool need_track_change_mark() override {
@@ -2712,6 +2812,145 @@ private:
     bool             m_thread_pinned = false;
     bool             m_logged_processing = false;
     unsigned         m_chunk_count = 0;
+
+    /* ── Async chunk accumulation for small ASIO chunks ──
+     * Dedicated processing thread + lock-free ring buffers.
+     * on_chunk() pushes input / pulls output in <1ms.
+     * Processing thread runs plugin_process() on ~500ms batches. */
+    enum { ASYNC_FILLING = 0, ASYNC_RUNNING = 1, ASYNC_DRAINING = 2, ASYNC_STOPPED = 3 };
+    struct {
+        ringbuf_t    input;
+        ringbuf_t    output;
+        HANDLE       thread;
+        HANDLE       input_ready;   /* auto-reset: batch accumulated */
+        HANDLE       stop_event;    /* manual-reset: shutdown */
+        volatile LONG state;
+        int          batch_frames;  /* target: ~500ms of PCM frames */
+        int          batch_in_bytes;  /* batch_frames * channels * sizeof(float) */
+        int          batch_out_bytes; /* batch_frames * channels * 3 (i24) */
+        int          channels;
+        unsigned     pcm_rate;
+        uint32_t     out_pcm_rate;
+        float       *proc_in;
+        uint8_t     *proc_out;
+        size_t       proc_out_alloc;
+        bool         active;
+        bool         silence_emitted;
+    } m_async = {};
+
+    static DWORD WINAPI async_proc_thread(LPVOID param) {
+        dsp_dsd_trellis *self = (dsp_dsd_trellis *)param;
+        auto &a = self->m_async;
+
+        /* High priority for processing thread */
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
+        HANDLE events[2] = { a.input_ready, a.stop_event };
+
+        while (1) {
+            DWORD wait = WaitForMultipleObjects(2, events, FALSE, 200);
+            if (wait == WAIT_OBJECT_0 + 1) break; /* stop_event */
+
+            LONG state = InterlockedCompareExchange(&a.state, 0, 0);
+            if (state == ASYNC_STOPPED) break;
+
+            int avail = ringbuf_available(&a.input);
+            bool draining = (state == ASYNC_DRAINING);
+
+            /* Process batch if enough input, or partial batch if draining */
+            int to_process_bytes = 0;
+            int to_process_frames = 0;
+            if (avail >= a.batch_in_bytes) {
+                to_process_bytes = a.batch_in_bytes;
+                to_process_frames = a.batch_frames;
+            } else if (draining && avail > 0) {
+                /* Partial batch: round down to frame boundary */
+                int frame_bytes = a.channels * (int)sizeof(float);
+                to_process_frames = avail / frame_bytes;
+                to_process_bytes = to_process_frames * frame_bytes;
+            }
+
+            if (to_process_frames > 0 && a.proc_in && a.proc_out) {
+                ringbuf_read(&a.input, a.proc_in, to_process_bytes);
+
+                /* Ensure output buffer is large enough */
+                size_t out_need = (size_t)to_process_frames * a.channels * 3 * 8;
+                if (out_need > a.proc_out_alloc) {
+                    uint8_t *p = (uint8_t *)realloc(a.proc_out, out_need);
+                    if (p) { a.proc_out = p; a.proc_out_alloc = out_need; }
+                }
+
+                size_t out_frames = plugin_process(self->m_state,
+                    a.proc_in, a.proc_out,
+                    (size_t)to_process_frames, a.channels, a.pcm_rate);
+
+                if (out_frames > 0) {
+                    int out_bytes = (int)(out_frames * a.channels * 3);
+                    ringbuf_write(&a.output, a.proc_out, out_bytes);
+                }
+
+                /* Transition from FILLING to RUNNING after first batch */
+                if (state == ASYNC_FILLING)
+                    InterlockedCompareExchange(&a.state, ASYNC_RUNNING, ASYNC_FILLING);
+
+                if (draining && ringbuf_available(&a.input) == 0)
+                    InterlockedExchange(&a.state, ASYNC_STOPPED);
+            }
+        }
+
+        /* Thread exits */
+        return 0;
+    }
+
+    void async_init(int channels, unsigned pcm_rate, uint32_t out_pcm_rate) {
+        async_shutdown();
+
+        m_async.channels = channels;
+        m_async.pcm_rate = pcm_rate;
+        m_async.out_pcm_rate = out_pcm_rate;
+        m_async.batch_frames = (int)(pcm_rate / 2); /* ~500ms */
+        m_async.batch_in_bytes = m_async.batch_frames * channels * (int)sizeof(float);
+        m_async.batch_out_bytes = m_async.batch_frames * channels * 3;
+
+        /* Ring buffers: 4× batch size for headroom, power of 2 */
+        ringbuf_init(&m_async.input, m_async.batch_in_bytes * 4);
+        ringbuf_init(&m_async.output, m_async.batch_out_bytes * 4);
+
+        /* Processing buffers */
+        m_async.proc_in = (float *)malloc((size_t)m_async.batch_in_bytes * 2);
+        m_async.proc_out_alloc = (size_t)m_async.batch_out_bytes * 2;
+        m_async.proc_out = (uint8_t *)malloc(m_async.proc_out_alloc);
+
+        m_async.input_ready = CreateEventW(NULL, FALSE, FALSE, NULL); /* auto-reset */
+        m_async.stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);   /* manual-reset */
+        InterlockedExchange(&m_async.state, ASYNC_FILLING);
+        m_async.active = true;
+        m_async.silence_emitted = false;
+
+        m_async.thread = CreateThread(NULL, 0, async_proc_thread, this, 0, NULL);
+        if (m_async.thread)
+            trellis_log("async: started proc thread, batch=%d frames (%.0fms)",
+                        m_async.batch_frames,
+                        (double)m_async.batch_frames / pcm_rate * 1000.0);
+    }
+
+    void async_shutdown() {
+        if (m_async.thread) {
+            SetEvent(m_async.stop_event);
+            WaitForSingleObject(m_async.thread, 2000);
+            CloseHandle(m_async.thread);
+            m_async.thread = NULL;
+        }
+        if (m_async.input_ready) { CloseHandle(m_async.input_ready); m_async.input_ready = NULL; }
+        if (m_async.stop_event) { CloseHandle(m_async.stop_event); m_async.stop_event = NULL; }
+        ringbuf_free(&m_async.input);
+        ringbuf_free(&m_async.output);
+        free(m_async.proc_in); m_async.proc_in = NULL;
+        free(m_async.proc_out); m_async.proc_out = NULL;
+        m_async.proc_out_alloc = 0;
+        m_async.active = false;
+        m_async.silence_emitted = false;
+    }
 
     /* Anti-pop / deferred output state */
     bool             m_antipop_pending = true;         /* insert lead-in on first chunk */
