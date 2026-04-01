@@ -1839,7 +1839,7 @@ public:
 
     ~dsp_dsd_trellis() {
         trellis_log("shutting down");
-        async_shutdown();
+        accum_shutdown();
         httpapi_destroy(m_httpapi);
         log_set_enabled(false);
         plugin_destroy(m_state);
@@ -2047,7 +2047,10 @@ public:
                         chunk_cfg.trellis_cands, chunk_cfg.trellis_depth, chunk_cfg.trellis_lat,
                         (int)chunk_cfg.fir_gain_db, chunk_cfg.fs_in, chunk_cfg.fs_out);
         }
-        plugin_set_config(m_state, &chunk_cfg);
+        /* During accum mode, worker thread owns plugin_set_config.
+         * Config is passed via work_cfg snapshot when batch is submitted. */
+        if (!m_accum.active)
+            plugin_set_config(m_state, &chunk_cfg);
 
         /* Log actual engine config on first few chunks */
         if (m_chunk_count < 3) {
@@ -2102,57 +2105,96 @@ public:
                 }
             }
 
-            /* Check for small chunks — use async batch processing */
+            /* Check for small chunks — use synchronous batch accumulation */
             double chunk_ms = (double)pcm_frames / (double)pcm_rate * 1000.0;
 
             if (chunk_ms >= 100.0) {
-                /* Large chunk: direct processing (test install / normal path) */
-                if (m_async.active) async_shutdown();
+                /* Large chunk: direct processing */
+                if (m_accum.active) accum_shutdown();
                 out_frames = plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
                                             pcm_frames, (int)channels, pcm_rate);
             } else {
-                /* Small chunk: async batch processing.
-                 * on_chunk returns in <1ms. Processing on dedicated thread. */
+                /* Small chunk: accumulate, batch-process, drain.
+                 * All synchronous — no threads, no races. */
                 uint32_t dop_pcm_rate = chunk_cfg.fs_out ? chunk_cfg.fs_out / 16 : pcm_rate;
 
-                if (!m_async.active) {
-                    async_init((int)channels, pcm_rate, dop_pcm_rate);
-                    /* Emit initial silence for latency fill (~500ms) */
-                    int sil_ms = (int)((double)m_async.batch_frames / pcm_rate * 1000.0);
-                    insert_silence_chunk((int)channels, dop_pcm_rate, true, sil_ms);
-                    trellis_log("async: initial %dms silence lead-in", sil_ms);
+                if (!m_accum.active) {
+                    accum_init((int)channels, pcm_rate, dop_pcm_rate);
+                    /* Force engine + GPU init NOW (before accumulation).
+                     * Without this, init is deferred to the first batch
+                     * and blocks for ~500ms (GPU probe + create + SDM setup). */
+                    plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
+                                   0, (int)channels, pcm_rate);
                 }
 
-                /* Push input to ring buffer (<0.1ms) */
-                int in_bytes = (int)(pcm_frames * channels * sizeof(float));
-                ringbuf_write(&m_async.input, in_f32.get_ptr(), in_bytes);
-
-                /* Signal proc thread if batch accumulated */
-                if (ringbuf_available(&m_async.input) >= m_async.batch_in_bytes)
-                    SetEvent(m_async.input_ready);
-
-                /* Pull output from ring buffer */
-                int out_bytes_needed = (int)(pcm_frames * channels * 3);
-                if (ringbuf_available(&m_async.output) >= out_bytes_needed) {
-                    pfc::array_staticsize_t<uint8_t> drain_buf;
-                    drain_buf.set_size_discard((size_t)out_bytes_needed);
-                    ringbuf_read(&m_async.output, drain_buf.get_ptr(), out_bytes_needed);
-
-                    /* Insert processed output chunk */
-                    audio_chunk_impl out_chunk;
-                    out_chunk.set_data_fixedpoint_ex(
-                        drain_buf.get_ptr(), (size_t)out_bytes_needed,
-                        dop_pcm_rate, channels, 24,
-                        audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
-                        audio_chunk::g_guess_channel_config(channels));
-                    insert_chunk(out_chunk);
-                } else {
-                    /* No output yet (filling) or underrun: emit silence */
-                    insert_silence_chunk((int)channels, dop_pcm_rate, true,
-                                          (int)(chunk_ms + 0.5));
+                /* 1. Check if worker finished — only swap when current drain is done.
+                 * If drain is done but worker still busy, BLOCK briefly.
+                 * The worker has been running for ~200ms (accumulation time),
+                 * so it should be nearly done — wait is at most a few ms.
+                 * This avoids raw DoP passthrough which causes garbling. */
+                int cur_remaining = m_accum.out_total - m_accum.out_pos;
+                if (m_accum.worker_busy && cur_remaining <= 0) {
+                    /* Block until worker finishes — never passthrough raw DoP */
+                    DWORD wr = WaitForSingleObject(m_accum.batch_done, 500);
+                    if (wr == WAIT_OBJECT_0) {
+                        m_accum.drain_idx = m_accum.work_write_idx;
+                        m_accum.out_total = (int)InterlockedCompareExchange(
+                            &m_accum.work_result, 0, 0);
+                        m_accum.out_pos = 0;
+                        m_accum.worker_busy = false;
+                        m_accum.primed = true;
+                    }
                 }
 
-                /* Track output state for anti-pop */
+                /* 2. Append input to accumulation buffer (always, before drain) */
+                int need = m_accum.in_frames + (int)pcm_frames;
+                if (need > m_accum.in_alloc) {
+                    m_accum.in_alloc = need * 2;
+                    m_accum.in_buf = (float *)realloc(m_accum.in_buf,
+                        (size_t)m_accum.in_alloc * channels * sizeof(float));
+                }
+                memcpy(m_accum.in_buf + (size_t)m_accum.in_frames * channels,
+                       in_f32.get_ptr(), pcm_frames * channels * sizeof(float));
+                m_accum.in_frames += (int)pcm_frames;
+
+                /* 3. Submit batch to worker when enough input AND worker is idle.
+                 * Cap at batch_target to avoid huge batches from passthrough accumulation. */
+                if (m_accum.in_frames >= m_accum.batch_target && !m_accum.worker_busy) {
+                    int proc_frames = m_accum.batch_target;
+                    int write_idx = 1 - m_accum.drain_idx;
+
+                    size_t out_need = (size_t)proc_frames * channels * 3 * 8;
+                    if ((int)out_need > m_accum.out_alloc) {
+                        m_accum.out_alloc = (int)out_need;
+                        m_accum.out_buf[0] = (uint8_t *)realloc(m_accum.out_buf[0], out_need);
+                        m_accum.out_buf[1] = (uint8_t *)realloc(m_accum.out_buf[1], out_need);
+                    }
+                    if (proc_frames > m_accum.work_alloc) {
+                        m_accum.work_alloc = proc_frames * 2;
+                        m_accum.work_buf = (float *)realloc(m_accum.work_buf,
+                            (size_t)m_accum.work_alloc * channels * sizeof(float));
+                    }
+
+                    memcpy(m_accum.work_buf, m_accum.in_buf,
+                           (size_t)proc_frames * channels * sizeof(float));
+                    m_accum.work_frames = proc_frames;
+                    m_accum.work_write_idx = write_idx;
+                    m_accum.work_cfg = chunk_cfg;
+                    m_accum.worker_busy = true;
+
+                    /* Shift leftover input to front of buffer */
+                    int leftover = m_accum.in_frames - proc_frames;
+                    if (leftover > 0) {
+                        memmove(m_accum.in_buf,
+                                m_accum.in_buf + (size_t)proc_frames * channels,
+                                (size_t)leftover * channels * sizeof(float));
+                    }
+                    m_accum.in_frames = leftover;
+
+                    SetEvent(m_accum.batch_ready);
+                }
+
+                /* Track state for anti-pop */
                 m_last_out_pcm_rate = dop_pcm_rate;
                 m_last_out_is_dop = true;
                 m_last_channels = (int)channels;
@@ -2160,7 +2202,41 @@ public:
                 m_last_is_dop_input = true;
                 m_chunk_count++;
                 m_logged_processing = true;
-                return false; /* drop original chunk — we inserted output above */
+
+                /* 4. Drain output or passthrough */
+                int remaining = m_accum.out_total - m_accum.out_pos;
+                if (g_log_enabled && m_chunk_count <= 30) {
+                    trellis_log("accum #%u: in=%d drain=%d/%d busy=%d primed=%d rem=%d",
+                                m_chunk_count, m_accum.in_frames, m_accum.out_pos,
+                                m_accum.out_total, (int)m_accum.worker_busy,
+                                (int)m_accum.primed, remaining);
+                }
+                if (remaining > 0) {
+                    /* Overwrite the input chunk with processed output */
+                    int drain = ((int)pcm_frames < remaining) ? (int)pcm_frames : remaining;
+                    int drain_bytes = drain * (int)channels * 3;
+                    int offset_bytes = m_accum.out_pos * (int)channels * 3;
+
+                    chunk->set_data_fixedpoint_ex(
+                        m_accum.out_buf[m_accum.drain_idx] + offset_bytes,
+                        (size_t)drain_bytes,
+                        dop_pcm_rate, channels, 24,
+                        audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
+                        audio_chunk::g_guess_channel_config(channels));
+                    m_accum.out_pos += drain;
+                    return true; /* keep modified chunk */
+                } else if (!m_accum.primed) {
+                    /* Initial fill: overwrite with silence */
+                    insert_silence_chunk((int)channels, dop_pcm_rate, true,
+                                          (int)(chunk_ms + 0.5));
+                    return false;
+                } else {
+                    /* Should not reach here — worker wait above ensures
+                     * drain is always available. Safety: emit silence. */
+                    insert_silence_chunk((int)channels, dop_pcm_rate, true,
+                                          (int)(chunk_ms + 0.5));
+                    return false;
+                }
             }
 
         } else if (is_dop && dsd_pcm_cross) {
@@ -2530,35 +2606,55 @@ public:
         if (!m_state || m_channels == 0)
             return;
 
-        /* Drain async processor */
-        if (m_async.active && m_async.thread) {
-            InterlockedExchange(&m_async.state, ASYNC_DRAINING);
-            SetEvent(m_async.input_ready);
-            /* Wait for processing thread to finish draining */
-            WaitForSingleObject(m_async.thread, 3000);
+        if (m_accum.active) {
+            int ch = m_accum.channels;
 
-            /* Emit remaining output via insert_chunk */
-            int ch = m_async.channels;
-            int frame_bytes = ch * 3;
-            while (ringbuf_available(&m_async.output) >= frame_bytes) {
-                int avail = ringbuf_available(&m_async.output);
-                int emit_frames = avail / frame_bytes;
-                if (emit_frames > 8192) emit_frames = 8192;
-                int emit_bytes = emit_frames * frame_bytes;
+            /* Wait for worker to finish if busy */
+            if (m_accum.worker_busy && m_accum.batch_done) {
+                WaitForSingleObject(m_accum.batch_done, 3000);
+                m_accum.drain_idx = m_accum.work_write_idx;
+                m_accum.out_total = (int)InterlockedCompareExchange(&m_accum.work_result, 0, 0);
+                m_accum.out_pos = 0;
+                m_accum.worker_busy = false;
+            }
 
-                pfc::array_staticsize_t<uint8_t> buf;
-                buf.set_size_discard((size_t)emit_bytes);
-                ringbuf_read(&m_async.output, buf.get_ptr(), emit_bytes);
-
+            /* Drain remaining output from current drain buffer */
+            if (m_accum.out_pos < m_accum.out_total) {
+                int remaining = m_accum.out_total - m_accum.out_pos;
+                int emit_bytes = remaining * ch * 3;
+                int offset_bytes = m_accum.out_pos * ch * 3;
                 audio_chunk_impl out;
                 out.set_data_fixedpoint_ex(
-                    buf.get_ptr(), (size_t)emit_bytes,
-                    m_async.out_pcm_rate, (unsigned)ch, 24,
+                    m_accum.out_buf[m_accum.drain_idx] + offset_bytes, (size_t)emit_bytes,
+                    m_accum.out_pcm_rate, (unsigned)ch, 24,
                     audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
                     audio_chunk::g_guess_channel_config((unsigned)ch));
                 insert_chunk(out);
             }
-            async_shutdown();
+
+            /* Process any remaining accumulated input (synchronous, end of stream) */
+            if (m_accum.in_frames > 0) {
+                int write_idx = 1 - m_accum.drain_idx;
+                size_t out_need = (size_t)m_accum.in_frames * ch * 3 * 8;
+                if ((int)out_need > m_accum.out_alloc) {
+                    m_accum.out_alloc = (int)out_need;
+                    m_accum.out_buf[0] = (uint8_t *)realloc(m_accum.out_buf[0], out_need);
+                    m_accum.out_buf[1] = (uint8_t *)realloc(m_accum.out_buf[1], out_need);
+                }
+                size_t result = plugin_process(m_state, m_accum.in_buf,
+                    m_accum.out_buf[write_idx], (size_t)m_accum.in_frames, ch, m_accum.pcm_rate);
+                if (result > 0) {
+                    int emit_bytes = (int)(result * ch * 3);
+                    audio_chunk_impl out;
+                    out.set_data_fixedpoint_ex(
+                        m_accum.out_buf[write_idx], (size_t)emit_bytes,
+                        m_accum.out_pcm_rate, (unsigned)ch, 24,
+                        audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
+                        audio_chunk::g_guess_channel_config((unsigned)ch));
+                    insert_chunk(out);
+                }
+                m_accum.in_frames = 0;
+            }
         }
 
         /* Drain SDM latency — but NOT when antipop preserves SDM state,
@@ -2610,7 +2706,7 @@ public:
     void on_endoftrack(abort_callback & /*abort*/) override {}
 
     void flush() override {
-        async_shutdown();
+        accum_shutdown();
         plugin_flush(m_state);
         m_logged_passthrough = false;
         m_logged_processing = false;
@@ -2619,15 +2715,7 @@ public:
     }
 
     double get_latency() override {
-        double lat = plugin_get_latency(m_state);
-        if (m_async.active && m_async.out_pcm_rate > 0) {
-            int in_bytes = ringbuf_available(&m_async.input);
-            int out_bytes = ringbuf_available(&m_async.output);
-            int in_frames = in_bytes / (m_async.channels * (int)sizeof(float));
-            int out_frames = out_bytes / (m_async.channels * 3);
-            lat += (double)(in_frames + out_frames) / m_async.out_pcm_rate;
-        }
-        return lat;
+        return 0.0;
     }
 
     bool need_track_change_mark() override {
@@ -2813,143 +2901,136 @@ private:
     bool             m_logged_processing = false;
     unsigned         m_chunk_count = 0;
 
-    /* ── Async chunk accumulation for small ASIO chunks ──
-     * Dedicated processing thread + lock-free ring buffers.
-     * on_chunk() pushes input / pulls output in <1ms.
-     * Processing thread runs plugin_process() on ~500ms batches. */
-    enum { ASYNC_FILLING = 0, ASYNC_RUNNING = 1, ASYNC_DRAINING = 2, ASYNC_STOPPED = 3 };
+    /* ── Async chunk accumulation with worker thread ──
+     * on_chunk: accumulate input + drain output (<1ms, never blocks)
+     * Worker thread: plugin_process on batches (absorbs scheduling jitter)
+     * Double-buffered output: worker writes buf[write], on_chunk drains buf[drain] */
     struct {
-        ringbuf_t    input;
-        ringbuf_t    output;
+        /* Input accumulation (written by on_chunk only) */
+        float       *in_buf;
+        int          in_frames;
+        int          in_alloc;
+        /* Double-buffered output */
+        uint8_t     *out_buf[2];
+        int          out_alloc;     /* bytes per buffer */
+        int          out_total;     /* frames in drain buffer */
+        int          out_pos;       /* drain position */
+        int          drain_idx;     /* buffer being drained by on_chunk */
+        /* Worker thread */
         HANDLE       thread;
-        HANDLE       input_ready;   /* auto-reset: batch accumulated */
+        HANDLE       batch_ready;   /* auto-reset: input batch ready for worker */
+        HANDLE       batch_done;    /* auto-reset: worker finished processing */
         HANDLE       stop_event;    /* manual-reset: shutdown */
-        volatile LONG state;
-        int          batch_frames;  /* target: ~500ms of PCM frames */
-        int          batch_in_bytes;  /* batch_frames * channels * sizeof(float) */
-        int          batch_out_bytes; /* batch_frames * channels * 3 (i24) */
+        /* Batch handoff: on_chunk writes these, worker reads them */
+        float       *work_buf;      /* snapshot of input for worker */
+        int          work_frames;   /* frame count for worker */
+        int          work_alloc;    /* allocated capacity */
+        int          work_write_idx;/* which out_buf worker writes to */
+        volatile LONG work_result;  /* output frames from worker (atomic) */
+        /* Config snapshot for worker (avoids race on m_config) */
+        dsd_config_t work_cfg;
+        /* General */
+        int          batch_target;
         int          channels;
         unsigned     pcm_rate;
         uint32_t     out_pcm_rate;
-        float       *proc_in;
-        uint8_t     *proc_out;
-        size_t       proc_out_alloc;
         bool         active;
-        bool         silence_emitted;
-    } m_async = {};
+        bool         primed;
+        bool         worker_busy;   /* worker is currently processing */
+    } m_accum = {};
 
-    static DWORD WINAPI async_proc_thread(LPVOID param) {
+    static DWORD WINAPI accum_worker(LPVOID param) {
         dsp_dsd_trellis *self = (dsp_dsd_trellis *)param;
-        auto &a = self->m_async;
+        auto &a = self->m_accum;
 
-        /* High priority for processing thread */
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
-        HANDLE events[2] = { a.input_ready, a.stop_event };
-
-        while (1) {
-            DWORD wait = WaitForMultipleObjects(2, events, FALSE, 200);
-            if (wait == WAIT_OBJECT_0 + 1) break; /* stop_event */
-
-            LONG state = InterlockedCompareExchange(&a.state, 0, 0);
-            if (state == ASYNC_STOPPED) break;
-
-            int avail = ringbuf_available(&a.input);
-            bool draining = (state == ASYNC_DRAINING);
-
-            /* Process batch if enough input, or partial batch if draining */
-            int to_process_bytes = 0;
-            int to_process_frames = 0;
-            if (avail >= a.batch_in_bytes) {
-                to_process_bytes = a.batch_in_bytes;
-                to_process_frames = a.batch_frames;
-            } else if (draining && avail > 0) {
-                /* Partial batch: round down to frame boundary */
-                int frame_bytes = a.channels * (int)sizeof(float);
-                to_process_frames = avail / frame_bytes;
-                to_process_bytes = to_process_frames * frame_bytes;
-            }
-
-            if (to_process_frames > 0 && a.proc_in && a.proc_out) {
-                ringbuf_read(&a.input, a.proc_in, to_process_bytes);
-
-                /* Ensure output buffer is large enough */
-                size_t out_need = (size_t)to_process_frames * a.channels * 3 * 8;
-                if (out_need > a.proc_out_alloc) {
-                    uint8_t *p = (uint8_t *)realloc(a.proc_out, out_need);
-                    if (p) { a.proc_out = p; a.proc_out_alloc = out_need; }
+        /* Pin to a selected core from cpuset (avoid LP0 and hot cores).
+         * Use the last selected core — least likely to conflict with
+         * SDM workers which use the first cores. */
+        {
+            uint32_t ids[CPUSET_MAX_CPUS];
+            int n = plugin_get_selected_cores(self->m_state, ids, CPUSET_MAX_CPUS);
+            if (n > 0) {
+                ULONG cpuset_id = (ULONG)ids[n - 1]; /* last = least contended */
+                typedef BOOL (WINAPI *PFN)(HANDLE, const ULONG *, ULONG);
+                PFN pfn = (PFN)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                    "SetThreadSelectedCpuSets");
+                if (pfn) {
+                    pfn(GetCurrentThread(), &cpuset_id, 1);
+                    trellis_log("accum worker pinned to cpuset %u (LP%u)",
+                                cpuset_id, cpuset_id - 256);
                 }
-
-                size_t out_frames = plugin_process(self->m_state,
-                    a.proc_in, a.proc_out,
-                    (size_t)to_process_frames, a.channels, a.pcm_rate);
-
-                if (out_frames > 0) {
-                    int out_bytes = (int)(out_frames * a.channels * 3);
-                    ringbuf_write(&a.output, a.proc_out, out_bytes);
-                }
-
-                /* Transition from FILLING to RUNNING after first batch */
-                if (state == ASYNC_FILLING)
-                    InterlockedCompareExchange(&a.state, ASYNC_RUNNING, ASYNC_FILLING);
-
-                if (draining && ringbuf_available(&a.input) == 0)
-                    InterlockedExchange(&a.state, ASYNC_STOPPED);
             }
         }
 
-        /* Thread exits */
+        HANDLE events[2] = { a.batch_ready, a.stop_event };
+        while (1) {
+            DWORD wait = WaitForMultipleObjects(2, events, FALSE, 500);
+            if (wait == WAIT_OBJECT_0 + 1) break; /* stop */
+
+            if (wait == WAIT_OBJECT_0 && a.work_frames > 0) {
+                /* Apply config snapshot, then process */
+                plugin_set_config(self->m_state, &a.work_cfg);
+
+                size_t result = plugin_process(self->m_state,
+                    a.work_buf, a.out_buf[a.work_write_idx],
+                    (size_t)a.work_frames, a.channels, a.pcm_rate);
+
+                InterlockedExchange(&a.work_result, (LONG)result);
+                SetEvent(a.batch_done);
+            }
+        }
         return 0;
     }
 
-    void async_init(int channels, unsigned pcm_rate, uint32_t out_pcm_rate) {
-        async_shutdown();
+    void accum_init(int channels, unsigned pcm_rate, uint32_t out_pcm_rate) {
+        accum_shutdown();
+        m_accum.channels = channels;
+        m_accum.pcm_rate = pcm_rate;
+        m_accum.out_pcm_rate = out_pcm_rate;
+        m_accum.batch_target = (int)(pcm_rate / 5); /* ~200ms */
+        m_accum.in_alloc = m_accum.batch_target * 2;
+        m_accum.in_buf = (float *)malloc((size_t)m_accum.in_alloc * channels * sizeof(float));
+        m_accum.out_alloc = (int)((size_t)m_accum.batch_target * channels * 3 * 8);
+        m_accum.out_buf[0] = (uint8_t *)malloc((size_t)m_accum.out_alloc);
+        m_accum.out_buf[1] = (uint8_t *)malloc((size_t)m_accum.out_alloc);
+        m_accum.work_alloc = m_accum.in_alloc;
+        m_accum.work_buf = (float *)malloc((size_t)m_accum.work_alloc * channels * sizeof(float));
+        m_accum.in_frames = 0;
+        m_accum.out_total = 0;
+        m_accum.out_pos = 0;
+        m_accum.drain_idx = 0;
+        m_accum.work_frames = 0;
+        m_accum.work_result = 0;
+        m_accum.active = true;
+        m_accum.primed = false;
+        m_accum.worker_busy = false;
 
-        m_async.channels = channels;
-        m_async.pcm_rate = pcm_rate;
-        m_async.out_pcm_rate = out_pcm_rate;
-        m_async.batch_frames = (int)(pcm_rate / 5); /* ~200ms — safe margin for volume changes */
-        m_async.batch_in_bytes = m_async.batch_frames * channels * (int)sizeof(float);
-        m_async.batch_out_bytes = m_async.batch_frames * channels * 3;
+        m_accum.batch_ready = CreateEventW(NULL, FALSE, FALSE, NULL);
+        m_accum.batch_done = CreateEventW(NULL, FALSE, FALSE, NULL);
+        m_accum.stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+        m_accum.thread = CreateThread(NULL, 0, accum_worker, this, 0, NULL);
 
-        /* Ring buffers: 4× batch size for headroom, power of 2 */
-        ringbuf_init(&m_async.input, m_async.batch_in_bytes * 4);
-        ringbuf_init(&m_async.output, m_async.batch_out_bytes * 4);
-
-        /* Processing buffers */
-        m_async.proc_in = (float *)malloc((size_t)m_async.batch_in_bytes * 2);
-        m_async.proc_out_alloc = (size_t)m_async.batch_out_bytes * 2;
-        m_async.proc_out = (uint8_t *)malloc(m_async.proc_out_alloc);
-
-        m_async.input_ready = CreateEventW(NULL, FALSE, FALSE, NULL); /* auto-reset */
-        m_async.stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);   /* manual-reset */
-        InterlockedExchange(&m_async.state, ASYNC_FILLING);
-        m_async.active = true;
-        m_async.silence_emitted = false;
-
-        m_async.thread = CreateThread(NULL, 0, async_proc_thread, this, 0, NULL);
-        if (m_async.thread)
-            trellis_log("async: started proc thread, batch=%d frames (%.0fms)",
-                        m_async.batch_frames,
-                        (double)m_async.batch_frames / pcm_rate * 1000.0);
+        trellis_log("accum: batch=%d frames (%.0fms), worker thread",
+                    m_accum.batch_target,
+                    (double)m_accum.batch_target / pcm_rate * 1000.0);
     }
 
-    void async_shutdown() {
-        if (m_async.thread) {
-            SetEvent(m_async.stop_event);
-            WaitForSingleObject(m_async.thread, 2000);
-            CloseHandle(m_async.thread);
-            m_async.thread = NULL;
+    void accum_shutdown() {
+        if (m_accum.thread) {
+            SetEvent(m_accum.stop_event);
+            WaitForSingleObject(m_accum.thread, 3000);
+            CloseHandle(m_accum.thread); m_accum.thread = NULL;
         }
-        if (m_async.input_ready) { CloseHandle(m_async.input_ready); m_async.input_ready = NULL; }
-        if (m_async.stop_event) { CloseHandle(m_async.stop_event); m_async.stop_event = NULL; }
-        ringbuf_free(&m_async.input);
-        ringbuf_free(&m_async.output);
-        free(m_async.proc_in); m_async.proc_in = NULL;
-        free(m_async.proc_out); m_async.proc_out = NULL;
-        m_async.proc_out_alloc = 0;
-        m_async.active = false;
-        m_async.silence_emitted = false;
+        if (m_accum.batch_ready) { CloseHandle(m_accum.batch_ready); m_accum.batch_ready = NULL; }
+        if (m_accum.batch_done) { CloseHandle(m_accum.batch_done); m_accum.batch_done = NULL; }
+        if (m_accum.stop_event) { CloseHandle(m_accum.stop_event); m_accum.stop_event = NULL; }
+        free(m_accum.in_buf); m_accum.in_buf = NULL;
+        free(m_accum.out_buf[0]); m_accum.out_buf[0] = NULL;
+        free(m_accum.out_buf[1]); m_accum.out_buf[1] = NULL;
+        free(m_accum.work_buf); m_accum.work_buf = NULL;
+        memset(&m_accum, 0, sizeof(m_accum));
     }
 
     /* Anti-pop / deferred output state */
