@@ -3079,6 +3079,14 @@ size_t plugin_generate_tail(plugin_state_t *s, uint8_t *out_i24,
 }
 
 /* Get processing latency in seconds */
+/* Set gain/mute without triggering engine reinit */
+void plugin_set_gain(plugin_state_t *s, float gain, bool mute) {
+    if (s) {
+        s->config.gain = gain;
+        s->config.mute = mute;
+    }
+}
+
 double plugin_get_latency(const plugin_state_t *s) {
     if (!s || !s->initialized || s->detected_dsd_rate == 0)
         return 0.0;
