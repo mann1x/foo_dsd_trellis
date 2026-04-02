@@ -285,7 +285,7 @@ plugin_state_t *plugin_create(void) {
     cpuset_benchmark(&s->topology);
     s->topology_detected = true;
 
-    s->cpu_monitor = cpuset_monitor_create(&s->topology, 750, 30);
+    s->cpu_monitor = cpuset_monitor_create(&s->topology, 250, 90);
     if (s->cpu_monitor)
         cpuset_monitor_read(s->cpu_monitor, &s->topology);
 
@@ -303,8 +303,25 @@ plugin_state_t *plugin_create(void) {
     if (selected > 0) {
         memcpy(s->selected_core_ids, selected_ids,
                (size_t)selected * sizeof(uint32_t));
+
+        /* Split cores: last 2 go to IO pool, rest to compute pool.
+         * IO pool handles lightweight tasks (Unpack/Pack/accum orchestration).
+         * Compute pool handles heavy tasks (FIR/SDM/Full/Estimate).
+         * Minimum: 3 selected cores (1 compute + 2 io). */
+        int io_count = 2;
+        if (selected <= 2) io_count = 0;  /* too few — single pool */
+        else if (selected <= 4) io_count = 1;  /* tight — 1 io worker */
+        int compute_count = selected - io_count;
+
         s->pool = threadpool_create_cpuset(selected_ids, selected_lps,
-                                            selected_groups, selected);
+                                            selected_groups, compute_count);
+        if (s->pool && io_count > 0) {
+            s->io_pool = threadpool_create_cpuset(
+                selected_ids + compute_count,
+                selected_lps + compute_count,
+                selected_groups + compute_count,
+                io_count);
+        }
     }
     if (!s->pool)
         s->pool = threadpool_create(
@@ -524,7 +541,7 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     /* Start background CPU monitor (load + CPUSET refresh on dedicated thread).
      * First call: creates monitor. Subsequent calls: read latest snapshot. */
     if (!s->cpu_monitor && s->topology.initialized)
-        s->cpu_monitor = cpuset_monitor_create(&s->topology, 750, 30);
+        s->cpu_monitor = cpuset_monitor_create(&s->topology, 250, 90);
 
     /* Read latest load snapshot from background monitor (never blocks) */
     if (s->cpu_monitor)
@@ -701,11 +718,11 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         }
     }
 
-    /* Create dedicated IO pool for DoP unpack/pack (2 threads).
-     * Separate from SDM pool so unpack/pack don't compete with
-     * audio processing for cores. Uses OS scheduling (no pinning). */
-    /* io_pool disabled — use main pool for unpack/pack too.
-     * Separate unpinned io_pool causes those tasks to land on LP0/LP1. */
+    /* Worker reservation disabled — causes hang during first batch when
+     * set_reserved fires mid-processing inside plugin_init_engine.
+     * TODO: move set_reserved to worker_main.c after first plugin_process. */
+    /* if (s->pool && num_channels > 0)
+        threadpool_set_reserved(s->pool, num_channels); */
 
     /* Create ML filters if enabled and ONNX Runtime is available.
      * DSD512 same-rate: load pre-SDM preemph model (features → MLP → FIR on GPU).
@@ -869,7 +886,7 @@ bool plugin_get_cpuset_change(const plugin_state_t *s, uint64_t *mask) {
 /* ─── Worker migration (dry-run probe) ─── */
 
 #define MIGRATION_PROBE_CHUNKS  5     /* chunks to measure on new core */
-#define MIGRATION_COOLDOWN      50    /* chunks between migration attempts */
+#define MIGRATION_COOLDOWN      5     /* batches between migration attempts */
 #define MIGRATION_THRESHOLD     0.15  /* 15% improvement required to keep */
 
 static void migration_tick(plugin_state_t *s) {
@@ -886,8 +903,9 @@ static void migration_tick(plugin_state_t *s) {
 
     /* ── Check if any worker's core became loaded ──
      * Read fresh load data from background monitor.
-     * If any assigned core has >60% load, re-select all workers.
-     * 60% avoids false triggers from normal OS background (30-40%). */
+     * If any assigned core has >40% load, re-select all workers.
+     * 40% catches moderate contention early — any core above 40%
+     * risks RT stutter on bursty real-time workloads. */
     if (!s->cpu_monitor)
         return;
 
@@ -903,7 +921,7 @@ static void migration_tick(plugin_state_t *s) {
         uint32_t wid = threadpool_get_worker_cpuset(s->pool, i);
         if (wid == 0) continue;
         for (int j = 0; j < snap.count; j++) {
-            if (snap.entries[j].id == wid && snap.entries[j].load > 0.60) {
+            if (snap.entries[j].id == wid && snap.entries[j].load > 0.40) {
                 if (snap.entries[j].load > loaded_pct) {
                     loaded_pct = snap.entries[j].load;
                     loaded_cpuset = wid;
@@ -936,7 +954,7 @@ static void migration_tick(plugin_state_t *s) {
     for (int i = 0; i < new_count; i++) {
         bool is_loaded = false;
         for (int j = 0; j < snap.count; j++) {
-            if (snap.entries[j].id == new_ids[i] && snap.entries[j].load > 0.60) {
+            if (snap.entries[j].id == new_ids[i] && snap.entries[j].load > 0.40) {
                 is_loaded = true;
                 break;
             }

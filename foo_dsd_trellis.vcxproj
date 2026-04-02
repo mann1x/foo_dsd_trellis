@@ -221,6 +221,9 @@
     <ClCompile Include="src\resample.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\shm_ipc.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\httpapi.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>

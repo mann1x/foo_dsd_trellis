@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <tlhelp32.h>
 
 /* ─── Win32 API types for GetSystemCpuSetInformation ─── */
 
@@ -264,6 +265,165 @@ static void detect_vendor(cpu_topology_t *topo) {
     topo->is_intel = (strcmp(vendor, "GenuineIntel") == 0);
 }
 
+/* ─── Host thread detection ─── */
+
+/* Global hint for worker process: parent's affinity mask.
+ * Set by worker_main.c before plugin_create() so detect_host_threads
+ * uses the parent's actual cores instead of detecting its own. */
+uint64_t g_host_affinity_hint = 0;
+uint64_t g_system_affinity_hint = 0;
+
+/* Detect which cores the host process (fb2k) has threads pinned to.
+ * If g_host_affinity_hint is set (worker process), uses parent's mask.
+ * Otherwise enumerates threads in the current process. */
+static void detect_host_threads(cpu_topology_t *topo) {
+    extern void trellis_log_c(const char *);
+
+    /* Worker process hint: use parent's affinity instead of detecting own threads */
+    if (g_host_affinity_hint != 0 && g_host_affinity_hint != g_system_affinity_hint) {
+        char msg[256];
+        int pos = sprintf_s(msg, sizeof(msg), "host threads (parent hint): ");
+        int marked = 0;
+        for (int i = 0; i < topo->count; i++) {
+            uint8_t lp = topo->entries[i].logical_index;
+            if (lp < 64 && (g_host_affinity_hint & ((uint64_t)1 << lp))) {
+                topo->entries[i].host_thread = true;
+                if (marked > 0 && pos < (int)sizeof(msg) - 8)
+                    pos += sprintf_s(msg + pos, sizeof(msg) - pos, ", ");
+                if (pos < (int)sizeof(msg) - 8)
+                    pos += sprintf_s(msg + pos, sizeof(msg) - pos, "LP%u", lp);
+                marked++;
+            }
+        }
+        trellis_log_c(msg);
+        return;
+    }
+
+    DWORD pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return;
+
+    typedef BOOL (WINAPI *PFN_GetThreadGroupAffinity)(
+        HANDLE hThread, GROUP_AFFINITY *GroupAffinity);
+    PFN_GetThreadGroupAffinity pfn_gtga =
+        (PFN_GetThreadGroupAffinity)GetProcAddress(
+            GetModuleHandleW(L"kernel32.dll"), "GetThreadGroupAffinity");
+    if (!pfn_gtga) {
+        CloseHandle(snap);
+        return;
+    }
+
+    /* Build full system affinity mask per processor group.
+     * This is the "all cores" mask — any thread with fewer bits is pinned.
+     * Uses the system mask (not process mask) so external affinity tools
+     * (Process Lasso, etc.) are detected as pinning. */
+    DWORD_PTR sys_mask_g0[64] = {0};  /* system mask per group */
+    {
+        DWORD_PTR proc_aff = 0, sys_aff = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &proc_aff, &sys_aff);
+        sys_mask_g0[0] = sys_aff;  /* group 0 from GetProcessAffinityMask */
+        /* For groups >0, build from topology (all enabled LPs in that group) */
+        for (int i = 0; i < topo->count; i++) {
+            cpuset_entry_t *e = &topo->entries[i];
+            if (e->group > 0 && e->group < 64)
+                sys_mask_g0[e->group] |= (DWORD_PTR)1 << e->logical_index;
+        }
+    }
+
+    /* Track which LPs have pinned host threads */
+    bool lp_used[CPUSET_MAX_CPUS] = {0};
+    int thread_count = 0;
+    int pinned_count = 0;
+
+    THREADENTRY32 te;
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid)
+                continue;
+            HANDLE ht = OpenThread(THREAD_QUERY_INFORMATION, FALSE,
+                                   te.th32ThreadID);
+            if (!ht)
+                continue;
+            thread_count++;
+            GROUP_AFFINITY ga = {0};
+            if (pfn_gtga(ht, &ga)) {
+                /* Skip threads with full system affinity (not pinned) */
+                if (ga.Group < 64 && ga.Mask == sys_mask_g0[ga.Group]) {
+                    CloseHandle(ht);
+                    continue;
+                }
+                pinned_count++;
+                for (int i = 0; i < topo->count; i++) {
+                    cpuset_entry_t *e = &topo->entries[i];
+                    if (e->group == ga.Group) {
+                        DWORD_PTR bit = (DWORD_PTR)1 << e->logical_index;
+                        if (ga.Mask & bit)
+                            lp_used[i] = true;
+                    }
+                }
+            }
+            CloseHandle(ht);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+
+    /* Mark and log */
+    char msg[512];
+    int pos = sprintf_s(msg, sizeof(msg),
+        "host threads: %d total, %d pinned: ", thread_count, pinned_count);
+    int marked = 0;
+    for (int i = 0; i < topo->count; i++) {
+        if (lp_used[i]) {
+            topo->entries[i].host_thread = true;
+            if (marked > 0 && pos < (int)sizeof(msg) - 8)
+                pos += sprintf_s(msg + pos, sizeof(msg) - pos, ", ");
+            if (pos < (int)sizeof(msg) - 8)
+                pos += sprintf_s(msg + pos, sizeof(msg) - pos, "LP%u",
+                                 topo->entries[i].logical_index);
+            marked++;
+        }
+    }
+    if (marked > 0) {
+        trellis_log_c(msg);
+    } else {
+        /* No pinned threads detected — assume OS scheduler prefers LP0-3
+         * (highest scheduling_class cores). Mark them as host_thread. */
+        for (int i = 0; i < topo->count; i++) {
+            if (topo->entries[i].logical_index <= 3)
+                topo->entries[i].host_thread = true;
+        }
+        sprintf_s(msg, sizeof(msg),
+            "host threads: %d total, none pinned, assuming LP0-3 (OS scheduler)",
+            thread_count);
+        trellis_log_c(msg);
+    }
+
+    /* Log process affinity if restricted by external tool */
+    {
+        DWORD_PTR proc_aff = 0, sys_aff = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &proc_aff, &sys_aff);
+        if (proc_aff != sys_aff) {
+            char abuf[256];
+            int apos = sprintf_s(abuf, sizeof(abuf), "process affinity restricted: ");
+            for (int i = 0; i < topo->count; i++) {
+                cpuset_entry_t *e = &topo->entries[i];
+                if (e->group != 0) continue;  /* group 0 only from GetProcessAffinityMask */
+                DWORD_PTR bit = (DWORD_PTR)1 << e->logical_index;
+                if (proc_aff & bit) {
+                    if (apos > 30 && apos < (int)sizeof(abuf) - 8)
+                        apos += sprintf_s(abuf + apos, sizeof(abuf) - apos, ", ");
+                    if (apos < (int)sizeof(abuf) - 8)
+                        apos += sprintf_s(abuf + apos, sizeof(abuf) - apos, "LP%u",
+                                          e->logical_index);
+                }
+            }
+            trellis_log_c(abuf);
+        }
+    }
+}
+
 /* ─── Public API ─── */
 
 int cpuset_detect(cpu_topology_t *topo) {
@@ -371,20 +531,15 @@ int cpuset_detect(cpu_topology_t *topo) {
     /* Assign clusters */
     assign_clusters(topo);
 
-    /* Check system affinity mask — which cores are available at system level */
-    HANDLE proc = GetCurrentProcess();
-    DWORD_PTR proc_mask = 0, sys_mask = 0;
-    if (GetProcessAffinityMask(proc, &proc_mask, &sys_mask)) {
-        /* Apply system affinity mask: disable cores not in the system mask */
-        for (int i = 0; i < n; i++) {
-            uint8_t lp = topo->entries[i].logical_index;
-            if (lp < sizeof(DWORD_PTR) * 8) {
-                if (!(sys_mask & ((DWORD_PTR)1 << lp)))
-                    topo->entries[i].enabled = false;
-            }
-        }
-        /* Also apply process affinity mask if it's a subset of system mask */
-        if (proc_mask != sys_mask) {
+    /* Apply system AND process affinity masks.
+     * Process affinity (set by Process Lasso, etc.) is a hard OS constraint —
+     * SetThreadSelectedCpuSets cannot bypass it. Our threads can only run
+     * on cores within the process mask. Cores outside are disabled.
+     * Host-pinned cores within the mask are deprioritized via host_thread. */
+    {
+        HANDLE proc = GetCurrentProcess();
+        DWORD_PTR proc_mask = 0, sys_mask = 0;
+        if (GetProcessAffinityMask(proc, &proc_mask, &sys_mask)) {
             for (int i = 0; i < n; i++) {
                 uint8_t lp = topo->entries[i].logical_index;
                 if (lp < sizeof(DWORD_PTR) * 8) {
@@ -395,31 +550,33 @@ int cpuset_detect(cpu_topology_t *topo) {
         }
     }
 
-    /* Also check process-level CPU set restriction (Windows 10+) */
-    typedef BOOL (WINAPI *PFN_GetProcessDefaultCpuSets)(
-        HANDLE Process, PULONG CpuSetIds, ULONG CpuSetIdCount, PULONG RequiredIdCount);
-    PFN_GetProcessDefaultCpuSets pfn_getProcCpuSets =
-        (PFN_GetProcessDefaultCpuSets)GetProcAddress(
-            GetModuleHandleW(L"kernel32.dll"), "GetProcessDefaultCpuSets");
-
-    if (pfn_getProcCpuSets) {
-        ULONG req = 0;
-        pfn_getProcCpuSets(proc, NULL, 0, &req);
-        if (req > 0 && req <= CPUSET_MAX_CPUS) {
-            ULONG *ids = (ULONG *)malloc(req * sizeof(ULONG));
-            if (ids) {
-                ULONG got = 0;
-                if (pfn_getProcCpuSets(proc, ids, req, &got)) {
-                    for (int i = 0; i < n; i++)
-                        topo->entries[i].enabled = false;
-                    for (ULONG j = 0; j < got; j++) {
-                        for (int i = 0; i < n; i++) {
-                            if (topo->entries[i].id == ids[j])
-                                topo->entries[i].enabled = true;
+    /* Process-level CPU set restriction (CPUDoc, etc.) — these are hard
+     * system-level allocations that we MUST respect. */
+    {
+        typedef BOOL (WINAPI *PFN_GetProcessDefaultCpuSets)(
+            HANDLE Process, PULONG CpuSetIds, ULONG CpuSetIdCount, PULONG RequiredIdCount);
+        PFN_GetProcessDefaultCpuSets pfn_getProcCpuSets =
+            (PFN_GetProcessDefaultCpuSets)GetProcAddress(
+                GetModuleHandleW(L"kernel32.dll"), "GetProcessDefaultCpuSets");
+        if (pfn_getProcCpuSets) {
+            ULONG req = 0;
+            pfn_getProcCpuSets(GetCurrentProcess(), NULL, 0, &req);
+            if (req > 0 && req <= CPUSET_MAX_CPUS) {
+                ULONG *ids = (ULONG *)malloc(req * sizeof(ULONG));
+                if (ids) {
+                    ULONG got = 0;
+                    if (pfn_getProcCpuSets(GetCurrentProcess(), ids, req, &got)) {
+                        for (int i = 0; i < n; i++)
+                            topo->entries[i].enabled = false;
+                        for (ULONG j = 0; j < got; j++) {
+                            for (int i = 0; i < n; i++) {
+                                if (topo->entries[i].id == ids[j])
+                                    topo->entries[i].enabled = true;
+                            }
                         }
                     }
+                    free(ids);
                 }
-                free(ids);
             }
         }
     }
@@ -433,6 +590,9 @@ int cpuset_detect(cpu_topology_t *topo) {
                 topo->last_cpuset_mask |= ((uint64_t)1 << lp);
         }
     }
+
+    /* Detect host process (fb2k) thread affinity */
+    detect_host_threads(topo);
 
     topo->initialized = true;
     return 0;
@@ -727,16 +887,20 @@ void cpuset_update_load(cpu_topology_t *topo) {
     }
 }
 
-/* ─── Thread selection (tiered) ─── */
+/* ─── Thread selection (load-first tiered) ─── */
 
 /*
- * Tier-based core selection:
- *   Tier 1 (IDEAL):      T0 + P-core + load 0-30%
- *   Tier 2 (GOOD):       T0 + P-core + load 30-70%
- *   Tier 3 (ACCEPTABLE): T0 + P-core + load 70%+  OR  T0 + E-core + load 0-30%
- *   Tier 4 (LAST RESORT): T1 (SMT)  OR  E-core + load >30%
+ * Core selection: LOAD is the primary key.
+ * An unloaded T1/E-core is ALWAYS better than a heavy-loaded T0/P-core.
+ * Heavy-loaded cores cause 100% stutter regardless of core quality.
  *
- * Within each tier: load_bin ASC → scheduling_class ASC → cluster ASC → perf DESC
+ * Tier classification (core type quality, independent of load):
+ *   Tier 1 (IDEAL):       T0 + P-core + not host_thread
+ *   Tier 2 (GOOD):        T0 + P-core + host_thread, OR T0 + E-core
+ *   Tier 3 (ACCEPTABLE):  T1 (SMT sibling)
+ *   Tier 4 (LAST RESORT): E-core + host_thread
+ *
+ * Sort: load_bin ASC → tier ASC → perf DESC → cluster ASC
  */
 
 typedef struct {
@@ -750,13 +914,11 @@ typedef struct {
 static int cmp_candidate(const void *a, const void *b) {
     const select_candidate_t *ca = (const select_candidate_t *)a;
     const select_candidate_t *cb = (const select_candidate_t *)b;
-    /* Primary: tier ASC (exhaust tier 1 before tier 2, etc.) */
-    if (ca->tier != cb->tier) return ca->tier - cb->tier;
-    /* Secondary: load_bin ASC (lightest first) */
+    /* Primary: load_bin ASC (lightest first — heavy load = stutter) */
     if (ca->load_bin != cb->load_bin) return ca->load_bin - cb->load_bin;
-    /* Tertiary: perf_score DESC (fastest core wins — benchmark is the
-     * ground truth for core capability, not scheduling_class which has
-     * platform-specific semantics) */
+    /* Secondary: tier ASC (prefer T0/P-core when load is equal) */
+    if (ca->tier != cb->tier) return ca->tier - cb->tier;
+    /* Tertiary: perf_score DESC (fastest core wins) */
     if (ca->perf > cb->perf) return -1;
     if (ca->perf < cb->perf) return 1;
     /* Quaternary: cluster ASC (CCD_AUTO preference) */
@@ -820,36 +982,41 @@ int cpuset_select(const cpu_topology_t *topo,
                 continue;
         }
 
-        /* ── Tier classification (Phase 2) ── */
+        /* ── Tier classification (Phase 2) ──
+         * Tier reflects core TYPE quality only — load is handled by the
+         * primary sort key (load_bin). Tier breaks ties when load is equal. */
 
         bool is_t0 = (e->smt_thread == 0);
         bool is_pcore = (e->efficiency_class > 0 || !topo->is_hybrid);
+        bool is_host = e->host_thread;
 
         int load_bin = (int)(e->load * 10.0);
         if (load_bin < 0) load_bin = 0;
         if (load_bin > 9) load_bin = 9;
 
-        /* High scheduling_class (>=12) = OS-preferred core = always busy
-         * with background work. Treat as implicitly loaded even if
-         * measured load is 0% (parked cores freeze counters). */
+        /* High scheduling_class (>=12) = OS-preferred core = implicitly
+         * loaded even if measured load is 0% (parked cores freeze counters).
+         * Also host_thread cores get a load floor. */
         bool os_hot = (e->scheduling_class >= 12);
         int eff_load_bin = load_bin;
         if (os_hot && eff_load_bin < 4)
             eff_load_bin = 4;  /* floor at 40% for OS-hot cores */
+        if (is_host && eff_load_bin < 3)
+            eff_load_bin = 3;  /* floor at 30% for host-pinned cores */
 
         int tier;
-        if (is_t0 && is_pcore && eff_load_bin <= 2)
-            tier = 1;  /* IDEAL: T0 P-core, idle */
-        else if (is_t0 && is_pcore && eff_load_bin <= 6)
-            tier = 2;  /* GOOD: T0 P-core, moderate load */
-        else if (is_t0 && is_pcore)
-            tier = 3;  /* ACCEPTABLE: T0 P-core, heavy load */
-        else if (is_t0 && !is_pcore && eff_load_bin <= 2)
-            tier = 3;  /* ACCEPTABLE: idle E-core */
+        if (is_t0 && is_pcore && !is_host)
+            tier = 1;  /* IDEAL: T0 P-core, not host thread */
+        else if (is_t0 && is_pcore && is_host)
+            tier = 2;  /* GOOD: T0 P-core, but host thread contention */
+        else if (is_t0 && !is_pcore)
+            tier = 2;  /* GOOD: T0 E-core (unloaded E > loaded P) */
+        else if (!is_t0)
+            tier = 3;  /* ACCEPTABLE: T1 SMT sibling */
         else
-            tier = 4;  /* LAST RESORT: T1 or loaded E-core */
+            tier = 4;  /* LAST RESORT: E-core + host_thread */
 
-        /* ── Intra-tier sorting fields (Phase 3) ── */
+        /* ── Sort fields (load_bin primary, tier secondary) ── */
 
         cands[ncands].entry_index = i;
         cands[ncands].tier = tier;
@@ -859,7 +1026,7 @@ int cpuset_select(const cpu_topology_t *topo,
         ncands++;
     }
 
-    /* Sort by tier → load → sched_class → cluster → perf */
+    /* Sort by load → tier → perf → cluster */
     qsort(cands, (size_t)ncands, sizeof(select_candidate_t), cmp_candidate);
 
     /* ── Phase 4: Select top N ── */

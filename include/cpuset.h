@@ -60,6 +60,7 @@ typedef struct {
     bool     realtime;          /* Marked as real-time capable */
     uint8_t  raw_flags;         /* Raw AllFlags byte from GetSystemCpuSetInformation */
     double   load;              /* CPU load 0.0-1.0 (updated by cpuset_update_load) */
+    bool     host_thread;       /* Host process has threads with affinity to this core */
 } cpuset_entry_t;
 
 /* Cluster (CCD/Intel cluster) summary */

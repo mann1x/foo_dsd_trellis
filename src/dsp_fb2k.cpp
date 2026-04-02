@@ -26,6 +26,7 @@ extern "C" {
 #include "../include/cpuset.h"
 #include "../include/httpapi.h"
 #include "../include/ringbuf.h"
+#include "../include/shm_ipc.h"
 #include "../include/dop.h"
 #include "../include/engine.h"
 #include "../include/ntf.h"
@@ -1840,7 +1841,7 @@ public:
 
     ~dsp_dsd_trellis() {
         trellis_log("shutting down");
-        accum_shutdown();
+        worker_stop();
         httpapi_destroy(m_httpapi);
         log_set_enabled(false);
         plugin_destroy(m_state);
@@ -2050,7 +2051,7 @@ public:
         }
         /* During accum mode, worker thread owns plugin_set_config.
          * Config is passed via work_cfg snapshot when batch is submitted. */
-        if (!m_accum.active)
+        if (!m_worker.active)
             plugin_set_config(m_state, &chunk_cfg);
 
         /* Log actual engine config on first few chunks */
@@ -2083,6 +2084,7 @@ public:
 
         LARGE_INTEGER t0, t1, freq;
         QueryPerformanceCounter(&t0);
+        double process_ms = 0.0;
 
         size_t out_frames = 0;
 
@@ -2106,139 +2108,47 @@ public:
                 }
             }
 
-            /* Check for small chunks — use async accumulation.
-             * Only for same-rate DSD (i24 passthrough during startup must
-             * match output rate). Rate conversion uses direct processing. */
+            /* Check for small chunks — use out-of-process worker.
+             * Worker handles ALL DSD processing (same-rate and rate conversion).
+             * Large chunks (>100ms, e.g., test install) use direct processing. */
             double chunk_ms = (double)pcm_frames / (double)pcm_rate * 1000.0;
-            bool same_rate_dsd = (chunk_cfg.fs_out == 0 || chunk_cfg.fs_out == chunk_cfg.fs_in);
 
-            if (chunk_ms >= 100.0 || !same_rate_dsd) {
+            if (chunk_ms >= 100.0) {
                 /* Large chunk: direct processing */
-                if (m_accum.active) accum_shutdown();
+                if (m_worker.active) worker_stop();
                 out_frames = plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
                                             pcm_frames, (int)channels, pcm_rate);
             } else {
-                /* Small chunk: accumulate, batch-process, drain.
-                 * All synchronous — no threads, no races. */
+                /* Small chunk: out-of-process worker handles everything.
+                 * on_chunk just writes input to shared memory and reads output. */
                 uint32_t dop_pcm_rate = chunk_cfg.fs_out ? chunk_cfg.fs_out / 16 : pcm_rate;
 
-                if (!m_accum.active) {
-                    accum_init((int)channels, pcm_rate, dop_pcm_rate);
-                    /* Force engine + GPU init + SDM warmup NOW.
-                     * Feed a warmup chunk of DSD idle to:
-                     * 1. Trigger GPU/ML init (needs actual frames)
-                     * 2. Clear needs_warmup (warmup mute fires HERE,
-                     *    on throwaway data — not on real audio later)
-                     * Output is discarded. SDM state is warm. */
-                    {
-                        static const float idle[8] = {-1,1,1,-1,1,-1,-1,1};
-                        size_t warm_n = 1024 * channels;
-                        pfc::array_staticsize_t<float> warm_in;
-                        warm_in.set_size_discard(warm_n);
-                        for (size_t i = 0; i < warm_n; i++)
-                            warm_in[i] = idle[i & 7];
-                        plugin_process(m_state, warm_in.get_ptr(), out_buf.get_ptr(),
-                                       1024, (int)channels, pcm_rate);
+                /* 1. Launch worker process if not running */
+                if (!m_worker.active) {
+                    worker_start((int)channels, pcm_rate, dop_pcm_rate, &chunk_cfg);
+                    if (!m_worker.active) {
+                        /* Worker failed — fall back to direct processing */
+                        out_frames = plugin_process(m_state, in_f32.get_ptr(),
+                                                    out_buf.get_ptr(), pcm_frames,
+                                                    (int)channels, pcm_rate);
+                        goto direct_output;
                     }
                 }
 
-                /* 1. Append input to accumulation buffer */
-                int need = m_accum.in_frames + (int)pcm_frames;
-                if (need > m_accum.in_alloc) {
-                    m_accum.in_alloc = need * 2;
-                    m_accum.in_buf = (float *)realloc(m_accum.in_buf,
-                        (size_t)m_accum.in_alloc * channels * sizeof(float));
-                }
-                memcpy(m_accum.in_buf + (size_t)m_accum.in_frames * channels,
-                       in_f32.get_ptr(), pcm_frames * channels * sizeof(float));
-                m_accum.in_frames += (int)pcm_frames;
+                /* 2. Update gain/mute in shared memory (lock-free) */
+                m_worker.ipc.ctrl->gain = chunk_cfg.gain;
+                InterlockedExchange(&m_worker.ipc.ctrl->mute,
+                                    chunk_cfg.mute ? 1 : 0);
 
-                /* 2. First batch: process synchronously to prime the ring.
-                 * This blocks ~140ms but fills the ring so drain starts immediately. */
-                /* Sync fill: 2× batch_target to give ring headroom.
-                 * When drain starts, the ring has batch_target extra frames
-                 * so the worker has time (~140ms) to fill the next batch
-                 * before the ring runs dry. */
-                int sync_target = m_accum.batch_target * 2;
-                if (!m_accum.primed && m_accum.in_frames >= sync_target) {
-                    int proc_frames = sync_target;
-
-                    /* Ensure work_out can hold output */
-                    size_t out_need = (size_t)proc_frames * channels * 3 * 8;
-                    if ((int)out_need > m_accum.work_out_alloc) {
-                        m_accum.work_out_alloc = (int)out_need;
-                        m_accum.work_out = (uint8_t *)realloc(m_accum.work_out, out_need);
-                    }
-
-                    /* Process synchronously on fb2k thread */
-                    plugin_set_config(m_state, &chunk_cfg);
-                    m_accum.staged_gain = chunk_cfg.gain;
-                    m_accum.staged_mute = chunk_cfg.mute;
-
-                    size_t result = plugin_process(m_state, m_accum.in_buf,
-                        m_accum.work_out, (size_t)proc_frames,
-                        (int)channels, pcm_rate);
-
-                    /* Push to ring */
-                    if (result > 0) {
-                        int bytes = (int)(result * channels * 3);
-                        ringbuf_write(&m_accum.out_ring, m_accum.work_out, bytes);
-                    }
-
-                    /* Shift leftover input */
-                    int leftover = m_accum.in_frames - proc_frames;
-                    if (leftover > 0) {
-                        memmove(m_accum.in_buf,
-                                m_accum.in_buf + (size_t)proc_frames * channels,
-                                (size_t)leftover * channels * sizeof(float));
-                    }
-                    m_accum.in_frames = leftover;
-                    m_accum.primed = true;
-
-                    trellis_log("accum: primed with %u frames (ring=%d bytes)",
-                                (unsigned)result, ringbuf_available(&m_accum.out_ring));
-                }
-
-                /* 3. After primed: stage next batch. Can submit even while
-                 * worker is busy (double-buffered input = true pipeline). */
-                if (m_accum.primed && m_accum.in_frames >= m_accum.batch_target
-                    && !InterlockedCompareExchange(&m_accum.staged, 0, 0)) {
-                    int proc_frames = m_accum.batch_target;
-                    int stage_idx = 1 - m_accum.work_idx;
-
-                    /* Ensure buffers are large enough */
-                    size_t out_need = (size_t)proc_frames * channels * 3 * 8;
-                    if ((int)out_need > m_accum.work_out_alloc) {
-                        m_accum.work_out_alloc = (int)out_need;
-                        m_accum.work_out = (uint8_t *)realloc(m_accum.work_out, out_need);
-                    }
-                    if (proc_frames > m_accum.work_alloc) {
-                        m_accum.work_alloc = proc_frames * 2;
-                        m_accum.work_buf[0] = (float *)realloc(m_accum.work_buf[0],
-                            (size_t)m_accum.work_alloc * channels * sizeof(float));
-                        m_accum.work_buf[1] = (float *)realloc(m_accum.work_buf[1],
-                            (size_t)m_accum.work_alloc * channels * sizeof(float));
-                    }
-
-                    memcpy(m_accum.work_buf[stage_idx], m_accum.in_buf,
-                           (size_t)proc_frames * channels * sizeof(float));
-                    m_accum.work_frames[stage_idx] = proc_frames;
-                    m_accum.staged_gain = chunk_cfg.gain;
-                    m_accum.staged_mute = chunk_cfg.mute;
-                    InterlockedExchange(&m_accum.staged, 1);
-                    InterlockedExchange(&m_accum.worker_busy, 1);
-
-                    /* Shift leftover input */
-                    int leftover = m_accum.in_frames - proc_frames;
-                    if (leftover > 0) {
-                        memmove(m_accum.in_buf,
-                                m_accum.in_buf + (size_t)proc_frames * channels,
-                                (size_t)leftover * channels * sizeof(float));
-                    }
-                    m_accum.in_frames = leftover;
-
-                    SetEvent(m_accum.batch_ready);
-                    trellis_log("accum: submitted %d frames to worker", proc_frames);
+                /* 3. Write input float PCM to shared memory input ring */
+                {
+                    int write_bytes = (int)(pcm_frames * channels * sizeof(float));
+                    shm_ring_write(m_worker.ipc.in_ring,
+                                   m_worker.ipc.ctrl->in_capacity,
+                                   &m_worker.ipc.ctrl->in_write_pos,
+                                   &m_worker.ipc.ctrl->in_read_pos,
+                                   in_f32.get_ptr(), write_bytes);
+                    SetEvent(m_worker.ipc.input_event);
                 }
 
                 /* Track state for anti-pop */
@@ -2250,75 +2160,101 @@ public:
                 m_chunk_count++;
                 m_logged_processing = true;
 
-                /* 4. Drain from ring or passthrough raw DoP */
-                int ring_avail = ringbuf_available(&m_accum.out_ring);
-                int drain_frames_wanted = (int)pcm_frames;
-                int drain_bytes_wanted = drain_frames_wanted * (int)channels * 3;
+                /* 4. Read output i24 from shared memory output ring.
+                 * For rate conversion, output has more frames than input.
+                 * Output frames = input_frames * (fs_out / fs_in). */
+                uint32_t fs_in = chunk_cfg.fs_in;
+                uint32_t fs_out = chunk_cfg.fs_out ? chunk_cfg.fs_out : fs_in;
+                size_t out_pcm_frames = pcm_frames;
+                if (fs_out != fs_in && fs_in > 0)
+                    out_pcm_frames = (size_t)((double)pcm_frames * (double)fs_out / (double)fs_in);
+                int drain_bytes = (int)(out_pcm_frames * channels * 3);
+                if (g_log_enabled && m_chunk_count <= 5)
+                    trellis_log("drain: pcm_frames=%zu fs_in=%u fs_out=%u out_pcm_frames=%zu drain=%d",
+                                pcm_frames, fs_in, fs_out, out_pcm_frames, drain_bytes);
+                int out_avail = shm_ring_available(
+                    &m_worker.ipc.ctrl->out_write_pos,
+                    &m_worker.ipc.ctrl->out_read_pos);
+                bool primed = InterlockedCompareExchange(
+                    &m_worker.ipc.ctrl->primed, 0, 0) != 0;
 
-                if (g_log_enabled && m_chunk_count <= 30) {
-                    trellis_log("accum #%u: in=%d ring=%d busy=%d primed=%d",
-                                m_chunk_count, m_accum.in_frames, ring_avail,
-                                (int)InterlockedCompareExchange(&m_accum.worker_busy, 0, 0),
-                                (int)m_accum.primed);
+                if (g_log_enabled && (m_chunk_count <= 50 || (m_chunk_count % 100) == 0)) {
+                    trellis_log("worker #%u: out_ring=%d primed=%d wp=%ld rp=%ld",
+                                m_chunk_count, out_avail, (int)primed,
+                                m_worker.ipc.ctrl->out_write_pos,
+                                m_worker.ipc.ctrl->out_read_pos);
                 }
 
-                if (ring_avail >= drain_bytes_wanted) {
-                    /* Drain processed i24 from ring */
+                if (primed && out_avail >= drain_bytes) {
+                    /* Drain processed i24 from output ring */
                     pfc::array_staticsize_t<uint8_t> drain_buf;
-                    drain_buf.set_size_discard((size_t)drain_bytes_wanted);
-                    ringbuf_read(&m_accum.out_ring, drain_buf.get_ptr(), drain_bytes_wanted);
+                    drain_buf.set_size_discard((size_t)drain_bytes);
+                    shm_ring_read(m_worker.ipc.out_ring,
+                                  m_worker.ipc.ctrl->out_capacity,
+                                  &m_worker.ipc.ctrl->out_write_pos,
+                                  &m_worker.ipc.ctrl->out_read_pos,
+                                  drain_buf.get_ptr(), drain_bytes);
+
+                    /* Verify DoP markers in drained data */
+                    if (g_log_enabled && m_chunk_count <= 250) {
+                        uint8_t m0 = drain_buf[2]; /* marker of first sample */
+                        uint8_t m1 = drain_buf[channels * 3 + 2]; /* marker of second frame */
+                        trellis_log("drain verify: marker0=0x%02X marker1=0x%02X bytes=%d",
+                                    m0, m1, drain_bytes);
+                    }
 
                     chunk->set_data_fixedpoint_ex(
-                        drain_buf.get_ptr(), (size_t)drain_bytes_wanted,
+                        drain_buf.get_ptr(), (size_t)drain_bytes,
                         dop_pcm_rate, channels, 24,
                         audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
                         audio_chunk::g_guess_channel_config(channels));
-                    return true;
-                } else if (!m_accum.primed) {
-                    /* Before primed: convert float DoP to i24 passthrough.
-                     * Preserves DoP markers — DAC sees valid DSD. */
-                    size_t total_samples = (size_t)pcm_frames * channels;
-                    pfc::array_staticsize_t<uint8_t> pt_buf;
-                    pt_buf.set_size_discard(total_samples * 3);
-                    const float *pt_src = in_f32.get_ptr();
-                    uint8_t *dst = pt_buf.get_ptr();
-                    for (size_t i = 0; i < total_samples; i++) {
-                        int32_t v = (int32_t)(pt_src[i] * 2147483648.0);
-                        dst[i*3]   = (uint8_t)((v >> 8)  & 0xFF);
-                        dst[i*3+1] = (uint8_t)((v >> 16) & 0xFF);
-                        dst[i*3+2] = (uint8_t)((v >> 24) & 0xFF);
+
+                    /* Track DoP marker phase from last drained frame.
+                     * Marker byte is at offset [last_frame * ch * 3 + 2] (3rd byte).
+                     * 0x05 = phase 0, 0xFA = phase 1. Next frame continues. */
+                    {
+                        size_t last = ((size_t)out_pcm_frames - 1) * channels * 3;
+                        uint8_t last_marker = drain_buf[last + 2];
+                        /* After this frame, next frame flips phase */
+                        m_worker.marker_phase = (last_marker == 0x05) ? 1 : 0;
                     }
-                    chunk->set_data_fixedpoint_ex(
-                        pt_buf.get_ptr(), total_samples * 3,
-                        dop_pcm_rate, channels, 24,
-                        audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
-                        audio_chunk::g_guess_channel_config(channels));
                     return true;
                 } else {
-                    /* Ring underrun after primed — drain what we have, pad rest.
-                     * This should be rare (worker slower than playback). */
-                    if (ring_avail > 0) {
-                        int partial_frames = ring_avail / ((int)channels * 3);
-                        int partial_bytes = partial_frames * (int)channels * 3;
-                        pfc::array_staticsize_t<uint8_t> drain_buf;
-                        drain_buf.set_size_discard((size_t)partial_bytes);
-                        ringbuf_read(&m_accum.out_ring, drain_buf.get_ptr(), partial_bytes);
-                        chunk->set_data_fixedpoint_ex(
-                            drain_buf.get_ptr(), (size_t)partial_bytes,
-                            dop_pcm_rate, channels, 24,
-                            audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
-                            audio_chunk::g_guess_channel_config(channels));
-                        if (g_log_enabled)
-                            trellis_log("accum: ring underrun, partial %d/%d frames",
-                                        partial_frames, drain_frames_wanted);
-                        return true;
-                    }
-                    /* Nothing in ring — emit silence */
-                    if (g_log_enabled)
-                        trellis_log("accum: ring empty, silence");
-                    insert_silence_chunk((int)channels, dop_pcm_rate, true,
-                                          (int)(chunk_ms + 0.5));
-                    return false;
+                    /* Ring not ready or low: output i24 DSD silence.
+                     * Same i24 format as drain — consistent output. */
+                    if (primed && g_log_enabled)
+                        trellis_log("worker: ring low (%d/%d bytes)",
+                                    out_avail, drain_bytes);
+                    static const float dsd_0x69[8] = {
+                        -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f
+                    };
+                    size_t sil_dsd = (size_t)out_pcm_frames * DOP_BITS_PER_FRAME;
+                    size_t sil_total = (size_t)out_pcm_frames * channels;
+                    pfc::array_staticsize_t<float> dsd_idle;
+                    dsd_idle.set_size_discard(sil_dsd);
+                    for (size_t i = 0; i < sil_dsd; i++)
+                        dsd_idle[i] = dsd_0x69[i & 7];
+                    pfc::array_staticsize_t<uint8_t> mono_i24;
+                    mono_i24.set_size_discard(out_pcm_frames * 3);
+                    int new_phase = dop_pack_i24(dsd_idle.get_ptr(), mono_i24.get_ptr(),
+                                                  sil_dsd, m_worker.marker_phase);
+                    m_worker.marker_phase = new_phase;
+                    pfc::array_staticsize_t<uint8_t> sil_i24;
+                    sil_i24.set_size_discard(sil_total * 3);
+                    for (size_t f = 0; f < out_pcm_frames; f++)
+                        for (unsigned ch = 0; ch < channels; ch++) {
+                            size_t dst = (f * channels + ch) * 3;
+                            size_t src = f * 3;
+                            sil_i24[dst]     = mono_i24[src];
+                            sil_i24[dst + 1] = mono_i24[src + 1];
+                            sil_i24[dst + 2] = mono_i24[src + 2];
+                        }
+                    chunk->set_data_fixedpoint_ex(
+                        sil_i24.get_ptr(), sil_total * 3,
+                        dop_pcm_rate, channels, 24,
+                        audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
+                        audio_chunk::g_guess_channel_config(channels));
+                    return true;
                 }
             }
 
@@ -2393,9 +2329,10 @@ public:
                             out_rate / 16, out_rate / pcm_rate);
         }
 
+        direct_output: /* label for worker fallback path */
         QueryPerformanceCounter(&t1);
         QueryPerformanceFrequency(&freq);
-        double process_ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+        process_ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
 
         if (out_frames == 0) {
             m_chunk_count++;
@@ -2440,6 +2377,28 @@ public:
                     char topo_buf[512];
                     cpuset_summary(topo, topo_buf, sizeof(topo_buf));
                     trellis_log("CPU: %s", topo_buf);
+
+                    /* Log host process thread affinity */
+                    {
+                        char hbuf[256];
+                        int hpos = 0;
+                        int hcount = 0;
+                        for (int i = 0; i < topo->count; i++) {
+                            if (topo->entries[i].host_thread) {
+                                if (hcount > 0 && hpos < (int)sizeof(hbuf) - 8)
+                                    hpos += sprintf_s(hbuf + hpos, sizeof(hbuf) - hpos, ", ");
+                                if (hpos < (int)sizeof(hbuf) - 8)
+                                    hpos += sprintf_s(hbuf + hpos, sizeof(hbuf) - hpos, "LP%u",
+                                                      topo->entries[i].logical_index);
+                                hcount++;
+                            }
+                        }
+                        if (hcount > 0)
+                            trellis_log("host threads pinned to: %s", hbuf);
+                        else
+                            trellis_log("host threads: %d total, none pinned (OS scheduler decides)",
+                                        topo->count);
+                    }
 
                     if (g_log_enabled) {
                         cpuset_log_detail(topo, [](const char *line, void *) {
@@ -2689,51 +2648,31 @@ public:
         if (!m_state || m_channels == 0)
             return;
 
-        if (m_accum.active) {
-            int ch = m_accum.channels;
-
-            /* Spin-wait for worker to finish if busy */
-            for (int i = 0; i < 3000 && InterlockedCompareExchange(&m_accum.worker_busy, 0, 0); i++)
-                Sleep(1);
-
-            /* Drain all remaining ring data */
-            int ring_avail = ringbuf_available(&m_accum.out_ring);
-            if (ring_avail > 0) {
-                int drain_frames = ring_avail / (ch * 3);
+        if (m_worker.active) {
+            /* Drain remaining output from worker's ring */
+            int ch = m_worker.channels;
+            int out_avail = shm_ring_available(
+                &m_worker.ipc.ctrl->out_write_pos,
+                &m_worker.ipc.ctrl->out_read_pos);
+            if (out_avail > 0) {
+                int drain_frames = out_avail / (ch * 3);
                 int drain_bytes = drain_frames * ch * 3;
                 pfc::array_staticsize_t<uint8_t> drain_buf;
                 drain_buf.set_size_discard((size_t)drain_bytes);
-                ringbuf_read(&m_accum.out_ring, drain_buf.get_ptr(), drain_bytes);
+                shm_ring_read(m_worker.ipc.out_ring,
+                              m_worker.ipc.ctrl->out_capacity,
+                              &m_worker.ipc.ctrl->out_write_pos,
+                              &m_worker.ipc.ctrl->out_read_pos,
+                              drain_buf.get_ptr(), drain_bytes);
                 audio_chunk_impl out;
                 out.set_data_fixedpoint_ex(
                     drain_buf.get_ptr(), (size_t)drain_bytes,
-                    m_accum.out_pcm_rate, (unsigned)ch, 24,
+                    m_worker.out_pcm_rate, (unsigned)ch, 24,
                     audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
                     audio_chunk::g_guess_channel_config((unsigned)ch));
                 insert_chunk(out);
             }
-
-            /* Process any remaining accumulated input (synchronous, end of stream) */
-            if (m_accum.in_frames > 0) {
-                size_t out_need = (size_t)m_accum.in_frames * ch * 3 * 8;
-                if ((int)out_need > m_accum.work_out_alloc) {
-                    m_accum.work_out_alloc = (int)out_need;
-                    m_accum.work_out = (uint8_t *)realloc(m_accum.work_out, out_need);
-                }
-                size_t result = plugin_process(m_state, m_accum.in_buf,
-                    m_accum.work_out, (size_t)m_accum.in_frames, ch, m_accum.pcm_rate);
-                if (result > 0) {
-                    int emit_bytes = (int)(result * (size_t)ch * 3);
-                    audio_chunk_impl out;
-                    out.set_data_fixedpoint_ex(
-                        m_accum.work_out, (size_t)emit_bytes,
-                        m_accum.out_pcm_rate, (unsigned)ch, 24,
-                        audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
-                        audio_chunk::g_guess_channel_config((unsigned)ch));
-                    insert_chunk(out);
-                }
-                m_accum.in_frames = 0;
-            }
+            worker_stop();
         }
 
         /* Drain SDM latency — but NOT when antipop preserves SDM state,
@@ -2785,7 +2724,7 @@ public:
     void on_endoftrack(abort_callback & /*abort*/) override {}
 
     void flush() override {
-        accum_shutdown();
+        worker_stop();
         plugin_flush(m_state);
         m_logged_passthrough = false;
         m_logged_processing = false;
@@ -2794,7 +2733,26 @@ public:
     }
 
     double get_latency() override {
-        return 0.0;
+        /* Engine processing latency (trellis settling, FIR group delay) */
+        double lat = plugin_get_latency(m_state);
+
+        /* Accum buffering latency: input waiting + ring output waiting */
+        if (m_worker.active && m_worker.pcm_rate > 0) {
+            /* Input ring: data waiting to be processed */
+            int in_bytes = shm_ring_available(
+                &m_worker.ipc.ctrl->in_write_pos,
+                &m_worker.ipc.ctrl->in_read_pos);
+            int in_frames = in_bytes / (int)(m_worker.channels * sizeof(float));
+            lat += (double)in_frames / (double)m_worker.pcm_rate;
+            /* Output ring: processed data waiting to be drained */
+            int out_bytes = shm_ring_available(
+                &m_worker.ipc.ctrl->out_write_pos,
+                &m_worker.ipc.ctrl->out_read_pos);
+            int out_frames = out_bytes / (m_worker.channels * 3);
+            lat += (double)out_frames / (double)m_worker.pcm_rate;
+        }
+
+        return lat;
     }
 
     bool need_track_change_mark() override {
@@ -2980,183 +2938,133 @@ private:
     bool             m_logged_processing = false;
     unsigned         m_chunk_count = 0;
 
-    /* ── Async chunk accumulation with FIFO ring buffer ──
-     * on_chunk: accumulate input + drain ring output (<1ms, never blocks)
-     * Worker thread: plugin_process on batches → push to ring
-     * Ring buffer: SPSC lock-free, worker writes, on_chunk reads */
+    /* ── Out-of-process worker via shared memory IPC ──
+     * on_chunk: write input to shm ring, read output from shm ring (<0.5ms)
+     * Worker process: accumulates, batches, plugin_process, writes output
+     * Worker has its own CPU affinity (unrestricted by Process Lasso) */
     struct {
-        /* Input accumulation (written by on_chunk only) */
-        float       *in_buf;
-        int          in_frames;
-        int          in_alloc;
-        /* FIFO ring buffer for i24 output (worker writes, on_chunk reads) */
-        ringbuf_t    out_ring;
-        /* Worker temp output buffer */
-        uint8_t     *work_out;
-        int          work_out_alloc;
-        /* Worker thread */
-        HANDLE       thread;
-        HANDLE       batch_ready;   /* auto-reset: input batch ready for worker */
-        HANDLE       stop_event;    /* manual-reset: shutdown */
-        volatile LONG worker_busy;  /* 1 = worker processing, 0 = idle (atomic) */
-        /* Double-buffered batch input for pipelining.
-         * on_chunk stages next batch in buf[1-work_idx] while
-         * worker processes buf[work_idx]. Zero gap between batches. */
-        float       *work_buf[2];   /* double-buffered input */
-        int          work_frames[2];
-        int          work_alloc;    /* per-buffer alloc (both same size) */
-        int          work_idx;      /* which buf worker currently reads */
-        volatile LONG staged;       /* 1 = next batch ready in buf[1-work_idx] */
-        float        staged_gain;   /* gain for staged batch */
-        bool         staged_mute;
-        /* General */
-        int          batch_target;
+        shm_ipc_t    ipc;           /* shared memory + events */
+        HANDLE       worker_proc;   /* worker process handle */
+        bool         active;
         int          channels;
         unsigned     pcm_rate;
         uint32_t     out_pcm_rate;
-        bool         active;
-        bool         primed;
-    } m_accum = {};
+        int          batch_target;
+        int          marker_phase;  /* DoP marker phase for silence continuity */
+    } m_worker = {};
 
-    static DWORD WINAPI accum_worker(LPVOID param) {
-        dsp_dsd_trellis *self = (dsp_dsd_trellis *)param;
-        auto &a = self->m_accum;
+    void worker_start(int channels, unsigned pcm_rate, uint32_t out_pcm_rate,
+                      const dsd_config_t *config) {
+        worker_stop();
 
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        /* Create shared memory */
+        char suffix[32];
+        sprintf_s(suffix, sizeof(suffix), "%u", GetCurrentProcessId());
 
-        /* Pin to cpuset cores excluding LP0-3.
-         * Use the last selected core — least likely to conflict with
-         * SDM workers which use the first cores. */
+        int rc = shm_ipc_create(&m_worker.ipc, suffix,
+                                 channels, pcm_rate, out_pcm_rate, config);
+        if (rc != 0) {
+            trellis_log("worker: shm_ipc_create failed (%d) for suffix=%s", rc, suffix);
+            return;
+        }
+        trellis_log("worker: shm created (suffix=%s)", suffix);
+
+        /* Set initial gain/mute */
+        m_worker.ipc.ctrl->gain = config->gain;
+        InterlockedExchange(&m_worker.ipc.ctrl->mute, config->mute ? 1 : 0);
+
+        /* Find worker exe next to our DLL */
+        wchar_t dll_path[MAX_PATH];
+        HMODULE hmod = NULL;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)trellis_log_c, &hmod);
+        GetModuleFileNameW(hmod, dll_path, MAX_PATH);
+        /* Replace DLL name with worker exe name */
+        wchar_t *last_slash = wcsrchr(dll_path, L'\\');
+        if (last_slash)
+            wcscpy_s(last_slash + 1, MAX_PATH - (last_slash - dll_path + 1),
+                     L"foo_dsd_trellis_worker.exe");
+
+        /* Build command line */
+        wchar_t cmdline[MAX_PATH + 64];
+        swprintf_s(cmdline, MAX_PATH + 64, L"\"%s\" %hs", dll_path, suffix);
+
+        /* Launch worker process */
+        STARTUPINFOW si = { sizeof(si) };
+        PROCESS_INFORMATION pi = {};
+        if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
+                            CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS,
+                            NULL, NULL, &si, &pi)) {
+            trellis_log("worker: CreateProcess failed (%u)", GetLastError());
+            shm_ipc_destroy(&m_worker.ipc);
+            return;
+        }
+        CloseHandle(pi.hThread);
+        m_worker.worker_proc = pi.hProcess;
+
+        /* Reset child's process affinity to full system — this is the
+         * whole point of out-of-process worker. The parent may be
+         * restricted by Process Lasso, but the worker should use all cores. */
         {
-            uint32_t ids[CPUSET_MAX_CPUS];
-            int n = plugin_get_selected_cores(self->m_state, ids, CPUSET_MAX_CPUS);
-            /* Filter out LP0-3 */
-            int filtered = 0;
-            ULONG filtered_ids[CPUSET_MAX_CPUS];
-            for (int i = 0; i < n; i++) {
-                int lp = (int)(ids[i] - 256);
-                if (lp >= 4) {
-                    filtered_ids[filtered++] = (ULONG)ids[i];
-                }
-            }
-            if (filtered > 0) {
-                typedef BOOL (WINAPI *PFN)(HANDLE, const ULONG *, ULONG);
-                PFN pfn = (PFN)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
-                    "SetThreadSelectedCpuSets");
-                if (pfn) {
-                    ULONG cpuset_id = filtered_ids[filtered - 1]; /* last = least contended */
-                    pfn(GetCurrentThread(), &cpuset_id, 1);
-                    trellis_log("accum worker pinned to cpuset %u (LP%u)",
-                                cpuset_id, cpuset_id - 256);
-                }
+            DWORD_PTR proc_mask = 0, sys_mask = 0;
+            if (GetProcessAffinityMask(pi.hProcess, &proc_mask, &sys_mask)
+                && proc_mask != sys_mask) {
+                SetProcessAffinityMask(pi.hProcess, sys_mask);
+                trellis_log("worker: reset affinity to full system (0x%llx -> 0x%llx)",
+                            (unsigned long long)proc_mask, (unsigned long long)sys_mask);
             }
         }
 
-        HANDLE events[2] = { a.batch_ready, a.stop_event };
-        while (1) {
-            /* Wait for first batch or stop signal */
-            DWORD wait = WaitForMultipleObjects(2, events, FALSE, 50);
-            if (wait == WAIT_OBJECT_0 + 1) break;
-
-            /* Check for staged batch and swap */
-            if (wait == WAIT_OBJECT_0 || InterlockedCompareExchange(&a.staged, 0, 0)) {
-                if (InterlockedCompareExchange(&a.staged, 0, 1) == 1) {
-                    a.work_idx = 1 - a.work_idx;
-                }
+        /* Wait for worker to signal ready (up to 10s for GPU init) */
+        for (int i = 0; i < 200; i++) {
+            if (m_worker.ipc.ctrl->worker_status == SHM_STATUS_READY)
+                break;
+            if (m_worker.ipc.ctrl->worker_status == SHM_STATUS_ERROR) {
+                trellis_log("worker: reported error during init");
+                worker_stop();
+                return;
             }
-            int idx = a.work_idx;
-            if (a.work_frames[idx] > 0) {
-
-            process_batch:
-                plugin_set_gain(self->m_state, a.staged_gain, a.staged_mute);
-
-                size_t result = plugin_process(self->m_state,
-                    a.work_buf[idx], a.work_out,
-                    (size_t)a.work_frames[idx], a.channels, a.pcm_rate);
-
-                if (result > 0) {
-                    int bytes = (int)(result * (size_t)a.channels * 3);
-                    ringbuf_write(&a.out_ring, a.work_out, bytes);
-                }
-
-                a.work_frames[idx] = 0;
-
-                /* Check if next batch was staged during processing */
-                if (InterlockedCompareExchange(&a.staged, 0, 1) == 1) {
-                    /* Swap to staged buffer and process immediately */
-                    idx = 1 - idx;
-                    a.work_idx = idx;
-                    if (WaitForSingleObject(a.stop_event, 0) == WAIT_OBJECT_0) break;
-                    goto process_batch;
-                }
-
-                InterlockedExchange(&a.worker_busy, 0);
+            if (WaitForSingleObject(m_worker.worker_proc, 50) != WAIT_TIMEOUT) {
+                trellis_log("worker: process exited during init");
+                worker_stop();
+                return;
             }
         }
-        return 0;
+
+        if (m_worker.ipc.ctrl->worker_status != SHM_STATUS_READY) {
+            trellis_log("worker: timeout waiting for ready");
+            worker_stop();
+            return;
+        }
+
+        m_worker.active = true;
+        m_worker.channels = channels;
+        m_worker.pcm_rate = pcm_rate;
+        m_worker.out_pcm_rate = out_pcm_rate;
+        m_worker.batch_target = (int)(pcm_rate / 5);
+
+        trellis_log("worker: started (pid=%u, batch=%d frames, shm=%u bytes)",
+                    pi.dwProcessId, m_worker.batch_target,
+                    m_worker.ipc.ctrl->total_size);
     }
 
-    void accum_init(int channels, unsigned pcm_rate, uint32_t out_pcm_rate) {
-        accum_shutdown();
-        m_accum.channels = channels;
-        m_accum.pcm_rate = pcm_rate;
-        m_accum.out_pcm_rate = out_pcm_rate;
-        m_accum.batch_target = (int)(pcm_rate / 5); /* ~200ms */
-        m_accum.in_alloc = m_accum.batch_target * 2;
-        m_accum.in_buf = (float *)malloc((size_t)m_accum.in_alloc * channels * sizeof(float));
-
-        /* Ring buffer: 4x batch worth of i24 output */
-        int ring_size = m_accum.batch_target * channels * 3 * 4;
-        ringbuf_init(&m_accum.out_ring, ring_size);
-
-        /* Worker temp output buffer: 8x batch (rate conversion can expand) */
-        m_accum.work_out_alloc = (int)((size_t)m_accum.batch_target * channels * 3 * 8);
-        m_accum.work_out = (uint8_t *)malloc((size_t)m_accum.work_out_alloc);
-
-        m_accum.work_alloc = m_accum.in_alloc;
-        m_accum.work_buf[0] = (float *)malloc((size_t)m_accum.work_alloc * channels * sizeof(float));
-        m_accum.work_buf[1] = (float *)malloc((size_t)m_accum.work_alloc * channels * sizeof(float));
-        m_accum.in_frames = 0;
-        m_accum.work_frames[0] = 0;
-        m_accum.work_frames[1] = 0;
-        m_accum.work_idx = 0;
-        InterlockedExchange(&m_accum.staged, 0);
-        InterlockedExchange(&m_accum.worker_busy, 0);
-        m_accum.active = true;
-        m_accum.primed = false;
-        /* Initialize to current values so the worker doesn't trigger
-         * a full engine reinit on its first batch */
-        m_accum.staged_gain = get_cached_gain();
-        m_accum.staged_mute = get_cached_muted();
-
-        m_accum.batch_ready = CreateEventW(NULL, FALSE, FALSE, NULL);
-        m_accum.stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
-        m_accum.thread = CreateThread(NULL, 0, accum_worker, this, 0, NULL);
-
-        trellis_log("accum: batch=%d frames (%.0fms), ring=%d bytes, worker thread",
-                    m_accum.batch_target,
-                    (double)m_accum.batch_target / pcm_rate * 1000.0,
-                    m_accum.out_ring.capacity);
-    }
-
-    void accum_shutdown() {
-        if (m_accum.thread) {
-            SetEvent(m_accum.stop_event);
-            SetEvent(m_accum.batch_ready); /* wake worker so it sees stop */
-            /* Spin-wait for worker_busy to become 0 */
-            for (int i = 0; i < 300 && InterlockedCompareExchange(&m_accum.worker_busy, 0, 0); i++)
-                Sleep(1);
-            WaitForSingleObject(m_accum.thread, 3000);
-            CloseHandle(m_accum.thread); m_accum.thread = NULL;
+    void worker_stop() {
+        if (m_worker.worker_proc) {
+            /* Signal stop */
+            if (m_worker.ipc.stop_event)
+                SetEvent(m_worker.ipc.stop_event);
+            /* Wait for graceful exit */
+            if (WaitForSingleObject(m_worker.worker_proc, 3000) == WAIT_TIMEOUT) {
+                trellis_log("worker: timeout, terminating");
+                TerminateProcess(m_worker.worker_proc, 1);
+                WaitForSingleObject(m_worker.worker_proc, 1000);
+            }
+            CloseHandle(m_worker.worker_proc);
+            m_worker.worker_proc = NULL;
         }
-        if (m_accum.batch_ready) { CloseHandle(m_accum.batch_ready); m_accum.batch_ready = NULL; }
-        if (m_accum.stop_event) { CloseHandle(m_accum.stop_event); m_accum.stop_event = NULL; }
-        free(m_accum.in_buf); m_accum.in_buf = NULL;
-        ringbuf_free(&m_accum.out_ring);
-        free(m_accum.work_out); m_accum.work_out = NULL;
-        free(m_accum.work_buf[0]); m_accum.work_buf[0] = NULL;
-        free(m_accum.work_buf[1]); m_accum.work_buf[1] = NULL;
-        memset(&m_accum, 0, sizeof(m_accum));
+        shm_ipc_destroy(&m_worker.ipc);
+        memset(&m_worker, 0, sizeof(m_worker));
     }
 
     /* Anti-pop / deferred output state */

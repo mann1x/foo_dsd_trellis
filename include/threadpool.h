@@ -36,6 +36,14 @@ threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids,
                                        const uint16_t *groups,
                                        int count);
 
+/* Set number of reserved workers.
+ * Workers 0..reserved_count-1 ONLY process their per-worker queue
+ * (submit_to targets). They never touch the shared queue.
+ * Workers reserved_count..thread_count-1 ONLY process the shared queue.
+ * This prevents shared tasks from starving pinned SDM segments.
+ * Must be called after create, before any submit. */
+void threadpool_set_reserved(threadpool_t *pool, int reserved_count);
+
 /* Submit a channel block for processing.
  * Non-blocking; the block is queued for a worker thread. */
 int threadpool_submit(threadpool_t *pool, channel_block_t *block);

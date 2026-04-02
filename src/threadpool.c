@@ -122,6 +122,14 @@ struct threadpool {
     int          cpuset_id_count;
     volatile LONG reset_log_count;  /* set to 1 to reset worker log counter */
 
+    /* Worker role separation:
+     * Workers 0..reserved_count-1: RESERVED — only check per-worker queue.
+     *   Used by submit_to for pinned tasks (SDM segments).
+     *   These workers NEVER touch the shared queue.
+     * Workers reserved_count..thread_count-1: SHARED — only check shared queue.
+     *   Used by submit for FIR, Estimate, Full, Unpack, Pack.
+     *   These workers NEVER check per-worker queues. */
+    int          reserved_count;    /* 0 = all workers check both (legacy) */
 };
 
 /* SetThreadSelectedCpuSets — loaded dynamically (Windows 10+) */
@@ -152,39 +160,62 @@ static DWORD WINAPI worker_func(LPVOID param) {
      * THREAD_PRIORITY_HIGHEST provides sufficient priority elevation. */
     HANDLE mmcss_handle = NULL;
 
-    /* Hard-pin this thread to its designated LP.
-     * SetThreadAffinityMask is a hard constraint the OS cannot override. */
-    if (pool->lp_indices && my_index < pool->cpuset_id_count) {
+    /* Pin this thread to its designated core via SetThreadSelectedCpuSets.
+     * This bypasses process affinity restrictions (e.g., Process Lasso)
+     * and works at the CPU set level. Falls back to SetThreadAffinityMask
+     * only if SetThreadSelectedCpuSets is unavailable. */
+    if (pool->cpuset_ids && my_index < pool->cpuset_id_count) {
+        PFN_SetThreadSelectedCpuSets pfn = (PFN_SetThreadSelectedCpuSets)
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                           "SetThreadSelectedCpuSets");
+        if (pfn) {
+            ULONG id = (ULONG)pool->cpuset_ids[my_index];
+            pfn(GetCurrentThread(), &id, 1);
+        } else if (pool->lp_indices) {
+            DWORD_PTR mask = (DWORD_PTR)1 << pool->lp_indices[my_index];
+            SetThreadAffinityMask(GetCurrentThread(), mask);
+        }
+    } else if (pool->lp_indices && my_index < pool->cpuset_id_count) {
         DWORD_PTR mask = (DWORD_PTR)1 << pool->lp_indices[my_index];
         SetThreadAffinityMask(GetCurrentThread(), mask);
     }
 
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
-    /* Build wait handles: [0] = per-worker event, [1] = shared semaphore */
+    /* Wait on both per-worker event and shared semaphore always.
+     * Role-based filtering happens AFTER wakeup — simpler than
+     * dynamic wait handle reconfiguration, and spurious wakeups
+     * are negligible (just a re-check + continue). */
     worker_queue_t *my_queue = (pool->worker_queues) ? &pool->worker_queues[my_index] : NULL;
+
     HANDLE wait_handles[2];
     int n_handles = 0;
     if (my_queue) wait_handles[n_handles++] = my_queue->wake_event;
     wait_handles[n_handles++] = pool->work_sem;
 
     for (;;) {
-        /* Wait for per-worker task, shared task, or shutdown */
         WaitForMultipleObjects((DWORD)n_handles, wait_handles, FALSE, INFINITE);
 
         if (InterlockedCompareExchange(&pool->shutdown, 0, 0))
             break;
 
-        /* Check per-worker queue first (targeted tasks) */
+        /* Read role dynamically (set_reserved may be called after thread start) */
+        int rc = pool->reserved_count;
+        bool is_reserved = (rc > 0 && my_index < rc);
+        bool is_shared   = (rc > 0 && my_index >= rc);
+        /* rc == 0: legacy — check both queues */
+
         channel_block_t *block = NULL;
-        if (my_queue && InterlockedCompareExchange(&my_queue->count, 0, 0) > 0) {
+
+        /* Reserved workers (or legacy): check per-worker queue */
+        if (!is_shared && my_queue && InterlockedCompareExchange(&my_queue->count, 0, 0) > 0) {
             LONG idx = InterlockedDecrement(&my_queue->count);
             if (idx >= 0)
                 block = my_queue->queue[idx];
         }
 
-        /* Fall back to shared queue */
-        if (!block) {
+        /* Shared workers (or legacy): check shared queue */
+        if (!block && !is_reserved) {
             EnterCriticalSection(&pool->queue_cs);
             if (pool->queue_count > 0) {
                 block = pool->queue[pool->queue_head];
@@ -194,8 +225,14 @@ static DWORD WINAPI worker_func(LPVOID param) {
             LeaveCriticalSection(&pool->queue_cs);
         }
 
-        if (!block)
+        if (!block) {
+            /* If a reserved worker woke on work_sem but found no per-worker
+             * task, it consumed a semaphore count that was meant for a shared
+             * worker. Re-release it so the shared worker can pick it up. */
+            if (is_reserved)
+                ReleaseSemaphore(pool->work_sem, 1, NULL);
             continue;
+        }
 
         /* Log task: what the worker is doing and which core it runs on */
         {
@@ -430,6 +467,20 @@ threadpool_t *threadpool_create(int thread_count, DWORD affinity_mask) {
     return pool;
 }
 
+void threadpool_set_reserved(threadpool_t *pool, int reserved_count) {
+    if (!pool) return;
+    if (reserved_count < 0) reserved_count = 0;
+    if (reserved_count > pool->thread_count) reserved_count = pool->thread_count;
+    pool->reserved_count = reserved_count;
+    {
+        char msg[128];
+        sprintf_s(msg, sizeof(msg), "pool: %d workers (%d reserved, %d shared)",
+                  pool->thread_count, reserved_count,
+                  pool->thread_count - reserved_count);
+        trellis_log_c(msg);
+    }
+}
+
 int threadpool_submit(threadpool_t *pool, channel_block_t *block) {
     EnterCriticalSection(&pool->queue_cs);
 
@@ -588,35 +639,19 @@ int threadpool_migrate_thread(threadpool_t *pool, int thread_index, uint32_t new
         new_lp = (uint8_t)((int)base_lp + ((int)new_cpuset_id - (int)base_id));
     }
 
-    /* Hard affinity — check if multi-group */
-    bool multi_group = false;
-    if (pool->groups) {
-        for (int i = 0; i < pool->cpuset_id_count; i++) {
-            if (pool->groups[i] > 0) { multi_group = true; break; }
+    /* Use SetThreadSelectedCpuSets (bypasses process affinity).
+     * Falls back to SetThreadAffinityMask if unavailable. */
+    {
+        PFN_SetThreadSelectedCpuSets pfn = (PFN_SetThreadSelectedCpuSets)
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                           "SetThreadSelectedCpuSets");
+        if (pfn) {
+            ULONG id = (ULONG)new_cpuset_id;
+            pfn(pool->threads[thread_index], &id, 1);
+        } else {
+            DWORD_PTR mask = (DWORD_PTR)1 << new_lp;
+            SetThreadAffinityMask(pool->threads[thread_index], mask);
         }
-    }
-
-    if (multi_group) {
-        PFN_SetThreadGroupAffinity pfn_ga = (PFN_SetThreadGroupAffinity)
-            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadGroupAffinity");
-        if (pfn_ga) {
-            /* Find group for this cpuset_id (search known entries, fallback to 0) */
-            uint16_t grp = 0;
-            for (int i = 0; i < pool->cpuset_id_count; i++) {
-                if (pool->cpuset_ids[i] == new_cpuset_id) {
-                    grp = pool->groups[i];
-                    break;
-                }
-            }
-            GROUP_AFFINITY ga;
-            memset(&ga, 0, sizeof(ga));
-            ga.Group = grp;
-            ga.Mask = (KAFFINITY)1 << new_lp;
-            pfn_ga(pool->threads[thread_index], &ga, NULL);
-        }
-    } else {
-        DWORD_PTR mask = (DWORD_PTR)1 << new_lp;
-        SetThreadAffinityMask(pool->threads[thread_index], mask);
     }
 
     /* Update tracked cpuset ID and LP index */

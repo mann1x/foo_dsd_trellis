@@ -179,6 +179,8 @@ int engine_channel_init(engine_channel_t *eng, int channel,
         else if (is_rate_conv)
             eng->fir_gain = fir_gain_db_to_linear(FIR_GAIN_DEFAULT); /* -3 dB for PCM→DSD */
 
+
+
         /* Apply user FIR gain override.
          * Auto: use path_config gain (0.708 = -3 dB for all paths).
          * Explicit: replace path_config gain with user's choice. */
@@ -734,12 +736,13 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
 
     /* Path-adaptive lookup — always look up for cands/depth/lat/gain.
      * NTF from path_config is only used when ntf_override == NTF_AUTO. */
-    const path_config_t *pc = NULL;
-    if (sdm_mode == SDM_MODE_TRELLIS) {
-        pc = path_config_lookup(fs_in, fs_out);
-    }
+    /* Look up path config for ALL SDM modes — fir_gain applies to both
+     * Trellis and PreCorr (prevents SDM overload from FIR output peaks).
+     * NTF/cands/depth/lat from path_config are Trellis-specific. */
+    const path_config_t *pc = path_config_lookup(fs_in, fs_out);
 
-    if (pc) {
+    if (pc && sdm_mode == SDM_MODE_TRELLIS) {
+        /* Trellis: use path table for NTF, cands, depth, lat, gain */
         info->ntf_filter = (int)pc->filter;
         info->cands = pc->cands;
         info->lat = pc->lat;
@@ -747,11 +750,12 @@ int engine_get_path_info(uint32_t fs_in, uint32_t fs_out,
         info->state_limit = pc->state_limit;
         info->fir_gain = pc->fir_gain;
     } else {
-        /* Auto-select or user override */
+        /* PreCorr or no path config: use config values for SDM params */
         info->ntf_filter = ntf_override; /* keep NTF_AUTO or user value */
         info->cands = cfg->trellis_cands;
         info->lat = cfg->trellis_lat;
-        info->fir_gain = 1.0f;
+        /* fir_gain from path table if available, else 1.0 */
+        info->fir_gain = pc ? pc->fir_gain : 1.0f;
     }
 
     /* Auto-compute optimal lat when lat=0 (auto).
