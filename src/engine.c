@@ -373,12 +373,20 @@ size_t engine_process_block(engine_channel_t *eng,
              * Features on CPU (subsampled), MLP via ONNX on GPU, FIR on CPU. */
             if (cfg->ml_enabled)
                 engine_apply_preemph(eng, cfg, count);
-            /* Re-encode via SDM (CPU only) */
+            /* Re-encode via SDM (CPU only).
+             * Trellis SDM internally scales input by 0.5 to prevent quantizer
+             * overload from FIR rate-conversion peaks (±2.24). For same-rate
+             * boxcar path (output ≤ ±1.0), compensate by 2× so the 0.5
+             * cancels out and the gain is unity. */
             size_t sdm_out;
             if (eng->sdm_mode == SDM_MODE_PRECORR)
                 sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
-            else
+            else {
+                /* Compensate for Trellis 0.5× internal scaling on same-rate */
+                for (size_t i = 0; i < count; i++)
+                    eng->fir_buf[i] *= 2.0;
                 sdm_out = (eng->sdm_fast ? sdm_process_block_fast : sdm_process_block)(&eng->sdm, eng->fir_buf, out, count);
+            }
             return sdm_out;
         }
     }

@@ -1138,7 +1138,7 @@ void sdm_estimate_state_multibit(const ntf_filter_t *filter,
         state[i] = init_state[i];
 
     for (size_t n = 0; n < count; n++) {
-        double x = in[n] * 0.5;  /* same scale as sdm_process_block */
+        double x = in[n] * 0.5;
 
         /* NTF filter calc with y=0 (generic order) */
         new_state[0] = state[0] - g[0] * state[1] + x;

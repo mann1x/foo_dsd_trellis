@@ -7,6 +7,7 @@
 #include "../include/trellis.h"
 #include "../include/ntf.h"
 #include "../include/fir.h"
+#include "../include/precorr.h"
 #include "../include/sinad_measure.h"
 #include <math.h>
 
@@ -1030,6 +1031,8 @@ static void test_gpu_cpu_divergence(void) {
     g_tests_passed++;
 }
 
+static void test_sdm_gain_transfer(void);  /* forward decl */
+
 void test_trellis_suite(void) {
     TEST_SUITE("Trellis SDM");
     TEST_RUN(test_gpu_cpu_divergence);
@@ -1047,6 +1050,112 @@ void test_trellis_suite(void) {
     TEST_RUN(test_sdm_sinad_dsd256);
     TEST_RUN(test_sdm_sinad_dsd512);
     TEST_RUN(test_sdm_sinad_multibit);
+    TEST_RUN(test_sdm_gain_transfer);
+}
+
+/* ─── Gain transfer measurement ─── */
+
+/* Measure how much signal level the boxcar+SDM pipeline preserves.
+ * Generates DSD-encoded 1kHz sine, processes through boxcar→gain→SDM,
+ * measures Goertzel power of input and output at the tone frequency.
+ * Reports the gain transfer in dB. */
+static void test_sdm_gain_transfer(void) {
+    printf("\n=== Gain Transfer: input vs output signal power ===\n");
+
+    struct {
+        unsigned rate_mult;
+        int nc; int lat; int depth;
+        int sdm_mode; /* 0=trellis, 1=precorr */
+        const char *label;
+    } cases[] = {
+        { 64,  2, 32, 16, 0, "DSD64 Trellis" },
+        { 128, 2, 128, 4, 0, "DSD128 Trellis" },
+        { 256, 2, 128, 4, 0, "DSD256 Trellis" },
+        { 512, 2, 32,  4, 0, "DSD512 Trellis" },
+        { 64,  4, 32,  8, 1, "DSD64 PreCorr" },
+        { 128, 4, 128, 8, 1, "DSD128 PreCorr" },
+        { 256, 4, 128, 8, 1, "DSD256 PreCorr" },
+        { 512, 4, 32,  8, 1, "DSD512 PreCorr" },
+    };
+
+    for (int c = 0; c < (int)(sizeof(cases)/sizeof(cases[0])); c++) {
+        unsigned rate_mult = cases[c].rate_mult;
+        unsigned dsd_rate = rate_mult * 44100;
+        unsigned n_dsd = (rate_mult <= 64)  ? 262144u :
+                         (rate_mult <= 128) ? 524288u :
+                         (rate_mult <= 256) ? 1048576u : 2097152u;
+        double freq = 1000.0;
+
+        /* Generate DSD-encoded 1kHz sine via reference SDM */
+        const ntf_filter_t *f = ntf_auto_select(dsd_rate);
+        if (!f) { printf("  %s: no NTF\n", cases[c].label); continue; }
+
+        float *dsd_in = (float *)malloc(n_dsd * sizeof(float));
+        double *smooth = (double *)malloc(n_dsd * sizeof(double));
+        float *out = (float *)malloc(n_dsd * sizeof(float));
+        if (!dsd_in || !smooth || !out) {
+            free(dsd_in); free(smooth); free(out); continue;
+        }
+
+        {
+            sdm_context_t ref;
+            sdm_context_init(&ref, f, 8, 2, 128);
+            double *sine = (double *)malloc(n_dsd * sizeof(double));
+            for (unsigned i = 0; i < n_dsd; i++)
+                sine[i] = 0.5 * sin(2.0 * M_PI * freq * i / dsd_rate);
+            size_t ref_n = sdm_process_block(&ref, sine, dsd_in, n_dsd);
+            free(sine);
+            sdm_context_free(&ref);
+            for (size_t i = ref_n; i < n_dsd; i++)
+                dsd_in[i] = (i & 1) ? 1.0f : -1.0f;
+        }
+
+        /* Measure INPUT signal power (DSD-encoded tone, no processing) */
+        double input_power = goertzel_power(dsd_in, n_dsd, freq, (double)dsd_rate);
+
+        /* Process: boxcar(32 taps) → gain(1.0) → SDM */
+        {
+            int taps = 32; /* same as engine */
+            double sum = 0.0, ring[128] = {0};
+            int pos = 0;
+            double inv_n = 1.0 / (double)taps;
+            double gain = 1.0; /* 0 dB — no attenuation */
+            for (unsigned i = 0; i < n_dsd; i++) {
+                double s = dsd_in[i] >= 0.0f ? 1.0 : -1.0;
+                sum -= ring[pos]; ring[pos] = s; sum += s;
+                pos = (pos + 1) % taps;
+                smooth[i] = sum * inv_n * gain;
+            }
+        }
+
+        /* Process through SDM */
+        size_t produced;
+        if (cases[c].sdm_mode == 1) {
+            /* PreCorr */
+            const ntf_filter_t *pf = ntf_auto_select_precorr(dsd_rate);
+            if (!pf) pf = f;
+            precorr_context_t pctx;
+            precorr_context_init(&pctx, pf);
+            produced = precorr_process_block(&pctx, smooth, out, n_dsd);
+        } else {
+            /* Trellis */
+            sdm_context_t ctx;
+            sdm_context_init(&ctx, f, cases[c].depth, cases[c].nc, cases[c].lat);
+            produced = sdm_process_block(&ctx, smooth, out, n_dsd);
+            sdm_context_free(&ctx);
+        }
+
+        /* Measure OUTPUT signal power */
+        double output_power = goertzel_power(out, produced, freq, (double)dsd_rate);
+
+        /* Gain transfer */
+        double transfer_db = 10.0 * log10(output_power / (input_power > 0 ? input_power : 1e-30));
+
+        printf("  %s: input=%.3e output=%.3e transfer=%.2f dB\n",
+               cases[c].label, input_power, output_power, transfer_db);
+
+        free(dsd_in); free(smooth); free(out);
+    }
 }
 
 /* ─── Pipeline SINAD: simulate actual engine path ─── */
