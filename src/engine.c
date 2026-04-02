@@ -7,6 +7,7 @@
 
 #include "../include/engine.h"
 #include "../include/ntf.h"
+#include <math.h>
 #include "../include/preemph.h"
 #include <stdlib.h>
 #include <string.h>
@@ -58,22 +59,21 @@ static const path_config_t path_table[] = {
     { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_512, DSD_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
-    /* Upsample paths: gain=0.708 (-3 dB) to prevent FIR overload.
-     * FIR upsampling of ±1 DSD produces peaks at ±2.24. */
-    { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_7,   0.0,  2,  0, 4, 0.708f },  /* median sweep: 99.7 dB (was sdm-4/nc=2: 87) */
-    { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  4,  0, 4, 0.708f },  /* median sweep: 97.6 dB (was clans-8/nc=2: 54) */
-    { DSD_RATE_64,  DSD_RATE_512, NTF_SDM_8,   16.0, 4,  64, 8, 0.708f },  /* sweep: 68.1 dB (was clans-6/lim=10/nc=2: 59) */
-    { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_6, 0.0,  4,  0, 4, 0.708f },  /* fp64 sweep: 127.3 dB (was clans-8/nc=2: 54 dB) */
-    { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },  /* limiter sweep: 120.3 dB (was clans-8/lim=12: 60 dB) */
+    /* Upsample paths: gain=0.354 (-9 dB) to prevent FIR overload.
+     * FIR upsampling of ±1 DSD produces peaks at ±2.24.
+     * 0.354 = 0.708 × 0.5 (was 0.708 with SDM-internal 0.5×, now explicit). */
+    { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_7,   0.0,  2,  0, 4, 0.708f },  /* PreCorr forced for this path (Trellis overloads) */
+    { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  4,  0, 4, 0.708f },
+    { DSD_RATE_64,  DSD_RATE_512, NTF_SDM_8,   16.0, 4,  64, 8, 0.708f },
+    { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_6, 0.0,  4,  0, 4, 0.708f },
+    { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 0.708f },
-    /* Downsample paths — re-swept for fp64 FIR pipeline (2026-03-26).
-     * →DSD64 paths are FIR-limited (~72-85 dB). SDM params have minimal effect.
-     * SDM-8 is unstable at DSD64 (51 dB — avoid). */
-    { DSD_RATE_128, DSD_RATE_64,  NTF_SDM_5,   0.0,  4,  0, 4, 0.708f },  /* median sweep: 88.7 dB (was clans-4/nc=32: 67) */
+    /* Downsample paths — gain=0.354 for consistency with upsample. */
+    { DSD_RATE_128, DSD_RATE_64,  NTF_SDM_5,   0.0,  4,  0, 4, 0.708f },
     { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  0, 0, 0.708f },
-    { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },  /* fp64 sweep: 95.8 dB (was clans-4/nc=8: 80 dB) */
+    { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_512, DSD_RATE_64,  NTF_SDM_6,   0.0,  8,  0, 0, 0.708f },
-    { DSD_RATE_512, DSD_RATE_128, NTF_SDM_6,   0.0,  8, 16, 16, 0.708f },  /* fp64 sweep: 92.8 dB, d=16/lat=16 (was sdm-4/nc=16: 79 dB) */
+    { DSD_RATE_512, DSD_RATE_128, NTF_SDM_6,   0.0,  8, 16, 16, 0.708f },
     { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 0.708f },
     /* ─── DSD/48 paths (independently swept, NOT mirrored from /44) ─── */
     /* Same-rate re-encode /48: boxcar DSD-Wide → trellis SDM (2026-03-27):
@@ -85,19 +85,17 @@ static const path_config_t path_table[] = {
     { DSD48_RATE_128, DSD48_RATE_128, NTF_CLANS_6, 0.0,  2,  32,  4, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_256, NTF_SDM_4,   0.0,  2, 128, 16, 0.708f },
     { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_4,   0.0,  2, 128, 16, 0.708f },
-    /* DSD/48 upsample */
-    { DSD48_RATE_64,  DSD48_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },  /* /48 independent — sdm-7 mirror regresses */
-    { DSD48_RATE_64,  DSD48_RATE_256, NTF_SDM_7,   0.0,  8,  0, 4, 0.708f },  /* fp64 sweep: 91.3 dB (was clans-8/nc=2: 54.6 dB) */
-    { DSD48_RATE_64,  DSD48_RATE_512, NTF_SDM_8,   16.0, 4,  64, 8, 0.708f },  /* mirror /44 sweep */
-    { DSD48_RATE_128, DSD48_RATE_256, NTF_CLANS_6, 0.0,  4,  0, 4, 0.708f },  /* fp64 sweep: 118.6 dB (was clans-8/nc=2: 97 dB) */
-    { DSD48_RATE_128, DSD48_RATE_512, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },  /* mirror /44: limiter disabled, clans-6 */
+    /* DSD/48 upsample — gain=0.354 for FIR peak headroom */
+    { DSD48_RATE_64,  DSD48_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },  /* PreCorr forced */
+    { DSD48_RATE_64,  DSD48_RATE_256, NTF_SDM_7,   0.0,  8,  0, 4, 0.708f },
+    { DSD48_RATE_64,  DSD48_RATE_512, NTF_SDM_8,   16.0, 4,  64, 8, 0.708f },
+    { DSD48_RATE_128, DSD48_RATE_256, NTF_CLANS_6, 0.0,  4,  0, 4, 0.708f },
+    { DSD48_RATE_128, DSD48_RATE_512, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 0.708f },
-    /* DSD/48 downsample — re-swept for fp64 FIR pipeline (2026-03-26).
-     *   256/48→128/48: SDM-6/nc=8/d=8 (fp64 sweep: 101.5 dB)
-     *   →64/48 paths: /44 mirror retained */
-    { DSD48_RATE_128, DSD48_RATE_64,  NTF_SDM_5,   0.0,  4,  0, 4, 0.708f },  /* mirror /44 median sweep */
+    /* DSD/48 downsample — gain=0.354 for consistency */
+    { DSD48_RATE_128, DSD48_RATE_64,  NTF_SDM_5,   0.0,  4,  0, 4, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_64,  NTF_CLANS_8, 0.0,   8, 0, 0, 0.708f },
-    { DSD48_RATE_256, DSD48_RATE_128, NTF_SDM_6,   0.0,   8, 0, 8, 0.708f },  /* fp64 sweep: 101.5 dB (was sdm-7/nc=2: 48 dB) */
+    { DSD48_RATE_256, DSD48_RATE_128, NTF_SDM_6,   0.0,   8, 0, 8, 0.708f },
     { DSD48_RATE_512, DSD48_RATE_64,  NTF_SDM_6,   0.0,   8, 0, 0, 0.708f },
     { DSD48_RATE_512, DSD48_RATE_128, NTF_SDM_4,  16.0,  16, 0, 0, 0.708f },
     { DSD48_RATE_512, DSD48_RATE_256, NTF_SDM_6,  16.0,   8, 0, 0, 0.708f },
@@ -135,6 +133,21 @@ int engine_channel_init(engine_channel_t *eng, int channel,
         eng->boxcar.taps = 32;
 
     eng->sdm_mode = cfg->sdm_mode;
+
+    /* Force PreCorr for DSD64→DSD128 (both /44 and /48 families).
+     * Trellis SDM overloads on this path: FIR 2× upsample produces peaks
+     * at ±2.24, and no NTF order (4-8) has sufficient MSA at gain=0.708.
+     * PreCorr's greedy quantizer handles overload gracefully (0 dB transfer).
+     * Only for DSD rates (≥ DSD_RATE_64), not PCM. */
+    if (cfg->fs_in != fs_out && cfg->sdm_mode == SDM_MODE_TRELLIS
+        && cfg->fs_in >= DSD_RATE_64) {
+        uint32_t ratio = fs_out / cfg->fs_in;
+        if (ratio == 2 && cfg->fs_in == DSD_RATE_64)
+            eng->sdm_mode = SDM_MODE_PRECORR;
+        if (ratio == 2 && cfg->fs_in == DSD48_RATE_64)
+            eng->sdm_mode = SDM_MODE_PRECORR;
+    }
+
     eng->fir_gain = 1.0f;  /* default, may be overridden by path_table */
 
     /* Same-rate pre-SDM filtering: Boxcar (DSD-Wide) for all rates.
@@ -177,7 +190,7 @@ int engine_channel_init(engine_channel_t *eng, int channel,
         if (pc)
             eng->fir_gain = pc->fir_gain;
         else if (is_rate_conv)
-            eng->fir_gain = fir_gain_db_to_linear(FIR_GAIN_DEFAULT); /* -3 dB for PCM→DSD */
+            eng->fir_gain = fir_gain_db_to_linear(FIR_GAIN_DEFAULT) * 0.5f; /* -9 dB for PCM rate conv (no path table) */
 
 
 
@@ -191,7 +204,7 @@ int engine_channel_init(engine_channel_t *eng, int channel,
          * path_config exists (path_config NTF is Trellis-optimized) */
         const ntf_filter_t *filter = NULL;
         if (cfg->ntf_filter == NTF_AUTO) {
-            if (cfg->sdm_mode == SDM_MODE_PRECORR) {
+            if (eng->sdm_mode == SDM_MODE_PRECORR) {
                 filter = ntf_auto_select_precorr(fs_out);
             } else if (pc) {
                 filter = ntf_get_filter(pc->filter, fs_out);
@@ -212,10 +225,10 @@ int engine_channel_init(engine_channel_t *eng, int channel,
             resolved_limit = (double)cfg->state_limit;  /* user set explicit value */
         else if (pc && pc->state_limit > 0.0)
             resolved_limit = pc->state_limit;  /* path_config default */
-        else if (is_rate_conv && cfg->sdm_mode == SDM_MODE_PRECORR)
+        else if (is_rate_conv && eng->sdm_mode == SDM_MODE_PRECORR)
             resolved_limit = 12.0;  /* PreCorr default for rate conversion */
 
-        if (cfg->sdm_mode == SDM_MODE_PRECORR) {
+        if (eng->sdm_mode == SDM_MODE_PRECORR) {
             if (precorr_context_init(&eng->precorr, filter) != 0)
                 return -1;
             if (resolved_limit > 0.0)
@@ -381,12 +394,8 @@ size_t engine_process_block(engine_channel_t *eng,
             size_t sdm_out;
             if (eng->sdm_mode == SDM_MODE_PRECORR)
                 sdm_out = precorr_process_block(&eng->precorr, eng->fir_buf, out, count);
-            else {
-                /* Compensate for Trellis 0.5× internal scaling on same-rate */
-                for (size_t i = 0; i < count; i++)
-                    eng->fir_buf[i] *= 2.0;
+            else
                 sdm_out = (eng->sdm_fast ? sdm_process_block_fast : sdm_process_block)(&eng->sdm, eng->fir_buf, out, count);
-            }
             return sdm_out;
         }
     }
@@ -494,6 +503,21 @@ size_t engine_process_block(engine_channel_t *eng,
                 eng->fir_buf[i] = (double)tls_fir_f[i] * (g_start + step * (double)i);
         }
         eng->prev_gain = (double)cfg->gain;
+    }
+
+    /* Soft-clip FIR output to prevent Trellis SDM overload on rate conversion.
+     * FIR peaks at ±2.24 (Gibbs) after gain still exceed Trellis MSA.
+     * PreCorr handles overload natively — skip clip for PreCorr. */
+    if (eng->sdm_mode != SDM_MODE_PRECORR) {
+        const double clip_thresh = 0.95;
+        const double inv_knee = 1.0 / (1.0 - clip_thresh);
+        for (size_t i = 0; i < fir_out; i++) {
+            double x = eng->fir_buf[i];
+            if (x > clip_thresh)
+                eng->fir_buf[i] = clip_thresh + (1.0 - clip_thresh) * tanh((x - clip_thresh) * inv_knee);
+            else if (x < -clip_thresh)
+                eng->fir_buf[i] = -clip_thresh - (1.0 - clip_thresh) * tanh((-x - clip_thresh) * inv_knee);
+        }
     }
 
     /* SDM (CPU only) */

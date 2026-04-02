@@ -1138,7 +1138,7 @@ static void test_sdm_gain_transfer(void) {
             precorr_context_init(&pctx, pf);
             produced = precorr_process_block(&pctx, smooth, out, n_dsd);
         } else {
-            /* Trellis */
+            /* Trellis — no internal scaling (0.5× removed from SDM) */
             sdm_context_t ctx;
             sdm_context_init(&ctx, f, cases[c].depth, cases[c].nc, cases[c].lat);
             produced = sdm_process_block(&ctx, smooth, out, n_dsd);

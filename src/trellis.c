@@ -1027,13 +1027,13 @@ size_t sdm_process_block(sdm_context_t *ctx,
         ctx->pending += (unsigned)pre;
         len -= pre;
         while (pre--) {
-            sample_fn(ctx, *in++ * 0.5);
+            sample_fn(ctx, *in++);
         }
     }
 
     /* Produce output samples */
     while (len--) {
-        *outp++ = (float)sample_fn(ctx, *in++ * 0.5);
+        *outp++ = (float)sample_fn(ctx, *in++);
     }
 
     return (size_t)(outp - out);
@@ -1138,7 +1138,7 @@ void sdm_estimate_state_multibit(const ntf_filter_t *filter,
         state[i] = init_state[i];
 
     for (size_t n = 0; n < count; n++) {
-        double x = in[n] * 0.5;
+        double x = in[n];
 
         /* NTF filter calc with y=0 (generic order) */
         new_state[0] = state[0] - g[0] * state[1] + x;
