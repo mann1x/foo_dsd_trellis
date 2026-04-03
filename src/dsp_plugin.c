@@ -759,12 +759,6 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         }
     }
 
-    /* Worker reservation disabled — causes hang during first batch when
-     * set_reserved fires mid-processing inside plugin_init_engine.
-     * TODO: move set_reserved to worker_main.c after first plugin_process. */
-    /* if (s->pool && num_channels > 0)
-        threadpool_set_reserved(s->pool, num_channels); */
-
     /* Create ML filters if enabled and ONNX Runtime is available.
      * DSD512 same-rate: load pre-SDM preemph model (features → MLP → FIR on GPU).
      * Other rates: load post-SDM model if present. */
@@ -2778,6 +2772,15 @@ sdm_done:
 
     QueryPerformanceCounter(&t_pack_end);
     s->time_pack_ms = perf_ms(t_pack_start, t_pack_end);
+
+    /* Enable worker reservation after first successful chunk.
+     * Cannot be called during plugin_init_engine (deadlock: workers are
+     * mid-processing when set_reserved changes their role). Safe here
+     * because the pool is idle between chunks. */
+    if (s->chunk_counter == 0 && s->pool && num_channels > 0) {
+        threadpool_set_reserved(s->pool, num_channels);
+    }
+    s->chunk_counter++;
 
     return out_pcm_frames;
 }
