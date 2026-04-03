@@ -12,7 +12,6 @@ env:
   SOLUTION: foo_dsd_trellis.sln
   ONNXRUNTIME_VERSION: 1.24.4
   DIRECTML_VERSION: 1.15.4
-  CUDNN_VERSION: 9.8.0.87
 
 jobs:
   build:
@@ -50,15 +49,12 @@ jobs:
     - name: Download ONNX Runtime (DirectML + CUDA)
       shell: bash
       run: |
-        # DirectML build
         nuget install Microsoft.ML.OnnxRuntime.DirectML \
           -Version ${{ env.ONNXRUNTIME_VERSION }} \
           -OutputDirectory packages
-        # CUDA build (GPU Windows)
         nuget install Microsoft.ML.OnnxRuntime.Gpu.Windows \
           -Version ${{ env.ONNXRUNTIME_VERSION }} \
           -OutputDirectory packages
-        # DirectML redistributable
         nuget install Microsoft.AI.DirectML \
           -Version ${{ env.DIRECTML_VERSION }} \
           -OutputDirectory packages
@@ -86,60 +82,92 @@ jobs:
         cp README.md README.txt
         cp CHANGELOG.md CHANGELOG.txt
 
-    - name: Package base component (DirectML)
+    - name: Package base .fb2k-component (DirectML)
       shell: bash
       run: |
         VER="${{ steps.version.outputs.version }}"
         DML_ORT="packages/Microsoft.ML.OnnxRuntime.DirectML.${{ env.ONNXRUNTIME_VERSION }}"
         DML_RT="packages/Microsoft.AI.DirectML.${{ env.DIRECTML_VERSION }}"
-        STAGE="stage_base"
-        mkdir -p "$STAGE"
+        COMP="stage_base_comp"
+        mkdir -p "$COMP"
 
         # Plugin
-        cp bin/Release/x64/foo_dsd_trellis.dll "$STAGE/"
-        cp bin/Release/x64/foo_dsd_trellis_worker.exe "$STAGE/"
+        cp bin/Release/x64/foo_dsd_trellis.dll "$COMP/"
+        cp bin/Release/x64/foo_dsd_trellis_worker.exe "$COMP/"
 
         # Runtime deps
-        cp deps/x64/soxr.dll "$STAGE/"
+        cp deps/x64/soxr.dll "$COMP/"
 
         # ORT DirectML
-        cp "$DML_ORT/runtimes/win-x64/native/onnxruntime.dll" "$STAGE/"
-        cp "$DML_ORT/runtimes/win-x64/native/onnxruntime_providers_shared.dll" "$STAGE/"
+        cp "$DML_ORT/runtimes/win-x64/native/onnxruntime.dll" "$COMP/"
+        cp "$DML_ORT/runtimes/win-x64/native/onnxruntime_providers_shared.dll" "$COMP/"
 
         # DirectML redistributable
-        cp "$DML_RT/bin/x64-win/DirectML.dll" "$STAGE/"
+        cp "$DML_RT/bin/x64-win/DirectML.dll" "$COMP/"
 
         # ML models
         if ls models/*.onnx 1>/dev/null 2>&1; then
-          cp models/*.onnx "$STAGE/"
+          cp models/*.onnx "$COMP/"
         fi
 
-        # Docs
-        cp README.txt CHANGELOG.txt "$STAGE/"
-
-        cd "$STAGE"
+        # Create .fb2k-component (files at zip root)
+        cd "$COMP"
         7z a -tzip "../foo_dsd_trellis-${VER}-x64.fb2k-component" .
 
-    - name: Package CUDA addon
+    - name: Package base .zip (component + docs)
       shell: bash
       run: |
         VER="${{ steps.version.outputs.version }}"
-        GPU_ORT="packages/Microsoft.ML.OnnxRuntime.Gpu.Windows.${{ env.ONNXRUNTIME_VERSION }}"
-        STAGE="stage_cuda"
-        mkdir -p "$STAGE"
+        mkdir -p stage_base_zip
+        cp "foo_dsd_trellis-${VER}-x64.fb2k-component" stage_base_zip/
+        cp README.txt CHANGELOG.txt stage_base_zip/
+        cd stage_base_zip
+        7z a -tzip "../foo_dsd_trellis-${VER}-x64.zip" .
 
-        # ORT CUDA build (renamed to avoid conflict with DML build)
-        cp "$GPU_ORT/runtimes/win-x64/native/onnxruntime.dll" "$STAGE/onnxruntime_cuda.dll"
-        cp "$GPU_ORT/runtimes/win-x64/native/onnxruntime_providers_cuda.dll" "$STAGE/"
-        cp "$GPU_ORT/runtimes/win-x64/native/onnxruntime_providers_shared.dll" "$STAGE/"
+    - name: Package CUDA .fb2k-component (DirectML + CUDA)
+      shell: bash
+      run: |
+        VER="${{ steps.version.outputs.version }}"
+        DML_ORT="packages/Microsoft.ML.OnnxRuntime.DirectML.${{ env.ONNXRUNTIME_VERSION }}"
+        DML_RT="packages/Microsoft.AI.DirectML.${{ env.DIRECTML_VERSION }}"
+        GPU_ORT="packages/Microsoft.ML.OnnxRuntime.Gpu.Windows.${{ env.ONNXRUNTIME_VERSION }}"
+        COMP="stage_cuda_comp"
+        mkdir -p "$COMP"
+
+        # Plugin (same as base)
+        cp bin/Release/x64/foo_dsd_trellis.dll "$COMP/"
+        cp bin/Release/x64/foo_dsd_trellis_worker.exe "$COMP/"
+        cp deps/x64/soxr.dll "$COMP/"
+
+        # ORT DirectML (for DirectML fallback)
+        cp "$DML_ORT/runtimes/win-x64/native/onnxruntime.dll" "$COMP/"
+        cp "$DML_RT/bin/x64-win/DirectML.dll" "$COMP/"
+
+        # ORT CUDA (renamed to avoid conflict)
+        cp "$GPU_ORT/runtimes/win-x64/native/onnxruntime.dll" "$COMP/onnxruntime_cuda.dll"
+        cp "$GPU_ORT/runtimes/win-x64/native/onnxruntime_providers_cuda.dll" "$COMP/"
+        cp "$GPU_ORT/runtimes/win-x64/native/onnxruntime_providers_shared.dll" "$COMP/"
 
         # cuDNN DLLs
-        cp cudnn_wheel/extracted/nvidia/cudnn/bin/*.dll "$STAGE/"
+        cp cudnn_wheel/extracted/nvidia/cudnn/bin/*.dll "$COMP/"
 
-        # Docs
-        cp README.txt CHANGELOG.txt "$STAGE/"
+        # ML models
+        if ls models/*.onnx 1>/dev/null 2>&1; then
+          cp models/*.onnx "$COMP/"
+        fi
 
-        cd "$STAGE"
+        # Create .fb2k-component
+        cd "$COMP"
+        7z a -tzip "../foo_dsd_trellis-${VER}-x64-cuda.fb2k-component" .
+
+    - name: Package CUDA .zip (component + docs)
+      shell: bash
+      run: |
+        VER="${{ steps.version.outputs.version }}"
+        mkdir -p stage_cuda_zip
+        cp "foo_dsd_trellis-${VER}-x64-cuda.fb2k-component" stage_cuda_zip/
+        cp README.txt CHANGELOG.txt stage_cuda_zip/
+        cd stage_cuda_zip
         7z a -tzip "../foo_dsd_trellis-${VER}-x64-cuda.zip" .
 
     - name: Upload artifacts
@@ -147,8 +175,8 @@ jobs:
       with:
         name: foo_dsd_trellis-${{ steps.version.outputs.version }}-x64
         path: |
-          foo_dsd_trellis-*.fb2k-component
-          foo_dsd_trellis-*-cuda.zip
+          foo_dsd_trellis-*-x64.zip
+          foo_dsd_trellis-*-x64-cuda.zip
 
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2
@@ -157,13 +185,15 @@ jobs:
         body: |
           ## Install
 
-          **Base (DirectML ML support):** Download `foo_dsd_trellis-${{ steps.version.outputs.version }}-x64.fb2k-component` and open with foobar2000, or extract to `%APPDATA%\foobar2000-v2\user-components-x64\foo_dsd_trellis\`.
+          **Base (DirectML ML support):**
+          Download `foo_dsd_trellis-${{ steps.version.outputs.version }}-x64.zip`, extract, and open the `.fb2k-component` file with foobar2000.
 
-          **CUDA ML support (NVIDIA only):** Also extract `foo_dsd_trellis-${{ steps.version.outputs.version }}-x64-cuda.zip` into the same component folder. Requires CUDA Toolkit 12.x installed on the system.
+          **CUDA ML support (NVIDIA only):**
+          Download `foo_dsd_trellis-${{ steps.version.outputs.version }}-x64-cuda.zip` instead. Includes both DirectML and CUDA support. Requires CUDA Toolkit 12.x installed on the system.
 
-          See CHANGELOG for details.
+          See CHANGELOG.txt for details.
         files: |
-          foo_dsd_trellis-*.fb2k-component
-          foo_dsd_trellis-*-cuda.zip
+          foo_dsd_trellis-*-x64.zip
+          foo_dsd_trellis-*-x64-cuda.zip
         draft: false
         prerelease: false
