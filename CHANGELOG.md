@@ -5,6 +5,20 @@ All notable changes to foo_dsd_trellis will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-04-03
+
+### Fixed
+- **DirectML ML filter now works**: ORT uses the extended DML API (`OrtSessionOptionsAppendExecutionProviderEx_DML`) with an explicitly created D3D12 device, bypassing ORT's internal DXGI adapter enumeration that failed with `DXGI_ERROR_NOT_FOUND` on some systems.
+- **CUDA ML filter now works**: Dual ORT runtime support — `onnxruntime_cuda.dll` (CUDA EP, uses system CUDA toolkit) and `onnxruntime.dll` (DirectML EP). Auto mode tries CUDA first, falls back to DirectML, then CPU.
+- **ML filter in worker process**: `onnxruntime.dll` and ML model path resolution now falls back to the exe directory when `foo_dsd_trellis.dll` isn't loaded (out-of-process worker).
+- **Dialog shows actual ML EP**: Config dialog now shows "Ready (CUDA)" or "Ready (DirectML)" instead of generic "Ready (GPU)" for Auto mode.
+
+### Changed
+- **Split release packages**: Base package includes DirectML ML support (~48 MB). Separate CUDA package for NVIDIA users with system CUDA toolkit (~976 MB additional).
+- **Updated ONNX Runtime**: v1.24.4 (DirectML + CUDA builds).
+- **Updated DirectML**: v1.15.4 redistributable bundled (was missing, caused EP init failure).
+- **cuDNN 9**: Required for CUDA ML EP, loaded from system or component folder.
+
 ## [1.0.3] - 2026-04-03
 
 ### Fixed
@@ -98,6 +112,7 @@ Initial public release.
 - ONNX model runtime-loaded via DirectML
 - Causal dilated CNN for DSD quantization noise reduction
 
+[1.0.4]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.4
 [1.0.3]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.3
 [1.0.2]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.2
 [1.0.1]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.1

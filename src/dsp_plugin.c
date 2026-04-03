@@ -471,6 +471,8 @@ static bool resolve_ml_model_path_ex(wchar_t *path, size_t path_size,
                                       const wchar_t *filename) {
     HMODULE hmod = GetModuleHandleW(L"foo_dsd_trellis.dll");
     if (!hmod)
+        hmod = GetModuleHandleW(NULL);  /* Worker exe: use exe directory */
+    if (!hmod)
         return false;
     DWORD len = GetModuleFileNameW(hmod, path, (DWORD)path_size);
     if (len == 0 || len >= path_size)

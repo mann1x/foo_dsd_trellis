@@ -856,12 +856,29 @@ private:
                                 "OrtSessionOptionsAppendExecutionProvider_CUDA") != NULL);
                             FreeLibrary(hort);
                         }
+                        /* Also check CUDA build (onnxruntime_cuda.dll) */
+                        if (!has_cuda && hmod) {
+                            wchar_t cuda_path[MAX_PATH];
+                            DWORD clen = GetModuleFileNameW(hmod, cuda_path, MAX_PATH);
+                            if (clen > 0 && clen < MAX_PATH) {
+                                wchar_t *csep = wcsrchr(cuda_path, L'\\');
+                                if (csep) csep[1] = L'\0';
+                                wcscat_s(cuda_path, MAX_PATH, L"onnxruntime_cuda.dll");
+                                HMODULE hcuda = LoadLibraryW(cuda_path);
+                                if (hcuda) {
+                                    has_cuda = (GetProcAddress(hcuda,
+                                        "OrtSessionOptionsAppendExecutionProvider_CUDA") != NULL);
+                                    FreeLibrary(hcuda);
+                                }
+                            }
+                        }
                     }
                 }
                 if (ep == 0)       status = "Ready (CPU)";
                 else if (ep == 3)  status = has_cuda ? "Ready (CUDA)" : "Ready (CPU)";
                 else if (ep == 1)  status = has_dml ? "Ready (DirectML)" : "Ready (CPU)";
-                else               status = (has_cuda || has_dml) ? "Ready (GPU)" : "Ready (CPU)";
+                else               status = has_cuda ? "Ready (CUDA)" :
+                                            has_dml ? "Ready (DirectML)" : "Ready (CPU)";
             }
         }
         ::uSetDlgItemText(*this, IDC_STATIC_ML_STATUS, status);

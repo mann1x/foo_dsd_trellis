@@ -95,6 +95,9 @@ typedef OrtStatus *(*ort_DisableMemPattern_fn)(OrtSessionOptions *);
 
 /* DirectML EP — exported directly from onnxruntime.dll (not vtable) */
 typedef OrtStatus *(*OrtDmlAppendEP_fn)(OrtSessionOptions *, int);
+/* Extended DML EP — takes pre-created DML device + D3D12 command queue.
+ * More reliable than device-ID variant (avoids DXGI adapter enumeration issues). */
+typedef OrtStatus *(*OrtDmlAppendEPEx_fn)(OrtSessionOptions *, void * /*IDMLDevice**/, void * /*ID3D12CommandQueue**/);
 
 /* CUDA EP — vtable slot for ORT 1.16+ */
 #define ORT_SLOT_CREATE_CUDA_OPTIONS         148
@@ -147,6 +150,9 @@ typedef void (*ort_ReleaseModelMetadata_fn)(void *);
 /* ORT API version we target */
 #define ORT_API_VERSION_TARGET 18
 
+/* Forward declaration for D3D12+DML resources (defined below onnx_filter) */
+typedef struct dml_resources dml_resources_t;
+
 struct onnx_filter {
     OrtApi          api;           /* vtable wrapper */
     OrtEnv         *env;
@@ -166,37 +172,58 @@ struct onnx_filter {
     char           *output_name;   /* model output tensor name */
     const char     *ep_name;       /* "CUDA", "DirectML", or "CPU" */
     HMODULE         hort;          /* onnxruntime.dll handle */
+    dml_resources_t *dml_res;      /* D3D12+DML resources (Ex API only) */
 };
 
 /* ─── Resolve onnxruntime.dll path from component folder ───
  * Uses the same directory as foo_dsd_trellis.dll to avoid picking up
  * a wrong system-wide onnxruntime.dll (e.g. C:\Windows\System32). */
 
-static bool resolve_ort_path(wchar_t *path, size_t path_size) {
+/* Resolve the component directory (same folder as DLL or worker exe). */
+static bool resolve_component_dir(wchar_t *dir, size_t dir_size) {
     HMODULE hmod = GetModuleHandleW(L"foo_dsd_trellis.dll");
-    if (!hmod) {
-        /* Test exe fallback: try bare name */
-        wcsncpy_s(path, path_size, L"onnxruntime.dll", _TRUNCATE);
-        return true;
-    }
-    DWORD len = GetModuleFileNameW(hmod, path, (DWORD)path_size);
-    if (len == 0 || len >= path_size)
+    if (!hmod)
+        hmod = GetModuleHandleW(NULL);  /* Worker exe fallback */
+    if (!hmod)
         return false;
-    wchar_t *sep = wcsrchr(path, L'\\');
-    if (!sep) sep = wcsrchr(path, L'/');
+    DWORD len = GetModuleFileNameW(hmod, dir, (DWORD)dir_size);
+    if (len == 0 || len >= dir_size)
+        return false;
+    wchar_t *sep = wcsrchr(dir, L'\\');
+    if (!sep) sep = wcsrchr(dir, L'/');
     if (sep)
         sep[1] = L'\0';
     else
-        path[0] = L'\0';
-    wcscat_s(path, path_size, L"onnxruntime.dll");
+        dir[0] = L'\0';
     return true;
 }
 
-static HMODULE load_ort_dll(void) {
+/* Try loading an ORT DLL by name from the component directory.
+ * Uses LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR so the DLL's directory is
+ * in the search path for its dependencies (e.g., onnxruntime_providers_cuda.dll). */
+static HMODULE load_ort_by_name(const wchar_t *filename) {
     wchar_t path[MAX_PATH];
-    if (resolve_ort_path(path, MAX_PATH))
-        return LoadLibraryW(path);
-    return LoadLibraryW(L"onnxruntime.dll");
+    if (resolve_component_dir(path, MAX_PATH)) {
+        /* Add component dir to DLL search path for provider dependencies */
+        wchar_t dir[MAX_PATH];
+        wcscpy_s(dir, MAX_PATH, path);
+        SetDllDirectoryW(dir);
+
+        wcscat_s(path, MAX_PATH, filename);
+        HMODULE h = LoadLibraryW(path);
+        if (h) return h;
+    }
+    return LoadLibraryW(filename);  /* fallback: system search */
+}
+
+/* Load ORT DLL. Tries CUDA build first (onnxruntime_cuda.dll),
+ * then DirectML/default build (onnxruntime.dll).
+ * The CUDA build has CUDA EP, the DML build has DirectML EP.
+ * Both have CPU EP as fallback. */
+static HMODULE load_ort_dll(void) {
+    HMODULE h = load_ort_by_name(L"onnxruntime_cuda.dll");
+    if (h) return h;
+    return load_ort_by_name(L"onnxruntime.dll");
 }
 
 /* ─── DLL availability probe ─── */
@@ -251,6 +278,110 @@ const char *onnx_filter_last_error(void) {
     return g_ort_last_error[0] ? g_ort_last_error : NULL;
 }
 
+/* ─── D3D12 + DirectML device creation for Ex DML EP ─── */
+
+#include <initguid.h>
+
+/* D3D12 COM IIDs */
+DEFINE_GUID(IID_ID3D12Device_onnx,      0x189819f1,0x1db6,0x4b57,0xbe,0x54,0x18,0x21,0x33,0x9b,0x85,0xf7);
+DEFINE_GUID(IID_ID3D12CommandQueue_onnx, 0x0ec870a6,0x5d7e,0x4c22,0x8c,0xfc,0x5b,0xaa,0xe0,0x76,0x16,0xed);
+DEFINE_GUID(IID_IDXGIFactory4_onnx,     0x1bc6ea02,0xef36,0x464f,0xbf,0x0c,0x21,0xca,0x39,0xe5,0x16,0x8a);
+DEFINE_GUID(IID_IDMLDevice_onnx,         0x6dbd6437,0x96fd,0x423f,0xa8,0xc0,0x45,0x26,0x35,0x70,0x10,0x5d);
+
+/* Minimal COM vtable offsets for ID3D12Device, IDXGIFactory4, IDMLDevice */
+#define IUNKNOWN_RELEASE 2
+#define IDXGIFACTORY_ENUMADAPTERS1 12  /* IDXGIFactory1::EnumAdapters1 */
+#define ID3D12DEVICE_CREATECOMMANDQUEUE 8  /* ID3D12Device::CreateCommandQueue (slot) */
+
+typedef HRESULT (WINAPI *CreateDXGIFactory2_fn)(UINT, REFIID, void **);
+typedef HRESULT (WINAPI *D3D12CreateDevice_fn)(void *, int, REFIID, void **);
+typedef HRESULT (WINAPI *DMLCreateDevice_fn)(void *, int, REFIID, void **);
+
+/* Opaque handles for the DML device resources we create.
+ * Stored so we can release them when the ONNX filter is freed. */
+struct dml_resources {
+    void *dxgi_factory;   /* IDXGIFactory4* */
+    void *adapter;        /* IDXGIAdapter1* */
+    void *d3d12_device;   /* ID3D12Device* */
+    void *cmd_queue;      /* ID3D12CommandQueue* */
+    void *dml_device;     /* IDMLDevice* */
+    HMODULE h_d3d12;
+    HMODULE h_dxgi;
+    HMODULE h_dml;
+};
+
+static void dml_resources_free(dml_resources_t *r) {
+    if (!r) return;
+    /* Release in reverse creation order */
+    if (r->dml_device)    ((HRESULT (WINAPI **)(void *))*(void **)r->dml_device)[IUNKNOWN_RELEASE](r->dml_device);
+    if (r->cmd_queue)     ((HRESULT (WINAPI **)(void *))*(void **)r->cmd_queue)[IUNKNOWN_RELEASE](r->cmd_queue);
+    if (r->d3d12_device)  ((HRESULT (WINAPI **)(void *))*(void **)r->d3d12_device)[IUNKNOWN_RELEASE](r->d3d12_device);
+    if (r->adapter)       ((HRESULT (WINAPI **)(void *))*(void **)r->adapter)[IUNKNOWN_RELEASE](r->adapter);
+    if (r->dxgi_factory)  ((HRESULT (WINAPI **)(void *))*(void **)r->dxgi_factory)[IUNKNOWN_RELEASE](r->dxgi_factory);
+    /* Don't FreeLibrary — DLLs may still be in use by ORT session */
+}
+
+/* Create D3D12 device + command queue + DML device for the ORT Ex DML EP.
+ * Returns true on success; resources must be freed with dml_resources_free. */
+static bool dml_resources_create(dml_resources_t *r) {
+    memset(r, 0, sizeof(*r));
+
+    r->h_dxgi  = LoadLibraryW(L"dxgi.dll");
+    r->h_d3d12 = LoadLibraryW(L"d3d12.dll");
+    r->h_dml   = LoadLibraryW(L"DirectML.dll");
+    if (!r->h_dxgi || !r->h_d3d12 || !r->h_dml)
+        goto fail;
+
+    CreateDXGIFactory2_fn create_factory = (CreateDXGIFactory2_fn)
+        GetProcAddress(r->h_dxgi, "CreateDXGIFactory2");
+    D3D12CreateDevice_fn create_device = (D3D12CreateDevice_fn)
+        GetProcAddress(r->h_d3d12, "D3D12CreateDevice");
+    DMLCreateDevice_fn create_dml = (DMLCreateDevice_fn)
+        GetProcAddress(r->h_dml, "DMLCreateDevice");
+    if (!create_factory || !create_device || !create_dml)
+        goto fail;
+
+    /* 1. DXGI factory */
+    if (FAILED(create_factory(0, &IID_IDXGIFactory4_onnx, &r->dxgi_factory)))
+        goto fail;
+
+    /* 2. Enumerate adapter 0 */
+    {
+        typedef HRESULT (WINAPI *EnumAdapters1_fn)(void *, UINT, void **);
+        EnumAdapters1_fn enum_fn = ((EnumAdapters1_fn *)*(void **)r->dxgi_factory)[IDXGIFACTORY_ENUMADAPTERS1];
+        if (FAILED(enum_fn(r->dxgi_factory, 0, &r->adapter)))
+            goto fail;
+    }
+
+    /* 3. D3D12 device from adapter */
+    if (FAILED(create_device(r->adapter, 0xb000 /*D3D_FEATURE_LEVEL_11_0*/,
+                              &IID_ID3D12Device_onnx, &r->d3d12_device)))
+        goto fail;
+
+    /* 4. D3D12 command queue (direct, normal priority) */
+    {
+        /* D3D12_COMMAND_QUEUE_DESC: Type=DIRECT(0), Priority=NORMAL(0), Flags=0, NodeMask=0 */
+        struct { int Type; int Priority; int Flags; unsigned NodeMask; } desc = {0, 0, 0, 0};
+        typedef HRESULT (WINAPI *CreateCQ_fn)(void *, const void *, REFIID, void **);
+        /* CreateCommandQueue is at vtable slot 8 in ID3D12Device */
+        CreateCQ_fn cq_fn = ((CreateCQ_fn *)*(void **)r->d3d12_device)[ID3D12DEVICE_CREATECOMMANDQUEUE];
+        if (FAILED(cq_fn(r->d3d12_device, &desc, &IID_ID3D12CommandQueue_onnx, &r->cmd_queue)))
+            goto fail;
+    }
+
+    /* 5. DML device (no flags) */
+    if (FAILED(create_dml(r->d3d12_device, 0 /*DML_CREATE_DEVICE_FLAG_NONE*/,
+                           &IID_IDMLDevice_onnx, &r->dml_device)))
+        goto fail;
+
+    return true;
+
+fail:
+    dml_resources_free(r);
+    memset(r, 0, sizeof(*r));
+    return false;
+}
+
 /* ─── Create ─── */
 
 onnx_filter_t *onnx_filter_create(const wchar_t *model_path,
@@ -288,7 +419,10 @@ onnx_filter_t *onnx_filter_create(const wchar_t *model_path,
         cuda_append = (OrtCudaAppendEP_fn)GetProcAddress(
             hort, "OrtSessionOptionsAppendExecutionProvider_CUDA");
     }
+    OrtDmlAppendEPEx_fn dml_append_ex = NULL;
     if (ep == ML_EP_DIRECTML || ep == ML_EP_AUTO) {
+        dml_append_ex = (OrtDmlAppendEPEx_fn)GetProcAddress(
+            hort, "OrtSessionOptionsAppendExecutionProviderEx_DML");
         dml_append = (OrtDmlAppendEP_fn)GetProcAddress(
             hort, "OrtSessionOptionsAppendExecutionProvider_DML");
     }
@@ -335,14 +469,36 @@ onnx_filter_t *onnx_filter_create(const wchar_t *model_path,
             }
         }
 
-        /* Try DirectML */
-        if (dml_append && !gpu_ok) {
+        /* Try DirectML — Ex API first (explicit device), then basic (device ID) */
+        if ((dml_append_ex || dml_append) && !gpu_ok) {
             ORT_FN(api, ORT_SLOT_DISABLE_MEM_PATTERN, ort_DisableMemPattern_fn)(opts);
             ORT_FN(api, ORT_SLOT_SET_SESSION_EXECUTION_MODE,
                    ort_SetSessionExecutionMode_fn)(opts, ORT_SEQUENTIAL);
-            if (ort_ok_log(api, dml_append(opts, 0), "DirectML EP")) {
-                f->ep_name = "DirectML";
-                gpu_ok = true;
+
+            /* Ex API: create our own D3D12+DML device (more reliable) */
+            if (dml_append_ex && !gpu_ok) {
+                dml_resources_t *dr = (dml_resources_t *)calloc(1, sizeof(dml_resources_t));
+                if (dr && dml_resources_create(dr)) {
+                    if (ort_ok_log(api, dml_append_ex(opts, dr->dml_device,
+                                                       dr->cmd_queue), "DirectML EP (Ex)")) {
+                        f->ep_name = "DirectML";
+                        f->dml_res = dr;
+                        gpu_ok = true;
+                    } else {
+                        dml_resources_free(dr);
+                        free(dr);
+                    }
+                } else {
+                    free(dr);
+                }
+            }
+
+            /* Basic API fallback: let ORT create the device (device ID 0) */
+            if (dml_append && !gpu_ok) {
+                if (ort_ok_log(api, dml_append(opts, 0), "DirectML EP")) {
+                    f->ep_name = "DirectML";
+                    gpu_ok = true;
+                }
             }
         }
         /* CPU is always the final fallback — no action needed */
@@ -695,6 +851,12 @@ void onnx_filter_free(onnx_filter_t *f) {
     free(f->out_buf);
     free(f->input_name);
     free(f->output_name);
+
+    /* Release D3D12+DML resources (Ex API only) after ORT session is freed */
+    if (f->dml_res) {
+        dml_resources_free(f->dml_res);
+        free(f->dml_res);
+    }
 
     if (f->hort)
         FreeLibrary(f->hort);
