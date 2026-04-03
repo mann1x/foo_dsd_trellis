@@ -165,8 +165,10 @@ int engine_channel_init(engine_channel_t *eng, int channel,
             fir_lowpass_init(&eng->lowpass, cfg->fs_in);
     }
 
-    /* DSD→PCM decimation: FIR only, no SDM */
-    eng->fir_only = (fs_out < DSD_RATE_64 && cfg->fs_in >= DSD_RATE_64);
+    /* PCM output: FIR only, no SDM.
+     * SDM produces ±1.0 DSD bitstream — meaningless for PCM output.
+     * Covers both DSD→PCM decimation and PCM→PCM rate conversion. */
+    eng->fir_only = (fs_out < DSD_RATE_64);
 
     /* Resolve FIR precision: Auto defaults to fp64 */
     bool use_fp64 = true;

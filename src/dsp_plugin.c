@@ -129,6 +129,24 @@ typedef struct plugin_state {
     size_t             fir_tail_len;    /* = overlap */
     bool               fir_tail_valid;  /* false until first chunk completes */
 
+    /* Persistent PCM→PCM rate conversion state (survives across chunks) */
+    fir_chain_t       *pcm_fir;          /* per-channel FIR chains (same-family) */
+    resample_ctx_t   **pcm_resamplers;   /* per-channel polyphase resamplers (cross-family) */
+    int                pcm_conv_nch;     /* allocated channel count */
+    uint32_t           pcm_conv_rate_in; /* rate pair these were created for */
+    uint32_t           pcm_conv_rate_out;
+    float             *pcm_conv_ch_in;   /* cached de-interleave buffer */
+    float             *pcm_conv_ch_out;  /* cached output buffer */
+    size_t             pcm_conv_ch_in_sz;  /* pcm_conv_ch_in capacity (samples) */
+    size_t             pcm_conv_ch_out_sz; /* pcm_conv_ch_out capacity (samples) */
+    bool               pcm_conv_first_chunk; /* true after init — apply fade-in */
+
+    /* Persistent PCM→DSD cross-family resamplers (e.g., 96k→88.2k before FIR upsample) */
+    resample_ctx_t   **pcm_dsd_resamplers;
+    int                pcm_dsd_rs_nch;
+    uint32_t           pcm_dsd_rs_rate_in;
+    uint32_t           pcm_dsd_rs_rate_out;
+
     /* ── Worker migration (dry-run probe) ── */
     struct {
         bool     active;              /* probe in flight */
@@ -412,6 +430,29 @@ void plugin_destroy(plugin_state_t *s) {
         for (int i = 0; i < s->num_channels; i++)
             free(s->seg0_buf[i]);
         free(s->seg0_buf);
+    }
+
+    /* Free persistent PCM→PCM conversion state */
+    if (s->pcm_fir) {
+        for (int i = 0; i < s->pcm_conv_nch; i++)
+            fir_chain_free(&s->pcm_fir[i]);
+        free(s->pcm_fir);
+    }
+    if (s->pcm_resamplers) {
+        for (int i = 0; i < s->pcm_conv_nch; i++) {
+            if (s->pcm_resamplers[i])
+                resample_free(s->pcm_resamplers[i]);
+        }
+        free(s->pcm_resamplers);
+    }
+    free(s->pcm_conv_ch_in);
+    free(s->pcm_conv_ch_out);
+    if (s->pcm_dsd_resamplers) {
+        for (int i = 0; i < s->pcm_dsd_rs_nch; i++) {
+            if (s->pcm_dsd_resamplers[i])
+                resample_free(s->pcm_dsd_resamplers[i]);
+        }
+        free(s->pcm_dsd_resamplers);
     }
 
     /* Destroy GPU compute context */
@@ -2764,8 +2805,30 @@ size_t plugin_process_pcm(plugin_state_t *s,
     if (dsd_rate == 0)
         return 0;  /* Unsupported rate combination */
 
-    /* Always keep fs_in/fs_out in sync (plugin_set_config may have overwritten them) */
-    s->config.fs_in = pcm_rate;
+    /* Cross-family detection: PCM rate family != DSD rate family.
+     * e.g., 48k PCM → DSD/44 needs polyphase resample 48k→44.1k first. */
+    uint32_t dsd_base_unit = rate_is_48k_family(dsd_rate) ? 48000 : 44100;
+    bool pcm_is_44 = (pcm_rate % 44100 == 0);
+    bool cross_family = (pcm_is_44 && dsd_base_unit == 48000) ||
+                        (!pcm_is_44 && dsd_base_unit == 44100);
+
+    /* For cross-family: resample PCM to same-family rate, then FIR upsample.
+     * e.g., 48000 → 44100 → FIR 64x → DSD64/44 (2822400) */
+    uint32_t fir_input_rate = pcm_rate;
+    size_t fir_input_frames = pcm_frames;
+    if (cross_family) {
+        /* Target: highest same-family PCM rate <= pcm_rate */
+        uint32_t target = dsd_base_unit;
+        while (target * 2 <= pcm_rate)
+            target *= 2;
+        fir_input_rate = target;
+        fir_input_frames = (size_t)((double)pcm_frames *
+                           (double)fir_input_rate / (double)pcm_rate) + 1;
+    }
+
+    /* Set fs_in to the FIR input rate (post-resample for cross-family).
+     * The engine's FIR chain needs a power-of-2 ratio to the DSD output. */
+    s->config.fs_in = fir_input_rate;
     s->config.fs_out = dsd_rate;
 
     /* Initialize engine on first use or parameter change */
@@ -2794,27 +2857,6 @@ size_t plugin_process_pcm(plugin_state_t *s,
             return 0;
     }
 
-    /* Cross-family detection: PCM rate family != DSD rate family.
-     * e.g., 48k PCM → DSD/44 needs polyphase resample 48k→44.1k first. */
-    uint32_t dsd_base_unit = rate_is_48k_family(dsd_rate) ? 48000 : 44100;
-    bool pcm_is_44 = (pcm_rate % 44100 == 0);
-    bool cross_family = (pcm_is_44 && dsd_base_unit == 48000) ||
-                        (!pcm_is_44 && dsd_base_unit == 44100);
-
-    /* For cross-family: resample PCM to same-family rate, then FIR upsample.
-     * e.g., 48000 → 44100 → FIR 64x → DSD64/44 (2822400) */
-    uint32_t fir_input_rate = pcm_rate;
-    size_t fir_input_frames = pcm_frames;
-    if (cross_family) {
-        /* Target: highest same-family PCM rate <= pcm_rate */
-        uint32_t target = dsd_base_unit;
-        while (target * 2 <= pcm_rate)
-            target *= 2;
-        fir_input_rate = target;
-        fir_input_frames = (size_t)((double)pcm_frames *
-                           (double)fir_input_rate / (double)pcm_rate) + 1;
-    }
-
     uint32_t ratio = dsd_rate / fir_input_rate;
     size_t dsd_out_count = fir_input_frames * ratio + 256;
 
@@ -2831,20 +2873,44 @@ size_t plugin_process_pcm(plugin_state_t *s,
             s->ch_in[ch][f] = in_pcm[f * (size_t)num_channels + (size_t)ch];
     }
 
-    /* Cross-family: polyphase resample each channel in-place */
+    /* Cross-family: polyphase resample each channel in-place (persistent) */
     if (cross_family) {
-        for (int ch = 0; ch < num_channels; ch++) {
-            float *rs_out = (float *)malloc(fir_input_frames * sizeof(float));
-            if (!rs_out) return 0;
-            resample_ctx_t *rs = resample_create(pcm_rate, fir_input_rate,
-                                                  s->config.resample_engine,
-                                                  s->config.soxr_quality);
-            if (!rs) { free(rs_out); return 0; }
-            fir_input_frames = resample_process(rs, s->ch_in[ch], rs_out, pcm_frames);
-            resample_free(rs);
-            memcpy(s->ch_in[ch], rs_out, fir_input_frames * sizeof(float));
-            free(rs_out);
+        /* Init persistent resamplers on first use or rate/channel change */
+        if (s->pcm_dsd_rs_rate_in != pcm_rate ||
+            s->pcm_dsd_rs_rate_out != fir_input_rate ||
+            s->pcm_dsd_rs_nch != num_channels) {
+            if (s->pcm_dsd_resamplers) {
+                for (int i = 0; i < s->pcm_dsd_rs_nch; i++)
+                    if (s->pcm_dsd_resamplers[i]) resample_free(s->pcm_dsd_resamplers[i]);
+                free(s->pcm_dsd_resamplers);
+            }
+            s->pcm_dsd_resamplers = (resample_ctx_t **)calloc(
+                (size_t)num_channels, sizeof(resample_ctx_t *));
+            if (!s->pcm_dsd_resamplers) return 0;
+            for (int ch = 0; ch < num_channels; ch++) {
+                s->pcm_dsd_resamplers[ch] = resample_create(pcm_rate, fir_input_rate,
+                                                              s->config.resample_engine,
+                                                              s->config.soxr_quality);
+                if (!s->pcm_dsd_resamplers[ch]) return 0;
+            }
+            s->pcm_dsd_rs_nch = num_channels;
+            s->pcm_dsd_rs_rate_in = pcm_rate;
+            s->pcm_dsd_rs_rate_out = fir_input_rate;
         }
+
+        /* Allocate output buffer with margin for soxr's internal buffering.
+         * Persistent soxr may release extra buffered samples on later calls. */
+        size_t rs_buf_sz = fir_input_frames + 256;
+        float *rs_out = (float *)malloc(rs_buf_sz * sizeof(float));
+        if (!rs_out) return 0;
+
+        for (int ch = 0; ch < num_channels; ch++) {
+            size_t produced = resample_process(s->pcm_dsd_resamplers[ch],
+                                                s->ch_in[ch], rs_out, pcm_frames);
+            memcpy(s->ch_in[ch], rs_out, produced * sizeof(float));
+            if (ch == 0) fir_input_frames = produced;
+        }
+        free(rs_out);
         dsd_out_count = fir_input_frames * ratio + 256;
     }
 
@@ -2925,6 +2991,27 @@ size_t plugin_process_pcm(plugin_state_t *s,
  *
  * Returns: number of output PCM frames per channel, or 0 on error.
  */
+/* Free persistent PCM→PCM conversion state (called on rate/channel change). */
+static void pcm_conv_free(plugin_state_t *s) {
+    if (s->pcm_fir) {
+        for (int i = 0; i < s->pcm_conv_nch; i++)
+            fir_chain_free(&s->pcm_fir[i]);
+        free(s->pcm_fir);
+        s->pcm_fir = NULL;
+    }
+    if (s->pcm_resamplers) {
+        for (int i = 0; i < s->pcm_conv_nch; i++) {
+            if (s->pcm_resamplers[i])
+                resample_free(s->pcm_resamplers[i]);
+        }
+        free(s->pcm_resamplers);
+        s->pcm_resamplers = NULL;
+    }
+    s->pcm_conv_nch = 0;
+    s->pcm_conv_rate_in = 0;
+    s->pcm_conv_rate_out = 0;
+}
+
 size_t plugin_process_pcm_to_pcm(plugin_state_t *s,
                                   const float *in_pcm, float *out_pcm,
                                   size_t pcm_frames, int num_channels,
@@ -2933,58 +3020,113 @@ size_t plugin_process_pcm_to_pcm(plugin_state_t *s,
         return 0;
 
     if (pcm_rate_in == pcm_rate_out) {
-        /* Passthrough — shouldn't reach here, but handle gracefully */
         memcpy(out_pcm, in_pcm, pcm_frames * (size_t)num_channels * sizeof(float));
         return pcm_frames;
     }
 
     bool needs_polyphase = resample_needed(pcm_rate_in, pcm_rate_out);
 
+    /* Reinit persistent state if rate pair or channel count changed */
+    if (s->pcm_conv_rate_in != pcm_rate_in ||
+        s->pcm_conv_rate_out != pcm_rate_out ||
+        s->pcm_conv_nch != num_channels) {
+
+        pcm_conv_free(s);
+
+        if (needs_polyphase) {
+            s->pcm_resamplers = (resample_ctx_t **)calloc((size_t)num_channels,
+                                                           sizeof(resample_ctx_t *));
+            if (!s->pcm_resamplers) return 0;
+            for (int ch = 0; ch < num_channels; ch++) {
+                s->pcm_resamplers[ch] = resample_create(pcm_rate_in, pcm_rate_out,
+                                                         s->config.resample_engine,
+                                                         s->config.soxr_quality);
+                if (!s->pcm_resamplers[ch]) {
+                    pcm_conv_free(s);
+                    return 0;
+                }
+            }
+        } else {
+            s->pcm_fir = (fir_chain_t *)calloc((size_t)num_channels, sizeof(fir_chain_t));
+            if (!s->pcm_fir) return 0;
+            for (int ch = 0; ch < num_channels; ch++) {
+                if (fir_chain_init(&s->pcm_fir[ch], pcm_rate_in, pcm_rate_out) != 0) {
+                    pcm_conv_free(s);
+                    return 0;
+                }
+            }
+        }
+        s->pcm_conv_nch = num_channels;
+        s->pcm_conv_rate_in = pcm_rate_in;
+        s->pcm_conv_rate_out = pcm_rate_out;
+        s->pcm_conv_first_chunk = true;
+    }
+
     /* Estimate max output frames */
     size_t max_out = (size_t)((double)pcm_frames * (double)pcm_rate_out / (double)pcm_rate_in) + 256;
 
-    /* Per-channel processing */
-    float *ch_in  = (float *)malloc(pcm_frames * sizeof(float));
-    float *ch_out = (float *)malloc(max_out * sizeof(float));
-    if (!ch_in || !ch_out) { free(ch_in); free(ch_out); return 0; }
+    /* For multi-stage FIR downsample, fir_chain_process uses the output buffer
+     * as a ping-pong buffer. The first intermediate stage writes pcm_frames/2
+     * samples, which exceeds the final output size for ratio > 2. */
+    if (!needs_polyphase && pcm_rate_in > pcm_rate_out) {
+        size_t intermediate = pcm_frames / 2 + 256;
+        if (intermediate > max_out)
+            max_out = intermediate;
+    }
+
+    /* Grow cached buffers if needed */
+    if (s->pcm_conv_ch_in_sz < pcm_frames) {
+        free(s->pcm_conv_ch_in);
+        s->pcm_conv_ch_in = (float *)malloc(pcm_frames * sizeof(float));
+        s->pcm_conv_ch_in_sz = s->pcm_conv_ch_in ? pcm_frames : 0;
+    }
+    if (s->pcm_conv_ch_out_sz < max_out) {
+        free(s->pcm_conv_ch_out);
+        s->pcm_conv_ch_out = (float *)malloc(max_out * sizeof(float));
+        s->pcm_conv_ch_out_sz = s->pcm_conv_ch_out ? max_out : 0;
+    }
+    if (!s->pcm_conv_ch_in || !s->pcm_conv_ch_out)
+        return 0;
 
     size_t out_frames = 0;
 
     for (int ch = 0; ch < num_channels; ch++) {
         /* De-interleave */
         for (size_t f = 0; f < pcm_frames; f++)
-            ch_in[f] = in_pcm[f * (size_t)num_channels + (size_t)ch];
+            s->pcm_conv_ch_in[f] = in_pcm[f * (size_t)num_channels + (size_t)ch];
 
         size_t produced = 0;
 
         if (needs_polyphase) {
-            /* Cross-family: polyphase resampler */
-            resample_ctx_t *rs = resample_create(pcm_rate_in, pcm_rate_out,
-                                                  s->config.resample_engine,
-                                                  s->config.soxr_quality);
-            if (!rs) { free(ch_in); free(ch_out); return 0; }
-            produced = resample_process(rs, ch_in, ch_out, pcm_frames);
-            resample_free(rs);
+            produced = resample_process(s->pcm_resamplers[ch],
+                                        s->pcm_conv_ch_in, s->pcm_conv_ch_out,
+                                        pcm_frames);
         } else {
-            /* Same-family: FIR chain (power-of-2 ratio) */
-            fir_chain_t fir;
-            if (fir_chain_init(&fir, pcm_rate_in, pcm_rate_out) != 0) {
-                free(ch_in); free(ch_out);
-                return 0;
-            }
-            produced = fir_chain_process(&fir, ch_in, ch_out, pcm_frames);
-            fir_chain_free(&fir);
+            produced = fir_chain_process(&s->pcm_fir[ch],
+                                          s->pcm_conv_ch_in, s->pcm_conv_ch_out,
+                                          pcm_frames);
         }
 
         if (ch == 0) out_frames = produced;
 
+        /* Fade-in on first chunk to suppress FIR startup transient.
+         * The FIR delay line starts at zero, causing a ramp-up pop.
+         * 128 samples at output rate (~3ms at 44100) is enough. */
+        if (s->pcm_conv_first_chunk && produced > 0) {
+            size_t fade_len = 128;
+            if (fade_len > produced) fade_len = produced;
+            for (size_t i = 0; i < fade_len; i++)
+                s->pcm_conv_ch_out[i] *= (float)i / (float)fade_len;
+        }
+
         /* Re-interleave */
         for (size_t f = 0; f < produced; f++)
-            out_pcm[f * (size_t)num_channels + (size_t)ch] = ch_out[f];
+            out_pcm[f * (size_t)num_channels + (size_t)ch] = s->pcm_conv_ch_out[f];
     }
 
-    free(ch_in);
-    free(ch_out);
+    if (s->pcm_conv_first_chunk)
+        s->pcm_conv_first_chunk = false;
+
     return out_frames;
 }
 
@@ -3153,6 +3295,27 @@ void plugin_flush(plugin_state_t *s) {
     s->fir_tail_valid = false;
     s->needs_warmup = true;  /* prime SDM with real audio on next chunk */
     s->dop_marker_phase = 0; /* reset DoP marker phase */
+
+    /* Reset PCM→PCM FIR chain delay lines (seek/track change) */
+    if (s->pcm_fir) {
+        for (int i = 0; i < s->pcm_conv_nch; i++)
+            fir_chain_reset(&s->pcm_fir[i]);
+    }
+    /* Polyphase resamplers must be recreated (no reset API) */
+    if (s->pcm_resamplers)
+        pcm_conv_free(s);
+    /* PCM→DSD cross-family resamplers too */
+    if (s->pcm_dsd_resamplers) {
+        for (int i = 0; i < s->pcm_dsd_rs_nch; i++) {
+            if (s->pcm_dsd_resamplers[i])
+                resample_free(s->pcm_dsd_resamplers[i]);
+        }
+        free(s->pcm_dsd_resamplers);
+        s->pcm_dsd_resamplers = NULL;
+        s->pcm_dsd_rs_nch = 0;
+        s->pcm_dsd_rs_rate_in = 0;
+        s->pcm_dsd_rs_rate_out = 0;
+    }
 }
 
 /* Reconfigure with new settings */
