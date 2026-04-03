@@ -5,6 +5,22 @@ All notable changes to foo_dsd_trellis will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-04-03
+
+### Fixed
+- **PCM rate conversion crash**: Heap buffer overflow on multi-stage FIR downsample (e.g., PCM 352.8k→44.1k). The FIR chain's ping-pong intermediate buffer exceeded the output allocation for ratios > 2x.
+- **PCM rate conversion crackling**: FIR chains and polyphase resamplers were created/destroyed per chunk, losing filter delay line state at every chunk boundary. Now persistent across chunks.
+- **PCM→DSD cross-family routing**: Cross-family paths (e.g., PCM 96k→DSD256/44) failed because engine was initialized with the pre-resample rate, giving a non-power-of-2 FIR ratio. Now sets engine fs_in to the post-resample rate.
+- **PCM→DSD cross-family crackling**: Same stateless resampler issue as PCM→PCM, now persistent.
+- **PCM output through SDM**: `fir_only` condition only covered DSD→PCM, not PCM→PCM. SDM initialization failed silently for PCM output rates. Now all PCM output paths are FIR-only.
+- **PCM rate conversion pop at start**: 128-sample linear fade-in on first chunk suppresses FIR delay line startup transient.
+- **Trellis SDM -6 dB gain loss**: Hardcoded `× 0.5` in `sdm_process_block` was never compensated. Removed the internal scaling; gain now matches PreCorr on all paths.
+- **Consistent gain across all processing paths**: Same-rate, rate conversion, PCM — all produce matched output volume. Soft-clip at 0.95 (tanh) prevents Trellis overload on rate conversion. DSD64→DSD128 forced to PreCorr (Trellis overloads at any gain).
+
+### Changed
+- **Worker reservation re-enabled**: `threadpool_set_reserved` moved from `plugin_init_engine` (caused deadlock) to after first successful chunk. Reserved workers now exclusively process pinned SDM segments.
+- **Out-of-process worker**: Separate `foo_dsd_trellis_worker.exe` process with own CPU affinity for async DSD processing via shared memory IPC. Bypasses Process Lasso affinity restrictions.
+
 ## [1.0.2] - 2026-03-31
 
 ### Fixed
@@ -82,6 +98,7 @@ Initial public release.
 - ONNX model runtime-loaded via DirectML
 - Causal dilated CNN for DSD quantization noise reduction
 
+[1.0.3]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.3
 [1.0.2]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.2
 [1.0.1]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.1
 [1.0.0]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.0
