@@ -507,11 +507,10 @@ size_t engine_process_block(engine_channel_t *eng,
         eng->prev_gain = (double)cfg->gain;
     }
 
-    /* Soft-clip FIR output to prevent SDM overload on rate conversion.
-     * FIR 4x upsample peaks at ±2.24 (Gibbs), after gain=0.708 → ±1.59.
-     * Trellis overloads without clip. PreCorr doesn't crash but quality
-     * degrades with high peaks — soft-clip keeps input in linear range. */
-    {
+    /* Soft-clip FIR output to prevent Trellis SDM overload on rate conversion.
+     * FIR peaks at ±2.24 (Gibbs) after gain still exceed Trellis MSA.
+     * PreCorr handles overload natively — skip clip for PreCorr. */
+    if (eng->sdm_mode != SDM_MODE_PRECORR) {
         const double clip_thresh = 0.95;
         const double inv_knee = 1.0 / (1.0 - clip_thresh);
         for (size_t i = 0; i < fir_out; i++) {

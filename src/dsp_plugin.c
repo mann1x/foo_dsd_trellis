@@ -1483,25 +1483,6 @@ size_t plugin_process(plugin_state_t *s,
         /* PreCorr: GPU FIR done above, now run GPU PreCorr SDM.
          * Skip the parallel Trellis Phase 2 entirely. */
         if (s->config.sdm_mode == SDM_MODE_PRECORR) {
-            /* Soft-clip FIR output for rate conversion.
-             * FIR upsample peaks at ±2.24 (Gibbs), gain=0.708 → ±1.59.
-             * PreCorr quality degrades with peaks above ±1.0. */
-            if (need_rate_conv) {
-                const double clip_thresh = 0.95;
-                const double inv_knee = 1.0 / (1.0 - clip_thresh);
-                for (int ch = 0; ch < num_channels; ch++) {
-                    double *buf = fir_data[ch];
-                    size_t n = fir_counts[ch];
-                    for (size_t i = 0; i < n; i++) {
-                        double x = buf[i];
-                        if (x > clip_thresh)
-                            buf[i] = clip_thresh + (1.0 - clip_thresh) * tanh((x - clip_thresh) * inv_knee);
-                        else if (x < -clip_thresh)
-                            buf[i] = -clip_thresh - (1.0 - clip_thresh) * tanh((-x - clip_thresh) * inv_knee);
-                    }
-                }
-            }
-
             LARGE_INTEGER t_pc_start, t_pc_end;
             QueryPerformanceCounter(&t_pc_start);
             size_t fir_n = fir_counts[0];
