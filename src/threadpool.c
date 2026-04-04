@@ -194,45 +194,55 @@ static DWORD WINAPI worker_func(LPVOID param) {
     wait_handles[n_handles++] = pool->work_sem;
 
     for (;;) {
-        WaitForMultipleObjects((DWORD)n_handles, wait_handles, FALSE, INFINITE);
+        /* All workers wait on both wake_event + work_sem.
+         * The return value tells us which handle fired:
+         *   WAIT_OBJECT_0 = wake_event → check per-worker queue
+         *   WAIT_OBJECT_0+1 (or +0 if no queue) = work_sem → check shared queue
+         * Reserved workers: only act on wake_event, re-release work_sem if consumed.
+         * Shared workers: only act on work_sem, ignore wake_event spurious. */
+        DWORD wait_result = WaitForMultipleObjects((DWORD)n_handles, wait_handles, FALSE,
+                                                     my_queue ? 50 : INFINITE);
 
         if (InterlockedCompareExchange(&pool->shutdown, 0, 0))
             break;
 
-        /* Read role dynamically (set_reserved may be called after thread start) */
         int rc = pool->reserved_count;
         bool is_reserved = (rc > 0 && my_index < rc);
         bool is_shared   = (rc > 0 && my_index >= rc);
-        /* rc == 0: legacy — check both queues */
+
+        /* Determine which handle fired */
+        bool woke_on_wake_event = (my_queue && wait_result == WAIT_OBJECT_0);
+        bool woke_on_work_sem   = (wait_result == (DWORD)(my_queue ? WAIT_OBJECT_0 + 1 : WAIT_OBJECT_0));
 
         channel_block_t *block = NULL;
 
-        /* Reserved workers (or legacy): check per-worker queue */
-        if (!is_shared && my_queue && InterlockedCompareExchange(&my_queue->count, 0, 0) > 0) {
+        /* Check per-worker queue (wake_event fired, or legacy checks both) */
+        if ((woke_on_wake_event || !is_shared) &&
+            my_queue && InterlockedCompareExchange(&my_queue->count, 0, 0) > 0) {
             LONG idx = InterlockedDecrement(&my_queue->count);
             if (idx >= 0)
                 block = my_queue->queue[idx];
         }
 
-        /* Shared workers (or legacy): check shared queue */
-        if (!block && !is_reserved) {
-            EnterCriticalSection(&pool->queue_cs);
-            if (pool->queue_count > 0) {
-                block = pool->queue[pool->queue_head];
-                pool->queue_head = (pool->queue_head + 1) % MAX_QUEUE_SIZE;
-                pool->queue_count--;
+        /* Check shared queue (work_sem fired, or legacy checks both).
+         * Reserved workers that consumed work_sem must re-release it. */
+        if (!block && (woke_on_work_sem || !is_reserved)) {
+            if (is_reserved && woke_on_work_sem) {
+                /* Reserved worker stole a work_sem count — give it back */
+                ReleaseSemaphore(pool->work_sem, 1, NULL);
+            } else {
+                EnterCriticalSection(&pool->queue_cs);
+                if (pool->queue_count > 0) {
+                    block = pool->queue[pool->queue_head];
+                    pool->queue_head = (pool->queue_head + 1) % MAX_QUEUE_SIZE;
+                    pool->queue_count--;
+                }
+                LeaveCriticalSection(&pool->queue_cs);
             }
-            LeaveCriticalSection(&pool->queue_cs);
         }
 
-        if (!block) {
-            /* If a reserved worker woke on work_sem but found no per-worker
-             * task, it consumed a semaphore count that was meant for a shared
-             * worker. Re-release it so the shared worker can pick it up. */
-            if (is_reserved)
-                ReleaseSemaphore(pool->work_sem, 1, NULL);
+        if (!block)
             continue;
-        }
 
         /* Log task: what the worker is doing and which core it runs on */
         {
@@ -269,9 +279,23 @@ static DWORD WINAPI worker_func(LPVOID param) {
                                                      block->in, block->out,
                                                      block->count, block->discard);
         } else if (block->mode == BLOCK_MODE_FIR) {
-            block->out_count = engine_process_fir_gain(block->eng,
-                                                        block->in_f32, block->count,
-                                                        block->cfg, &block->fir_out);
+            {
+                LARGE_INTEGER t0, t1, freq;
+                QueryPerformanceCounter(&t0);
+                block->out_count = engine_process_fir_gain(block->eng,
+                                                            block->in_f32, block->count,
+                                                            block->cfg, &block->fir_out);
+                QueryPerformanceCounter(&t1);
+                QueryPerformanceFrequency(&freq);
+                double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+                static volatile LONG s_fir_log = 0;
+                if (InterlockedIncrement(&s_fir_log) <= 5) {
+                    char msg[128];
+                    sprintf_s(msg, sizeof(msg), "FIR done: ch=%d in=%zu out=%zu %.1fms",
+                              block->channel, (size_t)block->count, (size_t)block->out_count, ms);
+                    trellis_log_c(msg);
+                }
+            }
         } else if (block->mode == BLOCK_MODE_UNPACK) {
             /* DoP unpack: extract this channel from interleaved PCM.
              * Uses TLS buffer to avoid per-call malloc/free. */

@@ -193,7 +193,9 @@ int main(int argc, char *argv[]) {
             accum_frames += avail_frames;
         }
 
-        /* Process batch when we have enough */
+        /* Process in fixed batch_target chunks (200ms).
+         * Consistent output size prevents ring residual accumulation.
+         * The ring (4 seconds) absorbs the batch/drain size mismatch. */
         while (accum_frames >= batch_target) {
             int proc_frames = batch_target;
 

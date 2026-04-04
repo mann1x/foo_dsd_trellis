@@ -21,21 +21,22 @@ int shm_ipc_create(shm_ipc_t *ipc, const char *name_suffix,
                     const dsd_config_t *config) {
     memset(ipc, 0, sizeof(*ipc));
 
-    int batch_target = (int)(pcm_rate / 5);  /* ~200ms */
+    int batch_target = (int)(pcm_rate / 5);  /* ~200ms — minimum accumulation */
 
-    /* Output batch size: for rate conversion, output has more frames.
-     * config->fs_out/fs_in gives the rate ratio. */
+    /* Ring sizes based on 1 second of audio (not 200ms batch_target).
+     * The worker adapts batch size to match on_chunk (up to ~1s).
+     * Rings must hold 4× the actual batch for smooth buffering. */
     uint32_t fs_in = config->fs_in;
     uint32_t fs_out_actual = config->fs_out ? config->fs_out : fs_in;
-    int out_batch = batch_target;
-    if (fs_out_actual > fs_in && fs_in > 0)
-        out_batch = (int)((double)batch_target * (double)fs_out_actual / (double)fs_in);
 
-    /* Ring sizes: 8× batch, power of 2.
-     * Must hold enough batches so the worker never drops output
-     * during startup (before drain starts). */
-    int in_bytes_raw = batch_target * channels * (int)sizeof(float) * 8;
-    int out_bytes_raw = out_batch * channels * 3 * 8;
+    /* Input ring: 4 seconds of input PCM */
+    int in_bytes_raw = (int)pcm_rate * channels * (int)sizeof(float) * 4;
+
+    /* Output ring: 4 seconds of output i24 (accounts for rate conversion) */
+    int out_1s = (int)pcm_rate;
+    if (fs_out_actual > fs_in && fs_in > 0)
+        out_1s = (int)((double)pcm_rate * (double)fs_out_actual / (double)fs_in);
+    int out_bytes_raw = out_1s * channels * 3 * 4;
     int in_capacity = shm_next_pow2(in_bytes_raw);
     int out_capacity = shm_next_pow2(out_bytes_raw);
 

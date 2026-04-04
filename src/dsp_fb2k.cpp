@@ -2125,18 +2125,11 @@ public:
                 }
             }
 
-            /* Check for small chunks — use out-of-process worker.
-             * Worker handles ALL DSD processing (same-rate and rate conversion).
-             * Large chunks (>100ms, e.g., test install) use direct processing. */
-            double chunk_ms = (double)pcm_frames / (double)pcm_rate * 1000.0;
-
-            if (chunk_ms >= 100.0) {
-                /* Large chunk: direct processing */
-                if (m_worker.active) worker_stop();
-                out_frames = plugin_process(m_state, in_f32.get_ptr(), out_buf.get_ptr(),
-                                            pcm_frames, (int)channels, pcm_rate);
-            } else {
-                /* Small chunk: out-of-process worker handles everything.
+            /* Always use out-of-process worker for DSD processing.
+             * The worker runs with unrestricted CPU affinity, bypassing
+             * Process Lasso restrictions that limit fb2k to a few cores. */
+            {
+                /* Out-of-process worker handles everything.
                  * on_chunk just writes input to shared memory and reads output. */
                 uint32_t dop_pcm_rate = chunk_cfg.fs_out ? chunk_cfg.fs_out / 16 : pcm_rate;
 

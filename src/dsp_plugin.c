@@ -1470,9 +1470,38 @@ size_t plugin_process(plugin_state_t *s,
         QueryPerformanceCounter(&t_fir_end);
         s->time_fir_ms = perf_ms(t_fir_start, t_fir_end);
 
+        {
+            static int fir_phase_log = 0;
+            if (fir_phase_log++ < 5) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "FIR phase done: %.1fms, fir_counts[0]=%zu, sdm_mode=%d",
+                         s->time_fir_ms, (size_t)fir_counts[0], s->config.sdm_mode);
+                trellis_log_c(msg);
+            }
+        }
+
         /* PreCorr: GPU FIR done above, now run GPU PreCorr SDM.
          * Skip the parallel Trellis Phase 2 entirely. */
         if (s->config.sdm_mode == SDM_MODE_PRECORR) {
+            /* Soft-clip FIR output for rate conversion.
+             * FIR upsample peaks at ±2.24 (Gibbs), gain=0.708 → ±1.59.
+             * PreCorr quality degrades with peaks above ±1.0. */
+            if (need_rate_conv) {
+                const double clip_thresh = 0.95;
+                const double inv_knee = 1.0 / (1.0 - clip_thresh);
+                for (int ch = 0; ch < num_channels; ch++) {
+                    double *buf = fir_data[ch];
+                    size_t n = fir_counts[ch];
+                    for (size_t i = 0; i < n; i++) {
+                        double x = buf[i];
+                        if (x > clip_thresh)
+                            buf[i] = clip_thresh + (1.0 - clip_thresh) * tanh((x - clip_thresh) * inv_knee);
+                        else if (x < -clip_thresh)
+                            buf[i] = -clip_thresh - (1.0 - clip_thresh) * tanh((-x - clip_thresh) * inv_knee);
+                    }
+                }
+            }
+
             LARGE_INTEGER t_pc_start, t_pc_end;
             QueryPerformanceCounter(&t_pc_start);
             size_t fir_n = fir_counts[0];
@@ -1485,7 +1514,7 @@ size_t plugin_process(plugin_state_t *s,
                 s->gpu_das_buf_cap = s->gpu_das_in ? fir_n : 0;
                 s->gpu_das_buf_nch = s->gpu_das_in ? num_channels : 0;
             }
-            if (s->gpu_das_in && s->gpu_das_out) {
+            if (s->gpu && s->gpu_das_in && s->gpu_das_out) {
                 for (int ch = 0; ch < num_channels; ch++)
                     for (size_t i = 0; i < fir_n; i++)
                         s->gpu_das_in[ch * fir_n + i] = (float)fir_data[ch][i];
@@ -1547,15 +1576,41 @@ size_t plugin_process(plugin_state_t *s,
                             s->ch_out[ch], fir_n);
                 }
             } else {
-                /* Buffer alloc failed, CPU fallback */
+                /* Buffer alloc failed or GPU disabled, CPU fallback */
+                {
+                    static int pc_cpu_log = 0;
+                    if (pc_cpu_log++ < 5) {
+                        char msg[128];
+                        snprintf(msg, sizeof(msg), "PreCorr CPU fallback: fir_n=%zu", (size_t)fir_n);
+                        trellis_log_c(msg);
+                    }
+                }
                 for (int ch = 0; ch < num_channels; ch++)
                     dsd_out_count = precorr_process_block(
                         &s->channels[ch].precorr, fir_data[ch],
                         s->ch_out[ch], fir_n);
+                {
+                    static int pc_done_log = 0;
+                    if (pc_done_log++ < 5) {
+                        char msg[128];
+                        snprintf(msg, sizeof(msg), "PreCorr CPU done: out=%zu", (size_t)dsd_out_count);
+                        trellis_log_c(msg);
+                    }
+                }
             }
             QueryPerformanceCounter(&t_pc_end);
             s->time_sdm_ms = perf_ms(t_pc_start, t_pc_end);
             goto sdm_done;
+        }
+
+        {
+            static int phase2_log = 0;
+            if (phase2_log++ < 5) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "Phase 2 entry: segments=%d overlap=%zu fir_counts[0]=%zu",
+                         segments_per_ch, (size_t)overlap, (size_t)fir_counts[0]);
+                trellis_log_c(msg);
+            }
         }
 
         /* Phase 2: Get temp SDM contexts.
@@ -2776,9 +2831,8 @@ sdm_done:
     s->time_pack_ms = perf_ms(t_pack_start, t_pack_end);
 
     /* Enable worker reservation after first successful chunk.
-     * Cannot be called during plugin_init_engine (deadlock: workers are
-     * mid-processing when set_reserved changes their role). Safe here
-     * because the pool is idle between chunks. */
+     * Reserved workers only wait on per-worker wake_event (no work_sem),
+     * so shared queue tasks (FIR, SDM Phase 2) are never starved. */
     if (s->chunk_counter == 0 && s->pool && num_channels > 0) {
         threadpool_set_reserved(s->pool, num_channels);
     }
