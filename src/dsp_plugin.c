@@ -1238,9 +1238,12 @@ size_t plugin_process(plugin_state_t *s,
                        (s->config.gpu_sdm_enabled && s->gpu &&
                         s->config.sdm_mode == SDM_MODE_TRELLIS);
 
+    /* PreCorr rate conversion uses the sequential engine_process_block path
+     * (same as same-rate PreCorr). The parallel FIR+PreCorr split corrupts
+     * the output — engine_process_block handles FIR+SDM as one unit. */
     if (need_rate_conv && !skip_parallel && use_parallel &&
         num_threads > num_channels &&
-        (s->config.sdm_mode == SDM_MODE_TRELLIS || s->config.fs_in != fs_out)) {
+        (s->config.sdm_mode == SDM_MODE_TRELLIS)) {
         /* Trellis: always (same-rate uses boxcar internally via GPU lowpass).
          * PreCorr rate-conv: GPU FIR + GPU PreCorr intercept.
          * PreCorr same-rate: engine_process_block (CPU boxcar + CPU PreCorr).

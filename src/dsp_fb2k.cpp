@@ -2219,15 +2219,28 @@ public:
                         audio_chunk::FLAG_LITTLE_ENDIAN | audio_chunk::FLAG_SIGNED,
                         audio_chunk::g_guess_channel_config(channels));
 
-                    /* Track DoP marker phase from last drained frame.
-                     * Marker byte is at offset [last_frame * ch * 3 + 2] (3rd byte).
-                     * 0x05 = phase 0, 0xFA = phase 1. Next frame continues. */
+                    /* Track DoP marker phase from last drained frame. */
                     {
                         size_t last = ((size_t)out_pcm_frames - 1) * channels * 3;
                         uint8_t last_marker = drain_buf[last + 2];
-                        /* After this frame, next frame flips phase */
                         m_worker.marker_phase = (last_marker == 0x05) ? 1 : 0;
                     }
+
+                    /* Audio capture: convert drained i24 to float for capture */
+                    if (g_audio_capture.mode == 1 &&
+                        (g_audio_capture.state == CAPTURE_RECORDING || capture_check_armed())) {
+                        size_t total = out_pcm_frames * channels;
+                        pfc::array_staticsize_t<float> cap_f;
+                        cap_f.set_size_discard(total);
+                        const uint8_t *cap_src = drain_buf.get_ptr();
+                        for (size_t i = 0; i < total; i++) {
+                            int32_t v = (int32_t)cap_src[i*3] | ((int32_t)cap_src[i*3+1] << 8) | ((int32_t)cap_src[i*3+2] << 16);
+                            if (v & 0x800000) v |= (int32_t)0xFF000000;
+                            cap_f[i] = (float)((double)v / 8388608.0);
+                        }
+                        capture_write(cap_f.get_ptr(), out_pcm_frames, channels, dop_pcm_rate);
+                    }
+
                     return true;
                 } else {
                     /* Ring not ready or low: output i24 DSD silence.

@@ -194,6 +194,10 @@ int engine_channel_init(engine_channel_t *eng, int channel,
         else if (is_rate_conv)
             eng->fir_gain = fir_gain_db_to_linear(FIR_GAIN_DEFAULT) * 0.5f; /* -9 dB for PCM rate conv (no path table) */
 
+        /* No fir_gain reduction needed for PreCorr upsample.
+         * Boxcar DSD-Wide pre-smooth before FIR eliminates Gibbs peaks
+         * (±2.24 from raw DSD → ±1.0 from boxcar output). */
+
 
 
         /* Apply user FIR gain override.
@@ -456,22 +460,23 @@ size_t engine_process_block(engine_channel_t *eng,
         for (size_t i = 0; i < count; i++)
             tls_fir_d[i] = (double)in[i];
 
-        /* Boxcar pre-smooth for DSD256→128 downsample (+11 dB /48, +1.5 /44).
-         * 32-tap running average removes worst DSD noise spikes before FIR. */
-        if (fs_out < cfg->fs_in) {
-            unsigned base_r = rate_is_48k_family(cfg->fs_in) ? 48000 : 44100;
-            unsigned mult_in_r = cfg->fs_in / base_r;
-            unsigned mult_out_r = fs_out / base_r;
-            if (mult_in_r == 256 && mult_out_r == 128) {
-                const int btaps = 32;
-                double bsum = 0.0;
-                double ring[32] = {0};
-                int bp = 0;
-                double inv = 1.0 / (double)btaps;
+        /* Boxcar DSD-Wide pre-smooth before FIR rate conversion.
+         * Raw ±1.0 DSD through FIR produces ±2.24 Gibbs peaks.
+         * Boxcar first converts DSD to smooth multi-bit (within ±1.0),
+         * then FIR upsamples the smooth signal — peaks stay within
+         * PreCorr/Trellis linear range. No gain reduction needed.
+         * Uses the same rate-adaptive taps as same-rate boxcar. */
+        {
+            boxcar_t *bc = &eng->boxcar;
+            if (bc->taps > 0) {
+                const double inv_n = 1.0 / (double)bc->taps;
                 for (size_t i = 0; i < count; i++) {
-                    bsum -= ring[bp]; ring[bp] = tls_fir_d[i]; bsum += tls_fir_d[i];
-                    bp = (bp + 1) % btaps;
-                    tls_fir_d[i] = bsum * inv;
+                    double s = tls_fir_d[i];
+                    bc->sum -= bc->ring[bc->pos];
+                    bc->ring[bc->pos] = s;
+                    bc->sum += s;
+                    bc->pos = (bc->pos + 1) % bc->taps;
+                    tls_fir_d[i] = bc->sum * inv_n;
                 }
             }
         }
@@ -496,7 +501,36 @@ size_t engine_process_block(engine_channel_t *eng,
         }
         if (!tls_fir_f) return 0;
 
-        fir_out = fir_chain_process(&eng->fir, in, tls_fir_f, count);
+        /* Boxcar DSD-Wide pre-smooth (fp32 path) — same as fp64 path above */
+        {
+            boxcar_t *bc = &eng->boxcar;
+            if (bc->taps > 0) {
+                const double inv_n = 1.0 / (double)bc->taps;
+                /* Pre-smooth into TLS buffer, then FIR processes the smooth signal */
+                static __declspec(thread) float *tls_smooth = NULL;
+                static __declspec(thread) size_t tls_smooth_sz = 0;
+                if (tls_smooth_sz < count) {
+                    free(tls_smooth);
+                    tls_smooth = (float *)malloc(count * sizeof(float));
+                    tls_smooth_sz = tls_smooth ? count : 0;
+                }
+                if (tls_smooth) {
+                    for (size_t i = 0; i < count; i++) {
+                        double s = (double)in[i];
+                        bc->sum -= bc->ring[bc->pos];
+                        bc->ring[bc->pos] = s;
+                        bc->sum += s;
+                        bc->pos = (bc->pos + 1) % bc->taps;
+                        tls_smooth[i] = (float)(bc->sum * inv_n);
+                    }
+                    fir_out = fir_chain_process(&eng->fir, tls_smooth, tls_fir_f, count);
+                } else {
+                    fir_out = fir_chain_process(&eng->fir, in, tls_fir_f, count);
+                }
+            } else {
+                fir_out = fir_chain_process(&eng->fir, in, tls_fir_f, count);
+            }
+        }
 
         /* Widen to double and apply gain ramp in one pass */
         {
