@@ -20,7 +20,10 @@ A native foobar2000 DSP plugin that converts PCM and DSD audio to DSD using sigm
 | Volume Control | DSD-Wide: boxcar smoothing + gain + SDM re-encode (no PCM decimation) |
 | Anti-Pop | Three-layer anti-pop: SDM state preservation + DoP 0x69 silence trail + rate-switch DAC mute trick |
 | Parallel SDM | Density-Aligned Stitching (DAS) for artifact-free parallel Trellis processing |
+| Out-of-Process Worker | Separate worker process with unrestricted CPU affinity (bypasses Process Lasso). Adaptive batch sizing matches on_chunk size |
+| Boxcar Pre-Smooth | DSD-Wide boxcar pre-filter before FIR rate conversion eliminates Gibbs overshoot (±2.24 → ±0.7). Enables full 0 dB gain for PreCorr upsample |
 | GPU Compute | CUDA/DX12 acceleration for FIR, boxcar, lowpass. GPU SDM (experimental) |
+| ML Dual Runtime | ONNX Runtime with CUDA EP (onnxruntime_cuda.dll) + DirectML EP (onnxruntime.dll). Auto fallback: CUDA → DirectML → CPU |
 | Mute | Silence pattern substitution (0x69/0x96) |
 | DoP Detection | Auto-detect DoP markers (0x05/0xFA) in 24-bit PCM frames |
 | Output Modes | DoP (native DSD output) or PCM (for VU meter / non-DSD DACs) |
@@ -37,8 +40,11 @@ A native foobar2000 DSP plugin that converts PCM and DSD audio to DSD using sigm
 Four-layer design with clean separation of concerns:
 
 ```
-1-bit in -> unpack -> float32 @ Fs_in -> [IPP FIRMR] -> x gain -> SDM (Trellis|PreCorr) -> 1-bit out @ Fs_out
+Same-rate:  1-bit in -> unpack -> boxcar DSD-Wide -> x gain -> SDM (Trellis|PreCorr) -> 1-bit out
+Rate conv:  1-bit in -> unpack -> boxcar pre-smooth -> [IPP FIRMR] -> x gain -> SDM -> 1-bit out @ Fs_out
 ```
+
+All DSD processing runs in an out-of-process worker (`foo_dsd_trellis_worker.exe`) with full CPU affinity, communicating via lock-free shared memory ring buffers. The worker bypasses Process Lasso CPU restrictions that limit the parent foobar2000 process.
 
 | Layer | Purpose | Files |
 |-------|---------|-------|
@@ -47,6 +53,7 @@ Four-layer design with clean separation of concerns:
 | Processing Engine | IPP FIR rate conversion + gain + parallel SDM | `engine.c`, `fir.c` |
 | SDM | Trellis (Viterbi) or PreCorr (greedy + prediction) | `trellis.c`, `precorr.c`, `ntf.c` |
 | Polyphase Resampler | Cross-family PCM rate conversion (IPP + libsoxr) | `resample.c` |
+| Worker IPC | Out-of-process worker with shared memory SPSC ring buffers | `worker_main.c`, `shm_ipc.c` |
 | Infrastructure | Thread pool, CPU topology, REST API, ONNX ML, TUSBAudio | `threadpool.c`, `cpuset.c`, `httpapi.c`, `onnx_filter.c`, `tusbaudio.c` |
 
 Thread pool (`threadpool.c`) provides per-channel and per-segment parallelism with MMCSS "Pro Audio" scheduling.
@@ -350,56 +357,45 @@ Rate conversion uses production path_config values: per-path optimal NTF filter,
 
 | Path | Pre-SDM Processing | Why |
 |------|-------------------|-----|
-| **Same-rate** | Boxcar DSD-Wide (4-bit) | Preserves DSD noise as natural dither (+22 dB vs FIR LP) |
-| **Upsample** | Raw DSD ±1.0 → fp64 FIR polyphase | DSD noise acts as dither; FIR handles anti-imaging |
-| **→DSD512 upsample** | Raw DSD → 127-tap first stage FIR | Narrower transition band reduces noise accumulation |
-| **Downsample** | Raw DSD ±1.0 → fp64 FIR polyphase | DSD noise as dither is optimal |
-| **DSD256→128 DN** | 32-tap boxcar → fp64 FIR | Pre-smooth removes noise spikes (+11 dB /48) |
+| **Same-rate** | Boxcar DSD-Wide (32-64 taps) | Preserves DSD noise as natural dither (+22 dB vs FIR LP) |
+| **Rate conversion** | 8-tap boxcar pre-smooth → fp64 FIR polyphase | Eliminates Gibbs overshoot (±2.24 → ±0.7), enables 0 dB PreCorr gain. Fewer taps preserve HF for FIR (+39 dB vs same-rate taps) |
 | **DSD→PCM** | FIR decimation only (no SDM) | Multi-bit output, no re-encoding needed |
 
-Boxcar DSD-Wide: N-tap running average of ±1.0 DSD samples → multi-bit (log2(N)-bit) intermediate at DSD rate. Rate-adaptive taps: DSD64=32, DSD128/256=64, DSD512=128. The multi-bit intermediate preserves shaped noise as natural dither that the trellis SDM re-encoder tracks efficiently.
+Boxcar DSD-Wide: N-tap running average of ±1.0 DSD samples → multi-bit intermediate at DSD rate. Same-rate taps: DSD64=32, DSD128/256=64, DSD512=16. Rate conversion taps: 8 (fewer taps preserve HF for FIR, +39 dB vs same-rate taps on DSD128→DSD256).
 
-**44.1 kHz family — upsample** (end-to-end: DSD→fp64 FIR→SDM→Goertzel at output rate):
+**44.1 kHz family — rate conversion** (boxcar pre-smooth + FIR + SDM, nc=2 sweep-optimized):
 
-| Conversion | NTF | Gain | Lim | Cands | SINAD | A-wtd | MT | NMod |
-|------------|-----|------|-----|-------|------:|------:|---:|-----:|
-| DSD64→DSD128 | SDM-7 | 0.71 | off | 2 | 99.7 | 105.3 | 89.9 | 18.8 |
-| DSD64→DSD256 | CLANS-8 | 0.71 | off | 4 | 97.6 | 102.5 | 158.6 | 15.8 |
-| DSD64→DSD512 | SDM-8 | 0.71 | on | 4 | 60.2 | 62.6 | -2.3 | 0.4 |
-| DSD128→DSD256 | CLANS-6 | 0.71 | off | 4 | 105.9 | 111.9 | 117.7 | 11.2 |
-| DSD128→DSD512 | CLANS-6 | 0.71 | off | 2 | 89.4 | 95.5 | 130.7 | 14.4 |
-| DSD256→DSD512 | CLANS-8 | 0.71 | on | 2 | 114.2 | 120.0 | 147.3 | 21.0 |
+| Conversion | NTF | Gain | Lim | Cands | SINAD |
+|------------|-----|------|-----|-------|------:|
+| DSD64→DSD128 (UP) | CLANS-6 | 0.71 | off | 2 | 91.7 |
+| DSD64→DSD256 (UP) | CLANS-6 | 0.71 | off | 2 | 66.3 |
+| DSD64→DSD512 (UP) | CLANS-6 | 0.71 | 10.0 | 2 | 66.3 |
+| DSD128→DSD256 (UP) | CLANS-6 | 0.71 | off | 2 | 105.5 |
+| DSD128→DSD512 (UP) | CLANS-6 | 0.71 | off | 2 | 72.4 |
+| DSD256→DSD512 (UP) | CLANS-6 | 0.71 | off | 2 | 72.3 |
+| DSD128→DSD64 (DN) | CLANS-4 | 0.71 | off | 2 | 89.4 |
+| DSD256→DSD64 (DN) | SDM-6 | 0.71 | 12.0 | 2 | 74.2 |
+| DSD512→DSD64 (DN) | SDM-4 | 0.71 | 12.0 | 2 | 77.0 |
+| DSD256→DSD128 (DN) | SDM-6 | 0.71 | off | 2 | 101.4 |
+| DSD512→DSD128 (DN) | SDM-6 | 0.71 | off | 2 | 95.9 |
+| DSD512→DSD256 (DN) | SDM-6 | 0.71 | off | 2 | 100.9 |
 
-**44.1 kHz family — downsample** (end-to-end):
+**48 kHz family — rate conversion** (mirrored from /44 sweep, nc=2):
 
-| Conversion | NTF | Gain | Lim | Cands | SINAD | A-wtd | MT | NMod |
-|------------|-----|------|-----|-------|------:|------:|---:|-----:|
-| DSD128→DSD64 | SDM-5 | 0.71 | off | 4 | 71.8 | 77.9 | 85.9 | 20.9 |
-| DSD256→DSD64 | CLANS-8 | 0.71 | off | 8 | 73.0 | 78.3 | 99.7 | 8.6 |
-| DSD512→DSD64 | SDM-6 | 0.71 | off | 8 | 76.0 | 81.9 | 91.3 | 23.7 |
-| DSD256→DSD128 | CLANS-6 | 0.71 | off | 2 | 87.5 | 93.7 | 120.3 | 10.3 |
-| DSD512→DSD128 | SDM-6 | 0.71 | off | 8 | 101.0 | 107.6 | 95.1 | 21.8 |
-| DSD512→DSD256 | SDM-6 | 0.71 | on | 8 | 94.1 | 100.0 | 116.2 | 13.8 |
-
-**48 kHz family — rate conversion** (independently swept):
-
-| Conversion | NTF | Gain | Cands | SINAD | A-wtd | MT | NMod |
-|------------|-----|------|-------|------:|------:|---:|-----:|
-| DSD64/48→DSD128/48 (UP) | SDM-4 | 0.71 | 2 | 94.7 | 100.1 | 107.9 | 3.3 |
-| DSD64/48→DSD256/48 (UP) | SDM-7 | 0.71 | 8 | 82.9 | 88.4 | 117.6 | 9.2 |
-| DSD128/48→DSD256/48 (UP) | CLANS-6 | 0.71 | 4 | 107.2 | 113.3 | 115.1 | 40.1 |
-| DSD128/48→DSD64/48 (DN) | SDM-5 | 0.71 | 4 | 71.9 | 77.4 | 93.7 | 21.8 |
-| DSD256/48→DSD64/48 (DN) | CLANS-8 | 0.71 | 8 | 73.6 | 79.4 | 85.3 | 11.1 |
-| DSD256/48→DSD128/48 (DN) | SDM-6 | 0.71 | 8 | 92.3 | 98.4 | 118.5 | 11.0 |
+| Conversion | NTF | Gain | Cands | SINAD |
+|------------|-----|------|-------|------:|
+| DSD64/48→DSD256/48 (UP) | CLANS-6 | 0.71 | 2 | 66.7 |
+| DSD128/48→DSD256/48 (UP) | CLANS-6 | 0.71 | 2 | 117.7 |
+| DSD128/48→DSD64/48 (DN) | CLANS-4 | 0.71 | 2 | 79.4 |
+| DSD256/48→DSD128/48 (DN) | SDM-6 | 0.71 | 2 | 94.8 |
+| DSD256/48→DSD64/48 (DN) | SDM-6 | 0.71 | 2 | 84.1 |
 
 **Key observations:**
-- Same-rate: 85–109 dB via boxcar DSD-Wide (+22 dB vs FIR lowpass at DSD64)
-- Upsample 2x paths: 95–106 dB — excellent quality
-- DSD128→DSD512: 89 dB — 127-tap first FIR stage broke the 60 dB floor (+29 dB)
-- DSD256→DSD512: 114 dB — single-step upsample preserves quality
-- DSD64→DSD512: 60 dB — 4x+2x hybrid, fundamentally limited by DSD64 noise density
-- Downsample paths: 68–101 dB. fp64 FIR critical (fp32 loses 3–40 dB on multi-stage)
-- DSD256/48→DSD128/48: 92 dB — boxcar pre-smooth +11 dB over raw DSD input
+- All rate conversion uses nc=2 (matches same-rate throughput for parallel DAS)
+- 8-tap boxcar pre-smooth eliminates Gibbs peaks: DSD128→DSD256 jumped from 66 to 105 dB
+- PreCorr works at 0 dB gain on all upsample paths (boxcar keeps peaks within ±0.7)
+- DSD64→DSD256/512: ~66 dB — limited by DSD64 quantization noise floor
+- Downsample paths: 74–101 dB with nc=2 (3–7 dB below optimal nc=8)
 
 **Measurement methodology**: End-to-end pipeline (generate DSD → boxcar or FIR → SDM re-encode → Goertzel, audio band 0–22 kHz). fp64 FIR matches production (Auto=fp64). Multi-frequency median (900/1000/1100 Hz) for robustness against SDM limit-cycle sensitivity.
 
