@@ -59,6 +59,11 @@ void test_dsf_compare(void);
 void test_1_5bit_suite(void);
 void test_mt_sweep_suite(void);
 void test_downsample_sweep_suite(void);
+void test_rate_samerate_suite(void);
+void test_rate_upsample_suite(void);
+void test_rate_downsample_suite(void);
+void test_rate_pcm_suite(void);
+void test_rate_48k_suite(void);
 
 static const suite_entry_t suites[] = {
     { "dop",       "DoP",               test_dop_suite,        0 },
@@ -90,6 +95,11 @@ static const suite_entry_t suites[] = {
     { "mtsweep",   "MT Pipeline Sweep", test_mt_sweep_suite,         1 },
     { "dnsweep",   "Downsample Sweep",  test_downsample_sweep_suite, 1 },
     { "firexp",    "FIR Experiment",    test_fir_experiment_suite,   1 },
+    { "samerate",  "Same-Rate SINAD",   test_rate_samerate_suite,    0 },
+    { "upsample",  "Upsample SINAD",    test_rate_upsample_suite,   0 },
+    { "downsample","Downsample SINAD",   test_rate_downsample_suite, 0 },
+    { "dsdpcm",    "DSD to PCM SINAD",  test_rate_pcm_suite,        0 },
+    { "rate48",    "DSD/48 SINAD",      test_rate_48k_suite,        0 },
 };
 
 #define SUITE_COUNT (sizeof(suites) / sizeof(suites[0]))

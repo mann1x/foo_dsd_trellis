@@ -2002,6 +2002,81 @@ void test_rate_sinad_suite(void) {
     TEST_RUN(test_sinad_dsd128_48_pcm96);
 }
 
+/* ─── Targeted sub-suites for specific rate families ─── */
+
+void test_rate_samerate_suite(void) {
+    TEST_SUITE("Same-Rate SINAD");
+    { double s = measure_rate_sinad(DSD_RATE_64,  DSD_RATE_64);  TEST_ASSERT_TRUE(s > 55.0, "DSD64 same-rate"); }
+    { double s = measure_rate_sinad(DSD_RATE_128, DSD_RATE_128); TEST_ASSERT_TRUE(s > 70.0, "DSD128 same-rate"); }
+    { double s = measure_rate_sinad(DSD_RATE_256, DSD_RATE_256); TEST_ASSERT_TRUE(s > 90.0, "DSD256 same-rate"); }
+    { double s = measure_rate_sinad(DSD_RATE_512, DSD_RATE_512); TEST_ASSERT_TRUE(s > 100.0, "DSD512 same-rate"); }
+    TEST_RUN(test_sinad_dsd64_48_same);
+    TEST_RUN(test_sinad_dsd128_48_same);
+    TEST_RUN(test_sinad_dsd256_48_same);
+    TEST_RUN(test_sinad_dsd512_48_same);
+}
+
+void test_rate_upsample_suite(void) {
+    TEST_SUITE("Upsample SINAD");
+    TEST_RUN(test_sinad_up_64_128);
+    TEST_RUN(test_sinad_up_64_256);
+    TEST_RUN(test_sinad_up_64_512);
+    TEST_RUN(test_sinad_up_128_256);
+    TEST_RUN(test_sinad_up_128_512);
+    TEST_RUN(test_sinad_up_256_512);
+    TEST_RUN(test_sinad_up_64_48_128_48);
+    TEST_RUN(test_sinad_up_64_48_256_48);
+    TEST_RUN(test_sinad_up_128_48_256_48);
+}
+
+void test_rate_downsample_suite(void) {
+    TEST_SUITE("Downsample SINAD");
+    TEST_RUN(test_sinad_dn_128_64);
+    TEST_RUN(test_sinad_dn_256_64);
+    TEST_RUN(test_sinad_dn_512_64);
+    TEST_RUN(test_sinad_dn_256_128);
+    TEST_RUN(test_sinad_dn_512_128);
+    TEST_RUN(test_sinad_dn_512_256);
+    TEST_RUN(test_sinad_dn_128_48_64_48);
+    TEST_RUN(test_sinad_dn_256_48_128_48);
+    TEST_RUN(test_sinad_dn_256_48_64_48);
+}
+
+void test_rate_pcm_suite(void) {
+    TEST_SUITE("DSD to PCM SINAD");
+    TEST_RUN(test_sinad_dsd64_pcm44);
+    TEST_RUN(test_sinad_dsd64_pcm88);
+    TEST_RUN(test_sinad_dsd64_pcm176);
+    TEST_RUN(test_sinad_dsd128_pcm44);
+    TEST_RUN(test_sinad_dsd128_pcm88);
+    TEST_RUN(test_sinad_dsd128_pcm176);
+    TEST_RUN(test_sinad_dsd256_pcm44);
+    TEST_RUN(test_sinad_dsd256_pcm88);
+    TEST_RUN(test_sinad_dsd256_pcm176);
+    TEST_RUN(test_sinad_dsd512_pcm44);
+    TEST_RUN(test_sinad_dsd512_pcm88);
+    TEST_RUN(test_sinad_dsd512_pcm176);
+    TEST_RUN(test_sinad_dsd512_pcm352);
+    TEST_RUN(test_sinad_dsd64_48_pcm48);
+    TEST_RUN(test_sinad_dsd128_48_pcm96);
+}
+
+void test_rate_48k_suite(void) {
+    TEST_SUITE("DSD/48 Family SINAD");
+    TEST_RUN(test_sinad_dsd64_48_same);
+    TEST_RUN(test_sinad_dsd128_48_same);
+    TEST_RUN(test_sinad_dsd256_48_same);
+    TEST_RUN(test_sinad_dsd512_48_same);
+    TEST_RUN(test_sinad_up_64_48_128_48);
+    TEST_RUN(test_sinad_up_64_48_256_48);
+    TEST_RUN(test_sinad_up_128_48_256_48);
+    TEST_RUN(test_sinad_dn_128_48_64_48);
+    TEST_RUN(test_sinad_dn_256_48_128_48);
+    TEST_RUN(test_sinad_dn_256_48_64_48);
+    TEST_RUN(test_sinad_dsd64_48_pcm48);
+    TEST_RUN(test_sinad_dsd128_48_pcm96);
+}
+
 /* ─── Quick depth+NTF+nc sweep for weak rate conversion paths ─── */
 static void test_depth16_spot_check(void) {
     typedef struct {
