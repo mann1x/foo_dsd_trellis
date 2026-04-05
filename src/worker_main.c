@@ -254,7 +254,11 @@ int main(int argc, char *argv[]) {
             /* Check if ring has enough for primed */
             int out_avail = shm_ring_available(&ctrl->out_write_pos,
                                                 &ctrl->out_read_pos);
-            int primed_threshold = batch_target * channels * 3 * 3;
+            /* Priming threshold: 3x the actual output batch size.
+             * Use result (actual output frames) not batch_target (input frames)
+             * to handle downsample where output is much smaller than input. */
+            int primed_threshold = (int)(result * (size_t)channels * 3) * 3;
+            if (primed_threshold < 1) primed_threshold = batch_target * channels * 3 * 3;
             if (out_avail >= primed_threshold && !ctrl->primed) {
                 InterlockedExchange(&ctrl->primed, 1);
                 char msg[128];

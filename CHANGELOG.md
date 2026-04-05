@@ -5,6 +5,25 @@ All notable changes to foo_dsd_trellis will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] - 2026-04-05
+
+### Fixed
+- **DSD rate conversion noise**: Boxcar DSD-Wide pre-smooth (8 taps) before FIR upsample eliminates Gibbs overshoot (±2.24 peaks → ±0.7). Enables full 0 dB gain for PreCorr — no more noise on DSD64→DSD256 or DSD128→DSD256 upsample.
+- **DSD rate conversion stutter**: All rate conversion paths now use nc=2 candidates (sweep-optimized NTF/limiter/depth per path). Matches same-rate throughput for parallel DAS processing.
+- **PreCorr rate conversion corruption**: PreCorr rate conversion uses sequential engine_process_block path. The parallel FIR+PreCorr split was corrupting the output.
+- **Worker priming delay on downsample**: Priming threshold now based on actual output batch size, not input rate. DSD512→DSD64 primes in ~0.8s instead of ~6.5s.
+- **Playback time desync**: Latency reporting uses output rate for output ring (was using input rate — 8x underreport for downsample paths).
+- **Worker always-on**: All DSD processing uses out-of-process worker (removed 100ms chunk threshold). Bypasses Process Lasso CPU affinity restrictions for both small and large chunk installs.
+- **Threadpool semaphore starvation**: Shared workers respond to both wake_event and work_sem. Reserved workers that consume work_sem re-release immediately. Fixes Phase 2 parallel SDM deadlock.
+- **GPU PreCorr crash**: Skip GPU PreCorr path when `s->gpu` is NULL (GPU disabled).
+- **Worker ring buffer sizing**: Rings sized for 4 seconds of audio (was 8× 200ms batch). Prevents ring-full blocking on rate conversion.
+- **Worker ring drain**: Drain all available complete frames instead of demanding exact match. Prevents DSD512 silence from 128-frame warmup mismatch.
+
+### Changed
+- **Boxcar taps for rate conversion**: 8 taps (was same as same-rate 32-64). Fewer taps preserve HF content for FIR, improving DSD128→DSD256 SINAD from 66 to 105 dB (+39 dB).
+- **Per-path nc=2 configs**: All rate conversion paths swept and optimized for nc=2 candidates with boxcar pre-smooth. Quality maintained while halving Trellis CPU cost.
+- **Targeted test suites**: Added `--suite samerate`, `upsample`, `downsample`, `dsdpcm`, `rate48` for faster iteration on specific path families.
+
 ## [1.0.4] - 2026-04-03
 
 ### Fixed
@@ -112,6 +131,7 @@ Initial public release.
 - ONNX model runtime-loaded via DirectML
 - Causal dilated CNN for DSD quantization noise reduction
 
+[1.0.5]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.5
 [1.0.4]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.4
 [1.0.3]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.3
 [1.0.2]: https://github.com/mann1x/foo_dsd_trellis/releases/tag/v1.0.2

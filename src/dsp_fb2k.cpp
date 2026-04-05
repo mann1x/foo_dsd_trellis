@@ -2767,12 +2767,14 @@ public:
                 &m_worker.ipc.ctrl->in_read_pos);
             int in_frames = in_bytes / (int)(m_worker.channels * sizeof(float));
             lat += (double)in_frames / (double)m_worker.pcm_rate;
-            /* Output ring: processed data waiting to be drained */
+            /* Output ring: processed data waiting to be drained.
+             * Output rate may differ from input (rate conversion). */
             int out_bytes = shm_ring_available(
                 &m_worker.ipc.ctrl->out_write_pos,
                 &m_worker.ipc.ctrl->out_read_pos);
             int out_frames = out_bytes / (m_worker.channels * 3);
-            lat += (double)out_frames / (double)m_worker.pcm_rate;
+            uint32_t out_rate = m_worker.out_pcm_rate ? m_worker.out_pcm_rate : m_worker.pcm_rate;
+            lat += (double)out_frames / (double)out_rate;
         }
 
         return lat;
