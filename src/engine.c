@@ -59,23 +59,24 @@ static const path_config_t path_table[] = {
     { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_512, DSD_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
-    /* Rate conversion: boxcar DSD-Wide pre-smooth eliminates FIR Gibbs peaks.
-     * Original sweep-optimized NTF/cands/depth/lat per path.
-     * TODO: re-sweep with boxcar pre-smooth for potentially better params. */
-    /* Upsample */
-    { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_7,   0.0,  2,  0, 4, 0.708f },  /* PreCorr forced for this path */
-    { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  4,  0, 4, 0.708f },
-    { DSD_RATE_64,  DSD_RATE_512, NTF_SDM_8,   16.0, 4,  64, 8, 0.708f },
-    { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_6, 0.0,  4,  0, 4, 0.708f },
-    { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
-    { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 0.708f },
-    /* Downsample */
-    { DSD_RATE_128, DSD_RATE_64,  NTF_SDM_5,   0.0,  4,  0, 4, 0.708f },
-    { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  0, 0, 0.708f },
-    { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
-    { DSD_RATE_512, DSD_RATE_64,  NTF_SDM_6,   0.0,  8,  0, 0, 0.708f },
-    { DSD_RATE_512, DSD_RATE_128, NTF_SDM_6,   0.0,  8, 16, 16, 0.708f },
-    { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,  16.0,  8,  0, 0, 0.708f },
+    /* Rate conversion with boxcar DSD-Wide pre-smooth (2026-04-05 sweep).
+     * nc=2 for all paths — matches same-rate throughput for parallel DAS.
+     * Boxcar eliminates FIR Gibbs peaks, enabling lower cands without
+     * quality loss. Sweep: 6 paths × 10 NTF × 8 lim × 3 cands × 3 depth. */
+    /* Upsample (swept paths marked ✓, pending marked ~) */
+    { DSD_RATE_64,  DSD_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },  /* PreCorr forced */
+    { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },  /* ~ pending sweep */
+    { DSD_RATE_64,  DSD_RATE_512, NTF_CLANS_6, 10.0, 2,  0, 16, 0.708f }, /* ✓ 66.3 dB */
+    { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },  /* ~ pending sweep */
+    { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },  /* ~ pending sweep */
+    { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },  /* ~ pending sweep */
+    /* Downsample (all swept ✓) */
+    { DSD_RATE_128, DSD_RATE_64,  NTF_CLANS_4, 0.0,  2,  0, 4, 0.708f },  /* ✓ 89.4 dB */
+    { DSD_RATE_256, DSD_RATE_64,  NTF_SDM_6,  12.0,  2,  0, 4, 0.708f },  /* ✓ 74.2 dB */
+    { DSD_RATE_256, DSD_RATE_128, NTF_SDM_6,   0.0,  2,  0, 8, 0.708f },  /* ✓ 101.4 dB */
+    { DSD_RATE_512, DSD_RATE_64,  NTF_SDM_4,  12.0,  2,  0, 4, 0.708f },  /* ✓ 77.0 dB */
+    { DSD_RATE_512, DSD_RATE_128, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },  /* ~ pending sweep */
+    { DSD_RATE_512, DSD_RATE_256, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },  /* ~ pending sweep */
     /* ─── DSD/48 paths (independently swept, NOT mirrored from /44) ─── */
     /* Same-rate re-encode /48: boxcar DSD-Wide → trellis SDM (2026-03-27):
      *   DSD64/48:  SDM-6/d=16/lat=64  → 84.6 dB
@@ -86,20 +87,19 @@ static const path_config_t path_table[] = {
     { DSD48_RATE_128, DSD48_RATE_128, NTF_CLANS_6, 0.0,  2,  32,  4, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_256, NTF_SDM_4,   0.0,  2, 128, 16, 0.708f },
     { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_4,   0.0,  2, 128, 16, 0.708f },
-    /* DSD/48 upsample — original sweep-optimized params */
-    { DSD48_RATE_64,  DSD48_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },  /* PreCorr forced */
-    { DSD48_RATE_64,  DSD48_RATE_256, NTF_SDM_7,   0.0,  8,  0, 4, 0.708f },
-    { DSD48_RATE_64,  DSD48_RATE_512, NTF_SDM_8,   16.0, 4,  64, 8, 0.708f },
-    { DSD48_RATE_128, DSD48_RATE_256, NTF_CLANS_6, 0.0,  4,  0, 4, 0.708f },
+    /* DSD/48 rate conversion — mirrored from /44 sweep results, nc=2 */
+    { DSD48_RATE_64,  DSD48_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },  /* PreCorr forced */
+    { DSD48_RATE_64,  DSD48_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_64,  DSD48_RATE_512, NTF_CLANS_6, 10.0, 2,  0, 16, 0.708f },
+    { DSD48_RATE_128, DSD48_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD48_RATE_128, DSD48_RATE_512, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
-    { DSD48_RATE_256, DSD48_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 0.708f },
-    /* DSD/48 downsample — original sweep-optimized params */
-    { DSD48_RATE_128, DSD48_RATE_64,  NTF_SDM_5,   0.0,  4,  0, 4, 0.708f },
-    { DSD48_RATE_256, DSD48_RATE_64,  NTF_CLANS_8, 0.0,   8, 0, 0, 0.708f },
-    { DSD48_RATE_256, DSD48_RATE_128, NTF_SDM_6,   0.0,   8, 0, 8, 0.708f },
-    { DSD48_RATE_512, DSD48_RATE_64,  NTF_SDM_6,   0.0,   8, 0, 0, 0.708f },
-    { DSD48_RATE_512, DSD48_RATE_128, NTF_SDM_4,  16.0,  16, 0, 0, 0.708f },
-    { DSD48_RATE_512, DSD48_RATE_256, NTF_SDM_6,  16.0,   8, 0, 0, 0.708f },
+    { DSD48_RATE_256, DSD48_RATE_512, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_128, DSD48_RATE_64,  NTF_CLANS_4, 0.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_256, DSD48_RATE_64,  NTF_SDM_6,  12.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_256, DSD48_RATE_128, NTF_SDM_6,   0.0,  2,  0, 8, 0.708f },
+    { DSD48_RATE_512, DSD48_RATE_64,  NTF_SDM_4,  12.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_512, DSD48_RATE_128, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
+    { DSD48_RATE_512, DSD48_RATE_256, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
 };
 
 #define PATH_TABLE_COUNT (sizeof(path_table) / sizeof(path_table[0]))
