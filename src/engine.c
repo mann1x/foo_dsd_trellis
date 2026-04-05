@@ -123,15 +123,23 @@ int engine_channel_init(engine_channel_t *eng, int channel,
     eng->passthrough = false;
 
     /* Rate-adaptive boxcar taps for DSD-Wide smoothing.
-     * Trellis same-rate: DSD64=32 (94 dB), DSD128/256=64 (100-109 dB),
-     * DSD512=16 (118 dB — fewer taps preserve more dither at high OSR).
-     * Also used as PreCorr fallback. */
-    if (cfg->fs_in >= DSD_RATE_512)
-        eng->boxcar.taps = 16;
-    else if (cfg->fs_in >= DSD_RATE_128)
-        eng->boxcar.taps = 64;
-    else
-        eng->boxcar.taps = 32;
+     * Same-rate: DSD64=32, DSD128/256=64, DSD512=16 (tuned for boxcar+SDM).
+     * Rate conversion: fewer taps (4-8) preserve more HF content for FIR
+     * upsample, giving 30-40 dB better SINAD than same-rate taps.
+     * Sweep: DSD128→DSD256 boxcar=8 → 105.5 dB vs boxcar=64 → 66.2 dB. */
+    {
+        bool is_rate_conv = (cfg->fs_in != fs_out);
+        if (is_rate_conv) {
+            eng->boxcar.taps = 8;  /* optimal for rate conversion (sweep result) */
+        } else {
+            if (cfg->fs_in >= DSD_RATE_512)
+                eng->boxcar.taps = 16;
+            else if (cfg->fs_in >= DSD_RATE_128)
+                eng->boxcar.taps = 64;
+            else
+                eng->boxcar.taps = 32;
+        }
+    }
 
     eng->sdm_mode = cfg->sdm_mode;
 
