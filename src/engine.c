@@ -59,16 +59,17 @@ static const path_config_t path_table[] = {
     { DSD_RATE_128, DSD_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_256, DSD_RATE_256, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_512, DSD_RATE_512, NTF_SDM_6,   0.0,  2,  0, 4, 0.708f },
-    /* Upsample paths: gain=0.354 (-9 dB) to prevent FIR overload.
-     * FIR upsampling of ±1 DSD produces peaks at ±2.24.
-     * 0.354 = 0.708 × 0.5 (was 0.708 with SDM-internal 0.5×, now explicit). */
-    { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_7,   0.0,  2,  0, 4, 0.708f },  /* PreCorr forced for this path (Trellis overloads) */
+    /* Rate conversion: boxcar DSD-Wide pre-smooth eliminates FIR Gibbs peaks.
+     * Original sweep-optimized NTF/cands/depth/lat per path.
+     * TODO: re-sweep with boxcar pre-smooth for potentially better params. */
+    /* Upsample */
+    { DSD_RATE_64,  DSD_RATE_128, NTF_SDM_7,   0.0,  2,  0, 4, 0.708f },  /* PreCorr forced for this path */
     { DSD_RATE_64,  DSD_RATE_256, NTF_CLANS_8, 0.0,  4,  0, 4, 0.708f },
     { DSD_RATE_64,  DSD_RATE_512, NTF_SDM_8,   16.0, 4,  64, 8, 0.708f },
     { DSD_RATE_128, DSD_RATE_256, NTF_CLANS_6, 0.0,  4,  0, 4, 0.708f },
     { DSD_RATE_128, DSD_RATE_512, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD_RATE_256, DSD_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 0.708f },
-    /* Downsample paths — gain=0.354 for consistency with upsample. */
+    /* Downsample */
     { DSD_RATE_128, DSD_RATE_64,  NTF_SDM_5,   0.0,  4,  0, 4, 0.708f },
     { DSD_RATE_256, DSD_RATE_64,  NTF_CLANS_8, 0.0,  8,  0, 0, 0.708f },
     { DSD_RATE_256, DSD_RATE_128, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
@@ -85,14 +86,14 @@ static const path_config_t path_table[] = {
     { DSD48_RATE_128, DSD48_RATE_128, NTF_CLANS_6, 0.0,  2,  32,  4, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_256, NTF_SDM_4,   0.0,  2, 128, 16, 0.708f },
     { DSD48_RATE_512, DSD48_RATE_512, NTF_SDM_4,   0.0,  2, 128, 16, 0.708f },
-    /* DSD/48 upsample — gain=0.354 for FIR peak headroom */
+    /* DSD/48 upsample — original sweep-optimized params */
     { DSD48_RATE_64,  DSD48_RATE_128, NTF_SDM_4,   0.0,  2,  0, 4, 0.708f },  /* PreCorr forced */
     { DSD48_RATE_64,  DSD48_RATE_256, NTF_SDM_7,   0.0,  8,  0, 4, 0.708f },
     { DSD48_RATE_64,  DSD48_RATE_512, NTF_SDM_8,   16.0, 4,  64, 8, 0.708f },
     { DSD48_RATE_128, DSD48_RATE_256, NTF_CLANS_6, 0.0,  4,  0, 4, 0.708f },
     { DSD48_RATE_128, DSD48_RATE_512, NTF_CLANS_6, 0.0,  2,  0, 4, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_512, NTF_CLANS_8, 6.0,  2,  0, 4, 0.708f },
-    /* DSD/48 downsample — gain=0.354 for consistency */
+    /* DSD/48 downsample — original sweep-optimized params */
     { DSD48_RATE_128, DSD48_RATE_64,  NTF_SDM_5,   0.0,  4,  0, 4, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_64,  NTF_CLANS_8, 0.0,   8, 0, 0, 0.708f },
     { DSD48_RATE_256, DSD48_RATE_128, NTF_SDM_6,   0.0,   8, 0, 8, 0.708f },
