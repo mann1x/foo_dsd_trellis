@@ -66,7 +66,7 @@ jobs:
     - name: Run tests (quick suites only)
       shell: bash
       run: |
-        bin/Release/x64/foo_dsd_trellis_test.exe --exclude rate --exclude diag || true
+        bin/Release/x64/foo_dsd_trellis_test.exe --suite dop --suite ntf --suite fir --suite config --suite simd --suite hardening || true
       timeout-minutes: 10
 
     - name: Download cuDNN
