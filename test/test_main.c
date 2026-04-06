@@ -64,6 +64,7 @@ void test_rate_upsample_suite(void);
 void test_rate_downsample_suite(void);
 void test_rate_pcm_suite(void);
 void test_rate_48k_suite(void);
+void test_convolution_suite(void);
 
 static const suite_entry_t suites[] = {
     { "dop",       "DoP",               test_dop_suite,        0 },
@@ -75,6 +76,7 @@ static const suite_entry_t suites[] = {
     { "rate",      "Rate Conversion",   test_rate_sinad_suite, 0 },
     { "precorr",   "PreCorr SDM",       test_precorr_suite,    0 },
     { "hardening", "Hardening",         test_hardening_suite,  0 },
+    { "conv",      "Convolution",       test_convolution_suite, 0 },
     { "threadpool","Thread Pool",       test_threadpool_suite,  0 },
     { "sweep",     "Rate Conv Sweep",   test_rate_sweep_suite, 1 },
     { "depth16",   "Depth-16 Spot Check", test_depth16_suite,  1 },

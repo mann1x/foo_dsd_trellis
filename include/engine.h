@@ -11,6 +11,7 @@
 #include "fir.h"
 #include "onnx_filter.h"
 #include "gpu_compute.h"
+#include "convolution.h"
 
 /* DSD-Wide boxcar filter: smooths 1-bit DSD to multi-bit at same rate.
  * Tap count is rate-adaptive: more taps at higher DSD rates for smoother
@@ -41,6 +42,7 @@ typedef struct {
     bool             fir_only;   /* true for DSD→PCM decimation (no SDM) */
     onnx_filter_t   *ml_filter;  /* ONNX ML filter: pre-SDM preemph or post-SDM (NULL if disabled) */
     gpu_context_t   *gpu;        /* GPU compute context (shared, NULL if disabled) */
+    conv_state_t    *conv;       /* Convolution filter (room correction, NULL if disabled) */
 } engine_channel_t;
 
 /* Block processing mode */

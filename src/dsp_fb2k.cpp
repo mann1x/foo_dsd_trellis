@@ -433,7 +433,7 @@ static const GUID g_dsp_guid =
 /* ─── Preset serialization using dsp_preset_builder/parser ─── */
 
 static void make_preset(const dsd_config_t &cfg, dsp_preset &out) {
-    uint8_t buf[512];
+    uint8_t buf[2048];
     size_t len = config_serialize(&cfg, buf, sizeof(buf));
     out.set_owner(g_dsp_guid);
     out.set_data(buf, len);
@@ -505,6 +505,19 @@ public:
         COMMAND_HANDLER_EX(IDC_COMBO_RESAMPLE, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_COMBO_SOXR_QUALITY, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_BTN_TEST_SINAD, BN_CLICKED, OnTestSinad)
+        COMMAND_HANDLER_EX(IDC_CHECK_CONV_ENABLED, BN_CLICKED, OnChange)
+        COMMAND_HANDLER_EX(IDC_BTN_CONV_0, BN_CLICKED, OnConvBrowse)
+        COMMAND_HANDLER_EX(IDC_BTN_CONV_1, BN_CLICKED, OnConvBrowse)
+        COMMAND_HANDLER_EX(IDC_BTN_CONV_2, BN_CLICKED, OnConvBrowse)
+        COMMAND_HANDLER_EX(IDC_BTN_CONV_3, BN_CLICKED, OnConvBrowse)
+        COMMAND_HANDLER_EX(IDC_BTN_CONV_4, BN_CLICKED, OnConvBrowse)
+        COMMAND_HANDLER_EX(IDC_BTN_CONV_5, BN_CLICKED, OnConvBrowse)
+        COMMAND_HANDLER_EX(IDC_BTN_CONV_CLR_0, BN_CLICKED, OnConvClear)
+        COMMAND_HANDLER_EX(IDC_BTN_CONV_CLR_1, BN_CLICKED, OnConvClear)
+        COMMAND_HANDLER_EX(IDC_BTN_CONV_CLR_2, BN_CLICKED, OnConvClear)
+        COMMAND_HANDLER_EX(IDC_BTN_CONV_CLR_3, BN_CLICKED, OnConvClear)
+        COMMAND_HANDLER_EX(IDC_BTN_CONV_CLR_4, BN_CLICKED, OnConvClear)
+        COMMAND_HANDLER_EX(IDC_BTN_CONV_CLR_5, BN_CLICKED, OnConvClear)
         COMMAND_HANDLER_EX(IDC_EDIT_THREADS, EN_CHANGE, OnEditChange)
         COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_EDIT, CBN_SELCHANGE, OnRateMapEditChange)
         COMMAND_HANDLER_EX(IDC_COMBO_RATEMAP_EDIT, CBN_KILLFOCUS, OnComboKillFocus)
@@ -787,6 +800,19 @@ private:
             sq.SetCurSel(sel);
         }
 
+        /* Convolution Filter */
+        CheckDlgButton(IDC_CHECK_CONV_ENABLED, m_cfg.conv_enabled ? BST_CHECKED : BST_UNCHECKED);
+        {
+            static const int edit_ids[CONV_MAX_CHANNELS] = {
+                IDC_EDIT_CONV_0, IDC_EDIT_CONV_1, IDC_EDIT_CONV_2,
+                IDC_EDIT_CONV_3, IDC_EDIT_CONV_4, IDC_EDIT_CONV_5
+            };
+            for (int i = 0; i < CONV_MAX_CHANNELS; i++) {
+                if (m_cfg.conv_paths[i][0] != '\0')
+                    ::uSetDlgItemText(*this, edit_ids[i], m_cfg.conv_paths[i]);
+            }
+        }
+
         /* Show initial engine info */
         const cpu_features_t *cpu = cpu_detect();
         pfc::string_formatter info;
@@ -889,6 +915,56 @@ private:
         bool enabled = IsDlgButtonChecked(IDC_CHECK_GPU_ENABLED) == BST_CHECKED;
         CComboBox(GetDlgItem(IDC_COMBO_GPU_BACKEND)).EnableWindow(enabled);
         UpdateGpuStatus();
+    }
+
+    /* Convolution filter: map button ID to channel index */
+    static int conv_btn_to_channel(int id) {
+        static const int browse_ids[] = { IDC_BTN_CONV_0, IDC_BTN_CONV_1, IDC_BTN_CONV_2,
+                                           IDC_BTN_CONV_3, IDC_BTN_CONV_4, IDC_BTN_CONV_5 };
+        static const int clear_ids[]  = { IDC_BTN_CONV_CLR_0, IDC_BTN_CONV_CLR_1, IDC_BTN_CONV_CLR_2,
+                                           IDC_BTN_CONV_CLR_3, IDC_BTN_CONV_CLR_4, IDC_BTN_CONV_CLR_5 };
+        for (int i = 0; i < CONV_MAX_CHANNELS; i++) {
+            if (id == browse_ids[i] || id == clear_ids[i]) return i;
+        }
+        return -1;
+    }
+    static int conv_edit_id(int ch) {
+        static const int ids[] = { IDC_EDIT_CONV_0, IDC_EDIT_CONV_1, IDC_EDIT_CONV_2,
+                                    IDC_EDIT_CONV_3, IDC_EDIT_CONV_4, IDC_EDIT_CONV_5 };
+        return (ch >= 0 && ch < CONV_MAX_CHANNELS) ? ids[ch] : 0;
+    }
+
+    void OnConvBrowse(UINT, int id, CWindow) {
+        int ch = conv_btn_to_channel(id);
+        if (ch < 0) return;
+
+        wchar_t path[MAX_PATH] = {0};
+        OPENFILENAMEW ofn;
+        memset(&ofn, 0, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = m_hWnd;
+        ofn.lpstrFilter = L"WAV Files (*.wav)\0*.wav\0All Files (*.*)\0*.*\0";
+        ofn.lpstrFile = path;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        ofn.lpstrTitle = L"Select Impulse Response WAV";
+
+        if (GetOpenFileNameW(&ofn)) {
+            /* Convert wide path to UTF-8 for storage in config */
+            char utf8[CONV_PATH_MAX];
+            WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), NULL, NULL);
+            utf8[CONV_PATH_MAX - 1] = '\0';
+            strncpy(m_cfg.conv_paths[ch], utf8, CONV_PATH_MAX - 1);
+            m_cfg.conv_paths[ch][CONV_PATH_MAX - 1] = '\0';
+            ::uSetDlgItemText(*this, conv_edit_id(ch), utf8);
+        }
+    }
+
+    void OnConvClear(UINT, int id, CWindow) {
+        int ch = conv_btn_to_channel(id);
+        if (ch < 0) return;
+        m_cfg.conv_paths[ch][0] = '\0';
+        ::uSetDlgItemText(*this, conv_edit_id(ch), "");
     }
 
     void UpdateGpuStatus() {
@@ -1790,6 +1866,10 @@ private:
 
         /* rate_map and rate_ntf are maintained via OnRateMapEditChange/OnNtfEditChange */
 
+        /* Convolution filter */
+        m_cfg.conv_enabled = IsDlgButtonChecked(IDC_CHECK_CONV_ENABLED) == BST_CHECKED;
+        /* conv_paths are set directly by browse/clear handlers */
+
         config_validate(&m_cfg);
 
         dsp_preset_impl preset;
@@ -2226,9 +2306,9 @@ public:
                         m_worker.marker_phase = (last_marker == 0x05) ? 1 : 0;
                     }
 
-                    /* Audio capture: convert drained i24 to float for capture */
-                    if (g_audio_capture.mode == 1 &&
-                        (g_audio_capture.state == CAPTURE_RECORDING || capture_check_armed())) {
+                    /* Audio capture: convert drained i24 to float for capture.
+                     * Worker output is always DoP i24, capture in any mode. */
+                    if (g_audio_capture.state == CAPTURE_RECORDING || capture_check_armed()) {
                         size_t total = out_pcm_frames * channels;
                         pfc::array_staticsize_t<float> cap_f;
                         cap_f.set_size_discard(total);

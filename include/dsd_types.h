@@ -113,6 +113,10 @@ typedef enum {
  * Indices 0-11 are v15 legacy (unchanged), 12-19 are v16 additions. */
 #define RATE_MAP_COUNT_V15  12   /* v15 array size for config migration */
 #define RATE_MAP_COUNT      20
+
+/* Convolution filter constants */
+#define CONV_MAX_CHANNELS   6     /* L, R, C, LFE, SL, SR */
+#define CONV_PATH_MAX       260   /* MAX_PATH on Windows */
 #define RATE_MAP_PCM_COUNT  12   /* 8 standard + 4 high PCM */
 #define RATE_MAP_DSD44_COUNT 4
 #define RATE_MAP_DSD48_COUNT 4
@@ -394,6 +398,9 @@ typedef struct {
     int8_t    rate_parallel[RATE_MAP_COUNT];   /* Per-rate Trellis parallel: -1=Auto, 0=Sequential, 1=Parallel */
     bool      gpu_sdm_enabled;    /* Enable GPU Trellis SDM SBVD (experimental, default disabled) */
     int8_t    rate_fir_prec[RATE_MAP_COUNT];   /* Per-rate FIR precision: -1=Auto(fp64), 0=fp32, 1=fp64 */
+    /* v18: Convolution filter (room correction) */
+    bool      conv_enabled;                            /* Master convolution enable */
+    char      conv_paths[CONV_MAX_CHANNELS][CONV_PATH_MAX]; /* Per-channel WAV IR paths */
 } dsd_config_t;
 
 /* Trellis parallel mode (DAS segment count).
@@ -417,7 +424,7 @@ typedef struct {
 #define FIR_MODE_FIR      1
 
 /* Config serialization version */
-#define DSD_CONFIG_VERSION 17
+#define DSD_CONFIG_VERSION 18
 
 /* FIR gain Auto sentinel and default */
 #define FIR_GAIN_AUTO    (-128)
@@ -503,6 +510,9 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     memset(cfg->rate_parallel, 0xFF, sizeof(cfg->rate_parallel));     /* -1 = Auto */
     cfg->gpu_sdm_enabled = false;  /* GPU Trellis SDM disabled by default */
     memset(cfg->rate_fir_prec, 0xFF, sizeof(cfg->rate_fir_prec)); /* -1 = Auto (fp64) */
+    /* v18: Convolution filter */
+    cfg->conv_enabled = false;
+    memset(cfg->conv_paths, 0, sizeof(cfg->conv_paths));
 }
 
 #endif /* DSD_TYPES_H */

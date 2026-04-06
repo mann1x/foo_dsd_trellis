@@ -256,6 +256,31 @@ int gpu_cuda_multibit_setup(void *ctx, int order,
 int gpu_cuda_multibit_process(void *ctx, const double *in, float *out,
                                size_t count, int num_channels, float gain);
 
+/* ─── GPU Convolution (cuFFT + custom kernels) ─── */
+
+/* Opaque GPU convolution state */
+typedef struct gpu_conv_state gpu_conv_state_t;
+
+/* Query GPU convolution capability: max partitions for given rate.
+ * Returns 0 if GPU convolution not available (no cuFFT). */
+int gpu_conv_max_partitions(gpu_context_t *ctx, uint32_t signal_rate,
+                             int partition_size);
+
+/* Initialize GPU convolution for one channel.
+ * ir_freq: pre-FFT'd IR partitions (complex double, host memory)
+ * Returns NULL on failure. */
+gpu_conv_state_t *gpu_conv_init(gpu_context_t *ctx, int num_partitions,
+                                 int partition_size, int fft_size,
+                                 const void *ir_freq);
+
+/* Process one block: convolve buf in-place at signal rate.
+ * buf: fp64 samples (host), count samples. */
+int gpu_conv_process(gpu_context_t *ctx, gpu_conv_state_t *state,
+                      double *buf, size_t count);
+
+/* Free GPU convolution state. */
+void gpu_conv_free(gpu_context_t *ctx, gpu_conv_state_t *state);
+
 #ifdef __cplusplus
 }
 #endif

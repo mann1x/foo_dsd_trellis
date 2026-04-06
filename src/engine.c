@@ -264,6 +264,40 @@ int engine_channel_init(engine_channel_t *eng, int channel,
         }
     }
 
+    /* Convolution filter (room correction).
+     * Convolve directly at the signal rate — no decimation.
+     * The IR is resampled from its native rate (44.1/48k) up to the
+     * signal rate (DSD or PCM). For DSD256 this means the IR grows
+     * from 4k taps to ~256k taps, which UPOLS handles efficiently. */
+    eng->conv = NULL;
+    if (cfg->conv_enabled && channel < CONV_MAX_CHANNELS
+        && cfg->conv_paths[channel][0] != '\0') {
+        /* Convolution rate:
+         * PCM output → convolve directly at output rate (no decimation).
+         * DSD output → decimate to 4× base rate (176.4k/192k) on CPU.
+         *   GPU path will convolve at full DSD rate (added later). */
+        uint32_t conv_rate;
+        if (eng->fir_only) {
+            conv_rate = fs_out;
+        } else {
+            uint32_t base = (fs_out % 48000 == 0) ? 48000 : 44100;
+            conv_rate = base * 4;  /* 176400 or 192000 */
+        }
+        conv_state_t *cs = (conv_state_t *)calloc(1, sizeof(conv_state_t));
+        if (cs) {
+            if (conv_init(cs, fs_out, conv_rate) == 0) {
+                if (conv_load_ir(cs, cfg->conv_paths[channel]) == 0) {
+                    eng->conv = cs;
+                } else {
+                    conv_free(cs);
+                    free(cs);
+                }
+            } else {
+                free(cs);
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -401,6 +435,9 @@ size_t engine_process_block(engine_channel_t *eng,
              * Features on CPU (subsampled), MLP via ONNX on GPU, FIR on CPU. */
             if (cfg->ml_enabled)
                 engine_apply_preemph(eng, cfg, count);
+            /* Convolution filter (room correction) — same-rate DSD path */
+            if (eng->conv)
+                conv_process(eng->conv, eng->fir_buf, count);
             /* Re-encode via SDM (CPU only).
              * Trellis SDM internally scales input by 0.5 to prevent quantizer
              * overload from FIR rate-conversion peaks (±2.24). For same-rate
@@ -421,6 +458,9 @@ size_t engine_process_block(engine_channel_t *eng,
          * Uses IPP for SIMD-accelerated conversion when available. */
         double *fir_out_d;
         size_t fir_count = engine_process_fir_gain(eng, in, count, cfg, &fir_out_d);
+        /* Convolution filter (room correction) — PCM output path */
+        if (eng->conv)
+            conv_process(eng->conv, fir_out_d, fir_count);
         ippsConvert_64f32f(fir_out_d, out, (int)fir_count);
         return fir_count;
     }
@@ -565,6 +605,10 @@ size_t engine_process_block(engine_channel_t *eng,
         }
     }
 
+    /* Convolution filter (room correction) — rate conversion DSD path */
+    if (eng->conv)
+        conv_process(eng->conv, eng->fir_buf, fir_out);
+
     /* SDM (CPU only) */
     size_t sdm_out;
     if (eng->sdm_mode == SDM_MODE_PRECORR)
@@ -597,6 +641,8 @@ void engine_channel_reset(engine_channel_t *eng, bool preserve_sdm) {
         fir_lowpass_reset(&eng->lowpass);
     if (eng->ml_filter)
         onnx_filter_reset(eng->ml_filter);
+    if (eng->conv)
+        conv_reset(eng->conv);
 }
 
 void engine_channel_free(engine_channel_t *eng) {
@@ -614,6 +660,11 @@ void engine_channel_free(engine_channel_t *eng) {
     if (eng->ml_filter) {
         onnx_filter_free(eng->ml_filter);
         eng->ml_filter = NULL;
+    }
+    if (eng->conv) {
+        conv_free(eng->conv);
+        free(eng->conv);
+        eng->conv = NULL;
     }
 }
 
@@ -727,6 +778,10 @@ size_t engine_process_fir_gain(engine_channel_t *eng,
         }
         eng->prev_gain = (double)cfg->gain;
     }
+
+    /* Convolution is applied in dsp_plugin.c after the FIR phase completes
+     * for all channels — NOT here, to avoid double-application when
+     * dsp_plugin.c also hooks convolution after GPU/CPU FIR. */
 
     *fir_out_ptr = eng->fir_buf;
     return fir_count;

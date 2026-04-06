@@ -25,6 +25,7 @@
 #include "kernels/sdm_hawksford_ptx.h"
 #include "kernels/das_stitch_ptx.h"
 #include "kernels/sdm_multibit_ptx.h"
+#include "kernels/conv_kernels_ptx.h"
 
 /* ─── CUDA Driver API types (no CUDA headers needed) ─── */
 
@@ -41,6 +42,13 @@ typedef void          *CUevent;
 #define CU_CTX_SCHED_AUTO 0
 #define CU_CTX_SCHED_BLOCKING_SYNC 4
 #define EXT_SEED_SIZE (8 * 128 + 8 * 4 + 8 * 4 + 4 + 4 + 4)  /* 1100 bytes */
+
+/* ─── cuFFT types (delay-loaded, no cufft.h needed) ─── */
+typedef void *cufftHandle;
+#define CUFFT_SUCCESS 0
+#define CUFFT_Z2Z 0x69   /* complex double-to-complex double */
+#define CUFFT_FORWARD -1
+#define CUFFT_INVERSE  1
 
 /* ─── Delay-loaded function pointers ─── */
 
@@ -81,12 +89,26 @@ DECL_PFN(CUresult, cuEventDestroy, CUevent);
 DECL_PFN(CUresult, cuEventRecord, CUevent, CUstream);
 DECL_PFN(CUresult, cuEventSynchronize, CUevent);
 
+/* cuFFT function pointers (delay-loaded from cufft64_*.dll) */
+typedef int (*PFN_cufftPlan1d)(cufftHandle *, int, int, int);
+typedef int (*PFN_cufftExecZ2Z)(cufftHandle, void *, void *, int);
+typedef void (*PFN_cufftDestroy)(cufftHandle);
+typedef int (*PFN_cufftSetStream)(cufftHandle, CUstream);
+
+static HMODULE g_cufft_dll = NULL;
+static bool    g_cufft_available = false;
+static PFN_cufftPlan1d     pfn_cufftPlan1d;
+static PFN_cufftExecZ2Z    pfn_cufftExecZ2Z;
+static PFN_cufftDestroy    pfn_cufftDestroy;
+static PFN_cufftSetStream  pfn_cufftSetStream;
+
 static HMODULE g_nvcuda = NULL;
 static bool    g_probed = false;
 static bool    g_available = false;
 static char    g_device_name[128] = "";
 static size_t  g_vram_bytes = 0;
-static int     g_sm_count = 0;  /* Streaming Multiprocessors */
+static int     g_sm_count = 0;
+static int     g_clock_khz = 0;  /* GPU clock rate in kHz */
 
 /* Resolved function pointers */
 static PFN_cuInit              pfn_cuInit;
@@ -294,6 +316,14 @@ typedef struct {
     size_t         lp_f64_cap;
     double        *h_lp_f64_in;     /* host staging buffer */
     size_t         h_lp_f64_cap;
+    /* ─── GPU Convolution (cuFFT + custom kernels) ─── */
+    CUmodule       mod_conv;           /* conv_kernels PTX module */
+    CUfunction     fn_conv_r2c;        /* real_to_complex kernel */
+    CUfunction     fn_conv_cmul;       /* complex_mul kernel */
+    CUfunction     fn_conv_cmulacc;    /* complex_mul_acc kernel */
+    CUfunction     fn_conv_czero;      /* complex_zero kernel */
+    CUfunction     fn_conv_extract;    /* extract_output kernel */
+    int            gpu_clock_khz;      /* GPU clock rate */
 } cuda_context_t;
 
 /* ─── Helpers ─── */
@@ -430,9 +460,26 @@ bool gpu_cuda_probe(void) {
     pfn_cuDeviceGetName(g_device_name, sizeof(g_device_name), dev);
     pfn_cuDeviceTotalMem(&g_vram_bytes, dev);
 
-    /* Query SM count for optimal segment parallelism */
-    if (pfn_cuDeviceGetAttribute)
+    /* Query SM count and clock for convolution budget */
+    if (pfn_cuDeviceGetAttribute) {
         pfn_cuDeviceGetAttribute(&g_sm_count, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, dev);
+        pfn_cuDeviceGetAttribute(&g_clock_khz, 13 /* CU_DEVICE_ATTRIBUTE_CLOCK_RATE */, dev);
+    }
+
+    /* Probe cuFFT availability (delay-load cufft64_*.dll) */
+    if (!g_cufft_dll) {
+        /* Try common cuFFT DLL names */
+        const char *names[] = { "cufft64_11.dll", "cufft64_12.dll", "cufft64_10.dll", NULL };
+        for (int i = 0; names[i] && !g_cufft_dll; i++)
+            g_cufft_dll = LoadLibraryA(names[i]);
+        if (g_cufft_dll) {
+            pfn_cufftPlan1d    = (PFN_cufftPlan1d)GetProcAddress(g_cufft_dll, "cufftPlan1d");
+            pfn_cufftExecZ2Z   = (PFN_cufftExecZ2Z)GetProcAddress(g_cufft_dll, "cufftExecZ2Z");
+            pfn_cufftDestroy   = (PFN_cufftDestroy)GetProcAddress(g_cufft_dll, "cufftDestroy");
+            pfn_cufftSetStream = (PFN_cufftSetStream)GetProcAddress(g_cufft_dll, "cufftSetStream");
+            g_cufft_available = (pfn_cufftPlan1d && pfn_cufftExecZ2Z && pfn_cufftDestroy);
+        }
+    }
 
     g_available = true;
     return true;
@@ -520,6 +567,16 @@ gpu_context_t *gpu_cuda_create(void) {
         pfn_cuModuleGetFunction(&c->fn_mb_segments, c->mod_multibit, "sdm_multibit_segments");
         pfn_cuModuleGetFunction(&c->fn_mb_to_1bit, c->mod_multibit, "sdm_multibit_to_1bit");
     }
+
+    /* Load convolution kernels */
+    if (pfn_cuModuleLoadData(&c->mod_conv, g_ptx_conv_kernels) == CUDA_SUCCESS) {
+        pfn_cuModuleGetFunction(&c->fn_conv_r2c, c->mod_conv, "conv_real_to_complex");
+        pfn_cuModuleGetFunction(&c->fn_conv_cmul, c->mod_conv, "conv_complex_mul");
+        pfn_cuModuleGetFunction(&c->fn_conv_cmulacc, c->mod_conv, "conv_complex_mul_acc");
+        pfn_cuModuleGetFunction(&c->fn_conv_czero, c->mod_conv, "conv_complex_zero");
+        pfn_cuModuleGetFunction(&c->fn_conv_extract, c->mod_conv, "conv_extract_output");
+    }
+    c->gpu_clock_khz = g_clock_khz;
 
     /* Load DAS stitching kernels */
     if (pfn_cuModuleLoadData(&c->mod_das_stitch, g_ptx_das_stitch) == CUDA_SUCCESS) {

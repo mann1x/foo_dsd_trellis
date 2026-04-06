@@ -122,9 +122,15 @@ static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
     + RATE_MAP_COUNT             /* rate_fir_prec */ \
     )
 
+/* v18: v17 + conv_enabled(1) + conv_paths(6 × 260) */
+#define CONFIG_V18_SIZE (CONFIG_V17_SIZE \
+    + 1                                      /* conv_enabled */ \
+    + CONV_MAX_CHANNELS * CONV_PATH_MAX      /* conv_paths */ \
+    )
+
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
-    if (buf_size < CONFIG_V17_SIZE)
+    if (buf_size < CONFIG_V18_SIZE)
         return 0;
 
     size_t pos = 0;
@@ -204,6 +210,13 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
     /* v17: per-rate FIR precision */
     memcpy(buf + pos, cfg->rate_fir_prec, RATE_MAP_COUNT);
     pos += RATE_MAP_COUNT;
+
+    /* v18: convolution filter */
+    pos = write_u8(buf, pos, cfg->conv_enabled ? 1 : 0);
+    for (int i = 0; i < CONV_MAX_CHANNELS; i++) {
+        memcpy(buf + pos, cfg->conv_paths[i], CONV_PATH_MAX);
+        pos += CONV_PATH_MAX;
+    }
 
     return pos;
 }
@@ -367,6 +380,19 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
                 if (pos + RATE_MAP_COUNT <= buf_size) {
                     memcpy(cfg->rate_fir_prec, buf + pos, RATE_MAP_COUNT);
                     pos += RATE_MAP_COUNT;
+                }
+            }
+            /* Version 18 adds convolution filter */
+            if (version >= 18) {
+                if (pos + 1 + CONV_MAX_CHANNELS * CONV_PATH_MAX <= buf_size) {
+                    uint8_t u8;
+                    pos = read_u8(buf, pos, &u8);
+                    cfg->conv_enabled = (u8 != 0);
+                    for (int i = 0; i < CONV_MAX_CHANNELS; i++) {
+                        memcpy(cfg->conv_paths[i], buf + pos, CONV_PATH_MAX);
+                        cfg->conv_paths[i][CONV_PATH_MAX - 1] = '\0';  /* safety */
+                        pos += CONV_PATH_MAX;
+                    }
                 }
             }
         } else {

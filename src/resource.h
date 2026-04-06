@@ -33,6 +33,27 @@
 #define IDC_STATIC_SOXR_QUALITY     1041
 #define IDC_CHECK_GPU_SDM           1042
 
+/* Convolution filter controls */
+#define IDC_CHECK_CONV_ENABLED      1043
+#define IDC_EDIT_CONV_0             1044   /* L */
+#define IDC_BTN_CONV_0              1045   /* L browse */
+#define IDC_BTN_CONV_CLR_0          1046   /* L clear */
+#define IDC_EDIT_CONV_1             1047   /* R */
+#define IDC_BTN_CONV_1              1048
+#define IDC_BTN_CONV_CLR_1          1049
+#define IDC_EDIT_CONV_2             1050   /* C */
+#define IDC_BTN_CONV_2              1051
+#define IDC_BTN_CONV_CLR_2          1052
+#define IDC_EDIT_CONV_3             1053   /* LFE */
+#define IDC_BTN_CONV_3              1054
+#define IDC_BTN_CONV_CLR_3          1055
+#define IDC_EDIT_CONV_4             1056   /* SL */
+#define IDC_BTN_CONV_4              1057
+#define IDC_BTN_CONV_CLR_4          1058
+#define IDC_EDIT_CONV_5             1059   /* SR */
+#define IDC_BTN_CONV_5              1060
+#define IDC_BTN_CONV_CLR_5          1061
+
 // Next default values for new objects
 //
 #ifdef APSTUDIO_INVOKED

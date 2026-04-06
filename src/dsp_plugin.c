@@ -141,6 +141,10 @@ typedef struct plugin_state {
     size_t             pcm_conv_ch_out_sz; /* pcm_conv_ch_out capacity (samples) */
     bool               pcm_conv_first_chunk; /* true after init — apply fade-in */
 
+    /* Convolution for PCM→PCM path (separate from engine channels) */
+    conv_state_t      *pcm_conv_filters[CONV_MAX_CHANNELS];
+    uint32_t           pcm_conv_filter_rate; /* rate filters were created for */
+
     /* Persistent PCM→DSD cross-family resamplers (e.g., 96k→88.2k before FIR upsample) */
     resample_ctx_t   **pcm_dsd_resamplers;
     int                pcm_dsd_rs_nch;
@@ -1481,6 +1485,13 @@ size_t plugin_process(plugin_state_t *s,
                          s->time_fir_ms, (size_t)fir_counts[0], s->config.sdm_mode);
                 trellis_log_c(msg);
             }
+        }
+
+        /* Convolution filter (room correction) — after FIR phase, before SDM */
+        for (int ch = 0; ch < num_channels; ch++) {
+            if (s->channels[ch].conv)
+                conv_process(s->channels[ch].conv,
+                             s->channels[ch].fir_buf, fir_counts[ch]);
         }
 
         /* PreCorr: GPU FIR done above, now run GPU PreCorr SDM.
@@ -3053,6 +3064,15 @@ static void pcm_conv_free(plugin_state_t *s) {
     s->pcm_conv_nch = 0;
     s->pcm_conv_rate_in = 0;
     s->pcm_conv_rate_out = 0;
+    /* Free convolution filters for PCM path */
+    for (int i = 0; i < CONV_MAX_CHANNELS; i++) {
+        if (s->pcm_conv_filters[i]) {
+            conv_free(s->pcm_conv_filters[i]);
+            free(s->pcm_conv_filters[i]);
+            s->pcm_conv_filters[i] = NULL;
+        }
+    }
+    s->pcm_conv_filter_rate = 0;
 }
 
 size_t plugin_process_pcm_to_pcm(plugin_state_t *s,
@@ -3062,8 +3082,56 @@ size_t plugin_process_pcm_to_pcm(plugin_state_t *s,
     if (!s || pcm_rate_in == 0 || pcm_rate_out == 0 || num_channels == 0)
         return 0;
 
-    if (pcm_rate_in == pcm_rate_out) {
+    if (pcm_rate_in == pcm_rate_out && !s->config.conv_enabled) {
         memcpy(out_pcm, in_pcm, pcm_frames * (size_t)num_channels * sizeof(float));
+        return pcm_frames;
+    }
+
+    /* Same-rate with convolution: init conv filters if needed */
+    if (pcm_rate_in == pcm_rate_out && s->config.conv_enabled) {
+        if (s->pcm_conv_filter_rate != pcm_rate_out) {
+            for (int ch = 0; ch < CONV_MAX_CHANNELS; ch++) {
+                if (s->pcm_conv_filters[ch]) {
+                    conv_free(s->pcm_conv_filters[ch]);
+                    free(s->pcm_conv_filters[ch]);
+                    s->pcm_conv_filters[ch] = NULL;
+                }
+            }
+            for (int ch = 0; ch < num_channels && ch < CONV_MAX_CHANNELS; ch++) {
+                if (s->config.conv_paths[ch][0] != '\0') {
+                    conv_state_t *cs = (conv_state_t *)calloc(1, sizeof(conv_state_t));
+                    if (cs && conv_init(cs, pcm_rate_out, pcm_rate_out) == 0) {
+                        if (conv_load_ir(cs, s->config.conv_paths[ch]) == 0) {
+                            s->pcm_conv_filters[ch] = cs;
+                        } else { conv_free(cs); free(cs); }
+                    } else if (cs) { free(cs); }
+                }
+            }
+            s->pcm_conv_filter_rate = pcm_rate_out;
+        }
+
+        /* Apply convolution per channel */
+        memcpy(out_pcm, in_pcm, pcm_frames * (size_t)num_channels * sizeof(float));
+        for (int ch = 0; ch < num_channels && ch < CONV_MAX_CHANNELS; ch++) {
+            if (s->pcm_conv_filters[ch]) {
+                static __declspec(thread) double *tls_d = NULL;
+                static __declspec(thread) size_t tls_d_sz = 0;
+                if (tls_d_sz < pcm_frames) {
+                    free(tls_d);
+                    tls_d = (double *)malloc(pcm_frames * sizeof(double));
+                    tls_d_sz = tls_d ? pcm_frames : 0;
+                }
+                if (tls_d) {
+                    /* De-interleave + widen to double */
+                    for (size_t f = 0; f < pcm_frames; f++)
+                        tls_d[f] = (double)out_pcm[f * num_channels + ch];
+                    conv_process(s->pcm_conv_filters[ch], tls_d, pcm_frames);
+                    /* Narrow + re-interleave */
+                    for (size_t f = 0; f < pcm_frames; f++)
+                        out_pcm[f * num_channels + ch] = (float)tls_d[f];
+                }
+            }
+        }
         return pcm_frames;
     }
 
@@ -3103,6 +3171,34 @@ size_t plugin_process_pcm_to_pcm(plugin_state_t *s,
         s->pcm_conv_rate_in = pcm_rate_in;
         s->pcm_conv_rate_out = pcm_rate_out;
         s->pcm_conv_first_chunk = true;
+
+        /* Init convolution filters for PCM→PCM if enabled */
+        if (s->config.conv_enabled && s->pcm_conv_filter_rate != pcm_rate_out) {
+            /* Free old filters */
+            for (int ch = 0; ch < CONV_MAX_CHANNELS; ch++) {
+                if (s->pcm_conv_filters[ch]) {
+                    conv_free(s->pcm_conv_filters[ch]);
+                    free(s->pcm_conv_filters[ch]);
+                    s->pcm_conv_filters[ch] = NULL;
+                }
+            }
+            /* Create new for each channel with a path */
+            for (int ch = 0; ch < num_channels && ch < CONV_MAX_CHANNELS; ch++) {
+                if (s->config.conv_paths[ch][0] != '\0') {
+                    conv_state_t *cs = (conv_state_t *)calloc(1, sizeof(conv_state_t));
+                    if (cs && conv_init(cs, pcm_rate_out, pcm_rate_out) == 0) {
+                        if (conv_load_ir(cs, s->config.conv_paths[ch]) == 0) {
+                            s->pcm_conv_filters[ch] = cs;
+                        } else {
+                            conv_free(cs); free(cs);
+                        }
+                    } else if (cs) {
+                        free(cs);
+                    }
+                }
+            }
+            s->pcm_conv_filter_rate = pcm_rate_out;
+        }
     }
 
     /* Estimate max output frames */
@@ -3160,6 +3256,25 @@ size_t plugin_process_pcm_to_pcm(plugin_state_t *s,
             if (fade_len > produced) fade_len = produced;
             for (size_t i = 0; i < fade_len; i++)
                 s->pcm_conv_ch_out[i] *= (float)i / (float)fade_len;
+        }
+
+        /* Convolution filter (room correction) — PCM→PCM path.
+         * Widen float → double, convolve, narrow back. */
+        if (ch < CONV_MAX_CHANNELS && s->pcm_conv_filters[ch]) {
+            static __declspec(thread) double *tls_conv_d = NULL;
+            static __declspec(thread) size_t tls_conv_sz = 0;
+            if (tls_conv_sz < produced) {
+                free(tls_conv_d);
+                tls_conv_d = (double *)malloc(produced * sizeof(double));
+                tls_conv_sz = tls_conv_d ? produced : 0;
+            }
+            if (tls_conv_d) {
+                for (size_t i = 0; i < produced; i++)
+                    tls_conv_d[i] = (double)s->pcm_conv_ch_out[i];
+                conv_process(s->pcm_conv_filters[ch], tls_conv_d, produced);
+                for (size_t i = 0; i < produced; i++)
+                    s->pcm_conv_ch_out[i] = (float)tls_conv_d[i];
+            }
         }
 
         /* Re-interleave */

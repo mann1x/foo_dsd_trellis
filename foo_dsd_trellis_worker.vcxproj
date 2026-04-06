@@ -155,6 +155,7 @@
     <ClCompile Include="src\cpuset.c" />
     <ClCompile Include="src\precorr.c" />
     <ClCompile Include="src\wav_io.c" />
+    <ClCompile Include="src\convolution.c" />
     <ClCompile Include="src\onnx_filter.c" />
     <ClCompile Include="src\gpu_compute.c" />
     <ClCompile Include="src\gpu_dx11.c" />
@@ -169,6 +170,7 @@
     <ClInclude Include="include\fir.h" />
     <ClInclude Include="include\dop.h" />
     <ClInclude Include="include\engine.h" />
+    <ClInclude Include="include\convolution.h" />
     <ClInclude Include="include\threadpool.h" />
     <ClInclude Include="include\onnx_filter.h" />
   </ItemGroup>
