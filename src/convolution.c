@@ -415,11 +415,6 @@ int conv_load_ir(conv_state_t *state, const char *wav_path) {
         mono = mono_alloc;
     }
 
-    /* Compute original IR DC gain before resampling */
-    double orig_sum = 0.0;
-    for (int i = 0; i < ir_count; i++)
-        orig_sum += (double)mono[i];
-
     /* Resample IR to convolution rate */
     double *ir_d = NULL;
     int ir_resampled = resample_ir(mono, ir_count, wav.sample_rate,
@@ -432,18 +427,86 @@ int conv_load_ir(conv_state_t *state, const char *wav_path) {
         return -1;
     }
 
-    /* Normalize resampled IR to preserve original DC gain.
-     * Polyphase upsampling preserves amplitude but scales the sum by the
-     * upsample ratio. Without normalization, the output is amplified,
-     * causing SDM overload. */
+    /* Normalize resampled IR to preserve passband gain.
+     *
+     * Polyphase upsampling scales the frequency response by the upsample
+     * ratio. We measure the peak gain of the resampled IR in the frequency
+     * domain and normalize so the peak passband gain = 1.0.
+     *
+     * This works correctly for ALL filter types:
+     * - Lowpass: peak at DC → normalized to 0 dB at DC
+     * - Highpass: peak above cutoff → normalized to 0 dB in passband
+     * - Bandpass: peak in passband → normalized to 0 dB
+     * - Bandreject: peak in passband → normalized to 0 dB
+     *
+     * Safety: also clamp peak IR value to prevent speaker damage from
+     * corrupt or pathological filters. */
     {
-        double resampled_sum = 0.0;
-        for (int i = 0; i < ir_resampled; i++)
-            resampled_sum += ir_d[i];
-        if (fabs(resampled_sum) > 1e-10 && fabs(orig_sum) > 1e-10) {
-            double scale = orig_sum / resampled_sum;
+        /* Compute peak frequency response via FFT for passband normalization.
+         * Uses IPP DFT for speed — a single FFT of the IR gives the full
+         * frequency response, then we find the peak magnitude. */
+        int fft_n = 1;
+        while (fft_n < ir_resampled) fft_n <<= 1;
+        if (fft_n < 256) fft_n = 256;
+
+        int specSz = 0, specBufSz = 0, workBufSz = 0;
+        IppStatus nst = ippsDFTGetSize_C_64fc(fft_n, IPP_FFT_DIV_INV_BY_N,
+                                                ippAlgHintFast,
+                                                &specSz, &specBufSz, &workBufSz);
+        double peak_gain = 0.0;
+        if (nst == ippStsNoErr) {
+            IppsDFTSpec_C_64fc *nspec = (IppsDFTSpec_C_64fc *)ippsMalloc_8u(specSz);
+            Ipp8u *nsbuf = specBufSz > 0 ? ippsMalloc_8u(specBufSz) : NULL;
+            nst = ippsDFTInit_C_64fc(fft_n, IPP_FFT_DIV_INV_BY_N,
+                                      ippAlgHintFast, nspec, nsbuf);
+            if (nst == ippStsNoErr) {
+                Ipp64fc *cin = (Ipp64fc *)ippsMalloc_8u(fft_n * (int)sizeof(Ipp64fc));
+                Ipp64fc *cout = (Ipp64fc *)ippsMalloc_8u(fft_n * (int)sizeof(Ipp64fc));
+                Ipp8u *nwbuf = workBufSz > 0 ? ippsMalloc_8u(workBufSz) : NULL;
+                if (cin && cout) {
+                    for (int i = 0; i < fft_n; i++) {
+                        cin[i].re = (i < ir_resampled) ? ir_d[i] : 0.0;
+                        cin[i].im = 0.0;
+                    }
+                    ippsDFTFwd_CToC_64fc(cin, cout, nspec, nwbuf);
+                    for (int i = 0; i < fft_n; i++) {
+                        double mg = sqrt(cout[i].re * cout[i].re + cout[i].im * cout[i].im);
+                        if (mg > peak_gain) peak_gain = mg;
+                    }
+                }
+                if (cin) ippsFree(cin);
+                if (cout) ippsFree(cout);
+                if (nwbuf) ippsFree(nwbuf);
+            }
+            if (nspec) ippsFree(nspec);
+            if (nsbuf) ippsFree(nsbuf);
+        }
+
+        /* Normalize so peak passband gain = 1.0 */
+        if (peak_gain > 1e-10) {
+            double scale = 1.0 / peak_gain;
             for (int i = 0; i < ir_resampled; i++)
                 ir_d[i] *= scale;
+        }
+
+        /* Safety check: clamp peak IR value.
+         * A well-formed room correction IR should have peak < 10.0.
+         * Anything above indicates a corrupt or pathological filter
+         * that could damage speakers. */
+        double max_val = 0.0;
+        for (int i = 0; i < ir_resampled; i++) {
+            double av = fabs(ir_d[i]);
+            if (av > max_val) max_val = av;
+        }
+        if (max_val > 10.0) {
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "conv: WARNING: IR peak=%.1f exceeds safety limit, clamping",
+                     max_val);
+            trellis_log_c(msg);
+            double clamp_scale = 10.0 / max_val;
+            for (int i = 0; i < ir_resampled; i++)
+                ir_d[i] *= clamp_scale;
         }
     }
 
