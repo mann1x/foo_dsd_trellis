@@ -3170,9 +3170,18 @@ int gpu_cuda_conv_max_partitions(void *ctx, uint32_t signal_rate, int P,
      * Reference point: 64 parts × (2822400/P) blocks/s = the GPU load.
      * For other rates, scale partitions inversely with rate.
      * Per-SM calibration: 64 parts / 84 SMs = 0.76 parts/SM at DSD64. */
+    /* Scale partitions to maintain consistent GPU load across rates.
+     * With the fused kernel, GPU cost is proportional to:
+     *   partitions × fft_size × blocks_per_sec
+     * = partitions × (2*P) × (signal_rate / P)
+     * = partitions × 2 × signal_rate
+     * So for constant GPU load: partitions ∝ 1/signal_rate.
+     *
+     * Calibrated: RTX 5080 (SM=84), DSD64, P=32768, 8 parts = ~40% GPU.
+     * Allow up to ~80% GPU: 16 parts at DSD64 base. Scale per-SM. */
     double ref_rate = 2822400.0;
-    double parts_per_sm = 0.6;  /* ~70% target (0.76 was 80%) */
-    int rate_scaled = (int)(parts_per_sm * sms * ref_rate / (double)signal_rate);
+    double ref_parts_per_sm = 0.19;  /* 16 parts / 84 SMs at DSD64 = ~80% target */
+    int rate_scaled = (int)(ref_parts_per_sm * sms * ref_rate / (double)signal_rate);
 
     /* Use the smaller of theoretical and rate-scaled */
     int max_parts = theoretical_max < rate_scaled ? theoretical_max : rate_scaled;

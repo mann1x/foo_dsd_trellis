@@ -773,24 +773,29 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                 bool gpu_ok = false;
                 if (gpu_cs && conv_init(gpu_cs, fs, fs) == 0) {
                     gpu_cs->gpu_partitions = true;
+                    /* Budget controls IR tap count:
+                     * High=full, Medium=50%, Low=25%.
+                     * Estimate resampled length from rate ratio × original 4096 taps.
+                     * Truncation happens in conv_load_ir before partitioning. */
+                    {
+                        int est_taps = 4096 * (int)(fs / 44100);
+                        if (s->config.conv_budget == 1)
+                            gpu_cs->max_ir_taps = est_taps / 2;
+                        else if (s->config.conv_budget >= 2)
+                            gpu_cs->max_ir_taps = est_taps / 4;
+                    }
                     if (conv_load_ir(gpu_cs, s->config.conv_paths[ch]) == 0) {
-                        int max_parts = gpu_conv_max_partitions(
-                            s->gpu, fs, gpu_cs->ir.partition_size,
-                            s->config.conv_budget);
                         int parts = gpu_cs->ir.num_partitions;
-                        if (parts > max_parts && max_parts > 0) parts = max_parts;
-                        if (max_parts > 0) {
-                            gpu_cs->gpu_conv = gpu_conv_init(
-                                s->gpu, parts, gpu_cs->ir.partition_size,
-                                gpu_cs->ir.fft_size, gpu_cs->ir.freq_partitions);
-                            if (gpu_cs->gpu_conv) {
-                                gpu_cs->use_gpu = true;
-                                gpu_cs->gpu_ctx = s->gpu;
-                                gpu_cs->dec_ratio = 1;
-                                conv_free(cs); free(cs);
-                                s->channels[ch].conv = gpu_cs;
-                                gpu_ok = true;
-                            }
+                        gpu_cs->gpu_conv = gpu_conv_init(
+                            s->gpu, parts, gpu_cs->ir.partition_size,
+                            gpu_cs->ir.fft_size, gpu_cs->ir.freq_partitions);
+                        if (gpu_cs->gpu_conv) {
+                            gpu_cs->use_gpu = true;
+                            gpu_cs->gpu_ctx = s->gpu;
+                            gpu_cs->dec_ratio = 1;
+                            conv_free(cs); free(cs);
+                            s->channels[ch].conv = gpu_cs;
+                            gpu_ok = true;
                         }
                     }
                 }

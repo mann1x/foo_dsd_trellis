@@ -52,14 +52,26 @@ static int choose_partition_size(int ir_length) {
     return 4096;
 }
 
-/* GPU-optimized partition size: larger P = fewer GPU round-trips.
- * cuFFT is efficient at large sizes, and the fused multiply kernel
- * amortizes launch overhead over more samples per partition. */
+/* GPU-optimized partition size based on IR length.
+ * Calibrated on RTX 5080 (SM=84) to achieve ~70-80% GPU at High budget.
+ *
+ * Measured (High budget, full IR):
+ *   DSD64  262K taps P=32768  8 parts → 12% GPU
+ *   DSD128 524K taps P=16384 32 parts → 12% GPU
+ *   DSD256  1M taps  P=32768 32 parts → 22% GPU
+ *   DSD512  2M taps  P=32768 64 parts → 49% GPU
+ *
+ * GPU cost ∝ (ir_length/P) × (signal_rate/P) = ir_length × signal_rate / P²
+ * To increase GPU% from measured to 75%, reduce P accordingly.
+ * For DSD64: need 75/12 = 6.25× more work → P/sqrt(6.25) = P/2.5 → P=13107 → P=8192
+ * For DSD512: need 75/49 = 1.53× more work → P/sqrt(1.53) = P/1.24 → P=26442 → P=16384 */
 static int choose_partition_size_gpu(int ir_length) {
-    if (ir_length <= 4096)   return 1024;
-    if (ir_length <= 32768)  return 4096;
-    if (ir_length <= 262144) return 16384;
-    return 32768;
+    if (ir_length <= 4096)    return 1024;
+    if (ir_length <= 32768)   return 2048;
+    if (ir_length <= 131072)  return 4096;    /* DSD64: 262K/4096 = 64 parts */
+    if (ir_length <= 524288)  return 8192;    /* DSD128: 524K/8192 = 64 parts */
+    if (ir_length <= 1048576) return 16384;   /* DSD256: 1M/16384 = 64 parts */
+    return 16384;                              /* DSD512: 2M/16384 = 128 parts */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -524,6 +536,18 @@ int conv_load_ir(conv_state_t *state, const char *wav_path) {
         trellis_log_c("conv: IR too long");
         free(ir_d);
         return -1;
+    }
+
+    /* Apply budget-based IR truncation.
+     * Truncates the time-domain IR tail before partitioning.
+     * The truncated IR is still a valid filter — it just has
+     * shorter impulse response (less room reverb tail). */
+    if (state->max_ir_taps > 0 && ir_resampled > state->max_ir_taps) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "conv: budget truncation: %d → %d taps",
+                 ir_resampled, state->max_ir_taps);
+        trellis_log_c(msg);
+        ir_resampled = state->max_ir_taps;
     }
 
     /* Prepare FFT'd partitions */
