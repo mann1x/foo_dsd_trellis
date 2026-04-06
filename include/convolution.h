@@ -65,6 +65,10 @@ typedef struct {
     double         *dec_buf;    /* Decimated signal buffer */
     size_t          dec_buf_sz; /* Allocated size in samples */
     int             dec_ratio;  /* Decimation factor (1 = no decimation) */
+    /* GPU convolution (NULL if CPU-only) */
+    void           *gpu_conv;   /* gpu_conv_state_t* from gpu_compute.h */
+    void           *gpu_ctx;    /* gpu_context_t* for GPU calls */
+    bool            use_gpu;    /* true if GPU convolution is active */
 } conv_state_t;
 
 /* Initialise convolution state for a given processing rate.

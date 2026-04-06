@@ -275,11 +275,11 @@ gpu_conv_state_t *gpu_conv_init(gpu_context_t *ctx, int num_partitions,
 
 /* Process one block: convolve buf in-place at signal rate.
  * buf: fp64 samples (host), count samples. */
-int gpu_conv_process(gpu_context_t *ctx, gpu_conv_state_t *state,
+int gpu_conv_process(gpu_context_t *ctx, void *state,
                       double *buf, size_t count);
 
 /* Free GPU convolution state. */
-void gpu_conv_free(gpu_context_t *ctx, gpu_conv_state_t *state);
+void gpu_conv_free(gpu_context_t *ctx, void *state);
 
 #ifdef __cplusplus
 }

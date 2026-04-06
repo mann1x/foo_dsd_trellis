@@ -177,6 +177,7 @@
     <ClCompile Include="src\precorr.c" />
     <ClCompile Include="src\wav_io.c" />
     <ClCompile Include="src\convolution.c" />
+    <ClCompile Include="src\gpu_conv.c" />
     <ClCompile Include="src\onnx_filter.c" />
     <ClCompile Include="src\gpu_compute.c" />
     <ClCompile Include="src\gpu_dx11.c" />

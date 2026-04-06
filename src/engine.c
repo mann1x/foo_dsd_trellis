@@ -265,28 +265,41 @@ int engine_channel_init(engine_channel_t *eng, int channel,
     }
 
     /* Convolution filter (room correction).
-     * Convolve directly at the signal rate — no decimation.
-     * The IR is resampled from its native rate (44.1/48k) up to the
-     * signal rate (DSD or PCM). For DSD256 this means the IR grows
-     * from 4k taps to ~256k taps, which UPOLS handles efficiently. */
+     * GPU path: convolve at full DSD rate (max quality, no decimation).
+     * CPU path: decimate to 176.4/192kHz, convolve, interpolate back.
+     * PCM: always direct (no decimation needed). */
     eng->conv = NULL;
     if (cfg->conv_enabled && channel < CONV_MAX_CHANNELS
         && cfg->conv_paths[channel][0] != '\0') {
-        /* Convolution rate:
-         * PCM output → convolve directly at output rate (no decimation).
-         * DSD output → decimate to 4× base rate (176.4k/192k) on CPU.
-         *   GPU path will convolve at full DSD rate (added later). */
+        bool try_gpu = (eng->gpu && cfg->gpu_enabled && !eng->fir_only);
         uint32_t conv_rate;
-        if (eng->fir_only) {
-            conv_rate = fs_out;
+        if (try_gpu) {
+            conv_rate = fs_out;  /* GPU: full DSD rate */
+        } else if (eng->fir_only) {
+            conv_rate = fs_out;  /* PCM: direct */
         } else {
             uint32_t base = (fs_out % 48000 == 0) ? 48000 : 44100;
-            conv_rate = base * 4;  /* 176400 or 192000 */
+            conv_rate = base * 4;  /* CPU DSD: decimated */
         }
         conv_state_t *cs = (conv_state_t *)calloc(1, sizeof(conv_state_t));
         if (cs) {
             if (conv_init(cs, fs_out, conv_rate) == 0) {
                 if (conv_load_ir(cs, cfg->conv_paths[channel]) == 0) {
+                    /* Try GPU convolution if available */
+                    if (try_gpu && cs->ir.freq_partitions) {
+                        int max_parts = gpu_conv_max_partitions(
+                            eng->gpu, fs_out, cs->ir.partition_size);
+                        int parts = cs->ir.num_partitions;
+                        if (parts > max_parts) parts = max_parts;
+                        cs->gpu_conv = gpu_conv_init(
+                            eng->gpu, parts, cs->ir.partition_size,
+                            cs->ir.fft_size, cs->ir.freq_partitions);
+                        if (cs->gpu_conv) {
+                            cs->use_gpu = true;
+                            cs->gpu_ctx = eng->gpu;
+                            cs->dec_ratio = 1;
+                        }
+                    }
                     eng->conv = cs;
                 } else {
                     conv_free(cs);

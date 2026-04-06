@@ -233,6 +233,9 @@
     <ClCompile Include="src\convolution.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\gpu_conv.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\precorr.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>

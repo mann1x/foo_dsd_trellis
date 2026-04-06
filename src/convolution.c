@@ -20,6 +20,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include "../include/convolution.h"
+#include "../include/gpu_compute.h"
 #include "../include/fir.h"
 #include "../include/wav_io.h"
 #include "../include/resample.h"
@@ -589,8 +590,17 @@ static void conv_process_decimated(conv_state_t *state, double *buf, size_t coun
 }
 
 void conv_process(conv_state_t *state, double *buf, size_t count) {
-    if (!state || !state->active || !state->ch.ir) return;
+    if (!state || !state->active) return;
 
+    /* GPU path: full-rate convolution via cuFFT */
+    if (state->use_gpu && state->gpu_conv) {
+        gpu_conv_process((gpu_context_t *)state->gpu_ctx,
+                          (gpu_conv_state_t *)state->gpu_conv, buf, count);
+        return;
+    }
+
+    /* CPU path */
+    if (!state->ch.ir) return;
     if (state->dec_ratio > 1)
         conv_process_decimated(state, buf, count);
     else
@@ -604,6 +614,12 @@ void conv_reset(conv_state_t *state) {
 
 void conv_free(conv_state_t *state) {
     if (!state) return;
+
+    if (state->gpu_conv) {
+        gpu_conv_free((gpu_context_t *)state->gpu_ctx,
+                       (gpu_conv_state_t *)state->gpu_conv);
+        state->gpu_conv = NULL;
+    }
 
     channel_free(&state->ch);
 

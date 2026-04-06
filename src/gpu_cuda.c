@@ -3106,3 +3106,298 @@ fail:
     if (d_init_states) pfn_cuMemFree(d_init_states);
     return -1;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * GPU Convolution (cuFFT + custom kernels)
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+extern void trellis_log_c(const char *);
+
+/* Forward declarations */
+void gpu_cuda_conv_free(void *ctx, void *state);
+
+struct gpu_conv_state {
+    int            num_partitions;
+    int            partition_size;
+    int            fft_size;
+    cufftHandle    fft_plan;
+    CUdeviceptr    d_ir_freq;
+    CUdeviceptr   *d_fdl;
+    CUdeviceptr    d_input;
+    CUdeviceptr    d_accum;
+    CUdeviceptr    d_temp;
+    double        *h_staging;
+    size_t         h_staging_cap;
+    int            fdl_pos;
+    int            fdl_filled;
+    double        *fifo_buf;
+    int            fifo_avail;
+    int            fifo_read;
+    double        *overlap_buf;
+    int            buf_pos;
+};
+
+int gpu_cuda_conv_max_partitions(void *ctx, uint32_t signal_rate, int P) {
+    cuda_context_t *c = (cuda_context_t *)ctx;
+    if (!c || !g_cufft_available || !c->fn_conv_cmulacc) return 0;
+
+    int sms = c->num_sms > 0 ? c->num_sms : 16;
+    int clock_mhz = c->gpu_clock_khz > 0 ? c->gpu_clock_khz / 1000 : 1500;
+    int fft_size = P * 2;
+    int log2n = 0;
+    { int v = fft_size; while (v > 1) { v >>= 1; log2n++; } }
+
+    double throughput = (double)sms * clock_mhz * 32.0;
+    double blocks_per_sec = (double)signal_rate / P;
+    double fft_cost = fft_size * log2n * 5.0 * 2.0;
+    double mul_cost_per_part = fft_size * 6.0;
+    double budget = throughput * 1e6 / blocks_per_sec;
+    int max_parts = (int)((budget - fft_cost) / mul_cost_per_part);
+    if (max_parts < 4) max_parts = 4;
+    if (max_parts > 4096) max_parts = 4096;
+
+    {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "conv: GPU budget: SM=%d clock=%dMHz max=%d parts (P=%d rate=%u)",
+                 sms, clock_mhz, max_parts, P, signal_rate);
+        trellis_log_c(msg);
+    }
+    return max_parts;
+}
+
+void *gpu_cuda_conv_init(void *ctx, int num_partitions,
+                                      int partition_size, int fft_size,
+                                      const void *ir_freq_host) {
+    cuda_context_t *c = (cuda_context_t *)ctx;
+    if (!c || !g_cufft_available || !c->fn_conv_cmulacc) return NULL;
+
+    struct gpu_conv_state *s = (struct gpu_conv_state *)calloc(1, sizeof(*s));
+    if (!s) return NULL;
+
+    s->num_partitions = num_partitions;
+    s->partition_size = partition_size;
+    s->fft_size = fft_size;
+
+    size_t slot_bytes = (size_t)fft_size * 16;  /* sizeof(cuDoubleComplex) */
+
+    /* Create cuFFT plan */
+    if (pfn_cufftPlan1d(&s->fft_plan, fft_size, CUFFT_Z2Z, 1) != CUFFT_SUCCESS)
+        goto fail;
+    if (pfn_cufftSetStream)
+        pfn_cufftSetStream(s->fft_plan, c->streams[0]);
+
+    /* Upload IR partitions */
+    if (pfn_cuMemAlloc(&s->d_ir_freq, (size_t)num_partitions * slot_bytes) != CUDA_SUCCESS)
+        goto fail;
+    pfn_cuMemcpyHtoD(s->d_ir_freq, ir_freq_host, (size_t)num_partitions * slot_bytes);
+
+    /* Allocate FDL */
+    s->d_fdl = (CUdeviceptr *)calloc(num_partitions, sizeof(CUdeviceptr));
+    if (!s->d_fdl) goto fail;
+    for (int i = 0; i < num_partitions; i++) {
+        if (pfn_cuMemAlloc(&s->d_fdl[i], slot_bytes) != CUDA_SUCCESS) goto fail;
+        pfn_cuMemsetD8Async(s->d_fdl[i], 0, slot_bytes, c->streams[0]);
+    }
+
+    /* Work buffers */
+    if (pfn_cuMemAlloc(&s->d_input, slot_bytes) != CUDA_SUCCESS) goto fail;
+    if (pfn_cuMemAlloc(&s->d_accum, slot_bytes) != CUDA_SUCCESS) goto fail;
+    if (pfn_cuMemAlloc(&s->d_temp, slot_bytes) != CUDA_SUCCESS) goto fail;
+
+    /* Pinned host staging */
+    {
+        size_t cap = (size_t)fft_size * 2;
+        if (pfn_cuMemAllocHost((void **)&s->h_staging, cap * sizeof(double)) != CUDA_SUCCESS)
+            s->h_staging = (double *)malloc(cap * sizeof(double));
+        s->h_staging_cap = cap;
+    }
+
+    /* Host FIFO + overlap */
+    s->fifo_buf = (double *)calloc(partition_size * 2, sizeof(double));
+    s->overlap_buf = (double *)calloc(2 * partition_size, sizeof(double));
+    if (!s->fifo_buf || !s->overlap_buf) goto fail;
+
+    pfn_cuStreamSynchronize(c->streams[0]);
+
+    {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "conv: GPU init: %d parts P=%d VRAM=%.1fMB",
+                 num_partitions, partition_size,
+                 (double)(num_partitions * 2 + 3) * slot_bytes / (1024.0 * 1024.0));
+        trellis_log_c(msg);
+    }
+    return s;
+
+fail:
+    gpu_cuda_conv_free(ctx, s);
+    return NULL;
+}
+
+static void gpu_conv_do_partition(cuda_context_t *c, struct gpu_conv_state *s) {
+    int fft_size = s->fft_size;
+    int P = s->partition_size;
+    int np = s->num_partitions;
+    unsigned grid = (unsigned)((fft_size + 255) / 256);
+    size_t slot_bytes = (size_t)fft_size * 16;
+
+    /* Upload overlap buffer as real, pack to complex on GPU */
+    pfn_cuMemcpyHtoDAsync(s->d_temp, s->overlap_buf,
+                           2 * P * sizeof(double), c->streams[0]);
+    {
+        int count_arg = 2 * P;
+        int fs_arg = fft_size;
+        void *args[] = { &s->d_temp, &s->d_input, &count_arg, &fs_arg };
+        pfn_cuLaunchKernel(c->fn_conv_r2c, grid, 1, 1, 256, 1, 1, 0,
+                            c->streams[0], args, NULL);
+    }
+
+    /* Forward FFT → FDL[fdl_pos] */
+    pfn_cufftExecZ2Z(s->fft_plan, (void *)s->d_input,
+                      (void *)s->d_fdl[s->fdl_pos], CUFFT_FORWARD);
+
+    if (s->fdl_filled < np)
+        s->fdl_filled++;
+
+    /* Zero accumulator */
+    {
+        int n = fft_size;
+        void *args[] = { &s->d_accum, &n };
+        pfn_cuLaunchKernel(c->fn_conv_czero, grid, 1, 1, 256, 1, 1, 0,
+                            c->streams[0], args, NULL);
+    }
+
+    /* Multiply-accumulate */
+    int active = s->fdl_filled < np ? s->fdl_filled : np;
+    for (int k = 0; k < active; k++) {
+        int fdl_idx = (s->fdl_pos - k + np) % np;
+        CUdeviceptr d_fdl_k = s->d_fdl[fdl_idx];
+        CUdeviceptr d_ir_k = s->d_ir_freq + (CUdeviceptr)(k * slot_bytes);
+        int n = fft_size;
+        void *args[] = { &d_fdl_k, &d_ir_k, &s->d_accum, &n };
+        pfn_cuLaunchKernel(c->fn_conv_cmulacc, grid, 1, 1, 256, 1, 1, 0,
+                            c->streams[0], args, NULL);
+    }
+
+    /* Inverse FFT */
+    pfn_cufftExecZ2Z(s->fft_plan, (void *)s->d_accum,
+                      (void *)s->d_input, CUFFT_INVERSE);
+
+    /* Extract second half + download */
+    {
+        int P_arg = P;
+        int fs_arg = fft_size;
+        void *args[] = { &s->d_input, &s->d_temp, &P_arg, &fs_arg };
+        pfn_cuLaunchKernel(c->fn_conv_extract, (P + 255) / 256, 1, 1,
+                            256, 1, 1, 0, c->streams[0], args, NULL);
+    }
+
+    pfn_cuMemcpyDtoHAsync(s->h_staging, s->d_temp,
+                           P * sizeof(double), c->streams[0]);
+    pfn_cuStreamSynchronize(c->streams[0]);
+
+    /* cuFFT Z2Z inverse does not normalize — divide by fft_size */
+    double norm = 1.0 / (double)fft_size;
+    for (int i = 0; i < P; i++)
+        s->h_staging[i] *= norm;
+
+    s->fdl_pos = (s->fdl_pos + 1) % np;
+}
+
+int gpu_cuda_conv_process(void *ctx, void *state,
+                           double *buf, size_t count) {
+    cuda_context_t *c = (cuda_context_t *)ctx;
+    struct gpu_conv_state *s = (struct gpu_conv_state *)state;
+    if (!c || !s) return -1;
+
+    int P = s->partition_size;
+    int max_new = (int)((s->buf_pos + count) / (size_t)P) + 1;
+    int fifo_existing = s->fifo_avail - s->fifo_read;
+    if (fifo_existing < 0) fifo_existing = 0;
+
+    size_t total_need = (size_t)fifo_existing + (size_t)max_new * P;
+
+    static __declspec(thread) double *tls_fifo = NULL;
+    static __declspec(thread) size_t tls_fifo_sz = 0;
+    if (tls_fifo_sz < total_need) {
+        free(tls_fifo);
+        tls_fifo = (double *)malloc(total_need * sizeof(double));
+        tls_fifo_sz = tls_fifo ? total_need : 0;
+    }
+    if (!tls_fifo) return -1;
+
+    if (fifo_existing > 0)
+        memcpy(tls_fifo, s->fifo_buf + s->fifo_read,
+               fifo_existing * sizeof(double));
+    int fifo_len = fifo_existing;
+
+    /* Feed ALL input */
+    for (size_t in_pos = 0; in_pos < count; ) {
+        int need = P - s->buf_pos;
+        int avail = (int)(count - in_pos);
+        int n = (avail < need) ? avail : need;
+
+        memcpy(&s->overlap_buf[P + s->buf_pos], &buf[in_pos],
+               n * sizeof(double));
+        s->buf_pos += n;
+        in_pos += n;
+
+        if (s->buf_pos >= P) {
+            gpu_conv_do_partition(c, s);
+            memcpy(&tls_fifo[fifo_len], s->h_staging, P * sizeof(double));
+            fifo_len += P;
+            memmove(s->overlap_buf, &s->overlap_buf[P],
+                    P * sizeof(double));
+            s->buf_pos = 0;
+        }
+    }
+
+    /* Drain exactly count */
+    if ((size_t)fifo_len >= count) {
+        memcpy(buf, tls_fifo, count * sizeof(double));
+        int remain = fifo_len - (int)count;
+        if (remain > 0) {
+            if ((size_t)remain > (size_t)(P * 2)) {
+                free(s->fifo_buf);
+                s->fifo_buf = (double *)malloc(remain * sizeof(double));
+            }
+            if (s->fifo_buf)
+                memcpy(s->fifo_buf, &tls_fifo[count],
+                       remain * sizeof(double));
+            s->fifo_avail = remain;
+        } else {
+            s->fifo_avail = 0;
+        }
+        s->fifo_read = 0;
+    } else {
+        if (fifo_len > 0)
+            memcpy(buf, tls_fifo, fifo_len * sizeof(double));
+        s->fifo_avail = 0;
+        s->fifo_read = 0;
+    }
+
+    return 0;
+}
+
+void gpu_cuda_conv_free(void *ctx, void *state) {
+    struct gpu_conv_state *s = (struct gpu_conv_state *)state;
+    if (!s) return;
+    (void)ctx;
+
+    if (s->fft_plan && pfn_cufftDestroy)
+        pfn_cufftDestroy(s->fft_plan);
+    if (s->d_ir_freq) pfn_cuMemFree(s->d_ir_freq);
+    if (s->d_fdl) {
+        for (int i = 0; i < s->num_partitions; i++)
+            if (s->d_fdl[i]) pfn_cuMemFree(s->d_fdl[i]);
+        free(s->d_fdl);
+    }
+    if (s->d_input) pfn_cuMemFree(s->d_input);
+    if (s->d_accum) pfn_cuMemFree(s->d_accum);
+    if (s->d_temp) pfn_cuMemFree(s->d_temp);
+    if (s->h_staging) pfn_cuMemFreeHost(s->h_staging);
+    free(s->fifo_buf);
+    free(s->overlap_buf);
+    free(s);
+}

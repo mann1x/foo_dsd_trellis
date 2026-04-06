@@ -763,6 +763,48 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         for (int ch = 0; ch < s->num_channels; ch++) {
             s->channels[ch].gpu = s->gpu;
         }
+        /* Try GPU convolution now that GPU context is available */
+        for (int ch = 0; ch < s->num_channels; ch++) {
+            conv_state_t *cs = s->channels[ch].conv;
+            if (cs && !cs->use_gpu && s->config.conv_enabled
+                && !s->channels[ch].fir_only) {
+                int max_parts = gpu_conv_max_partitions(
+                    s->gpu, s->config.fs_out ? s->config.fs_out : dsd_rate,
+                    cs->ir.partition_size);
+                if (max_parts > 0 && cs->ir.freq_partitions) {
+                    /* Re-init at full DSD rate for GPU */
+                    uint32_t fs = s->config.fs_out ? s->config.fs_out : dsd_rate;
+                    /* Reload IR at full rate */
+                    conv_state_t *gpu_cs = (conv_state_t *)calloc(1, sizeof(conv_state_t));
+                    if (gpu_cs && conv_init(gpu_cs, fs, fs) == 0) {
+                        if (conv_load_ir(gpu_cs, s->config.conv_paths[ch]) == 0) {
+                            int parts = gpu_cs->ir.num_partitions;
+                            if (parts > max_parts) parts = max_parts;
+                            gpu_cs->gpu_conv = gpu_conv_init(
+                                s->gpu, parts, gpu_cs->ir.partition_size,
+                                gpu_cs->ir.fft_size, gpu_cs->ir.freq_partitions);
+                            if (gpu_cs->gpu_conv) {
+                                gpu_cs->use_gpu = true;
+                                gpu_cs->gpu_ctx = s->gpu;
+                                gpu_cs->dec_ratio = 1;
+                                /* Replace CPU conv with GPU conv */
+                                conv_free(cs);
+                                free(cs);
+                                s->channels[ch].conv = gpu_cs;
+                            } else {
+                                conv_free(gpu_cs);
+                                free(gpu_cs);
+                            }
+                        } else {
+                            conv_free(gpu_cs);
+                            free(gpu_cs);
+                        }
+                    } else if (gpu_cs) {
+                        free(gpu_cs);
+                    }
+                }
+            }
+        }
     }
 
     /* Create ML filters if enabled and ONNX Runtime is available.
@@ -3089,6 +3131,11 @@ size_t plugin_process_pcm_to_pcm(plugin_state_t *s,
 
     /* Same-rate with convolution: init conv filters if needed */
     if (pcm_rate_in == pcm_rate_out && s->config.conv_enabled) {
+        /* Create GPU context lazily for PCM convolution */
+        if (!s->gpu && s->config.gpu_enabled &&
+            gpu_available((gpu_backend_t)s->config.gpu_backend)) {
+            s->gpu = gpu_create((gpu_backend_t)s->config.gpu_backend);
+        }
         if (s->pcm_conv_filter_rate != pcm_rate_out) {
             for (int ch = 0; ch < CONV_MAX_CHANNELS; ch++) {
                 if (s->pcm_conv_filters[ch]) {
@@ -3102,6 +3149,23 @@ size_t plugin_process_pcm_to_pcm(plugin_state_t *s,
                     conv_state_t *cs = (conv_state_t *)calloc(1, sizeof(conv_state_t));
                     if (cs && conv_init(cs, pcm_rate_out, pcm_rate_out) == 0) {
                         if (conv_load_ir(cs, s->config.conv_paths[ch]) == 0) {
+                            /* Try GPU convolution for PCM */
+                            if (s->gpu && s->config.gpu_enabled &&
+                                cs->ir.freq_partitions) {
+                                int max_p = gpu_conv_max_partitions(
+                                    s->gpu, pcm_rate_out, cs->ir.partition_size);
+                                if (max_p > 0) {
+                                    int parts = cs->ir.num_partitions;
+                                    if (parts > max_p) parts = max_p;
+                                    cs->gpu_conv = gpu_conv_init(
+                                        s->gpu, parts, cs->ir.partition_size,
+                                        cs->ir.fft_size, cs->ir.freq_partitions);
+                                    if (cs->gpu_conv) {
+                                        cs->use_gpu = true;
+                                        cs->gpu_ctx = s->gpu;
+                                    }
+                                }
+                            }
                             s->pcm_conv_filters[ch] = cs;
                         } else { conv_free(cs); free(cs); }
                     } else if (cs) { free(cs); }
@@ -3188,6 +3252,23 @@ size_t plugin_process_pcm_to_pcm(plugin_state_t *s,
                     conv_state_t *cs = (conv_state_t *)calloc(1, sizeof(conv_state_t));
                     if (cs && conv_init(cs, pcm_rate_out, pcm_rate_out) == 0) {
                         if (conv_load_ir(cs, s->config.conv_paths[ch]) == 0) {
+                            /* Try GPU convolution for PCM rate-conv */
+                            if (s->gpu && s->config.gpu_enabled &&
+                                cs->ir.freq_partitions) {
+                                int max_p = gpu_conv_max_partitions(
+                                    s->gpu, pcm_rate_out, cs->ir.partition_size);
+                                if (max_p > 0) {
+                                    int parts = cs->ir.num_partitions;
+                                    if (parts > max_p) parts = max_p;
+                                    cs->gpu_conv = gpu_conv_init(
+                                        s->gpu, parts, cs->ir.partition_size,
+                                        cs->ir.fft_size, cs->ir.freq_partitions);
+                                    if (cs->gpu_conv) {
+                                        cs->use_gpu = true;
+                                        cs->gpu_ctx = s->gpu;
+                                    }
+                                }
+                            }
                             s->pcm_conv_filters[ch] = cs;
                         } else {
                             conv_free(cs); free(cs);
