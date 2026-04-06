@@ -52,6 +52,16 @@ static int choose_partition_size(int ir_length) {
     return 4096;
 }
 
+/* GPU-optimized partition size: larger P = fewer GPU round-trips.
+ * cuFFT is efficient at large sizes, and the fused multiply kernel
+ * amortizes launch overhead over more samples per partition. */
+static int choose_partition_size_gpu(int ir_length) {
+    if (ir_length <= 4096)   return 1024;
+    if (ir_length <= 32768)  return 4096;
+    if (ir_length <= 262144) return 16384;
+    return 32768;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
  * IPP DFT wrappers
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -185,8 +195,8 @@ static void conv_process_direct(conv_state_t *state, double *buf, size_t count);
 
 /* Partition IR and pre-compute DFTs */
 static int prepare_ir(conv_ir_t *ir, const double *samples, int count,
-                       uint32_t target_rate) {
-    int P = choose_partition_size(count);
+                       uint32_t target_rate, bool gpu_mode) {
+    int P = gpu_mode ? choose_partition_size_gpu(count) : choose_partition_size(count);
     int fft_size = P * 2;
     int fft_order = log2i(fft_size);
     int num_partitions = (count + P - 1) / P;
@@ -517,7 +527,8 @@ int conv_load_ir(conv_state_t *state, const char *wav_path) {
     }
 
     /* Prepare FFT'd partitions */
-    if (prepare_ir(&state->ir, ir_d, ir_resampled, state->conv_rate) != 0) {
+    if (prepare_ir(&state->ir, ir_d, ir_resampled, state->conv_rate,
+                    state->gpu_partitions) != 0) {
         free(ir_d);
         return -1;
     }

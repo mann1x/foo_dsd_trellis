@@ -400,6 +400,8 @@ typedef struct {
     int8_t    rate_fir_prec[RATE_MAP_COUNT];   /* Per-rate FIR precision: -1=Auto(fp64), 0=fp32, 1=fp64 */
     /* v18: Convolution filter (room correction) */
     bool      conv_enabled;                            /* Master convolution enable */
+    bool      conv_gpu;                                /* Use GPU for convolution (CUDA) */
+    int8_t    conv_budget;                             /* GPU budget: 0=High, 1=Medium, 2=Low */
     char      conv_paths[CONV_MAX_CHANNELS][CONV_PATH_MAX]; /* Per-channel WAV IR paths */
 } dsd_config_t;
 
@@ -422,6 +424,11 @@ typedef struct {
 #define FIR_MODE_AUTO    (-1)
 #define FIR_MODE_BOXCAR   0
 #define FIR_MODE_FIR      1
+
+/* Convolution GPU budget levels */
+#define CONV_BUDGET_HIGH   0   /* Full partition count — max quality */
+#define CONV_BUDGET_MEDIUM 1   /* ~50% of max partitions */
+#define CONV_BUDGET_LOW    2   /* ~25% of max partitions */
 
 /* Config serialization version */
 #define DSD_CONFIG_VERSION 18
@@ -512,6 +519,8 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     memset(cfg->rate_fir_prec, 0xFF, sizeof(cfg->rate_fir_prec)); /* -1 = Auto (fp64) */
     /* v18: Convolution filter */
     cfg->conv_enabled = false;
+    cfg->conv_gpu = true;      /* GPU convolution on by default */
+    cfg->conv_budget = CONV_BUDGET_HIGH;
     memset(cfg->conv_paths, 0, sizeof(cfg->conv_paths));
 }
 

@@ -271,7 +271,7 @@ int engine_channel_init(engine_channel_t *eng, int channel,
     eng->conv = NULL;
     if (cfg->conv_enabled && channel < CONV_MAX_CHANNELS
         && cfg->conv_paths[channel][0] != '\0') {
-        bool try_gpu = (eng->gpu && cfg->gpu_enabled && !eng->fir_only);
+        bool try_gpu = (eng->gpu && cfg->gpu_enabled && cfg->conv_gpu && !eng->fir_only);
         uint32_t conv_rate;
         if (try_gpu) {
             conv_rate = fs_out;  /* GPU: full DSD rate */
@@ -288,7 +288,8 @@ int engine_channel_init(engine_channel_t *eng, int channel,
                     /* Try GPU convolution if available */
                     if (try_gpu && cs->ir.freq_partitions) {
                         int max_parts = gpu_conv_max_partitions(
-                            eng->gpu, fs_out, cs->ir.partition_size);
+                            eng->gpu, fs_out, cs->ir.partition_size,
+                            cfg->conv_budget);
                         int parts = cs->ir.num_partitions;
                         if (parts > max_parts) parts = max_parts;
                         cs->gpu_conv = gpu_conv_init(

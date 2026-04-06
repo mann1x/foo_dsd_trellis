@@ -69,6 +69,7 @@ typedef struct {
     void           *gpu_conv;   /* gpu_conv_state_t* from gpu_compute.h */
     void           *gpu_ctx;    /* gpu_context_t* for GPU calls */
     bool            use_gpu;    /* true if GPU convolution is active */
+    bool            gpu_partitions; /* true: use larger P for GPU efficiency */
 } conv_state_t;
 
 /* Initialise convolution state for a given processing rate.

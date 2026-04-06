@@ -20,7 +20,8 @@
 extern void trellis_log_c(const char *msg);
 
 /* These are defined in gpu_cuda.c — we access via the dispatcher in gpu_compute.c */
-int gpu_cuda_conv_max_partitions(void *ctx, uint32_t signal_rate, int P);
+int gpu_cuda_conv_max_partitions(void *ctx, uint32_t signal_rate, int P,
+                                  int budget_level);
 void *gpu_cuda_conv_init(void *ctx, int num_partitions,
                                       int partition_size, int fft_size,
                                       const void *ir_freq_host);
@@ -31,10 +32,10 @@ void gpu_cuda_conv_free(void *ctx, void *state);
 /* ─── Public API (dispatches to CUDA backend) ─── */
 
 int gpu_conv_max_partitions(gpu_context_t *ctx, uint32_t signal_rate,
-                             int partition_size) {
+                             int partition_size, int budget_level) {
     if (!ctx) return 0;
-    /* Only CUDA backend supports convolution */
-    return gpu_cuda_conv_max_partitions(ctx, signal_rate, partition_size);
+    return gpu_cuda_conv_max_partitions(ctx, signal_rate, partition_size,
+                                         budget_level);
 }
 
 gpu_conv_state_t *gpu_conv_init(gpu_context_t *ctx, int num_partitions,

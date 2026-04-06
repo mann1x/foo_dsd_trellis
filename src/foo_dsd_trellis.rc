@@ -49,6 +49,9 @@ BEGIN
 
     GROUPBOX        "Convolution (Room Correction)", -1, 8, 400, 404, 78
     CONTROL         "Enable", IDC_CHECK_CONV_ENABLED, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 412, 40, 10
+    CONTROL         "CUDA GPU", IDC_CHECK_CONV_GPU, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 62, 412, 45, 10
+    LTEXT           "Budget:", -1, 112, 414, 28, 8
+    COMBOBOX        IDC_COMBO_CONV_BUDGET, 142, 412, 50, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
     /* Left column: L, R, C */
     LTEXT           "L:", -1, 16, 428, 10, 8
     EDITTEXT        IDC_EDIT_CONV_0, 26, 426, 130, 14, ES_AUTOHSCROLL | ES_READONLY

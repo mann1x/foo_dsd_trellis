@@ -263,8 +263,9 @@ typedef struct gpu_conv_state gpu_conv_state_t;
 
 /* Query GPU convolution capability: max partitions for given rate.
  * Returns 0 if GPU convolution not available (no cuFFT). */
+/* budget_level: 0=High (full), 1=Medium (50%), 2=Low (25%) */
 int gpu_conv_max_partitions(gpu_context_t *ctx, uint32_t signal_rate,
-                             int partition_size);
+                             int partition_size, int budget_level);
 
 /* Initialize GPU convolution for one channel.
  * ir_freq: pre-FFT'd IR partitions (complex double, host memory)

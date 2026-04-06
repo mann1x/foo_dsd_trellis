@@ -122,9 +122,11 @@ static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
     + RATE_MAP_COUNT             /* rate_fir_prec */ \
     )
 
-/* v18: v17 + conv_enabled(1) + conv_paths(6 × 260) */
+/* v18: v17 + conv_enabled(1) + conv_gpu(1) + conv_budget(1) + conv_paths(6 × 260) */
 #define CONFIG_V18_SIZE (CONFIG_V17_SIZE \
     + 1                                      /* conv_enabled */ \
+    + 1                                      /* conv_gpu */ \
+    + 1                                      /* conv_budget */ \
     + CONV_MAX_CHANNELS * CONV_PATH_MAX      /* conv_paths */ \
     )
 
@@ -213,6 +215,8 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
 
     /* v18: convolution filter */
     pos = write_u8(buf, pos, cfg->conv_enabled ? 1 : 0);
+    pos = write_u8(buf, pos, cfg->conv_gpu ? 1 : 0);
+    pos = write_u8(buf, pos, (uint8_t)cfg->conv_budget);
     for (int i = 0; i < CONV_MAX_CHANNELS; i++) {
         memcpy(buf + pos, cfg->conv_paths[i], CONV_PATH_MAX);
         pos += CONV_PATH_MAX;
@@ -382,15 +386,28 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
                     pos += RATE_MAP_COUNT;
                 }
             }
-            /* Version 18 adds convolution filter */
+            /* Version 18 adds convolution filter.
+             * Original v18: enabled(1) + paths(6×260).
+             * Updated v18: enabled(1) + gpu(1) + budget(1) + paths(6×260).
+             * Detect by checking if there's room for the extra 2 bytes. */
             if (version >= 18) {
-                if (pos + 1 + CONV_MAX_CHANNELS * CONV_PATH_MAX <= buf_size) {
+                size_t conv_min = 1 + CONV_MAX_CHANNELS * CONV_PATH_MAX;
+                if (pos + conv_min <= buf_size) {
                     uint8_t u8;
                     pos = read_u8(buf, pos, &u8);
                     cfg->conv_enabled = (u8 != 0);
+                    /* Check if new fields are present (2 extra bytes) */
+                    if (pos + 2 + CONV_MAX_CHANNELS * CONV_PATH_MAX <= buf_size) {
+                        pos = read_u8(buf, pos, &u8);
+                        cfg->conv_gpu = (u8 != 0);
+                        pos = read_u8(buf, pos, &u8);
+                        cfg->conv_budget = (int8_t)u8;
+                        if (cfg->conv_budget < 0 || cfg->conv_budget > 2)
+                            cfg->conv_budget = CONV_BUDGET_HIGH;
+                    }
                     for (int i = 0; i < CONV_MAX_CHANNELS; i++) {
                         memcpy(cfg->conv_paths[i], buf + pos, CONV_PATH_MAX);
-                        cfg->conv_paths[i][CONV_PATH_MAX - 1] = '\0';  /* safety */
+                        cfg->conv_paths[i][CONV_PATH_MAX - 1] = '\0';
                         pos += CONV_PATH_MAX;
                     }
                 }

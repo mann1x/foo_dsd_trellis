@@ -323,6 +323,7 @@ typedef struct {
     CUfunction     fn_conv_cmulacc;    /* complex_mul_acc kernel */
     CUfunction     fn_conv_czero;      /* complex_zero kernel */
     CUfunction     fn_conv_extract;    /* extract_output kernel */
+    CUfunction     fn_conv_fused;      /* fused_mul_acc kernel */
     int            gpu_clock_khz;      /* GPU clock rate */
 } cuda_context_t;
 
@@ -575,6 +576,7 @@ gpu_context_t *gpu_cuda_create(void) {
         pfn_cuModuleGetFunction(&c->fn_conv_cmulacc, c->mod_conv, "conv_complex_mul_acc");
         pfn_cuModuleGetFunction(&c->fn_conv_czero, c->mod_conv, "conv_complex_zero");
         pfn_cuModuleGetFunction(&c->fn_conv_extract, c->mod_conv, "conv_extract_output");
+        pfn_cuModuleGetFunction(&c->fn_conv_fused, c->mod_conv, "conv_fused_mul_acc");
     }
     c->gpu_clock_khz = g_clock_khz;
 
@@ -3122,7 +3124,8 @@ struct gpu_conv_state {
     int            fft_size;
     cufftHandle    fft_plan;
     CUdeviceptr    d_ir_freq;
-    CUdeviceptr   *d_fdl;
+    CUdeviceptr    d_fdl_flat;     /* contiguous: [num_parts * fft_size] cdoubles */
+    CUdeviceptr   *d_fdl;          /* unused, kept for compat */
     CUdeviceptr    d_input;
     CUdeviceptr    d_accum;
     CUdeviceptr    d_temp;
@@ -3135,9 +3138,13 @@ struct gpu_conv_state {
     int            fifo_read;
     double        *overlap_buf;
     int            buf_pos;
+    /* Device arrays for fused kernel */
+    CUdeviceptr    d_fdl_ptrs;     /* CUdeviceptr[num_partitions] on device */
+    CUdeviceptr    d_fdl_indices;  /* int[num_partitions] on device */
 };
 
-int gpu_cuda_conv_max_partitions(void *ctx, uint32_t signal_rate, int P) {
+int gpu_cuda_conv_max_partitions(void *ctx, uint32_t signal_rate, int P,
+                                  int budget_level) {
     cuda_context_t *c = (cuda_context_t *)ctx;
     if (!c || !g_cufft_available || !c->fn_conv_cmulacc) return 0;
 
@@ -3147,20 +3154,43 @@ int gpu_cuda_conv_max_partitions(void *ctx, uint32_t signal_rate, int P) {
     int log2n = 0;
     { int v = fft_size; while (v > 1) { v >>= 1; log2n++; } }
 
+    /* Compute theoretical max partitions from GPU throughput */
     double throughput = (double)sms * clock_mhz * 32.0;
     double blocks_per_sec = (double)signal_rate / P;
     double fft_cost = fft_size * log2n * 5.0 * 2.0;
     double mul_cost_per_part = fft_size * 6.0;
-    double budget = throughput * 1e6 / blocks_per_sec;
-    int max_parts = (int)((budget - fft_cost) / mul_cost_per_part);
+    double budget_flops = throughput * 1e6 / blocks_per_sec;
+    int theoretical_max = (int)((budget_flops - fft_cost) / mul_cost_per_part);
+
+    /* Apply target utilization cap based on real-world calibration.
+     *
+     * Measured: RTX 5080 SM=84, DSD64, 64 partitions (P=4096) = 80% GPU.
+     * Target: ~70% GPU utilization for real-time headroom.
+     *
+     * Reference point: 64 parts × (2822400/P) blocks/s = the GPU load.
+     * For other rates, scale partitions inversely with rate.
+     * Per-SM calibration: 64 parts / 84 SMs = 0.76 parts/SM at DSD64. */
+    double ref_rate = 2822400.0;
+    double parts_per_sm = 0.6;  /* ~70% target (0.76 was 80%) */
+    int rate_scaled = (int)(parts_per_sm * sms * ref_rate / (double)signal_rate);
+
+    /* Use the smaller of theoretical and rate-scaled */
+    int max_parts = theoretical_max < rate_scaled ? theoretical_max : rate_scaled;
+
+    /* Apply budget level: High=100%, Medium=50%, Low=25% */
+    if (budget_level == 1)
+        max_parts = max_parts / 2;
+    else if (budget_level >= 2)
+        max_parts = max_parts / 4;
+
     if (max_parts < 4) max_parts = 4;
     if (max_parts > 4096) max_parts = 4096;
 
     {
         char msg[128];
         snprintf(msg, sizeof(msg),
-                 "conv: GPU budget: SM=%d clock=%dMHz max=%d parts (P=%d rate=%u)",
-                 sms, clock_mhz, max_parts, P, signal_rate);
+                 "conv: GPU budget: SM=%d clock=%dMHz max=%d parts (P=%d rate=%u theory=%d scaled=%d)",
+                 sms, clock_mhz, max_parts, P, signal_rate, theoretical_max, rate_scaled);
         trellis_log_c(msg);
     }
     return max_parts;
@@ -3192,13 +3222,10 @@ void *gpu_cuda_conv_init(void *ctx, int num_partitions,
         goto fail;
     pfn_cuMemcpyHtoD(s->d_ir_freq, ir_freq_host, (size_t)num_partitions * slot_bytes);
 
-    /* Allocate FDL */
-    s->d_fdl = (CUdeviceptr *)calloc(num_partitions, sizeof(CUdeviceptr));
-    if (!s->d_fdl) goto fail;
-    for (int i = 0; i < num_partitions; i++) {
-        if (pfn_cuMemAlloc(&s->d_fdl[i], slot_bytes) != CUDA_SUCCESS) goto fail;
-        pfn_cuMemsetD8Async(s->d_fdl[i], 0, slot_bytes, c->streams[0]);
-    }
+    /* Allocate contiguous FDL buffer */
+    if (pfn_cuMemAlloc(&s->d_fdl_flat, (size_t)num_partitions * slot_bytes) != CUDA_SUCCESS)
+        goto fail;
+    pfn_cuMemsetD8Async(s->d_fdl_flat, 0, (size_t)num_partitions * slot_bytes, c->streams[0]);
 
     /* Work buffers */
     if (pfn_cuMemAlloc(&s->d_input, slot_bytes) != CUDA_SUCCESS) goto fail;
@@ -3217,6 +3244,10 @@ void *gpu_cuda_conv_init(void *ctx, int num_partitions,
     s->fifo_buf = (double *)calloc(partition_size * 2, sizeof(double));
     s->overlap_buf = (double *)calloc(2 * partition_size, sizeof(double));
     if (!s->fifo_buf || !s->overlap_buf) goto fail;
+
+    /* Device index array for fused multiply-accumulate kernel */
+    if (pfn_cuMemAlloc(&s->d_fdl_indices, (size_t)num_partitions * sizeof(int)) != CUDA_SUCCESS)
+        goto fail;
 
     pfn_cuStreamSynchronize(c->streams[0]);
 
@@ -3253,30 +3284,30 @@ static void gpu_conv_do_partition(cuda_context_t *c, struct gpu_conv_state *s) {
                             c->streams[0], args, NULL);
     }
 
-    /* Forward FFT → FDL[fdl_pos] */
+    /* Forward FFT → FDL[fdl_pos] (contiguous buffer) */
+    CUdeviceptr d_fdl_slot = s->d_fdl_flat + (CUdeviceptr)(s->fdl_pos * slot_bytes);
     pfn_cufftExecZ2Z(s->fft_plan, (void *)s->d_input,
-                      (void *)s->d_fdl[s->fdl_pos], CUFFT_FORWARD);
+                      (void *)d_fdl_slot, CUFFT_FORWARD);
 
     if (s->fdl_filled < np)
         s->fdl_filled++;
 
-    /* Zero accumulator */
-    {
-        int n = fft_size;
-        void *args[] = { &s->d_accum, &n };
-        pfn_cuLaunchKernel(c->fn_conv_czero, grid, 1, 1, 256, 1, 1, 0,
-                            c->streams[0], args, NULL);
-    }
-
-    /* Multiply-accumulate */
+    /* Fused multiply-accumulate: single kernel for all partitions.
+     * Upload FDL index array, then launch one kernel. */
     int active = s->fdl_filled < np ? s->fdl_filled : np;
-    for (int k = 0; k < active; k++) {
-        int fdl_idx = (s->fdl_pos - k + np) % np;
-        CUdeviceptr d_fdl_k = s->d_fdl[fdl_idx];
-        CUdeviceptr d_ir_k = s->d_ir_freq + (CUdeviceptr)(k * slot_bytes);
-        int n = fft_size;
-        void *args[] = { &d_fdl_k, &d_ir_k, &s->d_accum, &n };
-        pfn_cuLaunchKernel(c->fn_conv_cmulacc, grid, 1, 1, 256, 1, 1, 0,
+    {
+        int indices[4096];
+        for (int k = 0; k < active; k++)
+            indices[k] = (s->fdl_pos - k + np) % np;
+        pfn_cuMemcpyHtoDAsync(s->d_fdl_indices, indices,
+                               active * sizeof(int), c->streams[0]);
+
+        int fs_arg = fft_size;
+        int na_arg = active;
+        void *args[] = { &s->d_fdl_flat, &s->d_ir_freq,
+                          &s->d_accum, &s->d_fdl_indices,
+                          &fs_arg, &na_arg };
+        pfn_cuLaunchKernel(c->fn_conv_fused, grid, 1, 1, 256, 1, 1, 0,
                             c->streams[0], args, NULL);
     }
 
@@ -3293,16 +3324,20 @@ static void gpu_conv_do_partition(cuda_context_t *c, struct gpu_conv_state *s) {
                             256, 1, 1, 0, c->streams[0], args, NULL);
     }
 
+    /* Download P doubles — NO sync here, defer to batch end */
     pfn_cuMemcpyDtoHAsync(s->h_staging, s->d_temp,
                            P * sizeof(double), c->streams[0]);
-    pfn_cuStreamSynchronize(c->streams[0]);
+    /* Mark that we need sync before reading h_staging */
+    s->fdl_pos = (s->fdl_pos + 1) % np;
+}
 
-    /* cuFFT Z2Z inverse does not normalize — divide by fft_size */
-    double norm = 1.0 / (double)fft_size;
+/* Sync GPU stream and normalize the staging buffer */
+static void gpu_conv_sync_and_normalize(cuda_context_t *c, struct gpu_conv_state *s) {
+    pfn_cuStreamSynchronize(c->streams[0]);
+    double norm = 1.0 / (double)s->fft_size;
+    int P = s->partition_size;
     for (int i = 0; i < P; i++)
         s->h_staging[i] *= norm;
-
-    s->fdl_pos = (s->fdl_pos + 1) % np;
 }
 
 int gpu_cuda_conv_process(void *ctx, void *state,
@@ -3345,6 +3380,7 @@ int gpu_cuda_conv_process(void *ctx, void *state,
 
         if (s->buf_pos >= P) {
             gpu_conv_do_partition(c, s);
+            gpu_conv_sync_and_normalize(c, s);
             memcpy(&tls_fifo[fifo_len], s->h_staging, P * sizeof(double));
             fifo_len += P;
             memmove(s->overlap_buf, &s->overlap_buf[P],
@@ -3388,14 +3424,11 @@ void gpu_cuda_conv_free(void *ctx, void *state) {
     if (s->fft_plan && pfn_cufftDestroy)
         pfn_cufftDestroy(s->fft_plan);
     if (s->d_ir_freq) pfn_cuMemFree(s->d_ir_freq);
-    if (s->d_fdl) {
-        for (int i = 0; i < s->num_partitions; i++)
-            if (s->d_fdl[i]) pfn_cuMemFree(s->d_fdl[i]);
-        free(s->d_fdl);
-    }
+    if (s->d_fdl_flat) pfn_cuMemFree(s->d_fdl_flat);
     if (s->d_input) pfn_cuMemFree(s->d_input);
     if (s->d_accum) pfn_cuMemFree(s->d_accum);
     if (s->d_temp) pfn_cuMemFree(s->d_temp);
+    if (s->d_fdl_indices) pfn_cuMemFree(s->d_fdl_indices);
     if (s->h_staging) pfn_cuMemFreeHost(s->h_staging);
     free(s->fifo_buf);
     free(s->overlap_buf);

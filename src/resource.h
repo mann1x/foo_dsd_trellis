@@ -53,6 +53,8 @@
 #define IDC_EDIT_CONV_5             1059   /* SR */
 #define IDC_BTN_CONV_5              1060
 #define IDC_BTN_CONV_CLR_5          1061
+#define IDC_CHECK_CONV_GPU          1062
+#define IDC_COMBO_CONV_BUDGET       1063
 
 // Next default values for new objects
 //

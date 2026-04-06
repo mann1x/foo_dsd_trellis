@@ -767,19 +767,19 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
         for (int ch = 0; ch < s->num_channels; ch++) {
             conv_state_t *cs = s->channels[ch].conv;
             if (cs && !cs->use_gpu && s->config.conv_enabled
-                && !s->channels[ch].fir_only) {
-                int max_parts = gpu_conv_max_partitions(
-                    s->gpu, s->config.fs_out ? s->config.fs_out : dsd_rate,
-                    cs->ir.partition_size);
-                if (max_parts > 0 && cs->ir.freq_partitions) {
-                    /* Re-init at full DSD rate for GPU */
-                    uint32_t fs = s->config.fs_out ? s->config.fs_out : dsd_rate;
-                    /* Reload IR at full rate */
-                    conv_state_t *gpu_cs = (conv_state_t *)calloc(1, sizeof(conv_state_t));
-                    if (gpu_cs && conv_init(gpu_cs, fs, fs) == 0) {
-                        if (conv_load_ir(gpu_cs, s->config.conv_paths[ch]) == 0) {
-                            int parts = gpu_cs->ir.num_partitions;
-                            if (parts > max_parts) parts = max_parts;
+                && s->config.conv_gpu && !s->channels[ch].fir_only) {
+                uint32_t fs = s->config.fs_out ? s->config.fs_out : dsd_rate;
+                conv_state_t *gpu_cs = (conv_state_t *)calloc(1, sizeof(conv_state_t));
+                bool gpu_ok = false;
+                if (gpu_cs && conv_init(gpu_cs, fs, fs) == 0) {
+                    gpu_cs->gpu_partitions = true;
+                    if (conv_load_ir(gpu_cs, s->config.conv_paths[ch]) == 0) {
+                        int max_parts = gpu_conv_max_partitions(
+                            s->gpu, fs, gpu_cs->ir.partition_size,
+                            s->config.conv_budget);
+                        int parts = gpu_cs->ir.num_partitions;
+                        if (parts > max_parts && max_parts > 0) parts = max_parts;
+                        if (max_parts > 0) {
                             gpu_cs->gpu_conv = gpu_conv_init(
                                 s->gpu, parts, gpu_cs->ir.partition_size,
                                 gpu_cs->ir.fft_size, gpu_cs->ir.freq_partitions);
@@ -787,21 +787,15 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                                 gpu_cs->use_gpu = true;
                                 gpu_cs->gpu_ctx = s->gpu;
                                 gpu_cs->dec_ratio = 1;
-                                /* Replace CPU conv with GPU conv */
-                                conv_free(cs);
-                                free(cs);
+                                conv_free(cs); free(cs);
                                 s->channels[ch].conv = gpu_cs;
-                            } else {
-                                conv_free(gpu_cs);
-                                free(gpu_cs);
+                                gpu_ok = true;
                             }
-                        } else {
-                            conv_free(gpu_cs);
-                            free(gpu_cs);
                         }
-                    } else if (gpu_cs) {
-                        free(gpu_cs);
                     }
+                }
+                if (!gpu_ok && gpu_cs) {
+                    conv_free(gpu_cs); free(gpu_cs);
                 }
             }
         }
@@ -3151,9 +3145,10 @@ size_t plugin_process_pcm_to_pcm(plugin_state_t *s,
                         if (conv_load_ir(cs, s->config.conv_paths[ch]) == 0) {
                             /* Try GPU convolution for PCM */
                             if (s->gpu && s->config.gpu_enabled &&
-                                cs->ir.freq_partitions) {
+                                s->config.conv_gpu && cs->ir.freq_partitions) {
                                 int max_p = gpu_conv_max_partitions(
-                                    s->gpu, pcm_rate_out, cs->ir.partition_size);
+                                    s->gpu, pcm_rate_out, cs->ir.partition_size,
+                                    s->config.conv_budget);
                                 if (max_p > 0) {
                                     int parts = cs->ir.num_partitions;
                                     if (parts > max_p) parts = max_p;
@@ -3254,9 +3249,10 @@ size_t plugin_process_pcm_to_pcm(plugin_state_t *s,
                         if (conv_load_ir(cs, s->config.conv_paths[ch]) == 0) {
                             /* Try GPU convolution for PCM rate-conv */
                             if (s->gpu && s->config.gpu_enabled &&
-                                cs->ir.freq_partitions) {
+                                s->config.conv_gpu && cs->ir.freq_partitions) {
                                 int max_p = gpu_conv_max_partitions(
-                                    s->gpu, pcm_rate_out, cs->ir.partition_size);
+                                    s->gpu, pcm_rate_out, cs->ir.partition_size,
+                                    s->config.conv_budget);
                                 if (max_p > 0) {
                                     int parts = cs->ir.num_partitions;
                                     if (parts > max_p) parts = max_p;

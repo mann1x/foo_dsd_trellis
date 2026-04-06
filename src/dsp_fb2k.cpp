@@ -506,6 +506,8 @@ public:
         COMMAND_HANDLER_EX(IDC_COMBO_SOXR_QUALITY, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_BTN_TEST_SINAD, BN_CLICKED, OnTestSinad)
         COMMAND_HANDLER_EX(IDC_CHECK_CONV_ENABLED, BN_CLICKED, OnChange)
+        COMMAND_HANDLER_EX(IDC_CHECK_CONV_GPU, BN_CLICKED, OnChange)
+        COMMAND_HANDLER_EX(IDC_COMBO_CONV_BUDGET, CBN_SELCHANGE, OnChange)
         COMMAND_HANDLER_EX(IDC_BTN_CONV_0, BN_CLICKED, OnConvBrowse)
         COMMAND_HANDLER_EX(IDC_BTN_CONV_1, BN_CLICKED, OnConvBrowse)
         COMMAND_HANDLER_EX(IDC_BTN_CONV_2, BN_CLICKED, OnConvBrowse)
@@ -802,6 +804,16 @@ private:
 
         /* Convolution Filter */
         CheckDlgButton(IDC_CHECK_CONV_ENABLED, m_cfg.conv_enabled ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(IDC_CHECK_CONV_GPU, m_cfg.conv_gpu ? BST_CHECKED : BST_UNCHECKED);
+        {
+            CComboBox cb(GetDlgItem(IDC_COMBO_CONV_BUDGET));
+            cb.AddString(L"High");
+            cb.AddString(L"Medium");
+            cb.AddString(L"Low");
+            int sel = m_cfg.conv_budget;
+            if (sel < 0 || sel > 2) sel = 0;
+            cb.SetCurSel(sel);
+        }
         {
             static const int edit_ids[CONV_MAX_CHANNELS] = {
                 IDC_EDIT_CONV_0, IDC_EDIT_CONV_1, IDC_EDIT_CONV_2,
@@ -1868,6 +1880,9 @@ private:
 
         /* Convolution filter */
         m_cfg.conv_enabled = IsDlgButtonChecked(IDC_CHECK_CONV_ENABLED) == BST_CHECKED;
+        m_cfg.conv_gpu = IsDlgButtonChecked(IDC_CHECK_CONV_GPU) == BST_CHECKED;
+        m_cfg.conv_budget = (int8_t)CComboBox(GetDlgItem(IDC_COMBO_CONV_BUDGET)).GetCurSel();
+        if (m_cfg.conv_budget < 0 || m_cfg.conv_budget > 2) m_cfg.conv_budget = 0;
         /* conv_paths are set directly by browse/clear handlers */
 
         config_validate(&m_cfg);
