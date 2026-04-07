@@ -973,8 +973,7 @@ private:
             char utf8[CONV_PATH_MAX];
             WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), NULL, NULL);
             utf8[CONV_PATH_MAX - 1] = '\0';
-            strncpy(m_cfg.conv_paths[ch], utf8, CONV_PATH_MAX - 1);
-            m_cfg.conv_paths[ch][CONV_PATH_MAX - 1] = '\0';
+            strncpy_s(m_cfg.conv_paths[ch], CONV_PATH_MAX, utf8, _TRUNCATE);
             ::uSetDlgItemText(*this, conv_edit_id(ch), utf8);
         }
     }
