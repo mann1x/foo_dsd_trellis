@@ -1575,15 +1575,33 @@ size_t plugin_process(plugin_state_t *s,
         /* Convolution filter (room correction) — after FIR phase, before SDM.
          * Pipelined: launch all channels async (parallel CUDA streams),
          * then finalize all. GPU work for both channels overlaps. */
+        LARGE_INTEGER t_conv_launch_start, t_conv_launch_end;
+        LARGE_INTEGER t_conv_final_start,  t_conv_final_end;
+        QueryPerformanceCounter(&t_conv_launch_start);
         for (int ch = 0; ch < num_channels; ch++) {
             if (s->channels[ch].conv)
                 conv_launch(s->channels[ch].conv,
                             s->channels[ch].fir_buf, fir_counts[ch]);
         }
+        QueryPerformanceCounter(&t_conv_launch_end);
+        t_conv_final_start = t_conv_launch_end;
         for (int ch = 0; ch < num_channels; ch++) {
             if (s->channels[ch].conv)
                 conv_finalize(s->channels[ch].conv,
                               s->channels[ch].fir_buf, fir_counts[ch]);
+        }
+        QueryPerformanceCounter(&t_conv_final_end);
+        if (s->channels[0].conv) {
+            static int conv_log = 0;
+            if ((++conv_log) <= 4 || (conv_log % 50) == 0) {
+                double launch_ms = perf_ms(t_conv_launch_start, t_conv_launch_end);
+                double final_ms  = perf_ms(t_conv_final_start,  t_conv_final_end);
+                char msg[160];
+                snprintf(msg, sizeof(msg),
+                         "conv phase: launch=%.1fms finalize=%.1fms total=%.1fms (nch=%d)",
+                         launch_ms, final_ms, launch_ms + final_ms, num_channels);
+                trellis_log_c(msg);
+            }
         }
 
         /* PreCorr: GPU FIR done above, now run GPU PreCorr SDM.
@@ -2928,6 +2946,24 @@ sdm_done:
 
     QueryPerformanceCounter(&t_pack_end);
     s->time_pack_ms = perf_ms(t_pack_start, t_pack_end);
+
+    /* Per-chunk phase summary — only when conv is active (the case
+     * we care about debugging). Throttled to ~1/sec. */
+    if (s->channels[0].conv) {
+        static int phase_log = 0;
+        if ((++phase_log) <= 4 || (phase_log % 50) == 0) {
+            double total = s->time_unpack_ms + s->time_fir_ms
+                         + s->time_sdm_ms + s->time_pack_ms;
+            char msg[224];
+            snprintf(msg, sizeof(msg),
+                     "phase summary: unpack=%.1f fir=%.1f sdm=%.1f pack=%.1f "
+                     "sum=%.1fms (nch=%d, dsd_in=%zu)",
+                     s->time_unpack_ms, s->time_fir_ms,
+                     s->time_sdm_ms, s->time_pack_ms,
+                     total, num_channels, dsd_in_count);
+            trellis_log_c(msg);
+        }
+    }
 
     /* Enable worker reservation after first successful chunk.
      * Reserved workers only wait on per-worker wake_event (no work_sem),

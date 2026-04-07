@@ -3222,10 +3222,19 @@ struct gpu_conv_state {
      * (otherwise the captured fdl_pos sequence wouldn't match subsequent
      * batches). The graph encodes upload + chunk loop + download.
      *
-     * Two-slot cache: batch_count oscillates between two adjacent values
-     * (e.g. 68/69 at DSD512) due to leftover sample carry-over between
-     * calls. Caching both avoids re-capturing every other batch. */
-#define CONV_GRAPH_CACHE_N 4
+     * Cache is keyed by (batch_count, init_fdl_pos). batch_count oscillates
+     * between adjacent values from leftover carry-over (e.g. 34/35 at
+     * DSD256, 68/69 at DSD512). init_fdl_pos cycles through 0..np-1 as
+     * the FDL ring rotates each batch. So the worst-case distinct
+     * keys is roughly 2 * np.
+     *
+     * Cache must be sized >= 2*np to avoid thrashing. With CONV_GRAPH_CACHE_N=4
+     * and np=7 (DSD256 5ch), the cache thrashed: ~6 captures/sec across all
+     * channels, ~50ms of conv finalize spike per batch when fdl_pos hit an
+     * evicted slot. Bumping to 64 covers all current rate/cap combinations
+     * (DSD512 2M = np=32 → need 64). Each slot is just a CUgraphExec handle
+     * + 2 ints = 16 bytes. 64 slots × 16 bytes = 1 KB per conv state — free. */
+#define CONV_GRAPH_CACHE_N 64
     CUgraphExec    graph_exec[CONV_GRAPH_CACHE_N];
     int            graph_valid[CONV_GRAPH_CACHE_N];
     int            graph_batch_count[CONV_GRAPH_CACHE_N];
