@@ -443,10 +443,71 @@ int conv_load_ir(conv_state_t *state, const char *wav_path) {
         mono = mono_alloc;
     }
 
+    /* Pre-truncate the input IR if its post-resample size would exceed
+     * the budget cap. Without this, very long input IRs at high DSD
+     * rates would force the resample step to allocate huge upsampled
+     * buffers (e.g., a 32K-tap @ 48kHz room IR at DSD512 = 15M
+     * post-resample = 117 MB allocated and immediately rejected by
+     * the post-resample CONV_MAX_IR_TAPS gate, or worse — OOM).
+     *
+     * Pre-truncation is mathematically equivalent to post-truncation
+     * in terms of how much IR time is preserved (same impulse-centered
+     * window), but it bounds the resample memory to ~max_ir_taps × 8
+     * bytes regardless of input size.
+     *
+     * The post-resample centered truncation (~line 553 below) still
+     * runs and trims any small overshoot from the +64 sample margin
+     * we add here for resample filter edge effects. */
+    const float *resample_in = mono;
+    int resample_in_count = ir_count;
+    float *pretrunc_alloc = NULL;
+    if (state->max_ir_taps > 0 && wav.sample_rate > 0) {
+        double ratio = (double)state->conv_rate / (double)wav.sample_rate;
+        int max_input = (int)((double)state->max_ir_taps / ratio) + 64;
+        if (max_input < 1) max_input = 1;
+        if (ir_count > max_input) {
+            /* Find peak of the input IR (in float, before resample) */
+            int peak_idx = 0;
+            float peak_val = 0.0f;
+            for (int i = 0; i < ir_count; i++) {
+                float av = mono[i] >= 0.0f ? mono[i] : -mono[i];
+                if (av > peak_val) { peak_val = av; peak_idx = i; }
+            }
+            /* Centered window of max_input samples around the peak */
+            int half = max_input / 2;
+            int start = peak_idx - half;
+            if (start < 0) start = 0;
+            if (start + max_input > ir_count) start = ir_count - max_input;
+            if (start < 0) start = 0;
+
+            pretrunc_alloc = (float *)malloc((size_t)max_input * sizeof(float));
+            if (pretrunc_alloc) {
+                memcpy(pretrunc_alloc, mono + start,
+                       (size_t)max_input * sizeof(float));
+                resample_in = pretrunc_alloc;
+                resample_in_count = max_input;
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                    "conv: input pre-truncated %d → %d taps "
+                    "(peak@%d, %.1f → %.1f ms @ %u Hz, "
+                    "would-be post-resample %.0f exceeds cap %d)",
+                    ir_count, max_input, peak_idx,
+                    (double)ir_count * 1000.0 / (double)wav.sample_rate,
+                    (double)max_input * 1000.0 / (double)wav.sample_rate,
+                    wav.sample_rate,
+                    (double)ir_count * ratio, state->max_ir_taps);
+                trellis_log_c(msg);
+            }
+            /* If alloc failed, fall through with original mono — the
+             * post-resample gate will reject if needed. */
+        }
+    }
+
     /* Resample IR to convolution rate */
     double *ir_d = NULL;
-    int ir_resampled = resample_ir(mono, ir_count, wav.sample_rate,
+    int ir_resampled = resample_ir(resample_in, resample_in_count, wav.sample_rate,
                                     state->conv_rate, &ir_d);
+    free(pretrunc_alloc);
     free(mono_alloc);
     wav_free(&wav);
 
