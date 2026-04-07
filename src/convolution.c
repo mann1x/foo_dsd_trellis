@@ -65,14 +65,19 @@ static int choose_partition_size(int ir_length) {
  * To increase GPU% from measured to 75%, reduce P accordingly.
  * For DSD64: need 75/12 = 6.25× more work → P/sqrt(6.25) = P/2.5 → P=13107 → P=8192
  * For DSD512: need 75/49 = 1.53× more work → P/sqrt(1.53) = P/1.24 → P=26442 → P=16384 */
-/* GPU partition size: prefer large P to minimize kernel launches/sec.
- * Small P = more FFTs/sec + more MulAcc iterations = slower.
- * P=16384 is optimal for DSD256/512 (1378 ops/sec vs 5512 at P=4096).
- * Only use smaller P for very short IRs where P > ir_length. */
+/* GPU partition size: prefer P >= ir_length so num_partitions=1.
+ * Each output chunk does the SAME number of CUDA driver calls regardless
+ * of num_partitions (the multiply-accumulate is one fused kernel call).
+ * Larger P → fewer output chunks per batch → fewer driver calls total.
+ * For DSD512 (4.5M-sample batch): P=16384 → 275 chunks, P=65536 → 69
+ * chunks, ~4x fewer kernel launches and ~30ms less CPU queue time
+ * per channel. Cap at 65536 to keep FFT size and pinned mem reasonable. */
 static int choose_partition_size_gpu(int ir_length) {
     if (ir_length <= 2048)    return 1024;
     if (ir_length <= 8192)    return 4096;
-    return 16384;
+    if (ir_length <= 16384)   return 16384;
+    if (ir_length <= 32768)   return 32768;
+    return 65536;  /* IRs > 65536 use multi-partition mode */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════

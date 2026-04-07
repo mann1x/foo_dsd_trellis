@@ -3261,9 +3261,13 @@ void *gpu_cuda_conv_init(void *ctx, int num_partitions,
     if (pfn_cuMemAlloc(&s->d_accum, slot_bytes) != CUDA_SUCCESS) goto fail;
     if (pfn_cuMemAlloc(&s->d_temp, slot_bytes) != CUDA_SUCCESS) goto fail;
 
-    /* Pinned host staging — sized for batch processing (up to 32 partitions per call) */
+    /* Pinned host staging — sized for the largest DSD batch (~4.5M doubles).
+     * Bumped from 32*P to a fixed cap so first-batch doesn't trigger a
+     * pinned-mem realloc (~50ms cuMemAllocHost) on the hot path. */
     {
-        size_t cap = (size_t)partition_size * 32;
+        size_t cap = (size_t)5 * 1024 * 1024;  /* covers DSD512 batch */
+        if ((size_t)partition_size * 80 > cap)
+            cap = (size_t)partition_size * 80;
         if (pfn_cuMemAllocHost((void **)&s->h_staging, cap * sizeof(double)) != CUDA_SUCCESS) {
             s->h_staging = (double *)malloc(cap * sizeof(double));
             s->h_staging_pinned = 0;
@@ -3289,9 +3293,13 @@ void *gpu_cuda_conv_init(void *ctx, int num_partitions,
         goto fail;
 
     /* Pre-allocate batch input buffer for single-upload processing.
-     * Size for 300 partitions per batch (covers DSD512 @ 282240 PCM frames). */
+     * The total bytes per batch is fixed by the largest DSD rate (DSD512:
+     * ~4.5M doubles = 36MB), regardless of partition size. Allocate enough
+     * to fit DSD512's batch + 2 partitions of overhead. */
     {
-        size_t batch_cap = (size_t)(300 + 1) * partition_size;
+        size_t min_doubles = (size_t)5 * 1024 * 1024;  /* covers DSD512 batch */
+        size_t batch_cap = (size_t)82 * partition_size;
+        if (batch_cap < min_doubles) batch_cap = min_doubles;
         if (pfn_cuMemAlloc(&s->d_batch_in, batch_cap * sizeof(double)) != CUDA_SUCCESS)
             goto fail;
         if (pfn_cuMemAllocHost((void **)&s->h_batch_in,
@@ -3544,6 +3552,10 @@ int gpu_cuda_conv_launch(void *ctx, void *state, double *buf, size_t count) {
     struct gpu_conv_state *s = (struct gpu_conv_state *)state;
     if (!c || !s) return -1;
 
+    LARGE_INTEGER qf, qt0, qt1, qt2, qt3, qt4;
+    QueryPerformanceFrequency(&qf);
+    QueryPerformanceCounter(&qt0);
+
     pfn_cuCtxSetCurrent(c->context);
 
     int P = s->partition_size;
@@ -3608,6 +3620,8 @@ int gpu_cuda_conv_launch(void *ctx, void *state, double *buf, size_t count) {
         }
     }
 
+    QueryPerformanceCounter(&qt1);
+
     /* Build sliding window: [prev_tail(P)] [partial] [buf] */
     memcpy(s->h_batch_in, s->overlap_buf, (size_t)P * sizeof(double));
     if (s->buf_pos > 0)
@@ -3623,16 +3637,37 @@ int gpu_cuda_conv_launch(void *ctx, void *state, double *buf, size_t count) {
                (size_t)leftover * sizeof(double));
     s->buf_pos = leftover;
 
+    QueryPerformanceCounter(&qt2);
+
     /* Upload + queue kernels on this channel's stream — NO SYNC */
     CUstream stream = c->streams[s->stream_idx];
     pfn_cuMemcpyHtoDAsync(s->d_batch_in, s->h_batch_in,
                            input_doubles * sizeof(double), stream);
+
+    QueryPerformanceCounter(&qt3);
 
     for (int k = 0; k < batch_count; k++) {
         CUdeviceptr d_src = s->d_batch_in +
                             (CUdeviceptr)((size_t)k * P * sizeof(double));
         gpu_conv_do_partition_dev(c, s, d_src,
                                   s->h_staging + (size_t)k * P);
+    }
+
+    QueryPerformanceCounter(&qt4);
+    {
+        static volatile LONG s_log_count = 0;
+        if (InterlockedIncrement(&s_log_count) <= 5 ||
+            (s_log_count % 100) == 0) {
+            double t_setup  = (double)(qt1.QuadPart - qt0.QuadPart) * 1000.0 / (double)qf.QuadPart;
+            double t_memcpy = (double)(qt2.QuadPart - qt1.QuadPart) * 1000.0 / (double)qf.QuadPart;
+            double t_upload = (double)(qt3.QuadPart - qt2.QuadPart) * 1000.0 / (double)qf.QuadPart;
+            double t_queue  = (double)(qt4.QuadPart - qt3.QuadPart) * 1000.0 / (double)qf.QuadPart;
+            char msg[256];
+            sprintf_s(msg, sizeof(msg),
+                "conv_launch[s%d]: setup=%.2f memcpy=%.2f upload=%.2f queue=%.2fms (parts=%d)",
+                s->stream_idx, t_setup, t_memcpy, t_upload, t_queue, batch_count);
+            trellis_log_c(msg);
+        }
     }
     return 0;
 }
@@ -3642,6 +3677,10 @@ int gpu_cuda_conv_finalize(void *ctx, void *state, double *buf, size_t count) {
     cuda_context_t *c = (cuda_context_t *)ctx;
     struct gpu_conv_state *s = (struct gpu_conv_state *)state;
     if (!c || !s || !s->launched) return -1;
+
+    LARGE_INTEGER qf, qt0, qt1, qt2, qt3;
+    QueryPerformanceFrequency(&qf);
+    QueryPerformanceCounter(&qt0);
 
     int P = s->partition_size;
     int batch_count = s->launched_batch;
@@ -3653,6 +3692,8 @@ int gpu_cuda_conv_finalize(void *ctx, void *state, double *buf, size_t count) {
     if (batch_count > 0) {
         pfn_cuStreamSynchronize(c->streams[s->stream_idx]);
 
+        QueryPerformanceCounter(&qt1);
+
         double norm = 1.0 / (double)s->fft_size;
         int total_samples = batch_count * P;
         for (int i = 0; i < total_samples; i++)
@@ -3661,7 +3702,11 @@ int gpu_cuda_conv_finalize(void *ctx, void *state, double *buf, size_t count) {
         memcpy(&s->work_fifo[fifo_len], s->h_staging,
                (size_t)total_samples * sizeof(double));
         fifo_len += total_samples;
+    } else {
+        QueryPerformanceCounter(&qt1);
     }
+
+    QueryPerformanceCounter(&qt2);
 
     /* Drain exactly count to buf */
     if ((size_t)fifo_len >= count) {
@@ -3686,6 +3731,22 @@ int gpu_cuda_conv_finalize(void *ctx, void *state, double *buf, size_t count) {
             memcpy(buf, s->work_fifo, (size_t)fifo_len * sizeof(double));
         s->fifo_avail = 0;
         s->fifo_read = 0;
+    }
+
+    QueryPerformanceCounter(&qt3);
+    {
+        static volatile LONG s_log_count = 0;
+        if (InterlockedIncrement(&s_log_count) <= 5 ||
+            (s_log_count % 100) == 0) {
+            double t_sync   = (double)(qt1.QuadPart - qt0.QuadPart) * 1000.0 / (double)qf.QuadPart;
+            double t_norm   = (double)(qt2.QuadPart - qt1.QuadPart) * 1000.0 / (double)qf.QuadPart;
+            double t_drain  = (double)(qt3.QuadPart - qt2.QuadPart) * 1000.0 / (double)qf.QuadPart;
+            char msg[256];
+            sprintf_s(msg, sizeof(msg),
+                "conv_finalize[s%d]: sync=%.2f norm=%.2f drain=%.2fms (parts=%d)",
+                s->stream_idx, t_sync, t_norm, t_drain, batch_count);
+            trellis_log_c(msg);
+        }
     }
     return 0;
 }
