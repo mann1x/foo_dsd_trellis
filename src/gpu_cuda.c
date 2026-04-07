@@ -37,6 +37,14 @@ typedef void          *CUfunction;
 typedef unsigned long long CUdeviceptr;
 typedef void          *CUstream;
 typedef void          *CUevent;
+typedef void          *CUgraph;
+typedef void          *CUgraphExec;
+
+/* Stream capture mode (cuStreamBeginCapture). Use THREAD_LOCAL so other
+ * threads' CUDA work on the same context isn't accidentally captured. */
+#define CU_STREAM_CAPTURE_MODE_GLOBAL       0
+#define CU_STREAM_CAPTURE_MODE_THREAD_LOCAL 1
+#define CU_STREAM_CAPTURE_MODE_RELAXED      2
 
 #define CUDA_SUCCESS   0
 #define CU_CTX_SCHED_AUTO 0
@@ -88,6 +96,15 @@ DECL_PFN(CUresult, cuEventCreate, CUevent *, unsigned int);
 DECL_PFN(CUresult, cuEventDestroy, CUevent);
 DECL_PFN(CUresult, cuEventRecord, CUevent, CUstream);
 DECL_PFN(CUresult, cuEventSynchronize, CUevent);
+/* CUDA Graphs (since CUDA 10) — used to collapse the conv chunk loop
+ * into a single dispatch. cuGraphInstantiate signature uses the v2 form
+ * (CUgraphExec*, CUgraph, unsigned long long flags). */
+DECL_PFN(CUresult, cuStreamBeginCapture, CUstream, int /* CUstreamCaptureMode */);
+DECL_PFN(CUresult, cuStreamEndCapture, CUstream, CUgraph *);
+DECL_PFN(CUresult, cuGraphInstantiate, CUgraphExec *, CUgraph, unsigned long long);
+DECL_PFN(CUresult, cuGraphLaunch, CUgraphExec, CUstream);
+DECL_PFN(CUresult, cuGraphExecDestroy, CUgraphExec);
+DECL_PFN(CUresult, cuGraphDestroy, CUgraph);
 
 /* cuFFT function pointers (delay-loaded from cufft64_*.dll) */
 typedef int (*PFN_cufftPlan1d)(cufftHandle *, int, int, int);
@@ -144,6 +161,14 @@ static PFN_cuEventCreate       pfn_cuEventCreate;
 static PFN_cuEventDestroy      pfn_cuEventDestroy;
 static PFN_cuEventRecord       pfn_cuEventRecord;
 static PFN_cuEventSynchronize  pfn_cuEventSynchronize;
+/* CUDA Graphs (optional — only used by gpu_cuda_conv_launch). */
+static PFN_cuStreamBeginCapture pfn_cuStreamBeginCapture;
+static PFN_cuStreamEndCapture   pfn_cuStreamEndCapture;
+static PFN_cuGraphInstantiate   pfn_cuGraphInstantiate;
+static PFN_cuGraphLaunch        pfn_cuGraphLaunch;
+static PFN_cuGraphExecDestroy   pfn_cuGraphExecDestroy;
+static PFN_cuGraphDestroy       pfn_cuGraphDestroy;
+static bool                     g_cuda_graphs_available = false;
 
 /* Extended seed device buffer (used by DAS and hybrid paths) */
 static CUdeviceptr s_d_ext_seed = 0;
@@ -450,6 +475,31 @@ bool gpu_cuda_probe(void) {
         pfn_cuEventDestroy = (PFN_cuEventDestroy)GetProcAddress(g_nvcuda, "cuEventDestroy");
     pfn_cuEventRecord = (PFN_cuEventRecord)GetProcAddress(g_nvcuda, "cuEventRecord");
     pfn_cuEventSynchronize = (PFN_cuEventSynchronize)GetProcAddress(g_nvcuda, "cuEventSynchronize");
+
+    /* CUDA Graphs (optional — only used by conv_launch). All since CUDA 10.
+     * cuGraphInstantiate has v2 / v3 variants depending on driver; we use
+     * the original (no node-error params) which is exported as plain name
+     * since CUDA 12.x. Older drivers exported it as cuGraphInstantiate_v2. */
+    pfn_cuStreamBeginCapture = (PFN_cuStreamBeginCapture)
+        GetProcAddress(g_nvcuda, "cuStreamBeginCapture_v2");
+    if (!pfn_cuStreamBeginCapture)
+        pfn_cuStreamBeginCapture = (PFN_cuStreamBeginCapture)
+            GetProcAddress(g_nvcuda, "cuStreamBeginCapture");
+    pfn_cuStreamEndCapture = (PFN_cuStreamEndCapture)
+        GetProcAddress(g_nvcuda, "cuStreamEndCapture");
+    /* Use the 3-arg WithFlags variant only — the older 5-arg variants
+     * have a different signature and would crash if called via this typedef. */
+    pfn_cuGraphInstantiate = (PFN_cuGraphInstantiate)
+        GetProcAddress(g_nvcuda, "cuGraphInstantiateWithFlags");
+    pfn_cuGraphLaunch = (PFN_cuGraphLaunch)
+        GetProcAddress(g_nvcuda, "cuGraphLaunch");
+    pfn_cuGraphExecDestroy = (PFN_cuGraphExecDestroy)
+        GetProcAddress(g_nvcuda, "cuGraphExecDestroy");
+    pfn_cuGraphDestroy = (PFN_cuGraphDestroy)
+        GetProcAddress(g_nvcuda, "cuGraphDestroy");
+    g_cuda_graphs_available = (pfn_cuStreamBeginCapture && pfn_cuStreamEndCapture
+        && pfn_cuGraphInstantiate && pfn_cuGraphLaunch
+        && pfn_cuGraphExecDestroy && pfn_cuGraphDestroy);
 
     if (!ok) { g_available = false; return false; }
 
@@ -3161,6 +3211,19 @@ struct gpu_conv_state {
      * Avoids 1 cuMemcpyDtoHAsync per chunk (~30us each, 67 saved at DSD512). */
     CUdeviceptr    d_output_flat;  /* device: max_batch*P doubles */
     size_t         output_flat_cap;/* capacity in doubles */
+    /* CUDA Graph capture state — collapses the per-chunk dispatch loop
+     * into a single replayable launch. Only used when np divides batch_count
+     * (otherwise the captured fdl_pos sequence wouldn't match subsequent
+     * batches). The graph encodes upload + chunk loop + download.
+     *
+     * Two-slot cache: batch_count oscillates between two adjacent values
+     * (e.g. 68/69 at DSD512) due to leftover sample carry-over between
+     * calls. Caching both avoids re-capturing every other batch. */
+#define CONV_GRAPH_CACHE_N 4
+    CUgraphExec    graph_exec[CONV_GRAPH_CACHE_N];
+    int            graph_valid[CONV_GRAPH_CACHE_N];
+    int            graph_batch_count[CONV_GRAPH_CACHE_N];
+    int            graph_init_fdl_pos[CONV_GRAPH_CACHE_N];
 };
 
 int gpu_cuda_conv_max_partitions(void *ctx, uint32_t signal_rate, int P,
@@ -3654,24 +3717,98 @@ int gpu_cuda_conv_launch(void *ctx, void *state, double *buf, size_t count) {
 
     QueryPerformanceCounter(&qt2);
 
-    /* Upload + queue kernels on this channel's stream — NO SYNC */
     CUstream stream = c->streams[s->stream_idx];
-    pfn_cuMemcpyHtoDAsync(s->d_batch_in, s->h_batch_in,
-                           input_doubles * sizeof(double), stream);
+    int np = s->num_partitions;
+    int graph_compatible =
+        (g_cuda_graphs_available
+         && np > 0
+         && (batch_count % np) == 0  /* fdl_pos sequence repeats per batch */
+         && batch_count > 0);
 
-    QueryPerformanceCounter(&qt3);
-
-    for (int k = 0; k < batch_count; k++) {
-        CUdeviceptr d_src = s->d_batch_in +
-                            (CUdeviceptr)((size_t)k * P * sizeof(double));
-        gpu_conv_do_partition_dev(c, s, d_src, k);
+    /* Look for an existing cached graph matching this (batch_count, fdl_pos). */
+    int slot = -1;
+    if (graph_compatible) {
+        for (int i = 0; i < CONV_GRAPH_CACHE_N; i++) {
+            if (s->graph_valid[i]
+                && s->graph_batch_count[i] == batch_count
+                && s->graph_init_fdl_pos[i] == s->fdl_pos) {
+                slot = i;
+                break;
+            }
+        }
     }
 
-    /* Single batch-end DtoH: download all batch_count*P doubles in one
-     * async copy. Replaces 67 per-chunk DtoH memcpys (~30us each). */
-    pfn_cuMemcpyDtoHAsync(s->h_staging, s->d_output_flat,
-                           (size_t)batch_count * P * sizeof(double), stream);
+    if (slot >= 0) {
+        /* Hot path — single dispatch replays the entire upload + chunk
+         * loop + download as one captured graph. */
+        pfn_cuGraphLaunch(s->graph_exec[slot], stream);
+        s->fdl_pos = (s->fdl_pos + batch_count) % np;
+        if (s->fdl_filled < np) s->fdl_filled = np;  /* graph assumes warm */
+    } else {
+        /* Cold path — execute the loop normally, capturing if compatible.
+         * Find a free cache slot (or evict the oldest by linear order). */
+        int free_slot = -1;
+        if (graph_compatible) {
+            for (int i = 0; i < CONV_GRAPH_CACHE_N; i++) {
+                if (!s->graph_valid[i]) { free_slot = i; break; }
+            }
+            if (free_slot < 0) {
+                /* All slots used and none match — evict slot 0 */
+                free_slot = 0;
+                pfn_cuGraphExecDestroy(s->graph_exec[free_slot]);
+                s->graph_exec[free_slot] = NULL;
+                s->graph_valid[free_slot] = 0;
+            }
+        }
 
+        int do_capture = graph_compatible && (free_slot >= 0);
+        int capture_fdl_pos = s->fdl_pos;
+        CUgraph captured_graph = NULL;
+
+        if (do_capture) {
+            if (pfn_cuStreamBeginCapture(stream,
+                    CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) != CUDA_SUCCESS) {
+                do_capture = 0;
+            }
+        }
+
+        pfn_cuMemcpyHtoDAsync(s->d_batch_in, s->h_batch_in,
+                               input_doubles * sizeof(double), stream);
+
+        for (int k = 0; k < batch_count; k++) {
+            CUdeviceptr d_src = s->d_batch_in +
+                                (CUdeviceptr)((size_t)k * P * sizeof(double));
+            gpu_conv_do_partition_dev(c, s, d_src, k);
+        }
+
+        pfn_cuMemcpyDtoHAsync(s->h_staging, s->d_output_flat,
+                               (size_t)batch_count * P * sizeof(double), stream);
+
+        if (do_capture) {
+            CUresult rc_end = pfn_cuStreamEndCapture(stream, &captured_graph);
+            if (rc_end == CUDA_SUCCESS && captured_graph) {
+                CUgraphExec exec = NULL;
+                if (pfn_cuGraphInstantiate(&exec, captured_graph, 0ULL) == CUDA_SUCCESS) {
+                    s->graph_exec[free_slot] = exec;
+                    s->graph_valid[free_slot] = 1;
+                    s->graph_batch_count[free_slot] = batch_count;
+                    s->graph_init_fdl_pos[free_slot] = capture_fdl_pos;
+                    /* Replay the just-captured graph to actually execute. */
+                    pfn_cuGraphLaunch(exec, stream);
+                    char msg[160];
+                    sprintf_s(msg, sizeof(msg),
+                        "conv: graph captured [s%d] slot=%d batch_count=%d np=%d init_fdl=%d",
+                        s->stream_idx, free_slot, batch_count, np, capture_fdl_pos);
+                    trellis_log_c(msg);
+                }
+                pfn_cuGraphDestroy(captured_graph);
+            } else if (captured_graph) {
+                pfn_cuGraphDestroy(captured_graph);
+            }
+        }
+    }
+
+    QueryPerformanceCounter(&qt3);
     QueryPerformanceCounter(&qt4);
     {
         static volatile LONG s_log_count = 0;
@@ -3679,15 +3816,16 @@ int gpu_cuda_conv_launch(void *ctx, void *state, double *buf, size_t count) {
             (s_log_count % 100) == 0) {
             double t_setup  = (double)(qt1.QuadPart - qt0.QuadPart) * 1000.0 / (double)qf.QuadPart;
             double t_memcpy = (double)(qt2.QuadPart - qt1.QuadPart) * 1000.0 / (double)qf.QuadPart;
-            double t_upload = (double)(qt3.QuadPart - qt2.QuadPart) * 1000.0 / (double)qf.QuadPart;
-            double t_queue  = (double)(qt4.QuadPart - qt3.QuadPart) * 1000.0 / (double)qf.QuadPart;
+            double t_dispatch = (double)(qt3.QuadPart - qt2.QuadPart) * 1000.0 / (double)qf.QuadPart;
             char msg[256];
             sprintf_s(msg, sizeof(msg),
-                "conv_launch[s%d]: setup=%.2f memcpy=%.2f upload=%.2f queue=%.2fms (parts=%d)",
-                s->stream_idx, t_setup, t_memcpy, t_upload, t_queue, batch_count);
+                "conv_launch[s%d]: setup=%.2f memcpy=%.2f dispatch=%.2fms (parts=%d %s)",
+                s->stream_idx, t_setup, t_memcpy, t_dispatch, batch_count,
+                slot >= 0 ? "GRAPH" : "loop");
             trellis_log_c(msg);
         }
     }
+    (void)qt4;
     return 0;
 }
 
@@ -3775,6 +3913,14 @@ void gpu_cuda_conv_free(void *ctx, void *state) {
     if (!s) return;
     (void)ctx;
 
+    if (pfn_cuGraphExecDestroy) {
+        for (int i = 0; i < CONV_GRAPH_CACHE_N; i++) {
+            if (s->graph_exec[i]) {
+                pfn_cuGraphExecDestroy(s->graph_exec[i]);
+                s->graph_exec[i] = NULL;
+            }
+        }
+    }
     if (s->fft_plan && pfn_cufftDestroy)
         pfn_cufftDestroy(s->fft_plan);
     if (s->d_ir_freq) pfn_cuMemFree(s->d_ir_freq);
