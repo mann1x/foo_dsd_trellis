@@ -17,6 +17,8 @@
 #include <windows.h>
 #include <stdio.h>
 
+extern void trellis_log_c(const char *msg);
+
 /* ─── Path-adaptive SDM configuration table ───
  * Optimal NTF filter, limiter, candidates, and latency per rate conversion path.
  * Derived from comprehensive sweep (1,152 measurements, 2026-03-14).
@@ -360,6 +362,25 @@ int engine_channel_init(engine_channel_t *eng, int channel,
                     int nch = eng->num_channels > 1 ? eng->num_channels : 2;
                     if (nch > 2)
                         cap = (int)(((int64_t)cap * 2) / nch);
+                    /* User override (expert mode): if non-zero, replace
+                     * the auto-calibrated cap entirely. Clamped to the
+                     * absolute hard limit CONV_MAX_IR_TAPS. The user is
+                     * responsible for ensuring their override fits within
+                     * real-time budget — they can stutter their playback
+                     * with an unsafe cap. Logged so the user can see
+                     * what's actually being used. */
+                    if (cfg->conv_max_taps_override > 0) {
+                        int ovr = cfg->conv_max_taps_override;
+                        if (ovr > CONV_MAX_IR_TAPS) ovr = CONV_MAX_IR_TAPS;
+                        char msg[160];
+                        snprintf(msg, sizeof(msg),
+                                 "conv: cap override: auto=%d → user=%d taps "
+                                 "(rate=%u, nch=%d, sdm=%s)",
+                                 cap, ovr, fs_out, nch,
+                                 trellis ? "Trellis" : "PreCorr");
+                        trellis_log_c(msg);
+                        cap = ovr;
+                    }
                     cs->max_ir_taps = cap;
                 }
                 if (conv_load_ir(cs, cfg->conv_paths[channel]) == 0) {

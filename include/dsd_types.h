@@ -403,6 +403,12 @@ typedef struct {
     bool      conv_gpu;                                /* Use GPU for convolution (CUDA) */
     int8_t    conv_budget;                             /* GPU budget: 0=High, 1=Medium, 2=Low */
     char      conv_paths[CONV_MAX_CHANNELS][CONV_PATH_MAX]; /* Per-channel WAV IR paths */
+    /* v19: Custom IR tap cap override (expert mode).
+     * 0 = use auto-calibrated cap (default).
+     * >0 = explicit cap in post-resample taps. Lets the user push above
+     *      the auto-calibrated safe value at their own risk. The user
+     *      can stutter their playback with unsafe caps. */
+    int32_t   conv_max_taps_override;
 } dsd_config_t;
 
 /* Trellis parallel mode (DAS segment count).
@@ -431,7 +437,7 @@ typedef struct {
 #define CONV_BUDGET_LOW    2   /* ~25% of max partitions */
 
 /* Config serialization version */
-#define DSD_CONFIG_VERSION 18
+#define DSD_CONFIG_VERSION 19
 
 /* FIR gain Auto sentinel and default */
 #define FIR_GAIN_AUTO    (-128)
@@ -522,6 +528,8 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     cfg->conv_gpu = true;      /* GPU convolution on by default */
     cfg->conv_budget = CONV_BUDGET_HIGH;
     memset(cfg->conv_paths, 0, sizeof(cfg->conv_paths));
+    /* v19: 0 = auto-calibrated cap */
+    cfg->conv_max_taps_override = 0;
 }
 
 #endif /* DSD_TYPES_H */

@@ -55,6 +55,7 @@
 #define IDC_BTN_CONV_CLR_5          1061
 #define IDC_CHECK_CONV_GPU          1062
 #define IDC_COMBO_CONV_BUDGET       1063
+#define IDC_EDIT_CONV_CAP_OVERRIDE  1064  /* expert mode: custom IR tap cap, 0=auto */
 
 // Next default values for new objects
 //

@@ -8,6 +8,7 @@
 
 #include <string.h>
 #include "../include/dsd_types.h"
+#include "../include/convolution.h"  /* CONV_MAX_IR_TAPS */
 
 /* Forward declaration */
 void config_validate(dsd_config_t *cfg);
@@ -130,9 +131,14 @@ static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
     + CONV_MAX_CHANNELS * CONV_PATH_MAX      /* conv_paths */ \
     )
 
+/* v19: v18 + conv_max_taps_override(4) */
+#define CONFIG_V19_SIZE (CONFIG_V18_SIZE \
+    + 4                                      /* conv_max_taps_override */ \
+    )
+
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
-    if (buf_size < CONFIG_V18_SIZE)
+    if (buf_size < CONFIG_V19_SIZE)
         return 0;
 
     size_t pos = 0;
@@ -221,6 +227,9 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
         memcpy(buf + pos, cfg->conv_paths[i], CONV_PATH_MAX);
         pos += CONV_PATH_MAX;
     }
+
+    /* v19: custom IR tap cap override */
+    pos = write_i32(buf, pos, cfg->conv_max_taps_override);
 
     return pos;
 }
@@ -410,6 +419,19 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
                         cfg->conv_paths[i][CONV_PATH_MAX - 1] = '\0';
                         pos += CONV_PATH_MAX;
                     }
+                }
+            }
+            /* Version 19 adds custom IR tap cap override */
+            if (version >= 19) {
+                if (pos + 4 <= buf_size) {
+                    int32_t v;
+                    pos = read_i32(buf, pos, &v);
+                    cfg->conv_max_taps_override = v;
+                    /* Sanity clamp: 0 (auto) or [4096..CONV_MAX_IR_TAPS] */
+                    if (cfg->conv_max_taps_override != 0 &&
+                        (cfg->conv_max_taps_override < 4096 ||
+                         cfg->conv_max_taps_override > CONV_MAX_IR_TAPS))
+                        cfg->conv_max_taps_override = 0;
                 }
             }
         } else {

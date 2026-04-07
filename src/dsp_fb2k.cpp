@@ -815,6 +815,12 @@ private:
             cb.SetCurSel(sel);
         }
         {
+            /* Custom IR cap override (expert mode) — 0 means auto */
+            char buf[16];
+            sprintf_s(buf, sizeof(buf), "%d", m_cfg.conv_max_taps_override);
+            ::uSetDlgItemText(*this, IDC_EDIT_CONV_CAP_OVERRIDE, buf);
+        }
+        {
             static const int edit_ids[CONV_MAX_CHANNELS] = {
                 IDC_EDIT_CONV_0, IDC_EDIT_CONV_1, IDC_EDIT_CONV_2,
                 IDC_EDIT_CONV_3, IDC_EDIT_CONV_4, IDC_EDIT_CONV_5
@@ -1883,6 +1889,17 @@ private:
         m_cfg.conv_gpu = IsDlgButtonChecked(IDC_CHECK_CONV_GPU) == BST_CHECKED;
         m_cfg.conv_budget = (int8_t)CComboBox(GetDlgItem(IDC_COMBO_CONV_BUDGET)).GetCurSel();
         if (m_cfg.conv_budget < 0 || m_cfg.conv_budget > 2) m_cfg.conv_budget = 0;
+        {
+            /* Custom IR cap override (expert mode) — 0 means auto */
+            pfc::string8 buf;
+            ::uGetDlgItemText(*this, IDC_EDIT_CONV_CAP_OVERRIDE, buf);
+            int v = atoi(buf.get_ptr());
+            if (v < 0) v = 0;
+            if (v > CONV_MAX_IR_TAPS) v = CONV_MAX_IR_TAPS;
+            /* Anything < 4096 (other than 0) is too small to be useful */
+            if (v != 0 && v < 4096) v = 4096;
+            m_cfg.conv_max_taps_override = v;
+        }
         /* conv_paths are set directly by browse/clear handlers */
 
         config_validate(&m_cfg);
