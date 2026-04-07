@@ -65,13 +65,14 @@ static int choose_partition_size(int ir_length) {
  * To increase GPU% from measured to 75%, reduce P accordingly.
  * For DSD64: need 75/12 = 6.25× more work → P/sqrt(6.25) = P/2.5 → P=13107 → P=8192
  * For DSD512: need 75/49 = 1.53× more work → P/sqrt(1.53) = P/1.24 → P=26442 → P=16384 */
+/* GPU partition size: prefer large P to minimize kernel launches/sec.
+ * Small P = more FFTs/sec + more MulAcc iterations = slower.
+ * P=16384 is optimal for DSD256/512 (1378 ops/sec vs 5512 at P=4096).
+ * Only use smaller P for very short IRs where P > ir_length. */
 static int choose_partition_size_gpu(int ir_length) {
-    if (ir_length <= 4096)    return 1024;
-    if (ir_length <= 32768)   return 2048;
-    if (ir_length <= 131072)  return 4096;    /* DSD64: 262K/4096 = 64 parts */
-    if (ir_length <= 524288)  return 8192;    /* DSD128: 524K/8192 = 64 parts */
-    if (ir_length <= 1048576) return 16384;   /* DSD256: 1M/16384 = 64 parts */
-    return 16384;                              /* DSD512: 2M/16384 = 128 parts */
+    if (ir_length <= 2048)    return 1024;
+    if (ir_length <= 8192)    return 4096;
+    return 16384;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -539,14 +540,36 @@ int conv_load_ir(conv_state_t *state, const char *wav_path) {
     }
 
     /* Apply budget-based IR truncation.
-     * Truncates the time-domain IR tail before partitioning.
-     * The truncated IR is still a valid filter — it just has
-     * shorter impulse response (less room reverb tail). */
+     * For linear-phase filters, the main impulse is at the CENTER.
+     * Naive front-truncation would cut the impulse entirely.
+     * Instead: find the peak, center the truncation window on it,
+     * then shift the windowed IR to start at index 0.
+     * This preserves the main impulse while trimming pre/post-ringing. */
     if (state->max_ir_taps > 0 && ir_resampled > state->max_ir_taps) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "conv: budget truncation: %d → %d taps",
-                 ir_resampled, state->max_ir_taps);
+        /* Find peak index */
+        int peak_idx = 0;
+        double peak_val = 0.0;
+        for (int i = 0; i < ir_resampled; i++) {
+            double av = fabs(ir_d[i]);
+            if (av > peak_val) { peak_val = av; peak_idx = i; }
+        }
+        /* Center window on peak */
+        int half = state->max_ir_taps / 2;
+        int start = peak_idx - half;
+        if (start < 0) start = 0;
+        if (start + state->max_ir_taps > ir_resampled)
+            start = ir_resampled - state->max_ir_taps;
+        if (start < 0) start = 0;
+
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "conv: budget truncation: %d → %d taps (peak@%d, window [%d..%d])",
+                 ir_resampled, state->max_ir_taps, peak_idx, start,
+                 start + state->max_ir_taps - 1);
         trellis_log_c(msg);
+
+        if (start > 0)
+            memmove(ir_d, ir_d + start, (size_t)state->max_ir_taps * sizeof(double));
         ir_resampled = state->max_ir_taps;
     }
 
@@ -698,6 +721,32 @@ void conv_process(conv_state_t *state, double *buf, size_t count) {
     }
 
     /* CPU path */
+    if (!state->ch.ir) return;
+    if (state->dec_ratio > 1)
+        conv_process_decimated(state, buf, count);
+    else
+        conv_process_direct(state, buf, count);
+}
+
+/* Pipelined launch: queue GPU work async, return immediately. */
+void conv_launch(conv_state_t *state, double *buf, size_t count) {
+    if (!state || !state->active) return;
+    if (state->use_gpu && state->gpu_conv) {
+        gpu_conv_launch((gpu_context_t *)state->gpu_ctx,
+                         (gpu_conv_state_t *)state->gpu_conv, buf, count);
+    }
+    /* CPU path: defer all work to finalize (no async benefit on CPU) */
+}
+
+/* Pipelined finalize: sync GPU work and drain output, OR run CPU conv. */
+void conv_finalize(conv_state_t *state, double *buf, size_t count) {
+    if (!state || !state->active) return;
+    if (state->use_gpu && state->gpu_conv) {
+        gpu_conv_finalize((gpu_context_t *)state->gpu_ctx,
+                           (gpu_conv_state_t *)state->gpu_conv, buf, count);
+        return;
+    }
+    /* CPU path: run conv now */
     if (!state->ch.ir) return;
     if (state->dec_ratio > 1)
         conv_process_decimated(state, buf, count);

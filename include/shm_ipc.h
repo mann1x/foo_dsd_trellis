@@ -65,7 +65,15 @@ typedef struct {
 
     /* Total mapping size (for validation) */
     uint32_t        total_size;
+
+    /* Log ring (worker → DLL, SPSC) */
+    volatile LONG   log_write_pos;
+    volatile LONG   log_read_pos;
+    uint32_t        log_ring_offset;
+    int             log_ring_capacity;     /* power of 2, 0 = disabled */
 } shm_control_t;
+
+#define SHM_LOG_RING_SIZE  32768   /* 32KB log ring */
 
 /* Handle for an active IPC connection (one side) */
 typedef struct {
@@ -76,6 +84,7 @@ typedef struct {
     shm_control_t  *ctrl;              /* -> base + 0 */
     unsigned char  *in_ring;           /* -> base + in_ring_offset */
     unsigned char  *out_ring;          /* -> base + out_ring_offset */
+    unsigned char  *log_ring;          /* -> base + log_ring_offset */
 } shm_ipc_t;
 
 /* ─── Ring buffer ops (inline, work on shared memory indices) ─── */

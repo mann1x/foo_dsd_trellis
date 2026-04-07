@@ -41,15 +41,35 @@ void capture_write_dsd(float **ch_out, size_t count, int channels,
 volatile LONG g_gpu_sdm_override = 0;
 volatile LONG g_gpu_sdm_override_valid = 0;
 
-/* trellis_log_c — required by linked C modules */
+/* trellis_log_c — writes to SHM log ring (forwarded to DLL's plugin log).
+ * Falls back to temp file if SHM not yet available. */
 static FILE *g_log_file = NULL;
+static shm_ipc_t *g_log_ipc = NULL;  /* set after shm_ipc_open */
 
 void trellis_log_c(const char *msg) {
     SYSTEMTIME st;
     GetLocalTime(&st);
+
+    /* Format timestamped message */
+    char line[480];
+    int len = snprintf(line, sizeof(line), "[%02d:%02d:%02d.%03d] %s",
+                       st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
+    if (len < 0) len = 0;
+    if (len >= (int)sizeof(line)) len = (int)sizeof(line) - 1;
+    line[len] = '\n';
+    len++;
+
+    /* Write to SHM log ring if available */
+    if (g_log_ipc && g_log_ipc->log_ring && g_log_ipc->ctrl->log_ring_capacity > 0) {
+        shm_ring_write(g_log_ipc->log_ring, g_log_ipc->ctrl->log_ring_capacity,
+                        &g_log_ipc->ctrl->log_write_pos,
+                        &g_log_ipc->ctrl->log_read_pos,
+                        line, len);
+    }
+
+    /* Also write to temp file as fallback/debug */
     if (g_log_file) {
-        fprintf(g_log_file, "[%02d:%02d:%02d.%03d] %s\n",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
+        fwrite(line, 1, (size_t)len, g_log_file);
         fflush(g_log_file);
     }
 }
@@ -58,12 +78,10 @@ void trellis_log_c(const char *msg) {
 bool g_log_enabled = true;
 
 static void log_open(const char *suffix) {
-    /* Write log to TEMP dir (always writable) */
     char temp[MAX_PATH];
     GetTempPathA(MAX_PATH, temp);
     char path[MAX_PATH];
     sprintf_s(path, sizeof(path), "%sfoo_dsd_trellis_worker_%s.log", temp, suffix);
-    /* Share read access so logs can be read while worker is running */
     g_log_file = _fsopen(path, "a", _SH_DENYWR);
     if (g_log_file)
         fprintf(g_log_file, "--- worker started ---\n");
@@ -88,6 +106,9 @@ int main(int argc, char *argv[]) {
         trellis_log_c(msg);
         return 2;
     }
+
+    /* Enable SHM log ring — all trellis_log_c calls now go to DLL's log */
+    g_log_ipc = &ipc;
 
     shm_control_t *ctrl = ipc.ctrl;
     int channels = ctrl->channels;

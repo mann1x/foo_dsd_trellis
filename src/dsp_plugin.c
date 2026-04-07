@@ -546,7 +546,45 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     if (!s->channels)
         return -1;
 
+    /* Create GPU context BEFORE channel init so convolution can use it
+     * immediately (avoids wasteful CPU conv → GPU conv re-init cycle
+     * that causes startup stutter at DSD512). */
+    {
+        extern void trellis_log_c(const char *);
+        char msg[256];
+        sprintf_s(msg, sizeof(msg),
+            "GPU init check: enabled=%d gpu_ptr=%p backend=%d",
+            s->config.gpu_enabled, (void*)s->gpu, s->config.gpu_backend);
+        trellis_log_c(msg);
+    }
+    if (s->config.gpu_enabled && !s->gpu) {
+        extern void trellis_log_c(const char *);
+        bool avail = gpu_available((gpu_backend_t)s->config.gpu_backend);
+        {
+            char msg[128];
+            sprintf_s(msg, sizeof(msg), "GPU available(%d) = %d", s->config.gpu_backend, avail);
+            trellis_log_c(msg);
+        }
+        if (avail) {
+            s->gpu = gpu_create((gpu_backend_t)s->config.gpu_backend);
+            if (s->gpu) {
+                gpu_info_t ginfo;
+                gpu_get_info(&ginfo);
+                const char *be_name =
+                    ginfo.backend == GPU_BACKEND_CUDA ? "CUDA" :
+                    gpu_dx12_probe() ? "DX12 Async Compute" : "DX11";
+                char gmsg[256];
+                sprintf_s(gmsg, sizeof(gmsg),
+                    "GPU created: %s, %s (%zu MB). "
+                    "Offloading: FIR, gain, boxcar, Trellis SDM parallel",
+                    be_name, ginfo.device_name, ginfo.vram_mb);
+                trellis_log_c(gmsg);
+            }
+        }
+    }
+
     for (int i = 0; i < num_channels; i++) {
+        s->channels[i].gpu = s->gpu;  /* set GPU before init so conv can use it */
         if (engine_channel_init(&s->channels[i], i, &s->config) != 0) {
             for (int j = 0; j < i; j++)
                 engine_channel_free(&s->channels[j]);
@@ -659,42 +697,7 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
     /* Reset worker log counter so tasks get logged on each engine init */
     threadpool_reset_log(s->pool);
 
-    /* Create GPU compute context if enabled */
-    {
-        extern void trellis_log_c(const char *);
-        char msg[256];
-        sprintf_s(msg, sizeof(msg),
-            "GPU init check: enabled=%d gpu_ptr=%p backend=%d",
-            s->config.gpu_enabled, (void*)s->gpu, s->config.gpu_backend);
-        trellis_log_c(msg);
-    }
-    /* Step 1: Create GPU context if not yet created */
-    if (s->config.gpu_enabled && !s->gpu) {
-        bool avail = gpu_available((gpu_backend_t)s->config.gpu_backend);
-        {
-            extern void log_ring_write(const char *);
-            char msg[128];
-            sprintf_s(msg, sizeof(msg), "GPU available(%d) = %d", s->config.gpu_backend, avail);
-            trellis_log_c(msg);
-        }
-        if (avail) {
-            s->gpu = gpu_create((gpu_backend_t)s->config.gpu_backend);
-            if (s->gpu) {
-                gpu_info_t ginfo;
-                gpu_get_info(&ginfo);
-                const char *be_name =
-                    ginfo.backend == GPU_BACKEND_CUDA ? "CUDA" :
-                    gpu_dx12_probe() ? "DX12 Async Compute" : "DX11";
-                char gmsg[256];
-                sprintf_s(gmsg, sizeof(gmsg),
-                    "GPU created: %s, %s (%zu MB). "
-                    "Offloading: FIR, gain, boxcar, Trellis SDM parallel",
-                    be_name, ginfo.device_name, ginfo.vram_mb);
-                trellis_log_c(gmsg);
-            }
-        }
-    }
-    /* Step 2: (Re-)configure GPU for current rate/SDM params.
+    /* (Re-)configure GPU for current rate/SDM params.
      * Runs every rate change even if GPU already existed. */
     if (s->gpu) {
         /* Upload FIR coefficients for current rate */
@@ -759,51 +762,9 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
                     s->channels[0].precorr.state_limit);
             }
         }
-        /* Assign GPU context to all engine channels */
-        for (int ch = 0; ch < s->num_channels; ch++) {
-            s->channels[ch].gpu = s->gpu;
-        }
-        /* Try GPU convolution now that GPU context is available */
-        for (int ch = 0; ch < s->num_channels; ch++) {
-            conv_state_t *cs = s->channels[ch].conv;
-            if (cs && !cs->use_gpu && s->config.conv_enabled
-                && s->config.conv_gpu && !s->channels[ch].fir_only) {
-                uint32_t fs = s->config.fs_out ? s->config.fs_out : dsd_rate;
-                conv_state_t *gpu_cs = (conv_state_t *)calloc(1, sizeof(conv_state_t));
-                bool gpu_ok = false;
-                if (gpu_cs && conv_init(gpu_cs, fs, fs) == 0) {
-                    gpu_cs->gpu_partitions = true;
-                    /* Budget controls IR tap count:
-                     * High=full, Medium=50%, Low=25%.
-                     * Estimate resampled length from rate ratio × original 4096 taps.
-                     * Truncation happens in conv_load_ir before partitioning. */
-                    {
-                        int est_taps = 4096 * (int)(fs / 44100);
-                        if (s->config.conv_budget == 1)
-                            gpu_cs->max_ir_taps = est_taps / 2;
-                        else if (s->config.conv_budget >= 2)
-                            gpu_cs->max_ir_taps = est_taps / 4;
-                    }
-                    if (conv_load_ir(gpu_cs, s->config.conv_paths[ch]) == 0) {
-                        int parts = gpu_cs->ir.num_partitions;
-                        gpu_cs->gpu_conv = gpu_conv_init(
-                            s->gpu, parts, gpu_cs->ir.partition_size,
-                            gpu_cs->ir.fft_size, gpu_cs->ir.freq_partitions);
-                        if (gpu_cs->gpu_conv) {
-                            gpu_cs->use_gpu = true;
-                            gpu_cs->gpu_ctx = s->gpu;
-                            gpu_cs->dec_ratio = 1;
-                            conv_free(cs); free(cs);
-                            s->channels[ch].conv = gpu_cs;
-                            gpu_ok = true;
-                        }
-                    }
-                }
-                if (!gpu_ok && gpu_cs) {
-                    conv_free(gpu_cs); free(gpu_cs);
-                }
-            }
-        }
+        /* GPU context already assigned to channels before engine_channel_init.
+         * Conv is initialized directly with GPU in engine_channel_init,
+         * no re-init needed. */
     }
 
     /* Create ML filters if enabled and ONNX Runtime is available.
@@ -994,7 +955,11 @@ static void migration_tick(plugin_state_t *s) {
     cpu_topology_t snap;
     cpuset_monitor_read(s->cpu_monitor, &snap);
 
-    /* Check load on cores assigned to workers */
+    /* Check load on cores assigned to workers.
+     * Must account for our own workers' contribution to avoid detecting
+     * self-load as external contention. Each worker generates ~30% avg
+     * load during DSD processing bursts. Only trigger migration when
+     * observed load exceeds our workers' expected contribution + margin. */
     int num_workers = threadpool_get_thread_count(s->pool);
     bool any_loaded = false;
     uint32_t loaded_cpuset = 0;
@@ -1002,8 +967,22 @@ static void migration_tick(plugin_state_t *s) {
     for (int i = 0; i < num_workers; i++) {
         uint32_t wid = threadpool_get_worker_cpuset(s->pool, i);
         if (wid == 0) continue;
+        /* Count how many of our workers share this core */
+        int our_count = 0;
+        for (int w = 0; w < num_workers; w++) {
+            if (threadpool_get_worker_cpuset(s->pool, w) == wid)
+                our_count++;
+        }
+        /* Dynamic threshold: self-load + 30% external margin.
+         * DSD512 workers generate 70-80% burst load per core.
+         * 1 worker/core → threshold 0.85  (our ~55% avg + 30% external)
+         * 2 workers/core → threshold 0.95 (capped) */
+        double self_load = our_count * 0.55;
+        double threshold = self_load + 0.30;
+        if (threshold > 0.95) threshold = 0.95;
+
         for (int j = 0; j < snap.count; j++) {
-            if (snap.entries[j].id == wid && snap.entries[j].load > 0.40) {
+            if (snap.entries[j].id == wid && snap.entries[j].load > threshold) {
                 if (snap.entries[j].load > loaded_pct) {
                     loaded_pct = snap.entries[j].load;
                     loaded_cpuset = wid;
@@ -1528,11 +1507,18 @@ size_t plugin_process(plugin_state_t *s,
             }
         }
 
-        /* Convolution filter (room correction) — after FIR phase, before SDM */
+        /* Convolution filter (room correction) — after FIR phase, before SDM.
+         * Pipelined: launch all channels async (parallel CUDA streams),
+         * then finalize all. GPU work for both channels overlaps. */
         for (int ch = 0; ch < num_channels; ch++) {
             if (s->channels[ch].conv)
-                conv_process(s->channels[ch].conv,
-                             s->channels[ch].fir_buf, fir_counts[ch]);
+                conv_launch(s->channels[ch].conv,
+                            s->channels[ch].fir_buf, fir_counts[ch]);
+        }
+        for (int ch = 0; ch < num_channels; ch++) {
+            if (s->channels[ch].conv)
+                conv_finalize(s->channels[ch].conv,
+                              s->channels[ch].fir_buf, fir_counts[ch]);
         }
 
         /* PreCorr: GPU FIR done above, now run GPU PreCorr SDM.
@@ -3159,7 +3145,7 @@ size_t plugin_process_pcm_to_pcm(plugin_state_t *s,
                                     if (parts > max_p) parts = max_p;
                                     cs->gpu_conv = gpu_conv_init(
                                         s->gpu, parts, cs->ir.partition_size,
-                                        cs->ir.fft_size, cs->ir.freq_partitions);
+                                        cs->ir.fft_size, cs->ir.freq_partitions, ch);
                                     if (cs->gpu_conv) {
                                         cs->use_gpu = true;
                                         cs->gpu_ctx = s->gpu;
@@ -3263,7 +3249,7 @@ size_t plugin_process_pcm_to_pcm(plugin_state_t *s,
                                     if (parts > max_p) parts = max_p;
                                     cs->gpu_conv = gpu_conv_init(
                                         s->gpu, parts, cs->ir.partition_size,
-                                        cs->ir.fft_size, cs->ir.freq_partitions);
+                                        cs->ir.fft_size, cs->ir.freq_partitions, ch);
                                     if (cs->gpu_conv) {
                                         cs->use_gpu = true;
                                         cs->gpu_ctx = s->gpu;

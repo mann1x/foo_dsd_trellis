@@ -2277,6 +2277,36 @@ public:
                 if (g_log_enabled && m_chunk_count <= 5)
                     trellis_log("drain: pcm_frames=%zu fs_in=%u fs_out=%u out_pcm_frames=%zu drain=%d",
                                 pcm_frames, fs_in, fs_out, out_pcm_frames, drain_bytes);
+                /* Drain worker log messages from SHM ring → plugin log */
+                if (m_worker.ipc.log_ring && m_worker.ipc.ctrl->log_ring_capacity > 0) {
+                    int log_avail = shm_ring_available(
+                        &m_worker.ipc.ctrl->log_write_pos,
+                        &m_worker.ipc.ctrl->log_read_pos);
+                    while (log_avail > 0) {
+                        char lbuf[512];
+                        int n = log_avail > (int)sizeof(lbuf) - 1
+                              ? (int)sizeof(lbuf) - 1 : log_avail;
+                        int got = shm_ring_read(m_worker.ipc.log_ring,
+                            m_worker.ipc.ctrl->log_ring_capacity,
+                            &m_worker.ipc.ctrl->log_write_pos,
+                            &m_worker.ipc.ctrl->log_read_pos,
+                            lbuf, n);
+                        if (got <= 0) break;
+                        lbuf[got] = '\0';
+                        /* Split by newlines, forward each line */
+                        char *p = lbuf, *nl;
+                        while ((nl = strchr(p, '\n')) != NULL) {
+                            *nl = '\0';
+                            if (p[0] != '\0')
+                                trellis_log("[W] %s", p);
+                            p = nl + 1;
+                        }
+                        log_avail = shm_ring_available(
+                            &m_worker.ipc.ctrl->log_write_pos,
+                            &m_worker.ipc.ctrl->log_read_pos);
+                    }
+                }
+
                 int out_avail = shm_ring_available(
                     &m_worker.ipc.ctrl->out_write_pos,
                     &m_worker.ipc.ctrl->out_read_pos);

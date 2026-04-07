@@ -40,7 +40,8 @@ int shm_ipc_create(shm_ipc_t *ipc, const char *name_suffix,
     int in_capacity = shm_next_pow2(in_bytes_raw);
     int out_capacity = shm_next_pow2(out_bytes_raw);
 
-    uint32_t in_offset = SHM_CTRL_SIZE;
+    uint32_t log_offset = SHM_CTRL_SIZE;
+    uint32_t in_offset = log_offset + SHM_LOG_RING_SIZE;
     uint32_t out_offset = in_offset + (uint32_t)in_capacity;
     uint32_t total = out_offset + (uint32_t)out_capacity;
 
@@ -79,6 +80,8 @@ int shm_ipc_create(shm_ipc_t *ipc, const char *name_suffix,
     ipc->ctrl->out_capacity = out_capacity;
     ipc->ctrl->in_ring_offset = in_offset;
     ipc->ctrl->out_ring_offset = out_offset;
+    ipc->ctrl->log_ring_offset = log_offset;
+    ipc->ctrl->log_ring_capacity = SHM_LOG_RING_SIZE;
     ipc->ctrl->total_size = total;
     ipc->ctrl->worker_status = SHM_STATUS_STARTING;
     ipc->ctrl->primed = 0;
@@ -93,6 +96,7 @@ int shm_ipc_create(shm_ipc_t *ipc, const char *name_suffix,
 
     ipc->in_ring = (unsigned char *)ipc->base + in_offset;
     ipc->out_ring = (unsigned char *)ipc->base + out_offset;
+    ipc->log_ring = (unsigned char *)ipc->base + log_offset;
 
     /* Create events */
     char evt_name[256];
@@ -161,6 +165,9 @@ int shm_ipc_open(shm_ipc_t *ipc, const char *name_suffix) {
     ipc->ctrl = (shm_control_t *)ipc->base;
     ipc->in_ring = (unsigned char *)ipc->base + ipc->ctrl->in_ring_offset;
     ipc->out_ring = (unsigned char *)ipc->base + ipc->ctrl->out_ring_offset;
+    ipc->log_ring = (ipc->ctrl->log_ring_offset && ipc->ctrl->log_ring_capacity)
+                  ? (unsigned char *)ipc->base + ipc->ctrl->log_ring_offset
+                  : NULL;
 
     /* Open events */
     char evt_name[256];

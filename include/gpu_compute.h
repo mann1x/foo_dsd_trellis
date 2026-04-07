@@ -269,15 +269,24 @@ int gpu_conv_max_partitions(gpu_context_t *ctx, uint32_t signal_rate,
 
 /* Initialize GPU convolution for one channel.
  * ir_freq: pre-FFT'd IR partitions (complex double, host memory)
+ * channel_idx: channel number — used to assign per-channel CUDA stream
  * Returns NULL on failure. */
 gpu_conv_state_t *gpu_conv_init(gpu_context_t *ctx, int num_partitions,
                                  int partition_size, int fft_size,
-                                 const void *ir_freq);
+                                 const void *ir_freq, int channel_idx);
 
 /* Process one block: convolve buf in-place at signal rate.
  * buf: fp64 samples (host), count samples. */
 int gpu_conv_process(gpu_context_t *ctx, void *state,
                       double *buf, size_t count);
+
+/* Pipelined convolution: launch queues GPU work without syncing,
+ * finalize syncs and drains output to buf. Multiple channels can
+ * launch in parallel (each on its own CUDA stream) before any sync,
+ * allowing GPU work to overlap. Caller must call finalize on the same
+ * state with same buf/count after launch. */
+int gpu_conv_launch(gpu_context_t *ctx, void *state, double *buf, size_t count);
+int gpu_conv_finalize(gpu_context_t *ctx, void *state, double *buf, size_t count);
 
 /* Free GPU convolution state. */
 void gpu_conv_free(gpu_context_t *ctx, void *state);

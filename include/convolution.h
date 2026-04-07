@@ -91,6 +91,14 @@ int conv_load_ir(conv_state_t *state, const char *wav_path);
  * count: number of samples */
 void conv_process(conv_state_t *state, double *buf, size_t count);
 
+/* Pipelined process: launch + finalize.
+ * For GPU conv: launch queues GPU work asynchronously (no sync), finalize
+ * syncs and drains output to buf. Multiple channels can launch in parallel
+ * (each on its own CUDA stream) before any sync, allowing overlap.
+ * For CPU conv: launch is no-op, finalize calls conv_process. */
+void conv_launch(conv_state_t *state, double *buf, size_t count);
+void conv_finalize(conv_state_t *state, double *buf, size_t count);
+
 /* Reset convolution state (seek / track change).
  * Clears delay lines and internal buffers but keeps the loaded IR. */
 void conv_reset(conv_state_t *state);

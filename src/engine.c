@@ -114,7 +114,9 @@ static const path_config_t *path_config_lookup(uint32_t fs_in, uint32_t fs_out) 
 
 int engine_channel_init(engine_channel_t *eng, int channel,
                         const dsd_config_t *cfg) {
+    void *saved_gpu = eng->gpu;  /* preserve GPU ptr set by caller */
     memset(eng, 0, sizeof(*eng));
+    eng->gpu = saved_gpu;
     eng->channel = channel;
 
     uint32_t fs_out = cfg->fs_out ? cfg->fs_out : cfg->fs_in;
@@ -284,21 +286,37 @@ int engine_channel_init(engine_channel_t *eng, int channel,
         conv_state_t *cs = (conv_state_t *)calloc(1, sizeof(conv_state_t));
         if (cs) {
             if (conv_init(cs, fs_out, conv_rate) == 0) {
+                /* GPU conv: use larger partition sizes and cap IR taps
+                 * for real-time performance. Must set AFTER conv_init
+                 * (which memsets) and BEFORE conv_load_ir. */
+                if (try_gpu) {
+                    cs->gpu_partitions = true;
+                    /* Budget-based IR tap cap for GPU real-time.
+                     * Conv + SDM must complete within batch duration (0.2s at DSD512).
+                     * Measured with single-upload batch on RTX 5080:
+                     *   DSD512 512K taps (32 parts): 0.211s — 5.5% over budget
+                     *   DSD512 256K taps (16 parts): ~0.18s — sufficient headroom
+                     * Medium/Low further reduce by 2x/4x. */
+                    int cap;
+                    if (fs_out >= 22000000)       cap = 1 << 18;  /* 256K — DSD512 */
+                    else if (fs_out >= 11000000)   cap = 1 << 19;  /* 512K — DSD256 */
+                    else                           cap = 1 << 20;  /* 1M — DSD64/128 */
+                    if (cfg->conv_budget == 1)      cap >>= 1;
+                    else if (cfg->conv_budget >= 2)  cap >>= 2;
+                    cs->max_ir_taps = cap;
+                }
                 if (conv_load_ir(cs, cfg->conv_paths[channel]) == 0) {
                     /* Try GPU convolution if available */
                     if (try_gpu && cs->ir.freq_partitions) {
-                        int max_parts = gpu_conv_max_partitions(
-                            eng->gpu, fs_out, cs->ir.partition_size,
-                            cfg->conv_budget);
                         int parts = cs->ir.num_partitions;
-                        if (parts > max_parts) parts = max_parts;
                         cs->gpu_conv = gpu_conv_init(
                             eng->gpu, parts, cs->ir.partition_size,
-                            cs->ir.fft_size, cs->ir.freq_partitions);
+                            cs->ir.fft_size, cs->ir.freq_partitions, channel);
                         if (cs->gpu_conv) {
                             cs->use_gpu = true;
                             cs->gpu_ctx = eng->gpu;
                             cs->dec_ratio = 1;
+                            /* FIFO pre-fill is done inside gpu_cuda_conv_init */
                         }
                     }
                     eng->conv = cs;
