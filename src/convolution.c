@@ -639,6 +639,22 @@ int conv_load_ir(conv_state_t *state, const char *wav_path) {
         ir_resampled = state->max_ir_taps;
     }
 
+    /* Compute IR group delay from impulse peak position.
+     * For a linear-phase IR (typical REW correction filters, generic FIRs),
+     * the peak coincides with the group delay. For asymmetric IRs this
+     * is an approximation but still better than no compensation.
+     * This is the per-sample delay between input and the strongest
+     * output response — what fb2k needs to A/V-sync-compensate. */
+    {
+        int gd_peak = 0;
+        double gd_peak_val = 0.0;
+        for (int i = 0; i < ir_resampled; i++) {
+            double av = fabs(ir_d[i]);
+            if (av > gd_peak_val) { gd_peak_val = av; gd_peak = i; }
+        }
+        state->latency_samples = gd_peak;
+    }
+
     /* Prepare FFT'd partitions */
     if (prepare_ir(&state->ir, ir_d, ir_resampled, state->conv_rate,
                     state->gpu_partitions) != 0) {
@@ -666,11 +682,15 @@ int conv_load_ir(conv_state_t *state, const char *wav_path) {
     /* Log success */
     {
         char msg[384];
+        double lat_ms = (state->ir.target_rate > 0)
+                        ? (double)state->latency_samples * 1000.0 / (double)state->ir.target_rate
+                        : 0.0;
         snprintf(msg, sizeof(msg),
-                 "conv: loaded '%s' — %d taps @ %u Hz, P=%d, %d partitions, dec=%dx",
+                 "conv: loaded '%s' — %d taps @ %u Hz, P=%d, %d partitions, dec=%dx, "
+                 "group delay=%d samples (%.2f ms)",
                  wav_path, state->ir.ir_length, state->ir.target_rate,
                  state->ir.partition_size, state->ir.num_partitions,
-                 state->dec_ratio);
+                 state->dec_ratio, state->latency_samples, lat_ms);
         trellis_log_c(msg);
     }
     return 0;

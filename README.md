@@ -236,11 +236,11 @@ A 16 GB GPU runs the maximum config at any rate.
 
 ### Tips for better IRs
 
-- **Match the IR sample rate to your DSD family**. A 44.1 kHz IR upsamples cleanly (power-of-2) to all DSD/44 rates; 48 kHz to DSD/48. Cross-family combinations work but go through polyphase resampling (small SINAD penalty).
-- **Always 32-bit float**. 16/24-bit IRs introduce quantization noise into the IR's frequency response.
+- **Match the IR sample rate to your DSD family**. A 44.1 kHz IR upsamples cleanly (power-of-2) to all DSD/44 rates; 48 kHz to DSD/48. Cross-family combinations work fine — the polyphase resampler is at 95-114 dB SINAD, which is well below all DSD noise floors, so the difference is not audible.
+- **32-bit float is best, 24-bit is also fine**. The polyphase resampler is fp64; integer formats are converted on load. 24-bit IRs sit at -144 dB which is below every DSD floor — inaudible. Avoid 16-bit (-96 dB), which is audibly suboptimal.
 - **Mono per channel**. Stereo IRs are silently truncated to channel 0 (left). Always export L and R separately.
 - **Linear-phase IRs are preferred** — the centered-window truncation logic preserves the impulse peak. Min-phase and mixed-phase IRs work but lose more of their late tail when truncated.
-- **Keep IR length sane**. Longer IRs are not always better. At DSD512+Trellis the time budget is 88 ms — anything longer than that gets centered-truncated. For long room reverbs, prefer DSD64/128 (708-1420 ms budget).
+- **Keep IR length sane**. Longer IRs are not always better. At DSD512+Trellis the time budget caps the resampled IR at 2M taps — anything longer than that gets centered-truncated. For long room reverbs, prefer DSD64/128 (much higher tap budget at lower playback rates).
 - **Watch peak gain in REW**. If the inverted room response shows > +20 dB peaks anywhere, the SDM will overload. Use REW's "Trim peaks" or reduce the target curve aggressiveness. The plugin auto-normalizes passband peak to 1.0 and clamps absolute peak at 10.0 for speaker safety.
 - **Other tools** (Acourate, Audiolense, Dirac Live) also export WAV IRs — same rules apply.
 
@@ -248,15 +248,15 @@ A 16 GB GPU runs the maximum config at any rate.
 
 - **"conv: input pre-truncated N → M taps" in the log**: your IR is longer than the time budget at the current rate. The plugin kept the centered window around the impulse peak. Use a lower DSD rate or PreCorr SDM if you want more of your IR preserved.
 - **Stereo WAV used as mono**: channel 1 (right) is silently dropped. Always export per-channel.
-- **PCM int format**: works but adds quantization noise. Always export as float32.
-- **Sample-rate mismatch**: a 96 kHz IR played at DSD512 (44.1k family) goes through cross-family polyphase resampling. Sounds fine but adds a small SINAD penalty. Match the IR rate to the DSD family.
+- **16-bit PCM IRs**: avoid them — quantization noise sits at -96 dB which is above the DSD64 noise floor. 24-bit and 32-bit float are both fine.
+- **Sample-rate mismatch**: cross-family combinations (e.g., a 96 kHz IR played at DSD512) go through polyphase resampling at 95-114 dB SINAD. Below every DSD floor, so not audible. Matching the IR rate to the DSD family is convention, not necessity.
 
 ### Limitations
 
 - **Hard cap**: `CONV_MAX_IR_TAPS = 4M` post-resample taps. Inputs that would exceed this after resampling are pre-truncated centered on the impulse peak.
 - **Mono per channel**. Multi-channel WAVs use channel 0 only. Stereo correction = two separate WAV files (L/R).
-- **Independent L/R conv states** but they share the same partition size and budget.
-- **No latency compensation** (yet). Conv adds ~P/2 samples of latency — at DSD512 with P=65536, that's ~1.45 ms. Inaudible.
+- **Fully independent L/R**. Each channel has its own GPU buffers, CUDA stream, FDL, and graph cache. The only shared values are the partition size and per-rate budget cap (both are functions of the playback rate, not the channel).
+- **Latency**: the IR's group delay (impulse peak position) shows up as a per-sample delay between input and output. For linear-phase IRs that's `L/2` at the conv rate — e.g., a 2M-tap IR at DSD512 = 44 ms, a 4M-tap IR at DSD64 = 715 ms. The plugin reports this through fb2k's DSP latency API, so video players A/V-sync compensate automatically. Min-phase IRs have much smaller group delay.
 - **L/R only** in the current build. The settings dialog has surround channel slots (LFE/SL/SR/C) but the conv path runs only on the main L/R channels.
 
 ## DSD Rates

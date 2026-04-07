@@ -3532,10 +3532,25 @@ double plugin_get_latency(const plugin_state_t *s) {
     if (s->config.sdm_mode != SDM_MODE_PRECORR)
         sdm_lat = (double)s->config.trellis_lat / (double)fs_out;
 
+    /* Convolution latency: IR group delay (impulse peak position) reported
+     * in seconds. Symmetric L/R IRs give the same delay; take the max
+     * across channels to be safe with asymmetric setups. */
+    double conv_lat = 0.0;
+    for (int i = 0; i < s->num_channels; i++) {
+        const conv_state_t *cs = s->channels[i].conv;
+        if (cs && cs->active && cs->latency_samples > 0) {
+            uint32_t cr = cs->ir.target_rate;
+            if (cr > 0) {
+                double l = (double)cs->latency_samples / (double)cr;
+                if (l > conv_lat) conv_lat = l;
+            }
+        }
+    }
+
     /* Processing buffer: report extra latency so fb2k prefetches
      * more audio, preventing output underruns during heavy SDM work.
      * Scale with output rate — DSD512 needs more buffer than DSD64. */
-    return sdm_lat;
+    return sdm_lat + conv_lat;
 }
 
 /* Reset all channel states (on seek / discontinuity) */
