@@ -43,6 +43,8 @@ typedef struct {
     onnx_filter_t   *ml_filter;  /* ONNX ML filter: pre-SDM preemph or post-SDM (NULL if disabled) */
     gpu_context_t   *gpu;        /* GPU compute context (shared, NULL if disabled) */
     conv_state_t    *conv;       /* Convolution filter (room correction, NULL if disabled) */
+    int              num_channels;/* total channel count for this stream (preserved across init,
+                                     used to scale per-channel conv budget caps) */
 } engine_channel_t;
 
 /* Block processing mode */

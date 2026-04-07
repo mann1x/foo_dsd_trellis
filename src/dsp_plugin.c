@@ -621,6 +621,7 @@ static int plugin_init_engine(plugin_state_t *s, int num_channels,
 
     for (int i = 0; i < num_channels; i++) {
         s->channels[i].gpu = s->gpu;  /* set GPU before init so conv can use it */
+        s->channels[i].num_channels = num_channels;  /* used to scale conv caps */
         if (engine_channel_init(&s->channels[i], i, &s->config) != 0) {
             for (int j = 0; j < i; j++)
                 engine_channel_free(&s->channels[j]);

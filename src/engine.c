@@ -114,9 +114,11 @@ static const path_config_t *path_config_lookup(uint32_t fs_in, uint32_t fs_out) 
 
 int engine_channel_init(engine_channel_t *eng, int channel,
                         const dsd_config_t *cfg) {
-    void *saved_gpu = eng->gpu;  /* preserve GPU ptr set by caller */
+    void *saved_gpu = eng->gpu;       /* preserve GPU ptr set by caller */
+    int saved_nch = eng->num_channels;/* preserve channel count set by caller */
     memset(eng, 0, sizeof(*eng));
     eng->gpu = saved_gpu;
+    eng->num_channels = saved_nch;
     eng->channel = channel;
 
     uint32_t fs_out = cfg->fs_out ? cfg->fs_out : cfg->fs_in;
@@ -349,6 +351,15 @@ int engine_channel_init(engine_channel_t *eng, int channel,
                     }
                     if (cfg->conv_budget == 1)      cap >>= 1;
                     else if (cfg->conv_budget >= 2)  cap >>= 2;
+                    /* Scale cap inversely with channel count: GPU compute
+                     * scales linearly with channels and the caps above were
+                     * calibrated for stereo. With 5 channels at DSD256+
+                     * Trellis the 1M cap measures 105-116% of budget — too
+                     * high. Linear scaling brings it back into the safe
+                     * 70-85% window. */
+                    int nch = eng->num_channels > 1 ? eng->num_channels : 2;
+                    if (nch > 2)
+                        cap = (int)(((int64_t)cap * 2) / nch);
                     cs->max_ir_taps = cap;
                 }
                 if (conv_load_ir(cs, cfg->conv_paths[channel]) == 0) {
