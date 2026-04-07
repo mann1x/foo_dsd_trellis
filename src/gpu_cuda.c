@@ -3150,7 +3150,7 @@ struct gpu_conv_state {
     int            buf_pos;
     /* Device arrays for fused kernel */
     CUdeviceptr    d_fdl_ptrs;     /* CUdeviceptr[num_partitions] on device */
-    CUdeviceptr    d_fdl_indices;  /* int[num_partitions] on device */
+    /* d_fdl_indices removed: chunk_fdl_pos passed by value to fused kernel */
     int            h_staging_pinned; /* 1 if h_staging allocated via cuMemAllocHost */
     /* Batch input: single GPU upload for entire batch */
     CUdeviceptr    d_batch_in;     /* device: (1+max_batch)*P doubles */
@@ -3304,10 +3304,6 @@ void *gpu_cuda_conv_init(void *ctx, int num_partitions,
     s->fifo_avail = partition_size;  /* P zeros pre-loaded */
     s->fifo_read = 0;
 
-    /* Device index array for fused multiply-accumulate kernel */
-    if (pfn_cuMemAlloc(&s->d_fdl_indices, (size_t)num_partitions * sizeof(int)) != CUDA_SUCCESS)
-        goto fail;
-
     /* Pre-allocate batch input buffer for single-upload processing.
      * The total bytes per batch is fixed by the largest DSD rate (DSD512:
      * ~4.5M doubles = 36MB), regardless of partition size. Allocate enough
@@ -3378,20 +3374,18 @@ static void gpu_conv_do_partition_dev(cuda_context_t *c, struct gpu_conv_state *
     if (s->fdl_filled < np)
         s->fdl_filled++;
 
-    /* Fused multiply-accumulate: single kernel for all IR partitions */
-    int active = s->fdl_filled < np ? s->fdl_filled : np;
+    /* Fused multiply-accumulate: single kernel call, slot computed inline.
+     * The FDL is zero-initialised at conv_init, so iterating num_partitions
+     * unconditionally is correct even before the FDL is full (unfilled
+     * slots multiply to zero and contribute nothing). No host→device
+     * indices upload — chunk_fdl_pos is a single int passed by value. */
     {
-        int indices[4096];
-        for (int k = 0; k < active; k++)
-            indices[k] = (s->fdl_pos - k + np) % np;
-        pfn_cuMemcpyHtoDAsync(s->d_fdl_indices, indices,
-                               active * sizeof(int), stream);
-
         int fs_arg = fft_size;
-        int na_arg = active;
+        int np_arg = np;
+        int chunk_fdl_pos = s->fdl_pos;
         void *args[] = { &s->d_fdl_flat, &s->d_ir_freq,
-                          &s->d_accum, &s->d_fdl_indices,
-                          &fs_arg, &na_arg };
+                          &s->d_accum,
+                          &fs_arg, &np_arg, &chunk_fdl_pos };
         pfn_cuLaunchKernel(c->fn_conv_fused, grid, 1, 1, 256, 1, 1, 0,
                             stream, args, NULL);
     }
@@ -3789,7 +3783,6 @@ void gpu_cuda_conv_free(void *ctx, void *state) {
     if (s->d_accum) pfn_cuMemFree(s->d_accum);
     if (s->d_temp) pfn_cuMemFree(s->d_temp);
     if (s->d_output_flat) pfn_cuMemFree(s->d_output_flat);
-    if (s->d_fdl_indices) pfn_cuMemFree(s->d_fdl_indices);
     if (s->h_staging) {
         if (s->h_staging_pinned)
             pfn_cuMemFreeHost(s->h_staging);
