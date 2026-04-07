@@ -291,29 +291,45 @@ int engine_channel_init(engine_channel_t *eng, int channel,
                  * (which memsets) and BEFORE conv_load_ir. */
                 if (try_gpu) {
                     cs->gpu_partitions = true;
-                    /* Budget-based IR tap cap for GPU real-time.
-                     * Conv + SDM must complete within batch duration (0.2s).
-                     * Trellis SDM is far more CPU-intensive than PreCorr,
-                     * so it leaves much less headroom for convolution work.
-                     * Measured RTX 5080 + Trellis Par4 (DSD512), single-upload batch:
-                     *   PreCorr DSD512 256K (16 parts): 0.176s (88%)
-                     *   Trellis  DSD256 512K (32 parts): ~199ms steady, spikes 225ms (113%)
-                     *   Trellis  DSD512 256K (16 parts): worker stalls (does not complete)
-                     * Medium/Low further reduce by 2x/4x. */
+                    /* Budget-based IR tap cap for GPU real-time conv.
+                     * Caps are applied AFTER the IR is resampled to the
+                     * DSD playback rate, so they limit the post-resample
+                     * tap count (= the actual size of the partitioned
+                     * frequency-domain IR the GPU operates on).
+                     *
+                     * Calibrated empirically on RTX 5080 with the conv
+                     * dispatch optimizations applied (P=65536 single-
+                     * partition mode, consolidated DtoH, fdl_pos in
+                     * kernel, CUDA Graph capture). Trellis SDM cost
+                     * dominates the per-batch budget; conv cap controls
+                     * how much additional GPU/dispatch headroom is left.
+                     *
+                     * High budget (proc ≤ ~85%, GPU ≤ ~30%):
+                     *   DSD512+Trellis 2M (np=32): 80-83% proc, 28% GPU
+                     *   DSD256+Trellis 1M (np=16): 79-84% proc, 25% GPU
+                     *   DSD256+Trellis 2M (np=32): 79-91% proc — TOO HIGH (peaks)
+                     *   DSD128+Trellis 2M cap → 512K post-resample: 39-42% (room)
+                     *   DSD64 +Trellis 2M cap → 256K post-resample: 20-29% (room)
+                     *
+                     * Medium / Low: cap is halved / quartered. After the
+                     * conv overhead optimizations the GPU is no longer
+                     * the bottleneck — these mostly save VRAM and give
+                     * the user a way to dial down conv work for
+                     * VRAM-constrained or shared-GPU scenarios. */
                     bool trellis = (eng->sdm_mode == SDM_MODE_TRELLIS);
                     int cap;
                     if (fs_out >= 22000000) {        /* DSD512 */
-                        cap = trellis ? (1 << 16)    /* 64K — Trellis Par is heavy */
-                                      : (1 << 18);   /* 256K — PreCorr */
+                        cap = trellis ? (1 << 21)    /* 2M — measured 80-83% */
+                                      : (1 << 21);   /* 2M — PreCorr (cheaper SDM, more headroom) */
                     } else if (fs_out >= 11000000) { /* DSD256 */
-                        cap = trellis ? (1 << 17)    /* 128K — was 512K, spiked 113% */
-                                      : (1 << 19);   /* 512K — PreCorr */
+                        cap = trellis ? (1 << 20)    /* 1M — measured 79-84% (2M peaked 91%) */
+                                      : (1 << 21);   /* 2M — PreCorr */
                     } else if (fs_out >=  5000000) { /* DSD128 */
-                        cap = trellis ? (1 << 18)    /* 256K — Trellis */
-                                      : (1 << 20);   /* 1M  — PreCorr */
+                        cap = trellis ? (1 << 21)    /* 2M — DSD128 has plenty of headroom */
+                                      : (1 << 21);   /* 2M — PreCorr */
                     } else {                          /* DSD64 */
-                        cap = trellis ? (1 << 19)    /* 512K — Trellis */
-                                      : (1 << 20);   /* 1M  — PreCorr */
+                        cap = trellis ? (1 << 21)    /* 2M — DSD64 has lots of headroom */
+                                      : (1 << 21);   /* 2M — PreCorr */
                     }
                     if (cfg->conv_budget == 1)      cap >>= 1;
                     else if (cfg->conv_budget >= 2)  cap >>= 2;
