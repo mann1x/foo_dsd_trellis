@@ -3157,6 +3157,10 @@ struct gpu_conv_state {
     double        *h_batch_in;     /* pinned host mirror */
     size_t         batch_in_cap;   /* capacity in doubles */
     int            h_batch_in_pinned;
+    /* Batch output: single device buffer + single DtoH at end of batch.
+     * Avoids 1 cuMemcpyDtoHAsync per chunk (~30us each, 67 saved at DSD512). */
+    CUdeviceptr    d_output_flat;  /* device: max_batch*P doubles */
+    size_t         output_flat_cap;/* capacity in doubles */
 };
 
 int gpu_cuda_conv_max_partitions(void *ctx, uint32_t signal_rate, int P,
@@ -3261,6 +3265,18 @@ void *gpu_cuda_conv_init(void *ctx, int num_partitions,
     if (pfn_cuMemAlloc(&s->d_accum, slot_bytes) != CUDA_SUCCESS) goto fail;
     if (pfn_cuMemAlloc(&s->d_temp, slot_bytes) != CUDA_SUCCESS) goto fail;
 
+    /* Consolidated device output buffer: extract kernel writes directly here
+     * at offset chunk_idx*P, then ONE big DtoH at end of batch. Sized for
+     * the largest DSD rate. */
+    {
+        size_t out_cap = (size_t)5 * 1024 * 1024;  /* covers DSD512 batch */
+        if ((size_t)partition_size * 80 > out_cap)
+            out_cap = (size_t)partition_size * 80;
+        if (pfn_cuMemAlloc(&s->d_output_flat, out_cap * sizeof(double)) != CUDA_SUCCESS)
+            goto fail;
+        s->output_flat_cap = out_cap;
+    }
+
     /* Pinned host staging — sized for the largest DSD batch (~4.5M doubles).
      * Bumped from 32*P to a fixed cap so first-batch doesn't trigger a
      * pinned-mem realloc (~50ms cuMemAllocHost) on the hot path. */
@@ -3333,10 +3349,11 @@ fail:
 
 /* Process one UPOLS partition on GPU.
  * d_src: device pointer to 2*P doubles (sliding window in d_batch_in).
- * h_dest: pinned host pointer for P output doubles (async download).
- * NO host→device upload — all data already on device. */
+ * chunk_idx: index of this output chunk within the batch.
+ * Writes output to s->d_output_flat at offset chunk_idx*P (consolidated
+ * for a single batch-end DtoH transfer). */
 static void gpu_conv_do_partition_dev(cuda_context_t *c, struct gpu_conv_state *s,
-                                      CUdeviceptr d_src, double *h_dest) {
+                                      CUdeviceptr d_src, int chunk_idx) {
     int fft_size = s->fft_size;
     int P = s->partition_size;
     int np = s->num_partitions;
@@ -3383,17 +3400,18 @@ static void gpu_conv_do_partition_dev(cuda_context_t *c, struct gpu_conv_state *
     pfn_cufftExecZ2Z(s->fft_plan, (void *)s->d_accum,
                       (void *)s->d_input, CUFFT_INVERSE);
 
-    /* Extract second half → d_temp, download to h_dest */
+    /* Extract second half directly into the consolidated output buffer
+     * at offset chunk_idx*P. Single batch-end DtoH copies it all at once. */
     {
+        CUdeviceptr d_out = s->d_output_flat +
+                            (CUdeviceptr)((size_t)chunk_idx * P * sizeof(double));
         int P_arg = P;
         int fs_arg = fft_size;
-        void *args[] = { &s->d_input, &s->d_temp, &P_arg, &fs_arg };
+        void *args[] = { &s->d_input, &d_out, &P_arg, &fs_arg };
         pfn_cuLaunchKernel(c->fn_conv_extract, (P + 255) / 256, 1, 1,
                             256, 1, 1, 0, stream, args, NULL);
     }
 
-    pfn_cuMemcpyDtoHAsync(h_dest, s->d_temp,
-                           P * sizeof(double), stream);
     s->fdl_pos = (s->fdl_pos + 1) % np;
 }
 
@@ -3481,9 +3499,12 @@ int gpu_cuda_conv_process(void *ctx, void *state,
         for (int k = 0; k < batch_count; k++) {
             CUdeviceptr d_src = s->d_batch_in +
                                 (CUdeviceptr)((size_t)k * P * sizeof(double));
-            gpu_conv_do_partition_dev(c, s, d_src,
-                                      s->h_staging + (size_t)k * P);
+            gpu_conv_do_partition_dev(c, s, d_src, k);
         }
+
+        /* Single batch-end DtoH for the consolidated output buffer */
+        pfn_cuMemcpyDtoHAsync(s->h_staging, s->d_output_flat,
+                               (size_t)batch_count * P * sizeof(double), stream);
 
         /* Single sync */
         pfn_cuStreamSynchronize(stream);
@@ -3649,9 +3670,13 @@ int gpu_cuda_conv_launch(void *ctx, void *state, double *buf, size_t count) {
     for (int k = 0; k < batch_count; k++) {
         CUdeviceptr d_src = s->d_batch_in +
                             (CUdeviceptr)((size_t)k * P * sizeof(double));
-        gpu_conv_do_partition_dev(c, s, d_src,
-                                  s->h_staging + (size_t)k * P);
+        gpu_conv_do_partition_dev(c, s, d_src, k);
     }
+
+    /* Single batch-end DtoH: download all batch_count*P doubles in one
+     * async copy. Replaces 67 per-chunk DtoH memcpys (~30us each). */
+    pfn_cuMemcpyDtoHAsync(s->h_staging, s->d_output_flat,
+                           (size_t)batch_count * P * sizeof(double), stream);
 
     QueryPerformanceCounter(&qt4);
     {
@@ -3763,6 +3788,7 @@ void gpu_cuda_conv_free(void *ctx, void *state) {
     if (s->d_input) pfn_cuMemFree(s->d_input);
     if (s->d_accum) pfn_cuMemFree(s->d_accum);
     if (s->d_temp) pfn_cuMemFree(s->d_temp);
+    if (s->d_output_flat) pfn_cuMemFree(s->d_output_flat);
     if (s->d_fdl_indices) pfn_cuMemFree(s->d_fdl_indices);
     if (s->h_staging) {
         if (s->h_staging_pinned)
