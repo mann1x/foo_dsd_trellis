@@ -288,6 +288,42 @@ static int ensure_ch_bufs(plugin_state_t *s, int num_ch, size_t dsd_samples) {
 
 /* ─── Public API (called from C++ wrapper) ─── */
 
+/* Pre-initialize the GPU context using the current config.
+ * Called from worker_main.c BEFORE signaling "ready" so the
+ * 200-450ms gpu_create cost is hidden in worker startup,
+ * not charged to the first plugin_process call. Safe to call
+ * multiple times — no-op if GPU already created or disabled. */
+void plugin_pre_init_gpu(plugin_state_t *s) {
+    if (!s) return;
+    if (!s->config.gpu_enabled) return;
+    if (s->gpu) return;  /* already created */
+
+    extern void trellis_log_c(const char *);
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+
+    bool avail = gpu_available((gpu_backend_t)s->config.gpu_backend);
+    if (avail) {
+        s->gpu = gpu_create((gpu_backend_t)s->config.gpu_backend);
+        if (s->gpu) {
+            gpu_info_t ginfo;
+            gpu_get_info(&ginfo);
+            const char *be_name =
+                ginfo.backend == GPU_BACKEND_CUDA ? "CUDA" :
+                gpu_dx12_probe() ? "DX12 Async Compute" : "DX11";
+            QueryPerformanceCounter(&t1);
+            double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
+            char gmsg[256];
+            sprintf_s(gmsg, sizeof(gmsg),
+                "GPU pre-init: %s, %s (%zu MB) in %.0fms. "
+                "Offloading: FIR, gain, boxcar, Trellis SDM parallel",
+                be_name, ginfo.device_name, ginfo.vram_mb, ms);
+            trellis_log_c(gmsg);
+        }
+    }
+}
+
 plugin_state_t *plugin_create(void) {
     plugin_state_t *s = (plugin_state_t *)calloc(1, sizeof(plugin_state_t));
     if (!s) return NULL;
@@ -1955,9 +1991,21 @@ size_t plugin_process(plugin_state_t *s,
 
 
         /* Ensure cached segment output buffers are large enough.
-         * Reused across chunks to avoid malloc/free contention. */
+         * Must size by ACTUAL segment sizes after reposition (not the
+         * average fir/segs), since reposition can shift boundaries by
+         * up to 200000 samples, making one segment much bigger than
+         * the average. SDM input_count = nom_size + 2*overlap, output
+         * count = input_count - lat - discard. Use 2*overlap headroom
+         * + 4096 safety margin. Bug previously: undersized buffer
+         * caused silent heap corruption (no conv) or crash (with conv,
+         * which changes heap layout to put critical memory adjacent). */
         int total_all_segs = num_channels * segments_per_ch;
-        size_t max_seg_samples = fir_counts[0] / (size_t)segments_per_ch + overlap + 4096;
+        size_t max_seg_samples = 0;
+        for (int seg = 0; seg < segments_per_ch; seg++) {
+            size_t s_sz = seg_nominal_size[0][seg] + 2 * overlap + 4096;
+            if (s_sz > max_seg_samples) max_seg_samples = s_sz;
+        }
+        /* Reused across chunks to avoid malloc/free contention. */
         if (s->cached_seg_buf_count < total_all_segs ||
             s->cached_seg_buf_sz < max_seg_samples) {
             /* Grow cached buffers */

@@ -21,6 +21,7 @@ typedef struct plugin_state plugin_state_t;
 plugin_state_t *plugin_create(void);
 void            plugin_destroy(plugin_state_t *s);
 void            plugin_set_config(plugin_state_t *s, const dsd_config_t *cfg);
+void            plugin_pre_init_gpu(plugin_state_t *s);
 size_t          plugin_process(plugin_state_t *s, const float *in_pcm,
                                uint8_t *out_i24, size_t pcm_frames,
                                int num_channels, uint32_t pcm_rate);
@@ -151,6 +152,13 @@ int main(int argc, char *argv[]) {
 
     plugin_set_config(state, &ctrl->config);
 
+    /* Pre-initialize the GPU context now (before signaling ready).
+     * gpu_create + cuda init costs ~200-450ms which would otherwise
+     * be charged to the first plugin_process call (DSD512+Trellis
+     * "struggles to start" symptom). Doing it here hides the cost
+     * inside the parent's worker_start wait window (10s tolerance). */
+    plugin_pre_init_gpu(state);
+
     /* No eager warmup here — the first real batch from the input ring
      * has valid DoP markers which are needed for proper DSD rate detection
      * and engine initialization. The engine's warmup mute fires on the
@@ -181,6 +189,13 @@ int main(int argc, char *argv[]) {
     /* Main processing loop */
     HANDLE wait_events[2] = { ipc.input_event, ipc.stop_event };
     int batch_count = 0;
+
+    /* Batch timing for calibration diagnostics */
+    LARGE_INTEGER qpc_freq, qpc_t0, qpc_t1;
+    QueryPerformanceFrequency(&qpc_freq);
+    double last_proc_ms = 0.0;
+    double max_proc_ms = 0.0;
+    int    max_wait_ms = 0;
 
     while (1) {
         DWORD wait = WaitForMultipleObjects(2, wait_events, FALSE, 50);
@@ -232,11 +247,17 @@ int main(int argc, char *argv[]) {
                             ctrl->gain,
                             InterlockedCompareExchange(&ctrl->mute, 0, 0) != 0);
 
-            /* Process */
+            /* Process — measure wall-clock time for budget diagnostics */
+            QueryPerformanceCounter(&qpc_t0);
             size_t result = plugin_process(state, accum_buf, out_buf,
                                             (size_t)proc_frames, channels, pcm_rate);
+            QueryPerformanceCounter(&qpc_t1);
+            last_proc_ms = (double)(qpc_t1.QuadPart - qpc_t0.QuadPart)
+                           * 1000.0 / (double)qpc_freq.QuadPart;
+            if (last_proc_ms > max_proc_ms) max_proc_ms = last_proc_ms;
 
             /* Write i24 output to shared memory ring */
+            int last_wait_ms = 0;
             if (result > 0) {
                 int out_bytes = (int)(result * (size_t)channels * 3);
                 /* Wait for ring to have space before writing.
@@ -244,19 +265,19 @@ int main(int argc, char *argv[]) {
                  * the worker is ahead of real-time — wait for the parent
                  * to catch up. Never drop output data. */
                 {
-                    int wait_ms = 0;
                     while (shm_ring_free(&ctrl->out_write_pos,
                                           &ctrl->out_read_pos,
                                           ctrl->out_capacity) < out_bytes) {
                         if (WaitForSingleObject(ipc.stop_event, 10) == WAIT_OBJECT_0)
                             goto done;
-                        wait_ms += 10;
-                        if (wait_ms > 2000) {
+                        last_wait_ms += 10;
+                        if (last_wait_ms > 2000) {
                             trellis_log_c("worker: ring full timeout, parent not draining");
                             break;
                         }
                     }
                 }
+                if (last_wait_ms > max_wait_ms) max_wait_ms = last_wait_ms;
                 shm_ring_write(ipc.out_ring, ctrl->out_capacity,
                                &ctrl->out_write_pos, &ctrl->out_read_pos,
                                out_buf, out_bytes);
@@ -288,11 +309,19 @@ int main(int argc, char *argv[]) {
                 trellis_log_c(msg);
             }
 
-            if (batch_count <= 5 || (batch_count % 50) == 0) {
-                char msg[128];
+            if (batch_count <= 5 || (batch_count % 20) == 0) {
+                /* Compute audio duration of this batch (output frames at pcm_rate)
+                 * to give a budget percentage. */
+                double audio_ms = (pcm_rate > 0)
+                    ? ((double)result * 1000.0 / (double)pcm_rate)
+                    : 0.0;
+                double pct = (audio_ms > 0.0) ? (last_proc_ms * 100.0 / audio_ms) : 0.0;
+                char msg[224];
                 sprintf_s(msg, sizeof(msg),
-                    "worker: batch #%d, %zu frames out, ring=%d bytes",
-                    batch_count, result, out_avail);
+                    "worker: batch #%d %zu frames proc=%.1fms (%.0f%% of %.1fms) "
+                    "wait=%dms ring=%d max_proc=%.1fms max_wait=%dms",
+                    batch_count, result, last_proc_ms, pct, audio_ms,
+                    last_wait_ms, out_avail, max_proc_ms, max_wait_ms);
                 trellis_log_c(msg);
             }
 

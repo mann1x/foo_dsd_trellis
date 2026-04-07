@@ -7,39 +7,76 @@
  */
 
 #include "../include/gpu_compute.h"
+#include <windows.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 /* ─── Probe cache ─── */
 
-static bool g_probed = false;
+static bool g_cuda_probed = false;
+static bool g_dx12_probed = false;
+static bool g_dx11_probed = false;
 static bool g_cuda_available = false;
 static bool g_dx12_available = false;
 static bool g_dx11_available = false;
 static gpu_backend_t g_active_backend = GPU_BACKEND_NONE;
 
-bool gpu_available(gpu_backend_t preferred) {
-    if (!g_probed) {
-        g_cuda_available = gpu_cuda_probe();
-        g_dx12_available = gpu_dx12_probe();     /* prefer DX12 over DX11 */
-        g_dx11_available = gpu_dx11_probe();
-        g_probed = true;
-        {
-            extern void trellis_log_c(const char *);
-            char msg[128];
-            sprintf_s(msg, sizeof(msg), "GPU probe: cuda=%d dx12=%d dx11=%d",
-                      g_cuda_available, g_dx12_available, g_dx11_available);
-            trellis_log_c(msg);
-        }
-    }
+static void log_probe_result(const char *which, int avail, double ms) {
+    extern void trellis_log_c(const char *);
+    char msg[128];
+    sprintf_s(msg, sizeof(msg), "GPU probe: %s=%d (%.0fms)", which, avail, ms);
+    trellis_log_c(msg);
+}
 
+static bool probe_cuda(void) {
+    if (g_cuda_probed) return g_cuda_available;
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+    g_cuda_available = gpu_cuda_probe();
+    QueryPerformanceCounter(&t1);
+    g_cuda_probed = true;
+    log_probe_result("cuda", g_cuda_available,
+                     (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
+    return g_cuda_available;
+}
+
+static bool probe_dx12(void) {
+    if (g_dx12_probed) return g_dx12_available;
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+    g_dx12_available = gpu_dx12_probe();
+    QueryPerformanceCounter(&t1);
+    g_dx12_probed = true;
+    log_probe_result("dx12", g_dx12_available,
+                     (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
+    return g_dx12_available;
+}
+
+static bool probe_dx11(void) {
+    if (g_dx11_probed) return g_dx11_available;
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+    g_dx11_available = gpu_dx11_probe();
+    QueryPerformanceCounter(&t1);
+    g_dx11_probed = true;
+    log_probe_result("dx11", g_dx11_available,
+                     (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
+    return g_dx11_available;
+}
+
+bool gpu_available(gpu_backend_t preferred) {
+    /* Probe ONLY what's needed for the requested backend.
+     * AUTO short-circuits on first available (CUDA → DX12 → DX11). */
     switch (preferred) {
     case GPU_BACKEND_CUDA:
-        return g_cuda_available;
+        return probe_cuda();
     case GPU_BACKEND_DIRECTX:
-        return g_dx12_available || g_dx11_available;
+        return probe_dx12() || probe_dx11();
     case GPU_BACKEND_AUTO:
-        return g_cuda_available || (g_dx12_available || g_dx11_available);
+        if (probe_cuda()) return true;
+        if (probe_dx12()) return true;
+        return probe_dx11();
     default:
         return false;
     }
@@ -49,20 +86,16 @@ void gpu_get_info(gpu_info_t *info) {
     memset(info, 0, sizeof(*info));
     info->backend = GPU_BACKEND_NONE;
 
-    if (!g_probed) {
-        gpu_available(GPU_BACKEND_AUTO);
-    }
-
-    /* Prefer CUDA info if available */
-    if (g_cuda_available) {
+    /* Probe lazily — only check what's needed (matches gpu_available). */
+    if (probe_cuda()) {
         gpu_cuda_get_info(info);
         return;
     }
-    if (g_dx12_available) {
+    if (probe_dx12()) {
         gpu_dx12_get_info(info);
         return;
     }
-    if (g_dx11_available) {
+    if (probe_dx11()) {
         gpu_dx11_get_info(info);
         return;
     }
@@ -71,17 +104,14 @@ void gpu_get_info(gpu_info_t *info) {
 /* ─── Resolve backend for creation ─── */
 
 static gpu_backend_t resolve_backend(gpu_backend_t preferred) {
-    if (!g_probed)
-        gpu_available(GPU_BACKEND_AUTO);
-
     switch (preferred) {
     case GPU_BACKEND_CUDA:
-        return g_cuda_available ? GPU_BACKEND_CUDA : GPU_BACKEND_NONE;
+        return probe_cuda() ? GPU_BACKEND_CUDA : GPU_BACKEND_NONE;
     case GPU_BACKEND_DIRECTX:
-        return (g_dx12_available || g_dx11_available) ? GPU_BACKEND_DIRECTX : GPU_BACKEND_NONE;
+        return (probe_dx12() || probe_dx11()) ? GPU_BACKEND_DIRECTX : GPU_BACKEND_NONE;
     case GPU_BACKEND_AUTO:
-        if (g_cuda_available) return GPU_BACKEND_CUDA;
-        if (g_dx12_available || g_dx11_available) return GPU_BACKEND_DIRECTX;
+        if (probe_cuda()) return GPU_BACKEND_CUDA;
+        if (probe_dx12() || probe_dx11()) return GPU_BACKEND_DIRECTX;
         return GPU_BACKEND_NONE;
     default:
         return GPU_BACKEND_NONE;

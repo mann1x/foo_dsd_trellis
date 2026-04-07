@@ -292,15 +292,29 @@ int engine_channel_init(engine_channel_t *eng, int channel,
                 if (try_gpu) {
                     cs->gpu_partitions = true;
                     /* Budget-based IR tap cap for GPU real-time.
-                     * Conv + SDM must complete within batch duration (0.2s at DSD512).
-                     * Measured with single-upload batch on RTX 5080:
-                     *   DSD512 512K taps (32 parts): 0.211s — 5.5% over budget
-                     *   DSD512 256K taps (16 parts): ~0.18s — sufficient headroom
+                     * Conv + SDM must complete within batch duration (0.2s).
+                     * Trellis SDM is far more CPU-intensive than PreCorr,
+                     * so it leaves much less headroom for convolution work.
+                     * Measured RTX 5080 + Trellis Par4 (DSD512), single-upload batch:
+                     *   PreCorr DSD512 256K (16 parts): 0.176s (88%)
+                     *   Trellis  DSD256 512K (32 parts): ~199ms steady, spikes 225ms (113%)
+                     *   Trellis  DSD512 256K (16 parts): worker stalls (does not complete)
                      * Medium/Low further reduce by 2x/4x. */
+                    bool trellis = (eng->sdm_mode == SDM_MODE_TRELLIS);
                     int cap;
-                    if (fs_out >= 22000000)       cap = 1 << 18;  /* 256K — DSD512 */
-                    else if (fs_out >= 11000000)   cap = 1 << 19;  /* 512K — DSD256 */
-                    else                           cap = 1 << 20;  /* 1M — DSD64/128 */
+                    if (fs_out >= 22000000) {        /* DSD512 */
+                        cap = trellis ? (1 << 16)    /* 64K — Trellis Par is heavy */
+                                      : (1 << 18);   /* 256K — PreCorr */
+                    } else if (fs_out >= 11000000) { /* DSD256 */
+                        cap = trellis ? (1 << 17)    /* 128K — was 512K, spiked 113% */
+                                      : (1 << 19);   /* 512K — PreCorr */
+                    } else if (fs_out >=  5000000) { /* DSD128 */
+                        cap = trellis ? (1 << 18)    /* 256K — Trellis */
+                                      : (1 << 20);   /* 1M  — PreCorr */
+                    } else {                          /* DSD64 */
+                        cap = trellis ? (1 << 19)    /* 512K — Trellis */
+                                      : (1 << 20);   /* 1M  — PreCorr */
+                    }
                     if (cfg->conv_budget == 1)      cap >>= 1;
                     else if (cfg->conv_budget >= 2)  cap >>= 2;
                     cs->max_ir_taps = cap;
