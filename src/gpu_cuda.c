@@ -3172,7 +3172,13 @@ struct gpu_conv_state {
     int            num_partitions;
     int            partition_size;
     int            fft_size;
-    int            stream_idx;          /* which c->streams[] this channel uses */
+    /* Dedicated CUDA stream owned by this channel — created in conv_init,
+     * destroyed in conv_free. Decouples conv parallelism from the FIR
+     * pipeline triple-buffer streams (which are limited to NUM_STREAMS).
+     * With per-conv-state streams, every channel can run independently
+     * without sharing, even at 7.1 channel counts. */
+    CUstream       stream;
+    int            stream_idx;          /* numeric channel ID for logging */
     /* Pipelined launch state */
     int            launched;            /* 1 if launch done, awaiting finalize */
     int            launched_batch;      /* batch_count from last launch */
@@ -3301,8 +3307,11 @@ void *gpu_cuda_conv_init(void *ctx, int num_partitions,
     s->num_partitions = num_partitions;
     s->partition_size = partition_size;
     s->fft_size = fft_size;
-    /* Each channel uses its own CUDA stream → channels overlap on GPU */
-    s->stream_idx = channel_idx % NUM_STREAMS;
+    /* Each channel gets its own dedicated CUDA stream so up to N channels
+     * (5.1, 7.1, ...) can overlap on the GPU without sharing. */
+    s->stream_idx = channel_idx;
+    if (pfn_cuStreamCreate(&s->stream, 0) != CUDA_SUCCESS)
+        goto fail;
 
     size_t slot_bytes = (size_t)fft_size * 16;  /* sizeof(cuDoubleComplex) */
 
@@ -3310,7 +3319,7 @@ void *gpu_cuda_conv_init(void *ctx, int num_partitions,
     if (pfn_cufftPlan1d(&s->fft_plan, fft_size, CUFFT_Z2Z, 1) != CUFFT_SUCCESS)
         goto fail;
     if (pfn_cufftSetStream)
-        pfn_cufftSetStream(s->fft_plan, c->streams[s->stream_idx]);
+        pfn_cufftSetStream(s->fft_plan, s->stream);
 
     /* Upload IR partitions */
     if (pfn_cuMemAlloc(&s->d_ir_freq, (size_t)num_partitions * slot_bytes) != CUDA_SUCCESS)
@@ -3321,7 +3330,7 @@ void *gpu_cuda_conv_init(void *ctx, int num_partitions,
     if (pfn_cuMemAlloc(&s->d_fdl_flat, (size_t)num_partitions * slot_bytes) != CUDA_SUCCESS)
         goto fail;
     pfn_cuMemsetD8Async(s->d_fdl_flat, 0, (size_t)num_partitions * slot_bytes,
-                         c->streams[s->stream_idx]);
+                         s->stream);
 
     /* Work buffers */
     if (pfn_cuMemAlloc(&s->d_input, slot_bytes) != CUDA_SUCCESS) goto fail;
@@ -3388,7 +3397,7 @@ void *gpu_cuda_conv_init(void *ctx, int num_partitions,
         s->batch_in_cap = batch_cap;
     }
 
-    pfn_cuStreamSynchronize(c->streams[s->stream_idx]);
+    pfn_cuStreamSynchronize(s->stream);
 
     {
         char msg[160];
@@ -3418,7 +3427,7 @@ static void gpu_conv_do_partition_dev(cuda_context_t *c, struct gpu_conv_state *
     int np = s->num_partitions;
     unsigned grid = (unsigned)((fft_size + 255) / 256);
     size_t slot_bytes = (size_t)fft_size * 16;
-    CUstream stream = c->streams[s->stream_idx];
+    CUstream stream = s->stream;
 
     /* R2C: pack 2P real doubles from device memory → complex */
     {
@@ -3548,7 +3557,7 @@ int gpu_cuda_conv_process(void *ctx, void *state,
         memcpy(s->h_batch_in + P + s->buf_pos, buf, from_buf * sizeof(double));
 
         /* ONE upload — must use the same stream as the kernels */
-        CUstream stream = c->streams[s->stream_idx];
+        CUstream stream = s->stream;
         pfn_cuMemcpyHtoDAsync(s->d_batch_in, s->h_batch_in,
                                input_doubles * sizeof(double), stream);
 
@@ -3717,7 +3726,7 @@ int gpu_cuda_conv_launch(void *ctx, void *state, double *buf, size_t count) {
 
     QueryPerformanceCounter(&qt2);
 
-    CUstream stream = c->streams[s->stream_idx];
+    CUstream stream = s->stream;
     int np = s->num_partitions;
     int graph_compatible =
         (g_cuda_graphs_available
@@ -3847,7 +3856,7 @@ int gpu_cuda_conv_finalize(void *ctx, void *state, double *buf, size_t count) {
     s->launched = 0;
 
     if (batch_count > 0) {
-        pfn_cuStreamSynchronize(c->streams[s->stream_idx]);
+        pfn_cuStreamSynchronize(s->stream);
 
         QueryPerformanceCounter(&qt1);
 
@@ -3945,5 +3954,7 @@ void gpu_cuda_conv_free(void *ctx, void *state) {
     free(s->fifo_buf);
     free(s->overlap_buf);
     free(s->work_fifo);
+    if (s->stream && pfn_cuStreamDestroy)
+        pfn_cuStreamDestroy(s->stream);
     free(s);
 }
