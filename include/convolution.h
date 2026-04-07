@@ -71,6 +71,7 @@ typedef struct {
     bool            use_gpu;    /* true if GPU convolution is active */
     bool            gpu_partitions; /* true: use larger P for GPU efficiency */
     int             max_ir_taps;    /* 0=no limit, >0=truncate IR to this many taps */
+    bool            min_phase;      /* true: convert IR to min-phase before partitioning */
     /* IR group delay in samples at conv_rate. For linear-phase IRs this
      * is the position of the impulse peak in the (post-truncation) IR.
      * Used by plugin_get_latency to report A/V sync compensation to fb2k. */

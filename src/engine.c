@@ -383,6 +383,7 @@ int engine_channel_init(engine_channel_t *eng, int channel,
                     }
                     cs->max_ir_taps = cap;
                 }
+                cs->min_phase = cfg->conv_min_phase;
                 if (conv_load_ir(cs, cfg->conv_paths[channel]) == 0) {
                     /* Try GPU convolution if available */
                     if (try_gpu && cs->ir.freq_partitions) {

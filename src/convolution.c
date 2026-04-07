@@ -122,6 +122,144 @@ static void fft_inverse(conv_channel_t *ch, const Ipp64fc *in, Ipp64fc *out, int
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * Min-phase IR conversion (cepstral Hilbert transform)
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* Convert a real IR to its min-phase equivalent IN PLACE.
+ *
+ * Standard real-cepstrum / Hilbert-transform method:
+ *   1. FFT(x) → X
+ *   2. log_X = log(|X|) (with regularization floor)
+ *   3. c = IFFT(log_X)              ← real cepstrum
+ *   4. Apply min-phase Hilbert window:
+ *        c[0]            unchanged
+ *        c[1..N/2-1]     × 2 (positive-time, "causal" part)
+ *        c[N/2]          unchanged
+ *        c[N/2+1..N-1]   = 0  (negative-time part removed)
+ *   5. log_X_min = FFT(c)
+ *   6. X_min = exp(log_X_min)
+ *   7. IFFT(X_min) → real min-phase IR
+ *   8. Truncate to original length
+ *
+ * Result has the same magnitude response as the input but with
+ * approximately zero group delay (impulse peak near sample 0 instead
+ * of sample L/2). Trades the linear-phase characteristic for low
+ * latency. The phase distortion introduced is mostly inaudible at
+ * audio frequencies for typical room correction filters.
+ *
+ * Returns 0 on success, -1 on error (in which case x is unchanged). */
+static int convert_ir_to_min_phase(double *x, int L) {
+    if (L <= 1) return 0;
+
+    /* FFT length: at least 8x the IR length to avoid time-aliasing of
+     * the cepstrum. Round up to power of 2 for IPP DFT efficiency. */
+    int N = 1;
+    while (N < L * 8) N <<= 1;
+    if (N < 1024) N = 1024;
+
+    int specSize = 0, specBufSize = 0, workBufSize = 0;
+    IppStatus st = ippsDFTGetSize_C_64fc(N, IPP_FFT_DIV_INV_BY_N,
+                                          ippAlgHintAccurate,
+                                          &specSize, &specBufSize, &workBufSize);
+    if (st != ippStsNoErr) return -1;
+
+    IppsDFTSpec_C_64fc *spec = (IppsDFTSpec_C_64fc *)ippsMalloc_8u(specSize);
+    Ipp8u *specBuf = specBufSize > 0 ? ippsMalloc_8u(specBufSize) : NULL;
+    Ipp8u *workBuf = workBufSize > 0 ? ippsMalloc_8u(workBufSize) : NULL;
+    Ipp64fc *X = (Ipp64fc *)ippsMalloc_8u(N * (int)sizeof(Ipp64fc));
+    Ipp64fc *Y = (Ipp64fc *)ippsMalloc_8u(N * (int)sizeof(Ipp64fc));
+
+    if (!spec || !X || !Y) {
+        if (spec) ippsFree(spec);
+        if (specBuf) ippsFree(specBuf);
+        if (workBuf) ippsFree(workBuf);
+        if (X) ippsFree(X);
+        if (Y) ippsFree(Y);
+        return -1;
+    }
+
+    st = ippsDFTInit_C_64fc(N, IPP_FFT_DIV_INV_BY_N,
+                             ippAlgHintAccurate, spec, specBuf);
+    if (st != ippStsNoErr) {
+        ippsFree(spec);
+        if (specBuf) ippsFree(specBuf);
+        if (workBuf) ippsFree(workBuf);
+        ippsFree(X); ippsFree(Y);
+        return -1;
+    }
+
+    /* Step 1: Pack input into complex buffer (zero-padded). */
+    for (int i = 0; i < L; i++) {
+        X[i].re = x[i];
+        X[i].im = 0.0;
+    }
+    for (int i = L; i < N; i++) {
+        X[i].re = 0.0;
+        X[i].im = 0.0;
+    }
+
+    /* Step 2: Forward FFT. */
+    ippsDFTFwd_CToC_64fc(X, Y, spec, workBuf);
+
+    /* Step 3: log magnitude with regularization floor.
+     * Floor at -200 dB (1e-10) prevents log(0) singularity at spectral
+     * nulls and limits how much "boost" the min-phase exponentiation
+     * can apply at those nulls. Higher floor = more stable but less
+     * accurate magnitude reconstruction; lower floor = more accurate
+     * but unstable around nulls. -200 dB is a good audio compromise. */
+    const double mag_floor = 1e-10;
+    for (int i = 0; i < N; i++) {
+        double mag = sqrt(Y[i].re * Y[i].re + Y[i].im * Y[i].im);
+        if (mag < mag_floor) mag = mag_floor;
+        X[i].re = log(mag);  /* real cepstrum input */
+        X[i].im = 0.0;
+    }
+
+    /* Step 4: Inverse FFT to get real cepstrum. */
+    ippsDFTInv_CToC_64fc(X, Y, spec, workBuf);
+
+    /* Step 5: Apply min-phase Hilbert window in cepstral domain.
+     * The cepstrum of a min-phase signal is causal (zero for n<0).
+     * We fold the symmetric cepstrum into the causal half. */
+    /* Y[0] unchanged */
+    for (int i = 1; i < N / 2; i++) {
+        Y[i].re *= 2.0;
+        Y[i].im = 0.0;
+    }
+    /* Y[N/2] unchanged */
+    for (int i = N / 2 + 1; i < N; i++) {
+        Y[i].re = 0.0;
+        Y[i].im = 0.0;
+    }
+
+    /* Step 6: Forward FFT to get log of min-phase spectrum. */
+    ippsDFTFwd_CToC_64fc(Y, X, spec, workBuf);
+
+    /* Step 7: Exponentiate to get the min-phase complex spectrum. */
+    for (int i = 0; i < N; i++) {
+        double exp_re = exp(X[i].re);
+        double cs = cos(X[i].im);
+        double sn = sin(X[i].im);
+        Y[i].re = exp_re * cs;
+        Y[i].im = exp_re * sn;
+    }
+
+    /* Step 8: Inverse FFT to get the min-phase IR (real part). */
+    ippsDFTInv_CToC_64fc(Y, X, spec, workBuf);
+
+    /* Step 9: Copy first L samples back to x (truncate min-phase IR). */
+    for (int i = 0; i < L; i++)
+        x[i] = X[i].re;
+
+    ippsFree(spec);
+    if (specBuf) ippsFree(specBuf);
+    if (workBuf) ippsFree(workBuf);
+    ippsFree(X);
+    ippsFree(Y);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  * IR loading and preprocessing
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -605,6 +743,39 @@ int conv_load_ir(conv_state_t *state, const char *wav_path) {
         return -1;
     }
 
+    /* Optional min-phase conversion. Run before budget truncation so the
+     * truncation operates on the energy distribution of the min-phase IR
+     * (which is concentrated near sample 0, not centered on L/2). */
+    if (state->min_phase) {
+        /* Find peak before conversion for the log */
+        int pre_peak = 0;
+        double pre_peak_val = 0.0;
+        for (int i = 0; i < ir_resampled; i++) {
+            double av = fabs(ir_d[i]);
+            if (av > pre_peak_val) { pre_peak_val = av; pre_peak = i; }
+        }
+        if (convert_ir_to_min_phase(ir_d, ir_resampled) == 0) {
+            int post_peak = 0;
+            double post_peak_val = 0.0;
+            for (int i = 0; i < ir_resampled; i++) {
+                double av = fabs(ir_d[i]);
+                if (av > post_peak_val) { post_peak_val = av; post_peak = i; }
+            }
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "conv: min-phase conversion: peak %d → %d "
+                     "(latency %d → %d samples, %.1f → %.1f ms @ %u Hz)",
+                     pre_peak, post_peak, pre_peak, post_peak,
+                     (double)pre_peak * 1000.0 / (double)state->conv_rate,
+                     (double)post_peak * 1000.0 / (double)state->conv_rate,
+                     state->conv_rate);
+            trellis_log_c(msg);
+        } else {
+            trellis_log_c("conv: WARNING: min-phase conversion failed, "
+                          "using linear-phase IR");
+        }
+    }
+
     /* Apply budget-based IR truncation.
      * For linear-phase filters, the main impulse is at the CENTER.
      * Naive front-truncation would cut the impulse entirely.
@@ -626,12 +797,34 @@ int conv_load_ir(conv_state_t *state, const char *wav_path) {
         if (start + state->max_ir_taps > ir_resampled)
             start = ir_resampled - state->max_ir_taps;
         if (start < 0) start = 0;
+        int end = start + state->max_ir_taps;  /* exclusive */
 
-        char msg[160];
+        /* Compute energy in [head, kept window, tail] so the user can see
+         * how much of the IR is being discarded by the truncation. Energy
+         * is sum of squares (parseval). Reported as fraction of total
+         * energy in dB so it's audibly meaningful — e.g. -60 dB tail
+         * means the discarded portion is 60 dB below the kept portion
+         * (basically inaudible), -10 dB means the user is losing
+         * significant tail content. */
+        double e_head = 0.0, e_keep = 0.0, e_tail = 0.0;
+        for (int i = 0; i < start; i++)
+            e_head += ir_d[i] * ir_d[i];
+        for (int i = start; i < end; i++)
+            e_keep += ir_d[i] * ir_d[i];
+        for (int i = end; i < ir_resampled; i++)
+            e_tail += ir_d[i] * ir_d[i];
+        double e_tot = e_head + e_keep + e_tail;
+        double head_db = (e_tot > 1e-30 && e_head > 1e-30)
+                         ? 10.0 * log10(e_head / e_tot) : -200.0;
+        double tail_db = (e_tot > 1e-30 && e_tail > 1e-30)
+                         ? 10.0 * log10(e_tail / e_tot) : -200.0;
+
+        char msg[256];
         snprintf(msg, sizeof(msg),
-                 "conv: budget truncation: %d → %d taps (peak@%d, window [%d..%d])",
+                 "conv: budget truncation: %d → %d taps (peak@%d, window [%d..%d], "
+                 "discarded head=%.1f dB tail=%.1f dB rel total)",
                  ir_resampled, state->max_ir_taps, peak_idx, start,
-                 start + state->max_ir_taps - 1);
+                 end - 1, head_db, tail_db);
         trellis_log_c(msg);
 
         if (start > 0)

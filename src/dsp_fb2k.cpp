@@ -805,6 +805,7 @@ private:
         /* Convolution Filter */
         CheckDlgButton(IDC_CHECK_CONV_ENABLED, m_cfg.conv_enabled ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(IDC_CHECK_CONV_GPU, m_cfg.conv_gpu ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(IDC_CHECK_CONV_MIN_PHASE, m_cfg.conv_min_phase ? BST_CHECKED : BST_UNCHECKED);
         {
             CComboBox cb(GetDlgItem(IDC_COMBO_CONV_BUDGET));
             cb.AddString(L"High");
@@ -1887,6 +1888,7 @@ private:
         /* Convolution filter */
         m_cfg.conv_enabled = IsDlgButtonChecked(IDC_CHECK_CONV_ENABLED) == BST_CHECKED;
         m_cfg.conv_gpu = IsDlgButtonChecked(IDC_CHECK_CONV_GPU) == BST_CHECKED;
+        m_cfg.conv_min_phase = IsDlgButtonChecked(IDC_CHECK_CONV_MIN_PHASE) == BST_CHECKED;
         m_cfg.conv_budget = (int8_t)CComboBox(GetDlgItem(IDC_COMBO_CONV_BUDGET)).GetCurSel();
         if (m_cfg.conv_budget < 0 || m_cfg.conv_budget > 2) m_cfg.conv_budget = 0;
         {

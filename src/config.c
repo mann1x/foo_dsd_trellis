@@ -136,9 +136,14 @@ static size_t read_u16(const uint8_t *buf, size_t pos, uint16_t *val) {
     + 4                                      /* conv_max_taps_override */ \
     )
 
+/* v20: v19 + conv_min_phase(1) */
+#define CONFIG_V20_SIZE (CONFIG_V19_SIZE \
+    + 1                                      /* conv_min_phase */ \
+    )
+
 /* Serialise config to a byte buffer. Returns bytes written. */
 size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) {
-    if (buf_size < CONFIG_V19_SIZE)
+    if (buf_size < CONFIG_V20_SIZE)
         return 0;
 
     size_t pos = 0;
@@ -230,6 +235,9 @@ size_t config_serialize(const dsd_config_t *cfg, uint8_t *buf, size_t buf_size) 
 
     /* v19: custom IR tap cap override */
     pos = write_i32(buf, pos, cfg->conv_max_taps_override);
+
+    /* v20: min-phase IR conversion */
+    pos = write_u8(buf, pos, cfg->conv_min_phase ? 1 : 0);
 
     return pos;
 }
@@ -432,6 +440,14 @@ int config_deserialize(dsd_config_t *cfg, const uint8_t *buf, size_t buf_size) {
                         (cfg->conv_max_taps_override < 4096 ||
                          cfg->conv_max_taps_override > CONV_MAX_IR_TAPS))
                         cfg->conv_max_taps_override = 0;
+                }
+            }
+            /* Version 20 adds min-phase IR conversion flag */
+            if (version >= 20) {
+                if (pos + 1 <= buf_size) {
+                    uint8_t u8;
+                    pos = read_u8(buf, pos, &u8);
+                    cfg->conv_min_phase = (u8 != 0);
                 }
             }
         } else {

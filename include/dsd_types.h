@@ -409,6 +409,12 @@ typedef struct {
      *      the auto-calibrated safe value at their own risk. The user
      *      can stutter their playback with unsafe caps. */
     int32_t   conv_max_taps_override;
+    /* v20: Convert IR to min-phase before partitioning.
+     * Trades the linear-phase characteristic for near-zero latency.
+     * For typical room correction filters the phase distortion is
+     * inaudible but the latency saved is L/2 samples (44 ms at DSD512
+     * for a 2M-tap IR). Default false to preserve existing behavior. */
+    bool      conv_min_phase;
 } dsd_config_t;
 
 /* Trellis parallel mode (DAS segment count).
@@ -437,7 +443,7 @@ typedef struct {
 #define CONV_BUDGET_LOW    2   /* ~25% of max partitions */
 
 /* Config serialization version */
-#define DSD_CONFIG_VERSION 19
+#define DSD_CONFIG_VERSION 20
 
 /* FIR gain Auto sentinel and default */
 #define FIR_GAIN_AUTO    (-128)
@@ -530,6 +536,8 @@ static inline void dsd_config_defaults(dsd_config_t *cfg) {
     memset(cfg->conv_paths, 0, sizeof(cfg->conv_paths));
     /* v19: 0 = auto-calibrated cap */
     cfg->conv_max_taps_override = 0;
+    /* v20: linear-phase by default */
+    cfg->conv_min_phase = false;
 }
 
 #endif /* DSD_TYPES_H */
