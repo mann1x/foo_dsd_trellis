@@ -5,6 +5,42 @@ All notable changes to foo_dsd_trellis will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-04-07
+
+### Added
+
+- **Convolution filter (room correction)** — full GPU pipeline running at the playback DSD rate. Per-channel WAV impulse responses, up to 6 channels (5.1 surround). cuFFT for forward/inverse transforms, custom CUDA kernels for the partition multiply-accumulate, CUDA Graph capture for the per-batch chunk loop. Real-time at every DSD rate from DSD64 to DSD512 on an RTX 5080.
+- **Per-channel dedicated CUDA streams**: each conv channel creates and owns its own `CUstream` so up to 7.1 channels can overlap on the GPU without sharing.
+- **Per-rate / per-SDM-mode / per-channel-count budget caps**: the IR tap cap auto-scales by playback rate, by SDM mode (Trellis is heavier than PreCorr), and inversely by channel count (5.1 caps are 2/5 of stereo). Calibrated empirically via sweeps.
+- **Smart IR pre-truncation**: very long input IRs (e.g. 32K-tap @ 44.1k room IRs) are pre-truncated centered on the impulse peak before resample, bounding resample memory regardless of input size. Mathematically equivalent to post-truncation but doesn't allocate huge intermediate buffers.
+- **Latency compensation**: IR group delay (impulse peak position) is reported through fb2k's DSP latency API so video players A/V-sync compensate automatically. For a 2M-tap linear-phase IR at DSD512 the reported latency is 44 ms.
+- **Min-phase IR converter** (cepstral Hilbert transform): optional checkbox in conv settings. Converts the loaded IR to its min-phase equivalent before partitioning. Same magnitude response, near-zero group delay (latency drops from L/2 to ~0 ms). The phase distortion introduced is mostly inaudible at audio frequencies for typical room correction filters.
+- **Custom IR cap override** (expert mode): "Cap (taps, 0=auto)" edit field in the conv settings. Setting this non-zero replaces the auto-calibrated cap entirely — lets you push above the safe value at your own risk.
+- **Tail energy logging**: when budget truncation discards part of the IR, the log now reports head/tail energy in dB relative to total. E.g. "discarded head=-72 dB tail=-58 dB rel total" tells you the truncation cost ~58 dB worth of late reverb (inaudible).
+- **Worker batch phase timing** + per-batch summary log line for diagnosing time-budget bottlenecks (unpack / FIR / SDM / pack / conv breakdown per chunk).
+
+### Changed
+
+- **Worker self-load measurement via `GetThreadTimes`**: the worker thread migration logic was estimating self-load as a hardcoded `our_count * 0.55` per worker, calibrated for stereo at moderate DSD rates. On heavy multichannel workloads (5ch DSD256+Trellis+conv) each worker is much busier than that, and the algorithm was treating its own legitimate load as external contention — causing a "self-flee" loop with ~6 migrations/minute. Now uses real `GetThreadTimes`-based measurement plus stricter trigger criteria (core load ≥ 90% AND external ≥ 40%) and longer cooldown (5 → 25 batches).
+- **CUDA Graph cache 4 → 64 slots**: the conv graph cache key is `(batch_count, init_fdl_pos)` and `init_fdl_pos` cycles through 0..np-1 each batch. With np=7 (DSD256 5ch) the 4-slot cache thrashed: ~6 captures/sec, conv finalize variable 20-69 ms with periodic spikes. With 64 slots the cache fully covers all current rate × cap combinations, captures only happen at startup, and finalize is stable at 20-32 ms.
+- **Convolution settings dialog**: aligned all rows (FIR Gain, ML Filter, GPU Compute, PCM, Convolution) so labels, checkboxes, edits, and combos share a common visual baseline. Cap label width fixed (was truncating "0=auto):").
+- **README**: added a comprehensive Convolution section covering CPU/GPU implementation, time budget per rate, REW workflow, tips, common pitfalls, and limitations.
+
+### Fixed
+
+- **DSD512 + Trellis + conv silent crash**: `cached_seg_bufs` was sized for the *average* segment size, but reposition can shift segments by ±200K samples. The undersized buffer caused heap corruption — silent without conv (different heap layout), access violation with conv. Now sized for the largest *actual* segment size after reposition.
+- **DSD512 + Trellis startup struggle**: `gpu_create()` ran synchronously inside the first `plugin_process` call, costing ~456 ms — first batch was 290% over budget. GPU pre-init now runs in `worker_main` *before* the worker signals ready, hiding the cost in the parent's worker-start wait window.
+- **Conv overhead bottleneck**: 7-stage optimization arc dropped DSD512+Trellis steady proc from 210 ms (108% over budget, ring drained → crash) to 134 ms (67% of budget):
+  - Single-IR-partition mode for IRs ≤ 64K (P bumped to 65536) → 4× fewer batches, 75% fewer driver calls
+  - DtoH consolidation: one big copy per batch instead of one per chunk
+  - `fdl_pos` computed in-kernel: removed indices array upload
+  - CUDA Graph capture: entire upload+chunk-loop+download collapsed into a single replayable launch
+- **Debug build broken since v1.0.5**: `dsp_fb2k.cpp:976` used `strncpy` which trips warning-as-error in Debug. Replaced with `strncpy_s` using `_TRUNCATE`. All 4 configs (x64/Win32 × Release/Debug) now build clean.
+
+### Configuration
+
+- **Config version 18 → 20**: added `conv_enabled`, `conv_gpu`, `conv_budget`, `conv_paths[6]` (v18), `conv_max_taps_override` (v19), `conv_min_phase` (v20). Forward-compatible deserialization preserves earlier versions.
+
 ## [1.0.5] - 2026-04-05
 
 ### Fixed
