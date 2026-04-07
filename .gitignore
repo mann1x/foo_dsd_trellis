@@ -32,6 +32,7 @@ ipch/
 
 # foobar2000 SDK (vendored, download separately)
 foobar2000-sdk/
+fb2k-sdk-*.zip
 
 # foobar2000 test component
 foobar2000-test/

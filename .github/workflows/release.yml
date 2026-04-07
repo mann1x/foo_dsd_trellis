@@ -35,7 +35,7 @@ jobs:
     - name: Download foobar2000 SDK
       shell: bash
       run: |
-        gh release download deps --pattern "fb2k-sdk-*.zip" --dir .
+        gh release download deps --pattern "fb2k-sdk-*.zip" --dir . --skip-existing
         unzip -o fb2k-sdk-*.zip -d .
       env:
         GH_TOKEN: ${{ github.token }}
