@@ -966,8 +966,19 @@ bool plugin_get_cpuset_change(const plugin_state_t *s, uint64_t *mask) {
 /* ─── Worker migration (dry-run probe) ─── */
 
 #define MIGRATION_PROBE_CHUNKS  5     /* chunks to measure on new core */
-#define MIGRATION_COOLDOWN      5     /* batches between migration attempts */
+#define MIGRATION_COOLDOWN      25    /* batches between migration attempts (~5s @ DSD256) */
 #define MIGRATION_THRESHOLD     0.15  /* 15% improvement required to keep */
+/* Migration only triggers when BOTH:
+ *   - the candidate core is at >90% absolute load (real saturation)
+ *   - our worker's self-load on that core accounts for less than (load - 40%)
+ *     (i.e., real external contention is at least 40% of the core)
+ * GPU driver overhead from conv kernel launches typically lands on the
+ * same core as the launching worker but isn't attributed to the worker
+ * thread by GetThreadTimes — so a worker doing 35% SDM work can sit
+ * on a core measuring 70% total load with no actual contention.
+ * Migrating away wouldn't help, the GPU driver follows the launch site. */
+#define MIGRATION_LOAD_FLOOR    0.90  /* core must be >90% loaded to consider */
+#define MIGRATION_EXTERNAL_MIN  0.40  /* external contribution must be >40% */
 
 static void migration_tick(plugin_state_t *s) {
     if (!s->pool || !s->topology_detected)
@@ -994,35 +1005,52 @@ static void migration_tick(plugin_state_t *s) {
 
     /* Check load on cores assigned to workers.
      * Must account for our own workers' contribution to avoid detecting
-     * self-load as external contention. Each worker generates ~30% avg
-     * load during DSD processing bursts. Only trigger migration when
-     * observed load exceeds our workers' expected contribution + margin. */
+     * self-load as external contention. We measure each worker's actual
+     * CPU consumption over the cooldown window via GetThreadTimes (see
+     * threadpool_get_worker_self_load) — this is accurate for any
+     * channel count and DSD rate, unlike the old hardcoded 0.55 baseline
+     * which was calibrated for stereo at moderate DSD rates and caused
+     * a "self-flee" loop on heavy multichannel DSD256+ workloads.
+     * Only trigger migration when the observed core load exceeds the
+     * sum of our workers' actual self-load + 30% external margin. */
     int num_workers = threadpool_get_thread_count(s->pool);
+
+    /* Sample each worker's self-load once. The function maintains a
+     * baseline so calling it again later returns the load over the
+     * intervening interval (i.e. since the previous sample). */
+    double worker_self_load[CPUSET_MAX_CPUS];
+    for (int i = 0; i < num_workers && i < CPUSET_MAX_CPUS; i++)
+        worker_self_load[i] = threadpool_get_worker_self_load(s->pool, i);
+
     bool any_loaded = false;
     uint32_t loaded_cpuset = 0;
     double loaded_pct = 0.0;
+    double loaded_self = 0.0;
     for (int i = 0; i < num_workers; i++) {
         uint32_t wid = threadpool_get_worker_cpuset(s->pool, i);
         if (wid == 0) continue;
-        /* Count how many of our workers share this core */
-        int our_count = 0;
-        for (int w = 0; w < num_workers; w++) {
+        /* Sum the actual measured self-load of all our workers on this core. */
+        double self_load = 0.0;
+        for (int w = 0; w < num_workers && w < CPUSET_MAX_CPUS; w++) {
             if (threadpool_get_worker_cpuset(s->pool, w) == wid)
-                our_count++;
+                self_load += worker_self_load[w];
         }
-        /* Dynamic threshold: self-load + 30% external margin.
-         * DSD512 workers generate 70-80% burst load per core.
-         * 1 worker/core → threshold 0.85  (our ~55% avg + 30% external)
-         * 2 workers/core → threshold 0.95 (capped) */
-        double self_load = our_count * 0.55;
-        double threshold = self_load + 0.30;
-        if (threshold > 0.95) threshold = 0.95;
+        if (self_load > 0.95) self_load = 0.95;
 
+        /* Two-condition trigger: only migrate when the core is genuinely
+         * saturated AND the contention is clearly external. See comments
+         * on MIGRATION_LOAD_FLOOR / MIGRATION_EXTERNAL_MIN above. */
         for (int j = 0; j < snap.count; j++) {
-            if (snap.entries[j].id == wid && snap.entries[j].load > threshold) {
-                if (snap.entries[j].load > loaded_pct) {
-                    loaded_pct = snap.entries[j].load;
+            if (snap.entries[j].id != wid) continue;
+            double core_load = snap.entries[j].load;
+            double external = core_load - self_load;
+            if (external < 0.0) external = 0.0;
+            if (core_load >= MIGRATION_LOAD_FLOOR &&
+                external >= MIGRATION_EXTERNAL_MIN) {
+                if (core_load > loaded_pct) {
+                    loaded_pct = core_load;
                     loaded_cpuset = wid;
+                    loaded_self = self_load;
                 }
                 any_loaded = true;
             }
@@ -1091,8 +1119,8 @@ static void migration_tick(plugin_state_t *s) {
 
         char msg[256];
         int pos = snprintf(msg, sizeof(msg),
-            "migration: LP%d loaded (%.0f%%), re-pinned %d workers to (",
-            loaded_lp, loaded_pct * 100.0, repinned);
+            "migration: LP%d loaded (%.0f%%, self=%.0f%%), re-pinned %d workers to (",
+            loaded_lp, loaded_pct * 100.0, loaded_self * 100.0, repinned);
         for (int i = 0; i < new_count && pos < 240; i++)
             pos += snprintf(msg + pos, sizeof(msg) - pos,
                 "LP%d%s", new_lps[i], i < new_count - 1 ? "," : "");

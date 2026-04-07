@@ -122,6 +122,14 @@ struct threadpool {
     int          cpuset_id_count;
     volatile LONG reset_log_count;  /* set to 1 to reset worker log counter */
 
+    /* Per-thread CPU time tracking for self-load measurement.
+     * cpu_time_last_100ns: total kernel+user CPU time in 100ns units at last sample.
+     * wall_time_last_qpc:  QueryPerformanceCounter value at last sample.
+     * Both are updated in lock-step by threadpool_get_worker_self_load.
+     * 0 = not yet sampled (first call returns the neutral 0.55 default). */
+    ULONGLONG     *cpu_time_last_100ns; /* [thread_count] */
+    LONGLONG      *wall_time_last_qpc;  /* [thread_count] */
+
     /* Worker role separation:
      * Workers 0..reserved_count-1: RESERVED — only check per-worker queue.
      *   Used by submit_to for pinned tasks (SDM segments).
@@ -450,10 +458,15 @@ threadpool_t *threadpool_create(int thread_count, DWORD affinity_mask) {
     pool->last_rt_ratio = (double *)calloc((size_t)thread_count, sizeof(double));
     pool->rt_windows = (rt_window_t *)calloc((size_t)thread_count, sizeof(rt_window_t));
     pool->worker_queues = (worker_queue_t *)calloc((size_t)thread_count, sizeof(worker_queue_t));
-    if (!pool->threads || !pool->last_rt_ratio || !pool->rt_windows || !pool->worker_queues) {
+    pool->cpu_time_last_100ns = (ULONGLONG *)calloc((size_t)thread_count, sizeof(ULONGLONG));
+    pool->wall_time_last_qpc  = (LONGLONG  *)calloc((size_t)thread_count, sizeof(LONGLONG));
+    if (!pool->threads || !pool->last_rt_ratio || !pool->rt_windows || !pool->worker_queues
+        || !pool->cpu_time_last_100ns || !pool->wall_time_last_qpc) {
         free(pool->threads);
         free(pool->last_rt_ratio);
         free(pool->rt_windows);
+        free(pool->cpu_time_last_100ns);
+        free(pool->wall_time_last_qpc);
         free(pool->worker_queues);
         CloseHandle(pool->done_event);
         CloseHandle(pool->work_sem);
@@ -608,6 +621,8 @@ void threadpool_destroy(threadpool_t *pool) {
     free(pool->cpuset_ids);
     free(pool->lp_indices);
     free(pool->groups);
+    free(pool->cpu_time_last_100ns);
+    free(pool->wall_time_last_qpc);
     if (pool->worker_queues) {
         for (int i = 0; i < pool->thread_count; i++)
             CloseHandle(pool->worker_queues[i].wake_event);
@@ -739,6 +754,63 @@ uint32_t threadpool_get_worker_cpuset(threadpool_t *pool, int worker_index) {
     return pool->cpuset_ids[worker_index];
 }
 
+double threadpool_get_worker_self_load(threadpool_t *pool, int worker_index) {
+    if (!pool || worker_index < 0 || worker_index >= pool->thread_count)
+        return 0.55;
+    if (!pool->threads || !pool->threads[worker_index])
+        return 0.55;
+    if (!pool->cpu_time_last_100ns || !pool->wall_time_last_qpc)
+        return 0.55;
+
+    /* Sample current per-thread CPU time (kernel + user, in 100ns units). */
+    FILETIME ft_create, ft_exit, ft_kernel, ft_user;
+    if (!GetThreadTimes(pool->threads[worker_index],
+                         &ft_create, &ft_exit, &ft_kernel, &ft_user))
+        return 0.55;
+
+    ULARGE_INTEGER kernel_u, user_u;
+    kernel_u.LowPart  = ft_kernel.dwLowDateTime;
+    kernel_u.HighPart = ft_kernel.dwHighDateTime;
+    user_u.LowPart    = ft_user.dwLowDateTime;
+    user_u.HighPart   = ft_user.dwHighDateTime;
+    ULONGLONG cpu_now_100ns = kernel_u.QuadPart + user_u.QuadPart;
+
+    /* Sample wall clock. */
+    LARGE_INTEGER wall_now;
+    QueryPerformanceCounter(&wall_now);
+
+    /* Read previous baseline (set on previous call) and update. */
+    ULONGLONG cpu_base_100ns = pool->cpu_time_last_100ns[worker_index];
+    LONGLONG  wall_base_qpc  = pool->wall_time_last_qpc[worker_index];
+    pool->cpu_time_last_100ns[worker_index] = cpu_now_100ns;
+    pool->wall_time_last_qpc[worker_index]  = wall_now.QuadPart;
+
+    /* First call (no baseline yet) returns the neutral default. */
+    if (cpu_base_100ns == 0 || wall_base_qpc == 0)
+        return 0.55;
+
+    LARGE_INTEGER qpf;
+    QueryPerformanceFrequency(&qpf);
+    if (qpf.QuadPart <= 0)
+        return 0.55;
+
+    LONGLONG wall_delta_qpc = wall_now.QuadPart - wall_base_qpc;
+    if (wall_delta_qpc <= 0)
+        return 0.55;
+
+    /* CPU time is in 100ns ticks (1e-7 s); wall time delta is QPC ticks. */
+    double cpu_seconds  = (double)(cpu_now_100ns - cpu_base_100ns) * 1e-7;
+    double wall_seconds = (double)wall_delta_qpc / (double)qpf.QuadPart;
+
+    if (wall_seconds <= 0.0)
+        return 0.55;
+
+    double load = cpu_seconds / wall_seconds;
+    if (load < 0.0) load = 0.0;
+    if (load > 1.0) load = 1.0;
+    return load;
+}
+
 /* ─── CPUSET-aware thread pool creation ─── */
 
 threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids,
@@ -781,8 +853,11 @@ threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids,
     pool->lp_indices = (uint8_t *)malloc((size_t)count * sizeof(uint8_t));
     pool->groups = (uint16_t *)calloc((size_t)count, sizeof(uint16_t));
     pool->worker_queues = (worker_queue_t *)calloc((size_t)count, sizeof(worker_queue_t));
+    pool->cpu_time_last_100ns = (ULONGLONG *)calloc((size_t)count, sizeof(ULONGLONG));
+    pool->wall_time_last_qpc  = (LONGLONG  *)calloc((size_t)count, sizeof(LONGLONG));
     if (!pool->threads || !pool->last_rt_ratio || !pool->rt_windows ||
-        !pool->cpuset_ids || !pool->lp_indices || !pool->groups || !pool->worker_queues) {
+        !pool->cpuset_ids || !pool->lp_indices || !pool->groups || !pool->worker_queues
+        || !pool->cpu_time_last_100ns || !pool->wall_time_last_qpc) {
         free(pool->threads);
         free(pool->last_rt_ratio);
         free(pool->rt_windows);
@@ -790,6 +865,8 @@ threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids,
         free(pool->lp_indices);
         free(pool->groups);
         free(pool->worker_queues);
+        free(pool->cpu_time_last_100ns);
+        free(pool->wall_time_last_qpc);
         CloseHandle(pool->done_event);
         CloseHandle(pool->work_sem);
         DeleteCriticalSection(&pool->queue_cs);
@@ -828,6 +905,8 @@ threadpool_t *threadpool_create_cpuset(const uint32_t *cpuset_ids,
             free(pool->lp_indices);
             free(pool->groups);
             free(pool->worker_queues);
+            free(pool->cpu_time_last_100ns);
+            free(pool->wall_time_last_qpc);
             CloseHandle(pool->done_event);
             CloseHandle(pool->work_sem);
             DeleteCriticalSection(&pool->queue_cs);

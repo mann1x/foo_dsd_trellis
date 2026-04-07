@@ -93,4 +93,23 @@ double threadpool_get_worker_avg_rt(threadpool_t *pool, int worker_index);
  * Returns 0 if not available. */
 uint32_t threadpool_get_worker_cpuset(threadpool_t *pool, int worker_index);
 
+/* Measure the actual CPU consumption fraction of a worker thread since the
+ * last call. Uses GetThreadTimes to read per-thread kernel+user time and
+ * divides by the wall-clock interval since the previous sample. Returns a
+ * fraction in [0..1] where 1.0 means the thread was on-CPU 100% of the
+ * window. The first call after pool creation returns 0.55 (a neutral
+ * default — calibrated for stereo at moderate DSD rates) because there
+ * is no baseline yet to diff against.
+ *
+ * Window length is determined by how often the function is called: every
+ * call updates the baseline. Intended to be called from migration_tick
+ * with its natural ~5 batch cooldown rhythm (~1 second window).
+ *
+ * Used by the migration logic to distinguish between "the core is busy
+ * because of MY workers" and "the core is busy because of external
+ * contention". Without this, the migration logic credits 0.55 per worker
+ * which is too low for heavy multichannel DSD256+ workloads, causing
+ * the workers to perpetually flee their own legitimate self-load. */
+double threadpool_get_worker_self_load(threadpool_t *pool, int worker_index);
+
 #endif /* THREADPOOL_H */
