@@ -304,23 +304,29 @@ int engine_channel_init(engine_channel_t *eng, int channel,
                      * optimizations the GPU is no longer the bottleneck;
                      * proc time (mostly SDM cost) dominates.
                      *
+                     * Calibrated with two test IRs:
+                     *   no_mids_*.wav     (4096 taps @ 44.1k → 2M @ DSD512)
+                     *   no_mids_8k_*.wav  (8192 taps @ 44.1k → 4M @ DSD512)
+                     *
                      * Trellis HIGH (proc ≤ ~85%):
-                     *   DSD512 2M (np=32): 80-83% proc, 28% GPU
-                     *   DSD256 1M (np=16): 79-84% proc, 25% GPU
-                     *   DSD256 2M (np=32): 79-91% — TOO HIGH (peaks)
-                     *   DSD128 2M cap → 512K post-resample: 39-42% (room)
-                     *   DSD64  2M cap → 256K post-resample: 20-29% (room)
+                     *   DSD512 2M (np=32):                   80-83%, 28% GPU
+                     *   DSD256 1M (np=16):                   79-84%, 25% GPU
+                     *   DSD256 2M (np=32):                   79-91% — TOO HIGH (peaks)
+                     *   DSD128 4M cap → 1M post  (np=16):    41% steady, 58% peak
+                     *   DSD64  4M cap → 512K post (np=8):    20-31%, 24% GPU
                      *
                      * PreCorr HIGH (proc ≤ ~80%) — much lighter SDM:
-                     *   DSD512 2M post-resample (np=32): 74-78% proc, 37% GPU
-                     *   DSD256 2M cap → 1M post-resample (np=16): 35-38% (lots of room)
-                     *   DSD128 2M cap → 512K post-resample: 17-19% (lots of room)
-                     *   DSD64  2M cap → 256K post-resample:  8-13% (effectively free)
+                     *   DSD512 2M (np=32):                   74-78%, 37% GPU
+                     *   DSD512 4M (np=64):                   84-93% — TOO HIGH (peaks)
+                     *   DSD256 4M cap → 2M post  (np=32):    38-44%, 32% GPU
+                     *   DSD128 4M cap → 1M post  (np=16):    17-20%, 11% GPU
+                     *   DSD64  4M cap → 512K post (np=8):    8-17%, 18% GPU
                      *
-                     * The 2M cap is the ceiling we can verify with the
-                     * test IR (no_mids_*.wav, 2M raw taps). PreCorr could
-                     * potentially handle larger IRs at all rates but we
-                     * have no test data above 2M post-resample.
+                     * Sub-DSD512 caps are at 4M (the ceiling we can
+                     * verify with the 8k test IR). DSD512 maxes earlier
+                     * because it has the most conv chunks per batch
+                     * (68 vs 17/4 at lower rates), so per-chunk mul-acc
+                     * cost adds up faster.
                      *
                      * Medium / Low: cap is halved / quartered. After the
                      * conv overhead optimizations these mostly save VRAM
@@ -330,16 +336,16 @@ int engine_channel_init(engine_channel_t *eng, int channel,
                     int cap;
                     if (fs_out >= 22000000) {        /* DSD512 */
                         cap = trellis ? (1 << 21)    /* 2M — measured 80-83% */
-                                      : (1 << 21);   /* 2M — measured 74-78% */
+                                      : (1 << 21);   /* 2M — 4M was 84-93% (over) */
                     } else if (fs_out >= 11000000) { /* DSD256 */
-                        cap = trellis ? (1 << 20)    /* 1M — measured 79-84% (2M peaked 91%) */
-                                      : (1 << 21);   /* 2M — PreCorr 35-38%, can absorb the cap */
+                        cap = trellis ? (1 << 20)    /* 1M — 79-84% (2M peaked 91%) */
+                                      : (1 << 22);   /* 4M cap → 2M post: 38-44% */
                     } else if (fs_out >=  5000000) { /* DSD128 */
-                        cap = trellis ? (1 << 21)    /* 2M — Trellis 39-42% with this IR */
-                                      : (1 << 21);   /* 2M — PreCorr 17-19% with this IR */
+                        cap = trellis ? (1 << 22)    /* 4M cap → 1M post: 41% steady */
+                                      : (1 << 22);   /* 4M cap → 1M post: 17-20% */
                     } else {                          /* DSD64 */
-                        cap = trellis ? (1 << 21)    /* 2M — Trellis 20-29% with this IR */
-                                      : (1 << 21);   /* 2M — PreCorr 8-13% with this IR */
+                        cap = trellis ? (1 << 22)    /* 4M cap → 512K post: 20-31% */
+                                      : (1 << 22);   /* 4M cap → 512K post: 8-17% */
                     }
                     if (cfg->conv_budget == 1)      cap >>= 1;
                     else if (cfg->conv_budget >= 2)  cap >>= 2;
