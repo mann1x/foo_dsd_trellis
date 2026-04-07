@@ -23,7 +23,7 @@ A native foobar2000 DSP plugin that converts PCM and DSD audio to DSD using sigm
 | Out-of-Process Worker | Separate worker process with unrestricted CPU affinity (bypasses Process Lasso). Adaptive batch sizing matches on_chunk size |
 | Boxcar Pre-Smooth | DSD-Wide boxcar pre-filter before FIR rate conversion eliminates Gibbs overshoot (±2.24 → ±0.7). Enables full 0 dB gain for PreCorr upsample |
 | GPU Compute | CUDA/DX12 acceleration for FIR, boxcar, lowpass. GPU SDM (experimental) |
-| Convolution | GPU-accelerated UPOLS room correction at full DSD rate (per-channel WAV IR). cuFFT + custom kernels, CUDA Graph capture, ~0.3ms dispatch per channel. Per-rate / per-SDM-mode budget caps. Auto-truncation of long IRs centered on impulse peak |
+| Convolution | GPU-accelerated UPOLS room correction at full DSD rate (per-channel WAV IR). cuFFT + custom kernels, CUDA Graph capture, ~0.3ms dispatch per channel. Per-rate / per-SDM-mode / per-channel-count budget caps. Auto-truncation of long IRs centered on impulse peak. Up to 6 channels (5.1). Optional cepstral min-phase conversion for low-latency room correction. fb2k DSP latency API for automatic A/V-sync compensation |
 | ML Dual Runtime | ONNX Runtime with CUDA EP (onnxruntime_cuda.dll) + DirectML EP (onnxruntime.dll). Auto fallback: CUDA → DirectML → CPU |
 | Mute | Silence pattern substitution (0x69/0x96) |
 | DoP Detection | Auto-detect DoP markers (0x05/0xFA) in 24-bit PCM frames |
@@ -206,7 +206,13 @@ The DSP settings dialog has a **Budget: High / Medium / Low** selector under Con
 
 After the conv overhead optimizations (CUDA Graphs, partition_size bump, consolidated memcpys), the GPU is no longer the bottleneck — Medium/Low primarily save VRAM and give extra proc-time headroom on shared/loaded GPUs or VRAM-constrained systems. For most use cases **High is correct**.
 
-VRAM cost at HIGH budget per channel (stereo doubles this):
+The cap also scales **inversely with channel count** for multichannel. The values above were calibrated for stereo (2 channels). With 5.1 source the GPU compute is 2.5× more, so the per-channel cap is divided by `num_channels / 2`. So at 5 channels DSD256+Trellis is 1M ÷ 2.5 ≈ 400K taps. This keeps proc% at the same calibrated 80% target regardless of channel count.
+
+**Cap (taps, 0=auto)** — expert override field. Setting this to a non-zero value replaces the auto-calibrated cap entirely. Lets you push above the safe value: "I want to use my full 200ms IR at DSD512 even though it'll stutter on heavy passages". The value is in post-resample taps, range 4096 to 4M (CONV_MAX_IR_TAPS). 0 = auto. The override is logged whenever it kicks in so you can verify what's actually being used.
+
+**Min-phase** checkbox — converts the loaded IR to its min-phase equivalent (cepstral Hilbert transform) before partitioning. Same magnitude response as the original, but the impulse peak moves to ~sample 0 instead of L/2 — so the **latency drops from L/2 (44 ms for a 2M-tap IR at DSD512) to <1 ms**. Trades the linear-phase characteristic for low latency. The phase distortion introduced is mostly inaudible at audio frequencies for typical room correction filters; for percussive content where transient preservation matters, leave it off.
+
+VRAM cost at HIGH budget per channel (multichannel scales linearly):
 
 | Rate | Trellis | PreCorr |
 |---|---|---|
@@ -215,7 +221,7 @@ VRAM cost at HIGH budget per channel (stereo doubles this):
 | DSD256 | 70 MB | 134 MB |
 | DSD512 | 134 MB | 134 MB |
 
-A 16 GB GPU runs the maximum config at any rate.
+A 16 GB GPU runs the maximum config at any rate. Stereo: 2× per-channel. 5.1: 5× per-channel but cap is reduced 2.5×, so total VRAM is roughly the same as stereo at HIGH cap.
 
 ### Creating IRs with REW
 
@@ -254,10 +260,10 @@ A 16 GB GPU runs the maximum config at any rate.
 ### Limitations
 
 - **Hard cap**: `CONV_MAX_IR_TAPS = 4M` post-resample taps. Inputs that would exceed this after resampling are pre-truncated centered on the impulse peak.
-- **Mono per channel**. Multi-channel WAVs use channel 0 only. Stereo correction = two separate WAV files (L/R).
-- **Fully independent L/R**. Each channel has its own GPU buffers, CUDA stream, FDL, and graph cache. The only shared values are the partition size and per-rate budget cap (both are functions of the playback rate, not the channel).
-- **Latency**: the IR's group delay (impulse peak position) shows up as a per-sample delay between input and output. For linear-phase IRs that's `L/2` at the conv rate — e.g., a 2M-tap IR at DSD512 = 44 ms, a 4M-tap IR at DSD64 = 715 ms. The plugin reports this through fb2k's DSP latency API, so video players A/V-sync compensate automatically. Min-phase IRs have much smaller group delay.
-- **L/R only** in the current build. The settings dialog has surround channel slots (LFE/SL/SR/C) but the conv path runs only on the main L/R channels.
+- **Mono per channel**. Multi-channel WAVs use channel 0 only. Per-channel correction = one WAV file per channel (L/R/C/LFE/SL/SR).
+- **Fully independent per-channel processing**. Each channel has its own GPU buffers, dedicated CUDA stream, FDL, and graph cache. The only shared values are the partition size and per-rate budget cap (both are functions of the playback rate, not the channel).
+- **Multichannel support**: up to 6 channels (5.1). Tested with 5ch DSD64-DSD256 source (5×134 MB VRAM at HIGH cap, fits comfortably on 8 GB GPUs after the per-channel-count cap recalibration). DSD512 5.1 is theoretically supported but commercially extremely rare.
+- **Latency**: the IR's group delay (impulse peak position) shows up as a per-sample delay between input and output. For linear-phase IRs that's `L/2` at the conv rate — e.g., a 2M-tap IR at DSD512 = 44 ms, a 4M-tap IR at DSD64 = 715 ms. The plugin reports this through fb2k's DSP latency API, so video players A/V-sync compensate automatically. **Enable the Min-phase checkbox** for near-zero latency at the cost of phase linearity.
 
 ## DSD Rates
 
