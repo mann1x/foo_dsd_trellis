@@ -69,65 +69,60 @@ jobs:
         bin/Release/x64/foo_dsd_trellis_test.exe --suite dop --suite ntf --suite fir --suite config --suite simd --suite hardening || true
       timeout-minutes: 10
 
-    # === Code signing via SignPath Foundation (free for OSS) ===
+    # === Code signing via Microsoft Trusted Signing ===
     #
     # Signs foo_dsd_trellis.dll and foo_dsd_trellis_worker.exe with an
-    # Authenticode certificate from the SignPath Foundation OSS programme.
-    # Bundled deps (onnxruntime, DirectML, cuDNN, soxr, IPP) are already
-    # signed by their original publishers and don't need re-signing.
+    # Authenticode certificate issued by Microsoft Trusted Signing
+    # ($9.99/month Basic plan, includes 5,000 signing operations/month).
+    # The cert chain roots at "Microsoft Identity Verification Root
+    # Certificate Authority" — SmartScreen accepts it after a small
+    # reputation-building period and Smart App Control accepts it
+    # immediately, so signed binaries skip the install warnings on Win11.
     #
-    # Activates only when SIGNPATH_API_TOKEN is set in the repo secrets,
-    # so the workflow keeps working before/after the SignPath account
-    # is approved. See notes/setup_signpath.md for the one-time setup.
+    # Bundled deps (onnxruntime, DirectML, cuDNN, soxr, IPP) live in
+    # packages/ during the build and only get copied into the staging
+    # directories during packaging — they're already signed by their
+    # original publishers (Microsoft, NVIDIA, Intel) and don't need
+    # to be re-signed. The trusted-signing-action only touches files
+    # in bin/Release/x64.
+    #
+    # The signing steps activate only when AZURE_CLIENT_ID is present
+    # in the repo secrets, so the workflow keeps producing unsigned
+    # binaries before/after the Azure subscription + Trusted Signing
+    # account are set up. See notes/setup_trusted_signing.md for the
+    # one-time Azure setup.
 
-    - name: Stage unsigned binaries for signing
-      if: ${{ env.SIGNPATH_HAS_TOKEN == 'true' }}
+    - name: Sign binaries (Microsoft Trusted Signing)
+      if: ${{ env.SIGNING_ENABLED == 'true' }}
       env:
-        SIGNPATH_HAS_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
-      shell: bash
-      run: |
-        mkdir -p signpath_input
-        cp bin/Release/x64/foo_dsd_trellis.dll signpath_input/
-        cp bin/Release/x64/foo_dsd_trellis_worker.exe signpath_input/
-
-    - name: Upload unsigned binaries (for SignPath input)
-      if: ${{ env.SIGNPATH_HAS_TOKEN == 'true' }}
-      id: upload-unsigned
-      env:
-        SIGNPATH_HAS_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
-      uses: actions/upload-artifact@v4
+        SIGNING_ENABLED: ${{ secrets.AZURE_CLIENT_ID != '' }}
+      uses: azure/trusted-signing-action@v0.5.1
       with:
-        name: unsigned-binaries
-        path: signpath_input/
-        retention-days: 1
+        azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+        endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+        trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+        certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+        files-folder: bin/Release/x64
+        files-folder-filter: dll,exe
+        files-folder-recurse: false
+        file-digest: SHA256
+        timestamp-rfc3161: http://timestamp.acs.microsoft.com
+        timestamp-digest: SHA256
 
-    - name: Submit signing request to SignPath
-      if: ${{ env.SIGNPATH_HAS_TOKEN == 'true' }}
+    - name: Verify signatures
+      if: ${{ env.SIGNING_ENABLED == 'true' }}
       env:
-        SIGNPATH_HAS_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
-      uses: signpath/github-action-submit-signing-request@v1
-      with:
-        api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-        organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
-        project-slug: foo_dsd_trellis
-        signing-policy-slug: release-signing
-        artifact-configuration-slug: binaries
-        github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
-        wait-for-completion: true
-        output-artifact-directory: signpath_signed
-        wait-for-completion-timeout-in-seconds: 1800
-
-    - name: Replace unsigned binaries with signed ones
-      if: ${{ env.SIGNPATH_HAS_TOKEN == 'true' }}
-      env:
-        SIGNPATH_HAS_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
-      shell: bash
+        SIGNING_ENABLED: ${{ secrets.AZURE_CLIENT_ID != '' }}
+      shell: pwsh
       run: |
-        cp signpath_signed/foo_dsd_trellis.dll          bin/Release/x64/foo_dsd_trellis.dll
-        cp signpath_signed/foo_dsd_trellis_worker.exe   bin/Release/x64/foo_dsd_trellis_worker.exe
-        # Verify the signature is present
-        powershell -Command "Get-AuthenticodeSignature bin/Release/x64/foo_dsd_trellis.dll | Format-List"
-        powershell -Command "Get-AuthenticodeSignature bin/Release/x64/foo_dsd_trellis_worker.exe | Format-List"
+        Get-AuthenticodeSignature bin/Release/x64/foo_dsd_trellis.dll | Format-List
+        Get-AuthenticodeSignature bin/Release/x64/foo_dsd_trellis_worker.exe | Format-List
+        $dll = (Get-AuthenticodeSignature bin/Release/x64/foo_dsd_trellis.dll).Status
+        $exe = (Get-AuthenticodeSignature bin/Release/x64/foo_dsd_trellis_worker.exe).Status
+        if ($dll -ne 'Valid') { throw "DLL signature status: $dll" }
+        if ($exe -ne 'Valid') { throw "EXE signature status: $exe" }
 
     - name: Download cuDNN
       shell: bash
