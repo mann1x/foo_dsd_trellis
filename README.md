@@ -2,7 +2,47 @@
 
 A native foobar2000 DSP plugin that converts PCM and DSD audio to DSD using sigma-delta modulation. Supports two SDM modes: **Trellis** (Viterbi look-ahead, highest quality) and **PreCorr** (greedy + prediction correction, near-zero CPU). FIR rate conversion uses Intel IPP with automatic SSE2/AVX2/AVX-512 dispatch.
 
-**[Changelog](CHANGELOG.md)** | **[DAS Algorithm](Density-Aligned-Stitching/DAS-Algorithm.md)** | **[Convolution / Room Correction](#convolution-room-correction)**
+**[Changelog](CHANGELOG.md)** | **[DAS Algorithm](Density-Aligned-Stitching/DAS-Algorithm.md)** | **[Convolution / Room Correction](#convolution-room-correction)** | **[Installing](#installing)**
+
+## Installing
+
+Download the latest release from the [Releases page](https://github.com/mann1x/foo_dsd_trellis/releases), extract the `.zip`, and double-click the `.fb2k-component` file. foobar2000 will prompt to install it.
+
+### Two release flavours
+
+- **Base** (`foo_dsd_trellis-X.Y.Z-x64.zip`) — DirectML ML support. Works on any GPU (NVIDIA / AMD / Intel) and on CPU. Recommended for most users.
+- **CUDA** (`foo_dsd_trellis-X.Y.Z-x64-cuda.zip`) — DirectML + CUDA ML support. NVIDIA only. Requires CUDA Toolkit 12.x installed on the system. Use this only if you specifically want CUDA EP for the ML pre-emphasis filter.
+
+### Windows 11 install warnings (SmartScreen / Smart App Control)
+
+The binaries are not yet signed by a trusted publisher, so Windows 11 may block the install with one of two different mechanisms. They're often confused but the workaround depends on which one fires.
+
+#### SmartScreen (per-file, bypassable)
+
+**Symptom:** "Windows protected your PC — Microsoft Defender SmartScreen prevented an unrecognized app from starting" with a "More info → Run anyway" button.
+
+**Fix:** right-click the downloaded `.zip` (**before** extracting) → Properties → check **Unblock** at the bottom → OK. Then extract and install. This clears the "downloaded from internet" mark on every file inside the zip in one step.
+
+Or via PowerShell:
+
+```powershell
+Unblock-File C:\path\to\foo_dsd_trellis-1.1.0-x64.zip
+```
+
+#### Smart App Control (system-wide, no per-file override)
+
+**Symptom:** the install is silently blocked, no "Run anyway" option, no obvious error.
+
+**Check:** *Settings → Privacy & security → Windows Security → App & browser control → Smart App Control settings*. If it says "On", that's SAC blocking the install. If it says "Off" or "Evaluation", what's blocking you is SmartScreen — see the section above.
+
+**Workaround:** SAC has no per-file exclusion. Your only options are:
+
+1. **Turn SAC off** — *Settings → ... → Smart App Control settings → Off*. ⚠️ **Important:** once SAC is turned off it **cannot be turned back on** without reinstalling Windows. SAC is designed as a one-shot opt-in. If you care about having SAC active, don't turn it off — wait for a signed build instead.
+2. **Wait for a signed build.** Code signing via the [SignPath Foundation](https://signpath.org/) is on the roadmap and will eliminate both SAC and SmartScreen blocks. The setup is documented in [`notes/setup_signpath.md`](notes/setup_signpath.md).
+
+### Verifying the unsigned binaries
+
+If you want to confirm the binaries haven't been tampered with, the SHA-256 checksums of every release artifact are visible on the [GitHub release page](https://github.com/mann1x/foo_dsd_trellis/releases) under each `.zip`'s "Show sha256" expander.
 
 ## Features
 

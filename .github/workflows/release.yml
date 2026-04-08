@@ -69,6 +69,66 @@ jobs:
         bin/Release/x64/foo_dsd_trellis_test.exe --suite dop --suite ntf --suite fir --suite config --suite simd --suite hardening || true
       timeout-minutes: 10
 
+    # === Code signing via SignPath Foundation (free for OSS) ===
+    #
+    # Signs foo_dsd_trellis.dll and foo_dsd_trellis_worker.exe with an
+    # Authenticode certificate from the SignPath Foundation OSS programme.
+    # Bundled deps (onnxruntime, DirectML, cuDNN, soxr, IPP) are already
+    # signed by their original publishers and don't need re-signing.
+    #
+    # Activates only when SIGNPATH_API_TOKEN is set in the repo secrets,
+    # so the workflow keeps working before/after the SignPath account
+    # is approved. See notes/setup_signpath.md for the one-time setup.
+
+    - name: Stage unsigned binaries for signing
+      if: ${{ env.SIGNPATH_HAS_TOKEN == 'true' }}
+      env:
+        SIGNPATH_HAS_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+      shell: bash
+      run: |
+        mkdir -p signpath_input
+        cp bin/Release/x64/foo_dsd_trellis.dll signpath_input/
+        cp bin/Release/x64/foo_dsd_trellis_worker.exe signpath_input/
+
+    - name: Upload unsigned binaries (for SignPath input)
+      if: ${{ env.SIGNPATH_HAS_TOKEN == 'true' }}
+      id: upload-unsigned
+      env:
+        SIGNPATH_HAS_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: unsigned-binaries
+        path: signpath_input/
+        retention-days: 1
+
+    - name: Submit signing request to SignPath
+      if: ${{ env.SIGNPATH_HAS_TOKEN == 'true' }}
+      env:
+        SIGNPATH_HAS_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+      uses: signpath/github-action-submit-signing-request@v1
+      with:
+        api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+        organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+        project-slug: foo_dsd_trellis
+        signing-policy-slug: release-signing
+        artifact-configuration-slug: binaries
+        github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+        wait-for-completion: true
+        output-artifact-directory: signpath_signed
+        wait-for-completion-timeout-in-seconds: 1800
+
+    - name: Replace unsigned binaries with signed ones
+      if: ${{ env.SIGNPATH_HAS_TOKEN == 'true' }}
+      env:
+        SIGNPATH_HAS_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+      shell: bash
+      run: |
+        cp signpath_signed/foo_dsd_trellis.dll          bin/Release/x64/foo_dsd_trellis.dll
+        cp signpath_signed/foo_dsd_trellis_worker.exe   bin/Release/x64/foo_dsd_trellis_worker.exe
+        # Verify the signature is present
+        powershell -Command "Get-AuthenticodeSignature bin/Release/x64/foo_dsd_trellis.dll | Format-List"
+        powershell -Command "Get-AuthenticodeSignature bin/Release/x64/foo_dsd_trellis_worker.exe | Format-List"
+
     - name: Download cuDNN
       shell: bash
       run: |
