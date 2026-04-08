@@ -44,6 +44,9 @@ reference/
 .claude/
 CLAUDE.md
 
+# Local-only files (signing scripts, private notes, secrets — never committed)
+local/
+
 # NuGet
 packages/
 

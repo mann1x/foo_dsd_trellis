@@ -38,7 +38,7 @@ Unblock-File C:\path\to\foo_dsd_trellis-1.1.0-x64.zip
 **Workaround:** SAC has no per-file exclusion. Your only options are:
 
 1. **Turn SAC off** — *Settings → ... → Smart App Control settings → Off*. ⚠️ **Important:** once SAC is turned off it **cannot be turned back on** without reinstalling Windows. SAC is designed as a one-shot opt-in. If you care about having SAC active, don't turn it off — wait for a signed build instead.
-2. **Wait for a signed build.** Code signing via [Microsoft Trusted Signing](https://learn.microsoft.com/azure/trusted-signing/) is on the roadmap and will eliminate both SAC and SmartScreen blocks (the cert chains to a Microsoft root which SAC trusts immediately). Setup is documented in [`notes/setup_trusted_signing.md`](notes/setup_trusted_signing.md).
+2. **Wait for a signed build.** Code signing via [Certum Open Source Code Signing](https://shop.certum.eu/code-signing.html) is in progress and will eliminate both SAC and SmartScreen blocks. Signed releases will appear here once the certificate identity verification completes.
 
 ### Verifying the unsigned binaries
 
